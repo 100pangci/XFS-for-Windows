@@ -71,8 +71,6 @@ XfsExtent Ext(uint64_t startoff, uint64_t startblock, uint64_t count,
   return e;
 }
 
-std::string Reason(const Status& status) { return status.error().Format(); }
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
