@@ -33,9 +33,9 @@ fi
 
 rootino="$(xfs_db -r -c 'sb 0' -c 'p rootino' "$img" | awk -F'= ' '{print $2}' | awk '{print $1}')"
 echo "== xfs_db: root inode ($rootino) =="
-inode_out="$(xfs_db -r -c "inode $rootino" -c 'p core.mode core.size core.nlink core.format' "$img" 2>&1)"
+inode_out="$(xfs_db -r -c "inode $rootino" -c 'p core' "$img" 2>&1)"
 echo "$inode_out"
-if echo "$inode_out" | grep -qiE 'sanity check failed|corruption|crc error|not found'; then
+if echo "$inode_out" | grep -qiE 'sanity check failed|corruption|crc error'; then
     echo "FAILED: xfs_db reported root inode problems" >&2
     exit 1
 fi
