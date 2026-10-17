@@ -49,28 +49,49 @@ python tests\tools\xfs_probe.py build\smoke.img
 It must print `ALL STRUCTURAL CHECKS PASSED`. This catches bugs where the C++
 reader and writer share a wrong assumption.
 
-## Read-write tests (RW-0)
+## Read-write tests (RW-0 data, RW-1 transactions)
 
 The write path is the same core code for the CLI and for WinFsp, so it is
-tested in layers.
+tested in layers. RW-1 added the journal, so the layers now include a log
+format oracle and a crash matrix that Linux replays.
 
 ### 1. Unit and integration tests (no driver, no Linux)
 
 `xfs_tests` covers the range rules (holes, unwritten extents, EOF, immutable
 and append-only inodes, extent splits), the round trip through a real image,
-cache invalidation, the mount policy and the crash-injection configuration. The
-images come from `tests/support/fixture_image.cpp`, which builds a *consistent*
-filesystem with one allocated file on top of the real formatter:
+cache invalidation, the mount policy and the crash-injection configuration
+(`tests/unit/write_tests.cpp`). RW-1 added `tests/unit/journal_tests.cpp`:
+
+- the record layout (header fields, op chain, cycle stamping, CRC) checked
+  against a second, independent CRC computation in the test,
+- rejected records (too large, bad block/cycle, empty),
+- the write position a clean log establishes (`ReadLogPosition`),
+- the clean unmount record closing a dirty log,
+- `SetFileTimes`: only the core fields it owns change, the CRC stays valid and
+  the inode LSN equals the newest log record's LSN,
+- write-ahead ordering observed through a recording device: file data, then
+  log header, log data, flush, then the inode, then flush.
+
+The images come from `tests/support/fixture_image.cpp`, which builds a
+*consistent* filesystem with one allocated file on top of the real formatter:
 
 ```powershell
 build\tests\RelWithDebInfo\xfs_tests.exe --make-fixture C:\temp\fixture.img
 python tests\tools\fixture_probe.py C:\temp\fixture.img
+python tests\tools\log_probe.py C:\temp\fixture.img --expect clean
 ```
 
 The fixture is verified by an independent Python probe, and in CI by Linux
 `xfs_repair -n`, `xfs_db` and a loop mount
 (`tests/scripts/verify_fixture_linux.sh`) - the unit tests are only meaningful
 if the image they use is a real XFS filesystem.
+
+`tests/tools/log_probe.py` is the log oracle: it reimplements the record
+format from the kernel specification (magic/version/cycle/uuid, `h_lsn`,
+`h_len`, cycle stamping, the CRC over header plus stamped data, the op chain,
+the `xfs_inode_log_format`/`xfs_log_dinode` payloads, buffer items, cleared
+space) and also reads logs that the kernel itself wrote, which is checked in
+CI against the Linux-populated and golden images.
 
 ### 2. CLI write path
 
@@ -117,10 +138,39 @@ xfswin pwrite image.img /hello.bin 0 --rw-experimental --text=x
 # process terminates with exit code 0x58435348, no clean unmount
 ```
 
-then on Linux: `xfs_repair -n` and a mount. Valid results are the state before
-the transaction or the state after it - never in between. `:<hit>` selects
-which occurrence crashes (`after_metadata_write:3`). Point names are stable and
-listed by `xfs::ParseCrashPoint`.
+`:<hit>` selects which occurrence crashes (`after_metadata_write:3`). Point
+names are stable and listed by `xfs::ParseCrashPoint`. RW-1 turns this into a
+matrix over every point of one write:
+
+```powershell
+pwsh -File tests/scripts/verify_crash_windows.ps1 `
+  -Exe build\src\RelWithDebInfo\xfswin.exe `
+  -Tests build\tests\RelWithDebInfo\xfs_tests.exe -WorkDir out\crash
+```
+
+For each point the script copies the fixture image, runs the write with that
+point armed and checks the *pre-replay* state with
+`tests/tools/rw_crash_check.py`:
+
+- the log has at most one torn record and it is the newest,
+- the inode is never torn (magic, version, CRC),
+- if the inode changed, a complete log record with the same LSN *and* the same
+  timestamps describes it (write-ahead violation otherwise),
+- the file data is old or new.
+
+On Linux, `tests/scripts/verify_crash_linux.sh` mounts every image (so the
+kernel replays the log) and requires the window contract:
+
+| crash point | timestamps | data |
+|---|---|---|
+| `before_data_write` | old | old |
+| `after_data_write`, `before_log_write`, `mid_log_record` | old | new |
+| `after_log_commit`, `before_metadata_write`, `after_metadata_write`, `before/after_device_flush` | **new** (the kernel replayed our record) | new |
+| `mid_data_write`, `mid_metadata_write` (need more than one mapping/buffer to trigger) | old, new | old, new, mixed |
+
+plus a clean log after the unmount and `xfs_repair -n` staying silent. The
+"new" timestamps are not guessed: `tests/tools/rw_replay_check.py` reads them
+out of the complete log record in the image, which is what the kernel replays.
 
 ## Linux oracles (required for release)
 
@@ -228,11 +278,13 @@ image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 Every push runs nine jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
-   suite, formats a 300 MiB image, runs `xfswin check`, cross-checks the image
-   with the independent Python probe, builds the fixture image (one allocated
-   file) and probes it, and exercises the CLI write path (`pwrite`, refusals,
-   `check` after the write). Uploads `xfswin.exe`, the Windows-formatted image
-   and the fixture image.
+   suite (including the journal tests), formats a 300 MiB image, runs `xfswin
+   check`, cross-checks the image with the independent Python probe, builds the
+   fixture image (one allocated file) and probes it, exercises the CLI write
+   path (`pwrite`, refusals, `check` after the write), and runs the crash
+   matrix (`verify_crash_windows.ps1`), uploading the crash images for the
+   replay job. Uploads `xfswin.exe`, the Windows-formatted image, the fixture
+   image and the crash images.
 2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
    `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
    output) for comparison against the formatter.
@@ -259,11 +311,18 @@ Every push runs nine jobs:
    `xfs_repair -n` must stay clean, the two modified files must match the
    content regenerated by `tests/tools/rw_content.py` with the overlays
    applied, and every other file must be byte-identical to the pristine image.
-7. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+   It also runs `tests/tools/log_probe.py` over the Linux-written and
+   Windows-modified logs, so the parser oracle stays compatible with records
+   the kernel writes.
+7. **linux-verify-crash** (ubuntu-24.04): mounts every crash image from job 1,
+   which makes the kernel *replay* the log record this project wrote, and
+   requires the window contract from `docs/TESTING.md` §5 (old timestamps
+   before the record is durable, the logged new ones after it, data old or new,
+   a clean log afterwards and `xfs_repair -n` silence).8. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
    VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
    with the raw device backend, reads it back with `info`/`check`/`ls`, and
    detaches it. Uploads the VHD.
-8. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+9. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
    from the artifact and runs the full Linux verification (`xfs_db`,
    `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
    through the raw device path -- the CI stand-in for Case C hardware.

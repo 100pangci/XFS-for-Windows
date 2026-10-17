@@ -182,8 +182,9 @@ Consequences for the writer:
   `xfs_unmount_log_format { magic = 0x556e }`. Its position must be the head
   afterwards, which is automatic when it is the last thing written.
 - `h_prev_block` must point at the previous record's header block so recovery
-  can walk backwards; the very first record after mkfs points at the mkfs
-  record (or 0xffffffff if none - to be confirmed against tested output).
+  can walk backwards; the first record after mkfs links to the mkfs record,
+  which itself uses 0xffffffff (no predecessor) - both confirmed against
+  formatter, writer and kernel output.
 
 ## 6. What RW-1 implements
 
