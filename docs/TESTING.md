@@ -49,6 +49,79 @@ python tests\tools\xfs_probe.py build\smoke.img
 It must print `ALL STRUCTURAL CHECKS PASSED`. This catches bugs where the C++
 reader and writer share a wrong assumption.
 
+## Read-write tests (RW-0)
+
+The write path is the same core code for the CLI and for WinFsp, so it is
+tested in layers.
+
+### 1. Unit and integration tests (no driver, no Linux)
+
+`xfs_tests` covers the range rules (holes, unwritten extents, EOF, immutable
+and append-only inodes, extent splits), the round trip through a real image,
+cache invalidation, the mount policy and the crash-injection configuration. The
+images come from `tests/support/fixture_image.cpp`, which builds a *consistent*
+filesystem with one allocated file on top of the real formatter:
+
+```powershell
+build\tests\RelWithDebInfo\xfs_tests.exe --make-fixture C:\temp\fixture.img
+python tests\tools\fixture_probe.py C:\temp\fixture.img
+```
+
+The fixture is verified by an independent Python probe, and in CI by Linux
+`xfs_repair -n`, `xfs_db` and a loop mount
+(`tests/scripts/verify_fixture_linux.sh`) - the unit tests are only meaningful
+if the image they use is a real XFS filesystem.
+
+### 2. CLI write path
+
+```powershell
+xfswin pwrite test.img /hello.bin 4096 --rw-experimental --from=overlay.bin
+xfswin check test.img
+```
+
+`pwrite` performs the same core write the WinFsp `Write` callback does (in
+place, image only, requires `--rw-experimental`), so CI can verify writes
+against Linux oracles without the WinFsp driver.
+
+### 3. WinFsp read-write mount
+
+Without a driver, `xfswin selftest <image> --rw-experimental` drives the real
+callbacks (open, write, flush, re-open, read back) and checks that a write past
+EOF is refused. With a driver,
+`tests/scripts/verify_mount_rw_windows.ps1` mounts the image read-write,
+overwrites bytes in a file through WinFsp, verifies the read-back, asserts that
+create/delete/rename/mkdir/truncate/append/writes-past-EOF/writes-to-0444-files
+are all refused, then writes a second overlay through `xfswin pwrite` and runs
+`xfswin check`.
+
+### 4. Linux interoperability round trip (CI)
+
+```text
+Windows  format an image (read-write safe profile)
+Linux    populate it with deterministic files (tests/tools/rw_content.py)
+Windows  mount --rw-experimental, overwrite bytes in two files
+Linux    sudo tests/scripts/verify_rw_linux.sh modified.img rw.img recipe overlay
+```
+
+The last step requires, in this order: `xfs_repair -n` clean, both modified
+files equal to the content regenerated from `rw_content.py` with the overlays
+applied, every other file byte-identical to the pristine image, identical
+directory trees and a clean log. "Explorer shows the file" is not evidence;
+this is.
+
+### 5. Crash injection
+
+```powershell
+$env:XFSWIN_CRASH_AT = 'before_data_write'
+xfswin pwrite image.img /hello.bin 0 --rw-experimental --text=x
+# process terminates with exit code 0x58435348, no clean unmount
+```
+
+then on Linux: `xfs_repair -n` and a mount. Valid results are the state before
+the transaction or the state after it - never in between. `:<hit>` selects
+which occurrence crashes (`after_metadata_write:3`). Point names are stable and
+listed by `xfs::ParseCrashPoint`.
+
 ## Linux oracles (required for release)
 
 These steps need a Linux environment. On the current development machine no
@@ -152,37 +225,48 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs seven jobs:
+Every push runs nine jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
-   suite, formats a 300 MiB image, runs `xfswin check`, and cross-checks the
-   image with the independent Python probe. Uploads `xfswin.exe` and the
-   Windows-formatted image.
+   suite, formats a 300 MiB image, runs `xfswin check`, cross-checks the image
+   with the independent Python probe, builds the fixture image (one allocated
+   file) and probes it, and exercises the CLI write path (`pwrite`, refusals,
+   `check` after the write). Uploads `xfswin.exe`, the Windows-formatted image
+   and the fixture image.
 2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
    `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
    output) for comparison against the formatter.
 3. **linux-verify-windows** (ubuntu-24.04): takes the Windows-formatted image
    and runs the real `xfs_db` + `xfs_repair -n` + loop mounts (read-only and a
-   writable copy). Then it creates a *populated golden image* using Linux
+   writable copy), verifies the fixture image with `xfs_repair -n`, `xfs_db`
+   and a content check, then populates the Windows-formatted image for the
+   read-write round trip (`make_rw_image.sh`) and uploads it with the overlay
+   and recipe. It also creates a *populated golden image* using Linux
    `mkfs.xfs` and the kernel (Unicode names, large file, sparse file, extent
    btree, 5000-entry directory, symlink, hardlink) plus a sha256 manifest.
 4. **windows-read-linux-image**: runs `xfswin check` and compares directory
    listings, sizes, sha256 hashes, sparse/large file contents and symlink
    targets against the Linux-generated manifest (differential test).
 5. **windows-mount**: installs the WinFsp runtime, builds with the WinFsp SDK,
-   runs `xfswin selftest` (adapter callbacks without the driver), then mounts
-   the Linux image at `X:`, verifies reads/hashes/Unicode names, and asserts
-   that create/delete/rename/mkdir are rejected as write-protected before
-   unmounting.
-6. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+   runs `xfswin selftest` (adapter callbacks without the driver, read-only and
+   read-write), mounts the Linux image at `X:`, verifies
+   reads/hashes/Unicode names, asserts that create/delete/rename/mkdir are
+   rejected as write-protected, then mounts the read-write image with
+   `--rw-experimental`, overwrites bytes through the WinFsp `Write` callback,
+   asserts the RW-0 refusals, writes a second overlay through `xfswin pwrite`
+   and uploads the modified image.
+6. **linux-verify-rw** (ubuntu-24.04): verifies the read-write round trip:
+   `xfs_repair -n` must stay clean, the two modified files must match the
+   content regenerated by `tests/tools/rw_content.py` with the overlays
+   applied, and every other file must be byte-identical to the pristine image.
+7. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
    VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
    with the raw device backend, reads it back with `info`/`check`/`ls`, and
    detaches it. Uploads the VHD.
-7. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+8. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
    from the artifact and runs the full Linux verification (`xfs_db`,
    `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
    through the raw device path -- the CI stand-in for Case C hardware.
 
 This is the environment-independent version of the Linux/WinFsp acceptance
-checks; see the jobs for the exact commands. All seven jobs are green on the
-current `main`.
+checks; see the jobs for the exact commands.

@@ -61,6 +61,39 @@ jobs:
         shell: pwsh
         run: python tests/tools/xfs_probe.py out/windows.img
 
+      - name: Fixture image (one allocated file) for the RW tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = "build\tests\$env:BUILD_CONFIG\xfs_tests.exe"
+          & $tests --make-fixture out\fixture.img
+          if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
+          python tests/tools/fixture_probe.py out/fixture.img
+          if ($LASTEXITCODE -ne 0) { throw "fixture probe failed" }
+
+      - name: In-place write path (CLI) on a copy of the fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          Copy-Item out\fixture.img out\fixture-write.img
+          & $exe pwrite out\fixture-write.img /hello.bin 100 --rw-experimental --text=OVERWRITTEN
+          if ($LASTEXITCODE -ne 0) { throw "pwrite failed" }
+          # A write that would need an allocation must be refused.
+          & $exe pwrite out\fixture-write.img /hello.bin 32765 --rw-experimental --text=toolong
+          if ($LASTEXITCODE -eq 0) { throw "pwrite past EOF was not refused" }
+          # Growth, holes and unwritten extents are out of scope.
+          & $exe pwrite out\fixture-write.img /hello.bin 0 --rw-experimental --text=x
+          if ($LASTEXITCODE -ne 0) { throw "pwrite in place failed" }
+          & $exe check out\fixture-write.img
+          if ($LASTEXITCODE -ne 0) { throw "check failed after pwrite" }
+          # Without the confirmation flag nothing may be written.
+          & $exe pwrite out\fixture-write.img /hello.bin 0 --text=x
+          if ($LASTEXITCODE -ne 3) { throw "pwrite without --rw-experimental must exit 3" }
+          # Read-write mounting of a real device stays refused.
+          & $exe mount \\.\PhysicalDrive0 Y: --rw-experimental
+          if ($LASTEXITCODE -ne 3) { throw "rw mount of a raw device must exit 3" }
+
       - name: Upload xfswin.exe
         uses: actions/upload-artifact@v4
         with:
@@ -73,6 +106,13 @@ jobs:
         with:
           name: windows-image
           path: out/windows.img
+          if-no-files-found: error
+
+      - name: Upload fixture image
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-image
+          path: out/fixture.img
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -170,6 +210,33 @@ jobs:
           ls -l images/windows.img
           sudo bash tests/scripts/verify_windows_image_linux.sh images/windows.img
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixture-image
+          path: fixture
+
+      - name: Verify the fixture image (one allocated file) with Linux
+        run: |
+          ls -l fixture/fixture.img
+          sudo bash tests/scripts/verify_fixture_linux.sh fixture/fixture.img
+
+      - name: Populate the read-write interoperability image
+        run: |
+          sudo bash tests/scripts/make_rw_image.sh images/windows.img rw
+          ls -l rw
+
+      - name: Upload the read-write image (populated by Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-image
+          path: |
+            rw/rw.img
+            rw/rw-overlay.bin
+            rw/rw-recipe.json
+            rw/rw-pristine.sha256
+            rw/rw-repair.log
+          if-no-files-found: error
+
       - name: Create populated golden image (Linux mkfs + kernel)
         env:
           GOLDEN_POPULATED_SIZE: 512M
@@ -238,6 +305,11 @@ jobs:
           name: linux-golden
           path: golden
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-image
+          path: rw
+
       - name: Install WinFsp runtime and extract the SDK
         shell: pwsh
         run: |
@@ -298,6 +370,11 @@ jobs:
           $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
           & $exe selftest "golden\populated.img"
           if ($LASTEXITCODE -ne 0) { throw "adapter selftest failed" }
+          # Read-write self-test: overwrites bytes inside an existing file
+          # through the real Write/Flush callbacks.
+          Copy-Item "rw\rw.img" "rw\rw-selftest.img"
+          & $exe selftest "rw\rw-selftest.img" --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "read-write adapter selftest failed" }
 
       - name: Mount and verify read-only semantics
         shell: pwsh
@@ -306,6 +383,56 @@ jobs:
             -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
             -Image "golden\populated.img" `
             -Manifest "golden\populated.manifest.json"
+
+      - name: Mount read-write and overwrite existing data
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_mount_rw_windows.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Image "rw\rw.img" `
+            -Recipe "rw\rw-recipe.json" `
+            -Overlay "rw\rw-overlay.bin"
+
+      - name: Upload the read-write modified image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-modified
+          path: rw/rw-work/rw-modified.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the read-write round trip: xfs_repair -n must stay clean,
+  # the overwritten files must match the documented content with the overlays
+  # applied, and every other file must be byte-identical to the pristine image.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw:
+    needs: windows-mount
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-image
+          path: rw
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-modified
+          path: modified
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows read-write modification
+        run: |
+          ls -l rw modified
+          test "$(cat rw/rw-pristine.sha256)" = "$(sha256sum rw/rw.img | cut -d' ' -f1)"
+          sudo bash tests/scripts/verify_rw_linux.sh \
+            modified/rw-modified.img rw/rw.img rw/rw-recipe.json rw/rw-overlay.bin
 
   # ---------------------------------------------------------------------------
   # Raw device path (Case C): attach a fixed VHD as a real disk and format it
