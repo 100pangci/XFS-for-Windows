@@ -7,6 +7,7 @@ add_library(xfs_core STATIC
   core/error.cpp
   core/log.cpp
   core/log_checker.cpp
+  core/crash.cpp
   core/endian.cpp
   core/crc32c.cpp
   core/verifier.cpp
@@ -18,6 +19,7 @@ add_library(xfs_core STATIC
   core/directory.cpp
   core/symlink.cpp
   core/filesystem.cpp
+  core/invalidation.cpp
   block/image_device.cpp
   block/windows_raw_device.cpp
   mkfs/geometry.cpp
@@ -26,6 +28,10 @@ add_library(xfs_core STATIC
   mkfs/superblock_builder.cpp
   mkfs/journal_builder.cpp
   mkfs/formatter.cpp
+  write/policy.cpp
+  write/range.cpp
+  write/file_data.cpp
+  write/flush.cpp
   win_name_map.cpp
 )
 

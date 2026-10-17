@@ -12,12 +12,14 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "xfs/block_device.h"
+#include "xfs/cache.h"
 #include "xfs/directory.h"
 #include "xfs/error.h"
 #include "xfs/extent.h"
@@ -34,6 +36,11 @@ struct MountOptions {
   // understood. Never allowed by default; read-only access only, and the
   // caller is responsible for the safety implications.
   bool force_unsafe_ro = false;
+  // Requests a writable mount. The device must be writable, the log clean and
+  // the feature profile must pass CheckWritableProfile(); otherwise mounting
+  // fails instead of silently falling back to read-only. Callers that want
+  // read-only access after a refused read-write mount ask for read-only.
+  bool read_write = false;
 };
 
 struct XfsFileInfo {
@@ -125,11 +132,15 @@ class XfsFilesystem {
   const std::vector<std::string>& warnings() const { return warnings_; }
   uint64_t RootInode() const { return geometry_.rootino; }
 
+  // True when this mount may modify the filesystem (MountOptions::read_write
+  // plus a writable device, clean log and a writable feature profile).
+  bool writable() const { return writable_; }
+
   // ---- core API ----
   Result<XfsInode> OpenInode(uint64_t ino) const;
   Result<XfsInode> LookupPath(std::string_view path) const;
   Result<std::vector<XfsDirEntry>> ListDirectory(uint64_t ino) const;
-  Result<XfsDirEntry> LookupName(uint64_t dir_ino, std::string_view name) const;
+  Result<XfsDirEntry> LookupName(uint64_t ino, std::string_view name) const;
   Result<size_t> ReadFile(uint64_t ino, uint64_t offset, void* buffer,
                           size_t length) const;
   // Fast path: the caller already holds the inode (and may hold its cached
@@ -139,6 +150,25 @@ class XfsFilesystem {
                           uint64_t offset, void* buffer, size_t length) const;
   Result<std::string> ReadSymlink(uint64_t ino) const;
   Result<XfsFileInfo> GetFileInfo(uint64_t ino) const;
+
+  // ---- mutation API (read-write mounts only) ----
+  // Overwrites bytes inside extents that are already allocated and written.
+  // Never allocates, never converts an unwritten extent and never changes the
+  // inode size (see MapWrittenRange for the exact range rule). Returns the
+  // number of bytes written; on failure nothing is guaranteed to be intact
+  // beyond the reported error, but no metadata was touched either.
+  Result<size_t> OverwriteFileData(uint64_t ino, uint64_t offset,
+                                   const void* buffer, size_t length);
+
+  // Flushes pending writes to stable storage. Returns failure if the device
+  // flush fails: callers (WinFsp Flush, clean unmount) must not report
+  // success after a failed flush.
+  Status Flush();
+
+  // Central invalidation entry point: every mutation reports what it changed
+  // here instead of touching caches directly (see xfs/cache.h for the policy
+  // table).
+  void InvalidateCaches(const CacheInvalidation& invalidation) const;
 
   // ---- read-only consistency validation (xfswin check) ----
   CheckReport CheckConsistency(const CheckOptions& options) const;
@@ -155,10 +185,22 @@ class XfsFilesystem {
   };
   void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
 
+  // Parsed data-fork extent list, from the extent cache or freshly loaded.
+  // Shared between reads and writes so both see the same extents.
+  Result<std::shared_ptr<const std::vector<XfsExtent>>> LoadExtentsCached(
+      const XfsInode& inode) const;
+
   // ---- file data chunk cache ----
   // Reads are served in 256 KiB chunks so that one device read covers many
   // small reads (thumbnail/metadata decoders) and repeated reads never touch
   // the device again. A global byte budget bounds memory use; eviction is LRU.
+  //
+  // Writers and readers coordinate through a per-inode generation counter:
+  // a mutation writes the device first, then bumps the generation, then drops
+  // the affected chunks (in that order - see InvalidateCaches). A reader
+  // snapshots the generation before its device read and refuses to publish a
+  // chunk whose generation is no longer current, so a stale chunk can never
+  // survive in the cache.
   struct DataCacheKey {
     uint64_t ino = 0;
     uint64_t chunk = 0;
@@ -175,19 +217,30 @@ class XfsFilesystem {
   };
   struct DataCacheEntry {
     std::shared_ptr<const AlignedBuffer> data;
+    uint64_t generation = 0;  // data generation at insert time
     std::list<DataCacheKey>::iterator lru;
   };
   std::shared_ptr<const AlignedBuffer> LookupDataChunk(uint64_t ino,
                                                        uint64_t chunk) const;
   std::shared_ptr<const AlignedBuffer> InsertDataChunk(
-      uint64_t ino, uint64_t chunk,
-      std::shared_ptr<const AlignedBuffer> data) const;
+      uint64_t ino, uint64_t chunk, std::shared_ptr<const AlignedBuffer> data,
+      uint64_t generation) const;
+  // Current data generation of an inode (0 for never-written inodes).
+  uint64_t DataGeneration(uint64_t ino) const;
+  void DropDataChunks(uint64_t ino, uint64_t byte_offset, uint64_t byte_length,
+                      bool drop_all) const;
 
   std::unique_ptr<BlockDevice> device_;
   XfsSuperblock superblock_;
   XfsGeometry geometry_;
   MountOptions options_;
   std::vector<std::string> warnings_;
+  bool writable_ = false;
+
+  // Serializes mutations (coarse by design: correctness first, then per-object
+  // locking once the writer is stable). Also orders "device write" against
+  // "cache publication" for concurrent readers.
+  mutable std::mutex mutation_mutex_;
 
   mutable std::mutex cache_mutex_;
   mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;
@@ -202,6 +255,7 @@ class XfsFilesystem {
   mutable std::unordered_map<uint64_t, DirCache> dir_cache_;
   mutable size_t dir_cache_entries_ = 0;
 
+  static constexpr uint64_t kInodeChunkBytes = 16384;  // inode read-ahead chunk
   static constexpr uint64_t kDataChunkBytes = 512 * 1024;
   static constexpr size_t kDataCacheMaxBytes = 512ull * 1024 * 1024;
   mutable std::mutex data_mutex_;
@@ -209,6 +263,8 @@ class XfsFilesystem {
       data_cache_;
   mutable std::list<DataCacheKey> data_lru_;  // front = most recently used
   mutable size_t data_cache_bytes_ = 0;
+  // Per-inode write generation (see LookupDataChunk/InvalidateCaches).
+  mutable std::unordered_map<uint64_t, uint64_t> data_generation_;
 };
 
 }  // namespace xfs
