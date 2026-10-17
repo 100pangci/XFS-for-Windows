@@ -472,6 +472,11 @@ jobs:
           sudo bash tests/scripts/verify_rw_linux.sh \
             modified/rw-modified.img rw/rw.img rw/rw-recipe.json rw/rw-overlay.bin
 
+      - name: The log parser must also read kernel-written logs
+        run: |
+          python3 tests/tools/log_probe.py rw/rw.img --expect clean
+          python3 tests/tools/log_probe.py modified/rw-modified.img --expect clean
+
   # ---------------------------------------------------------------------------
   # Linux replays every crash window of the read-write writer. Each image was
   # killed at one XFSWIN_CRASH_AT point; the kernel has to mount it (replaying

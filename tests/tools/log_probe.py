@@ -52,6 +52,14 @@ TRANS_TYPE_CHECKPOINT = 40
 
 ITEM_INODE = 0x123B
 ITEM_BUF = 0x123C
+# Item types this parser does not model (intents and done items, quota).
+# Decoding stops at the first one so the rest of the chain is not guessed at.
+INTENT_ITEM_TYPES = {
+    0x1236: "efi", 0x1237: "efd", 0x1238: "iunlink", 0x123D: "dquot",
+    0x123E: "quotaoff", 0x123F: "icreate", 0x1240: "rui", 0x1241: "rud",
+    0x1242: "cui", 0x1243: "cud", 0x1244: "bui", 0x1245: "bud",
+    0x1246: "attri", 0x1247: "attrd", 0x1248: "xmi", 0x1249: "xmd",
+}
 UNMOUNT_TYPE = 0x556E
 
 # xfs_log_dinode field offsets (identical to the on-disk v3 core, host order).
@@ -180,6 +188,7 @@ class Record:
         self.crc_ok = False
         self.crc_unset = False
         self.cleared = False
+        self.notes = []
         self.num_ops = 0
         self.prev_block = 0
         self.ops = []
@@ -307,15 +316,45 @@ def decode_items(rec: Record):
             index += 1  # transaction header, not an item
             continue
         if len(op.payload) >= 4 and le16(op.payload, 0) == ITEM_INODE:
-            item = decode_inode_item(rec, index)
+            if index + 1 < len(rec.ops) and len(rec.ops[index + 1].payload) >= 96:
+                item = decode_inode_item(rec, index)
+                rec.items.append(item)
+                # ilf_size is the number of ops of this item: the format
+                # header, the core and one per logged fork region.
+                index += max(2, item.get("regions", 2))
+                continue
+            rec.notes.append(
+                "stopped decoding items at an inode item without a core "
+                "region")
+            break
+        if len(op.payload) >= 24 and le16(op.payload, 0) == ITEM_BUF:
+            # xfs_buf_log_format: blf_size is the number of regions of this
+            # item (the format header plus one op per logged chunk), so the
+            # chunk ops have to be skipped, not parsed as new items.
+            regions = le16(op.payload, 2)
+            item = {"type": "buf", "regions": regions,
+                    "blkno": struct.unpack_from("<q", op.payload, 8)[0],
+                    "blf_len": le16(op.payload, 6)}
             rec.items.append(item)
-            index += 2  # format header + one payload region
+            index += max(1, regions)
             continue
-        if len(op.payload) >= 4 and le16(op.payload, 0) == ITEM_BUF:
-            rec.items.append({"type": "buf", "regions": 1,
-                              "problem": "buffer item not decoded"})
-            index += 1
-            continue
+        if len(op.payload) >= 2:
+            item_type = le16(op.payload, 0)
+            intent = INTENT_ITEM_TYPES.get(item_type)
+            if intent is not None:
+                # Intent/done items (inode creation, extent free, ...) have
+                # their own region counts, which this parser does not model.
+                # Everything after them would be guesswork, so stop here and
+                # say so instead of reporting bogus unknown item types.
+                rec.items.append({"type": intent, "regions": None})
+                rec.notes.append(
+                    f"stopped decoding items at a {intent} item (type "
+                    f"{item_type:#x})")
+                break
+        rec.problems.append(
+            f"op {index}: unknown item type "
+            f"({le16(op.payload, 0) if len(op.payload) >= 2 else 'short'})")
+        index += 1
         rec.problems.append(
             f"op {index}: unknown item type "
             f"({le16(op.payload, 0) if len(op.payload) >= 2 else 'short'})")
@@ -341,12 +380,13 @@ def decode_inode_item(rec: Record, index: int):
     item["core_magic"] = le16(core, DINODE_MAGIC)
     item["core_mode"] = le16(core, DINODE_MODE)
     item["core_version"] = core[DINODE_VERSION]
-    item["atime"] = decode_timestamp(core, DINODE_ATIME)
-    item["mtime"] = decode_timestamp(core, DINODE_MTIME)
-    item["ctime"] = decode_timestamp(core, DINODE_CTIME)
-    item["core_size"] = le64(core, DINODE_SIZE_FIELD)
-    item["core_nblocks"] = le64(core, DINODE_NBLOCKS)
-    item["core_ino"] = le64(core, DINODE_INO)
+    if len(core) >= 160:
+        item["atime"] = decode_timestamp(core, DINODE_ATIME)
+        item["mtime"] = decode_timestamp(core, DINODE_MTIME)
+        item["ctime"] = decode_timestamp(core, DINODE_CTIME)
+        item["core_size"] = le64(core, DINODE_SIZE_FIELD)
+        item["core_nblocks"] = le64(core, DINODE_NBLOCKS)
+        item["core_ino"] = le64(core, DINODE_INO)
     return item
 
 
@@ -441,6 +481,7 @@ def verify(image_path: str, expect: str = "any", image: bytes = None):
             "items": r.items,
         } for r in result["valid"]],
         "torn_blocks": [r.block for r in result["torn"]],
+        "notes": [note for r in result["candidates"] for note in r.notes],
         "crc_unset_blocks": [r.block for r in result["valid"] if r.crc_unset],
         "failures": failures,
         "newest": newest,
@@ -486,7 +527,13 @@ def main(argv) -> int:
                     print(f"    inode {item['ino']} blkno {item['blkno']} "
                           f"len {item['len']} boffset {item['boffset']} "
                           f"fields {item['fields']:#x} "
-                          f"mtime {item['mtime']} size {item['core_size']}")
+                          f"mtime {item.get('mtime')} "
+                          f"size {item.get('core_size')}")
+                elif item.get("type") == "buf":
+                    print(f"    buffer blkno {item['blkno']} "
+                          f"len {item['blf_len']} regions {item['regions']}")
+                else:
+                    print(f"    {item.get('type')} item")
 
     if failures:
         for failure in failures:
@@ -499,3 +546,4 @@ def main(argv) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+

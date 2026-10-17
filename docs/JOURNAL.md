@@ -267,6 +267,25 @@ Two more facts learned while implementing:
   forward when the failure is within `XLOG_MAX_ICLOGS * hsize` of the head.
   That is what makes a crash between "header written" and "data written" leave
   the old state.
+- **An inode item names the inode *cluster*, not the inode.** `xfs_imap`
+  computes the cluster (8 KiB scaled by inode size on v3 filesystems, floored
+  to whole blocks) and `xfs_inode_item_format` logs `blkno` (a 512-byte daddr),
+  `len` (the cluster in 512-byte units) and `boffset` (the inode's byte offset
+  inside the cluster). Replay reads that buffer with the inode buffer verifier,
+  applies the logged core at `boffset`, recomputes the CRC and writes the whole
+  buffer back - and then validates the result with `xfs_dinode_verify`. A
+  one-block buffer at the inode's own address parses fine but is not what the
+  kernel describes; the crash-replay job proved the difference.
+- **The kernel marks stale log space with empty records.** While finding the
+  head it stamps blocks with `h_cycle = 0` / `h_len = 0` headers ("cleared"
+  space); `xlog_get_cycle` and `xlog_valid_rec_header` treat those as
+  non-records, so any reader of a log the kernel has touched must ignore them
+  (our parser does, or it reports thousands of bogus torn records).
+- **The unmount record's op length differs by writer.** mkfs.xfs writes
+  `oh_len = 8` with `xfs_unmount_log_format` in host order; the kernel's own
+  unmount record uses `oh_len = 0` with the same 8 bytes trailing. Recovery
+  only looks at the flag, and the clean/unmount decision is `h_num_logops == 1`
+  plus that flag, so both shapes mount identically.
 
 ## 8. Test strategy
 
