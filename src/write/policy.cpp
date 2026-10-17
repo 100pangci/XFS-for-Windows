@@ -134,9 +134,15 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo) {
   }
 
   // Quota: the quota inodes and the on-disk dquot trees must be updated by
-  // every allocation and inode change.
-  if (sb.qflags != 0 || sb.uquotino != 0 || sb.gquotino != 0 ||
-      sb.pquotino != 0) {
+  // every allocation and inode change. No quota in use is encoded either as 0
+  // (mkfs) or as NULLFSINO (all ones, what a mounted kernel writes back), so
+  // only a real inode number means quota is enabled.
+  constexpr uint64_t kNullFsino = 0xFFFFFFFFFFFFFFFFull;
+  auto has_quota_inode = [](uint64_t ino) {
+    return ino != 0 && ino != kNullFsino;
+  };
+  if (sb.qflags != 0 || has_quota_inode(sb.uquotino) ||
+      has_quota_inode(sb.gquotino) || has_quota_inode(sb.pquotino)) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "quota accounting is not supported for read-write")
         .Metadata("superblock")
