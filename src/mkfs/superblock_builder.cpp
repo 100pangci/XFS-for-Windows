@@ -40,7 +40,11 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   // No realtime device: mkfs writes NULLFSINO for both rt inode fields.
   PutBE64(p, sb::kRbmino, 0xffffffffffffffffULL);
   PutBE64(p, sb::kRsumino, 0xffffffffffffffffULL);
-  PutBE32(p, sb::kRextsize, 0);
+  // mkfs always writes a valid realtime extent size, even without an rt
+  // device: max(1, XFS_MIN_RTEXTSIZE / blocksize).
+  uint32_t rextsize = geo.block_size < 4096 ? (4096u >> geo.blocklog) : 1u;
+  if (rextsize == 0) rextsize = 1;
+  PutBE32(p, sb::kRextsize, rextsize);
   PutBE32(p, sb::kAgblocks, geo.agsize);
   PutBE32(p, sb::kAgcount, geo.agcount);
   PutBE32(p, sb::kRbmblocks, 0);

@@ -73,7 +73,7 @@ Shared header checks (per structure):
 |---|---|---|---|---|---|---|
 | superblock | XFSB | yes | yes | - | - | - |
 | AGF/AGI/AGFL | yes | yes | yes | - | yes | - |
-| inode | IN | yes (core 176 B) | yes | - | yes | - |
+| inode | IN | yes (whole inode) | yes | - | yes | - |
 | bnobt/cntbt/inobt/finobt | AB3B/AB3C/IAB3/FIB3 | yes | yes | yes | yes | AG number |
 | bmbt (long ptr) | BMA3 | yes | yes | yes | yes | inode number |
 | dir data/block/free | XDD3/XDB3/XDF3 | yes | yes | yes | yes | inode number |

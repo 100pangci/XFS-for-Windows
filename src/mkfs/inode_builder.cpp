@@ -27,7 +27,7 @@ void InitFreeInodeCore(const FormatGeometry& geo, uint8_t* core, uint64_t ino,
   PutBE32(core, di::kNextUnlinked, kNullAgino);
   PutBE64(core, di::kIno, ino);
   std::memcpy(core + di::kUuid, geo.meta_uuid.data(), 16);
-  UpdateXfsChecksum(core, di::kCoreSizeV3, di::kCrc);
+  UpdateXfsChecksum(core, geo.inode_size, di::kCrc);
 }
 
 // Root directory shortform content: "." and ".." entries.
@@ -103,10 +103,10 @@ void InitRootInode(const FormatGeometry& geo, uint8_t* core, uint32_t gen,
   PutBE64(core, di::kIno, geo.rootino);
   std::memcpy(core + di::kUuid, geo.meta_uuid.data(), 16);
 
-  UpdateXfsChecksum(core, di::kCoreSizeV3, di::kCrc);
-
-  // Data fork: shortform directory.
+  // Data fork: shortform directory. The inode CRC covers the whole inode, so
+  // the fork content must be in place before the checksum is computed.
   std::memcpy(core + di::kCoreSizeV3, sf.data.data(), sf.data.size());
+  UpdateXfsChecksum(core, geo.inode_size, di::kCrc);
 }
 
 }  // namespace

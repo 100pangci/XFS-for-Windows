@@ -24,11 +24,21 @@ for tool in xfs_db xfs_repair mount umount truncate; do
 done
 
 echo "== xfs_db: superblock =="
-xfs_db -r -c 'sb 0' -c 'p' "$img" | sed -n '1,45p'
+db_out="$(xfs_db -r -c 'sb 0' -c 'p' "$img" 2>&1)"
+echo "$db_out" | sed -n '1,45p'
+if echo "$db_out" | grep -qiE 'sanity check failed|corruption|crc error'; then
+    echo "FAILED: xfs_db reported superblock problems" >&2
+    exit 1
+fi
 
 rootino="$(xfs_db -r -c 'sb 0' -c 'p rootino' "$img" | awk -F'= ' '{print $2}' | awk '{print $1}')"
 echo "== xfs_db: root inode ($rootino) =="
-xfs_db -r -c "inode $rootino" -c 'p core.mode core.size core.nlink core.format' "$img"
+inode_out="$(xfs_db -r -c "inode $rootino" -c 'p core.mode core.size core.nlink core.format' "$img" 2>&1)"
+echo "$inode_out"
+if echo "$inode_out" | grep -qiE 'sanity check failed|corruption|crc error|not found'; then
+    echo "FAILED: xfs_db reported root inode problems" >&2
+    exit 1
+fi
 
 echo "== xfs_repair -n =="
 if ! xfs_repair -n "$img" > /tmp/xfswin-repair.log 2>&1; then

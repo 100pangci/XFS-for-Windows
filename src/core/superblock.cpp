@@ -427,8 +427,9 @@ Status ParseSuperblockBuffer(const uint8_t* buf, size_t len, bool verify_crc,
   }
 
   // Realtime geometry sanity (we refuse rt devices later, but the fields must
-  // still be structurally sound).
-  if (sb.rextsize != 0) {
+  // still be structurally sound). mkfs writes a nonzero sb_rextsize even when
+  // there is no realtime device, and libxfs validates this unconditionally.
+  {
     uint64_t rext_bytes = static_cast<uint64_t>(sb.rextsize) << sb.blocklog;
     constexpr uint64_t kMaxRtExtBytes = 1024ULL * 1024 * 1024;
     constexpr uint64_t kMinRtExtBytes = 4096;

@@ -129,6 +129,9 @@ def main(path: str) -> int:
     assert incompat & (1 << 0), "ftype should be enabled"
     assert features2 & 0x100, "crc bit should be set"
     assert (features2 & 0x2), "lazy sb count bit should be set"
+    rextsize = u32(sb, 80)
+    assert 4096 <= rextsize * blocksize <= 1024 * 1024 * 1024, (
+        "invalid realtime extent size", rextsize)
 
     meta_uuid = sbsect[248:264]
     if not (incompat & (1 << 2)):  # META_UUID not set
@@ -261,7 +264,7 @@ def main(path: str) -> int:
     inode = img.read(inode_offset, inodesize)
     assert u16(inode, 0) == DINODE_MAGIC, "root inode magic"
     assert inode[4] == 3, "root inode version"
-    check_crc(inode[:176], 100, "root inode")
+    check_crc(inode, 100, "root inode")
     assert u64(inode, 152) == rootino, "root inode number"
     assert inode[160:176] == meta_uuid, "root inode uuid"
     mode = u16(inode, 2)

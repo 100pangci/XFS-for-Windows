@@ -139,8 +139,9 @@ Status ParseInode(const uint8_t* buf, size_t len, const XfsGeometry& geo,
   Status s = DecodeAndCheckTimestamps(buf, &inode);
   if (!s.ok()) return s;
 
-  // CRC covers exactly the v3 core (176 bytes).
-  s = VerifyChecksum(buf, di::kCoreSizeV3, di::kCrc, "inode");
+  // The v3 inode CRC covers the entire inode (sb_inodesize), including the
+  // data/attr fork areas, not just the 176-byte core.
+  s = VerifyChecksum(buf, geo.inode_size, di::kCrc, "inode");
   if (!s.ok()) {
     auto err = s.error();
     err.ino = ino;

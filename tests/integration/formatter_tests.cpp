@@ -49,6 +49,8 @@ TEST(formatter_roundtrip) {
   CHECK_EQ(geo.inode_size, 512u);
   CHECK_EQ(geo.agcount, 4u);
   CHECK_EQ(geo.agblocks, 19200u);
+  // mkfs writes a nonzero realtime extent size even without an rt device.
+  CHECK_EQ(fs.value()->superblock().rextsize, 1u);
   CHECK_EQ(fs.value()->superblock().rootino, 64u);
 
   auto root = fs.value()->LookupPath("/");
