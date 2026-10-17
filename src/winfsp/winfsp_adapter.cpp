@@ -316,6 +316,7 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
     id = state.next_context_id++;
     state.contexts.emplace(id, std::move(node));
   }
+  XFS_WARN("open id=" << id << " '" << WideToUtf8(file_name) << "'");
   *file_context = reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
   return STATUS_SUCCESS;
 }
@@ -333,6 +334,7 @@ VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   // Idempotent: WinFsp closes a context on a failed Overwrite and then closes
   // it again when the handle is torn down.
   std::lock_guard<std::mutex> lock(state.context_mutex);
+  XFS_WARN("close id=" << ContextId(file_context));
   state.contexts.erase(ContextId(file_context));
 }
 
@@ -342,6 +344,7 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   AdapterState& state = *State(file_system);
   XfsInode node;
   if (!LookupContext(state, file_context, &node)) {
+    XFS_WARN("Read: stale context id=" << ContextId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   if (node.IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
@@ -365,6 +368,7 @@ NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   AdapterState& state = *State(file_system);
   XfsInode node;
   if (!LookupContext(state, file_context, &node)) {
+    XFS_WARN("GetFileInfo: stale context id=" << ContextId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   FillFileInfo(state, node, file_info);
@@ -429,6 +433,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   AdapterState& state = *State(file_system);
   XfsInode context;
   if (!LookupContext(state, file_context, &context)) {
+    XFS_WARN("ReadDirectory: stale context id=" << ContextId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   if (!context.IsDir()) return STATUS_NOT_A_DIRECTORY;
