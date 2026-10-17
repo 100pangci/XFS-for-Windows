@@ -357,7 +357,8 @@ Status ReadLocalData(const XfsInode& inode, uint64_t offset, void* buffer,
 
 Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
                             const XfsInode& inode, uint64_t file_offset,
-                            void* buffer, size_t len) {
+                            void* buffer, size_t len,
+                            const std::vector<XfsExtent>* cached_extents) {
   if (inode.format == di::kFormatLocal) {
     size_t copied = 0;
     Status s = ReadLocalData(inode, file_offset, buffer, len, &copied);
@@ -371,33 +372,64 @@ Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
         .Actual(inode.format);
   }
 
+  // Parse the extent list once per call (or use the caller's cached copy).
+  // The previous implementation re-parsed it for every mapped chunk, which is
+  // O(extents^2) for fragmented files.
+  std::vector<XfsExtent> local_extents;
+  const std::vector<XfsExtent>* extents = cached_extents;
+  if (!extents) {
+    Status s = LoadDataForkExtents(dev, geo, inode, &local_extents);
+    if (!s.ok()) return s.error();
+    extents = &local_extents;
+  }
+
   uint8_t* out = static_cast<uint8_t*>(buffer);
   size_t total = 0;
-  while (total < len && file_offset < inode.size) {
-    size_t want = static_cast<size_t>(
-        std::min<uint64_t>(len - total, inode.size - file_offset));
-    auto mapping = MapFileOffset(dev, geo, inode, file_offset);
-    if (!mapping.ok()) return mapping.error();
-    const XfsFileMapping& m = mapping.value();
+  const uint64_t block_size = geo.block_size;
+  const uint64_t file_blocks_total =
+      (inode.size + block_size - 1) >> geo.block_log;
 
-    uint64_t offset_in_block = file_offset & (geo.block_size - 1);
-    size_t chunk;
-    if (m.is_hole) {
-      chunk = static_cast<size_t>(
-          std::min<uint64_t>(want, geo.block_size - offset_in_block));
+  while (total < len && file_offset < inode.size) {
+    const size_t want = static_cast<size_t>(
+        std::min<uint64_t>(len - total, inode.size - file_offset));
+    const uint64_t file_block = file_offset >> geo.block_log;
+
+    // Largest extent whose startoff <= file_block.
+    size_t lo = 0, hi = extents->size();
+    while (lo < hi) {
+      const size_t mid = (lo + hi) / 2;
+      if ((*extents)[mid].startoff <= file_block) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    const XfsExtent* e = lo ? &(*extents)[lo - 1] : nullptr;
+    const uint64_t offset_in_block = file_offset & (block_size - 1);
+    size_t chunk = 0;
+
+    if (!e || file_block >= e->EndBlock()) {
+      // Hole: zero up to the next extent (or EOF) in one pass.
+      const uint64_t next_start =
+          lo < extents->size() ? (*extents)[lo].startoff : file_blocks_total;
+      uint64_t end_byte = next_start * block_size;
+      if (end_byte > inode.size) end_byte = inode.size;
+      if (end_byte <= file_offset) end_byte = file_offset + 1;
+      chunk = static_cast<size_t>(std::min<uint64_t>(want,
+                                                     end_byte - file_offset));
       std::memset(out + total, 0, chunk);
     } else {
-      uint64_t extent_offset_blocks =
-          (file_offset >> geo.block_log) - m.block_offset;
-      uint64_t extent_remaining_bytes =
-          (m.block_count - extent_offset_blocks) * geo.block_size -
-          offset_in_block;
-      chunk =
-          static_cast<size_t>(std::min<uint64_t>(want, extent_remaining_bytes));
-      if (m.is_unwritten) {
+      const uint64_t extent_offset_blocks = file_block - e->startoff;
+      const uint64_t extent_remaining_bytes =
+          (e->blockcount - extent_offset_blocks) * block_size - offset_in_block;
+      chunk = static_cast<size_t>(
+          std::min<uint64_t>(want, extent_remaining_bytes));
+      if (e->unwritten) {
         std::memset(out + total, 0, chunk);
       } else {
-        uint64_t read_off = geo.FsbToByte(m.fs_block) + offset_in_block;
+        const uint64_t read_off =
+            geo.FsbToByte(e->startblock + extent_offset_blocks) +
+            offset_in_block;
         if (!dev.Read(read_off, out + total, chunk)) {
           return XFS_ERR(XfsError::kIoError, "failed to read file data")
               .Ino(inode.ino)
@@ -405,6 +437,7 @@ Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
         }
       }
     }
+    if (chunk == 0) break;  // safety: never spin
     total += chunk;
     file_offset += chunk;
   }

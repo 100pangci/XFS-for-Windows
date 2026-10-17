@@ -187,10 +187,15 @@ guard callbacks the FSD does not lock at all.
 The filesystem is never written while mounted, so inode parsing and directory
 contents are cached:
 
-- `XfsFilesystem` caches up to 32k parsed inodes and up to 128 directory
-  listings (256k entries total, cleared wholesale when a cap is exceeded). This
-  removes repeated inode reads and directory parsing from Explorer's attribute
-  queries, path resolution and repeated enumerations.
+- `XfsFilesystem` caches up to 32k parsed inodes, up to 32k `XfsFileInfo`
+  records, up to 8192 per-inode extent lists, and up to 128 directory listings
+  (256k entries total; caches are cleared wholesale when a cap is exceeded).
+  Inodes are read in 16 KiB chunks (32 inodes at a time), so a directory with
+  tens of thousands of files costs hundreds of device reads instead of tens of
+  thousands.
+- `ReadFileData` parses the data fork once per call and walks the cached
+  extent list; the previous implementation re-parsed it for every mapped chunk
+  (O(extents^2) on fragmented files).
 - The WinFsp adapter caches the sorted Windows-name child list per directory
   (64 directories / 256k entries). WinFsp asks for one page at a time with a
   marker; without the cache every page would re-list, re-map and re-sort the

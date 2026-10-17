@@ -19,6 +19,7 @@
 #include "xfs/block_device.h"
 #include "xfs/directory.h"
 #include "xfs/error.h"
+#include "xfs/extent.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
 #include "xfs/superblock.h"
@@ -129,6 +130,14 @@ class XfsFilesystem {
 
   mutable std::mutex cache_mutex_;
   mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;
+  // 16 KiB inode-chunk read-ahead (shared so lookups stay cheap).
+  mutable std::unordered_map<uint64_t,
+                             std::shared_ptr<const std::vector<uint8_t>>>
+      inode_chunk_cache_;
+  mutable std::unordered_map<uint64_t, XfsFileInfo> info_cache_;
+  mutable std::unordered_map<uint64_t,
+                             std::shared_ptr<const std::vector<XfsExtent>>>
+      extent_cache_;
   mutable std::unordered_map<uint64_t, DirCache> dir_cache_;
   mutable size_t dir_cache_entries_ = 0;
 };

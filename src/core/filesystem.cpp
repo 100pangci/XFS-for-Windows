@@ -177,29 +177,83 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
 }
 
 Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
+  auto finish = [&](XfsInode inode) -> Result<XfsInode> {
+    if (inode.OnUnlinkedList()) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "inode is on the unlinked list; reading it read-only is "
+                     "not safe without journal replay")
+          .Ino(ino)
+          .Metadata("inode");
+    }
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      constexpr size_t kMaxCachedInodes = 32768;
+      if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
+      inode_cache_.emplace(ino, inode);
+    }
+    return inode;
+  };
+
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = inode_cache_.find(ino);
     if (it != inode_cache_.end()) return it->second;
   }
 
-  auto inode = ReadInode(*device_, geometry_, ino);
-  if (!inode.ok()) return inode.error();
-  if (inode.value().OnUnlinkedList()) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "inode is on the unlinked list; reading it read-only is "
-                   "not safe without journal replay")
+  if (!geometry_.InoValid(ino)) {
+    return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
         .Ino(ino)
         .Metadata("inode");
   }
 
+  // Read a whole 16 KiB inode chunk once; a directory full of files usually
+  // has many inodes in the same chunk, so this cuts device reads ~32x.
+  const uint64_t inode_off = geometry_.InoToByteOffset(ino);
+  constexpr uint64_t kChunkBytes = 16384;
+  const uint64_t chunk_start = inode_off & ~(kChunkBytes - 1);
+  std::shared_ptr<const std::vector<uint8_t>> chunk;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    constexpr size_t kMaxCachedInodes = 32768;
-    if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
-    inode_cache_.emplace(ino, inode.value());
+    auto it = inode_chunk_cache_.find(chunk_start);
+    if (it != inode_chunk_cache_.end()) chunk = it->second;
   }
-  return inode;
+  if (!chunk) {
+    const uint64_t dev_size = device_->Size();
+    uint64_t len = kChunkBytes;
+    if (chunk_start + len > dev_size) {
+      len = dev_size > chunk_start ? dev_size - chunk_start : 0;
+    }
+    if (len >= geometry_.inode_size) {
+      auto buf = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(len));
+      if (!device_->Read(chunk_start, buf->data(), buf->size())) {
+        return XFS_ERR(XfsError::kIoError, "failed to read inode")
+            .Ino(ino)
+            .Offset(chunk_start)
+            .Metadata("inode");
+      }
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        constexpr size_t kMaxChunks = 4096;  // 64 MiB of inode chunks
+        if (inode_chunk_cache_.size() >= kMaxChunks) inode_chunk_cache_.clear();
+        inode_chunk_cache_.emplace(chunk_start, buf);
+      }
+      chunk = std::move(buf);
+    }
+  }
+
+  const uint64_t local = inode_off - chunk_start;
+  if (chunk && local + geometry_.inode_size <= chunk->size()) {
+    XfsInode out;
+    Status s = ParseInode(chunk->data() + local,
+                          static_cast<size_t>(geometry_.inode_size),
+                          geometry_, ino, &out);
+    if (!s.ok()) return s.error();
+    return finish(std::move(out));
+  }
+
+  auto inode = ReadInode(*device_, geometry_, ino);
+  if (!inode.ok()) return inode.error();
+  return finish(std::move(inode.value()));
 }
 
 void XfsFilesystem::CacheDirectory(uint64_t ino,
@@ -305,8 +359,33 @@ Result<size_t> XfsFilesystem::ReadFile(uint64_t ino, uint64_t offset,
     return XFS_ERR(XfsError::kNotRegularFile, "cannot ReadFile a directory")
         .Ino(ino);
   }
+
+  if (inode.value().format == di::kFormatLocal) {
+    return ReadFileData(*device_, geometry_, inode.value(), offset, buffer,
+                        length);
+  }
+
+  std::shared_ptr<const std::vector<XfsExtent>> extents;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = extent_cache_.find(ino);
+    if (it != extent_cache_.end()) extents = it->second;
+  }
+  if (!extents) {
+    auto loaded = std::make_shared<std::vector<XfsExtent>>();
+    Status s =
+        LoadDataForkExtents(*device_, geometry_, inode.value(), loaded.get());
+    if (!s.ok()) return s.error();
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      constexpr size_t kMaxCachedExtentLists = 8192;
+      if (extent_cache_.size() >= kMaxCachedExtentLists) extent_cache_.clear();
+      extent_cache_.emplace(ino, loaded);
+    }
+    extents = std::move(loaded);
+  }
   return ReadFileData(*device_, geometry_, inode.value(), offset, buffer,
-                      length);
+                      length, extents.get());
 }
 
 Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
@@ -320,6 +399,12 @@ Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
 
 
 Result<XfsFileInfo> XfsFilesystem::GetFileInfo(uint64_t ino) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = info_cache_.find(ino);
+    if (it != info_cache_.end()) return it->second;
+  }
+
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   const XfsInode& i = inode.value();
@@ -341,6 +426,13 @@ Result<XfsFileInfo> XfsFilesystem::GetFileInfo(uint64_t ino) const {
   info.di_flags = i.flags;
   info.immutable = (i.flags & di::kDiFlagImmutable) != 0;
   info.append_only = (i.flags & di::kDiFlagAppend) != 0;
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    constexpr size_t kMaxCachedInfos = 32768;
+    if (info_cache_.size() >= kMaxCachedInfos) info_cache_.clear();
+    info_cache_.emplace(ino, info);
+  }
   return info;
 }
 

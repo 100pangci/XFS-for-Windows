@@ -58,9 +58,11 @@ Result<XfsFileMapping> MapFileOffset(BlockDevice& dev, const XfsGeometry& geo,
 // Reads `len` bytes at `file_offset` from an inode's data, handling holes and
 // unwritten extents (zero-filled), short reads at EOF, and multi-extent
 // span. Returns bytes actually copied (copied may be < len only at EOF).
+// `cached_extents` (optional) avoids re-parsing the data fork.
 Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
                             const XfsInode& inode, uint64_t file_offset,
-                            void* buffer, size_t len);
+                            void* buffer, size_t len,
+                            const std::vector<XfsExtent>* cached_extents = nullptr);
 
 // Reads the full data fork of a local (in-inode) fork.
 Status ReadLocalData(const XfsInode& inode, uint64_t offset, void* buffer,
