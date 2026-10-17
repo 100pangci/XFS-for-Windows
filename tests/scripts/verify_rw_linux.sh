@@ -73,7 +73,7 @@ if ! xfs_repair -n "$modified" > "$repair_log" 2>&1; then
     exit 1
 fi
 cat "$repair_log"
-if grep -qiE 'corruption|fatal|would fix|dirty log' "$repair_log"; then
+if grep -qiE 'corruption|fatal|dirty|would fix|ALERT|valuable metadata' "$repair_log"; then
     echo "FAILED: xfs_repair -n found problems" >&2
     rm -f "$repair_log"
     exit 1
