@@ -48,6 +48,7 @@ realtime device, no writes to existing filesystems.**
 | Writing that grows a file, fills a hole or converts an unwritten extent | **not implemented** (refused, never guessed) |
 | create / delete / rename / mkdir / truncate / symlink | **not implemented** (refused) |
 | Writing metadata (timestamps, allocation, directories) | **not implemented**; the journal stays clean |
+| Journal writer (metadata transactions) | **not implemented**; format and plan in [docs/JOURNAL.md](docs/JOURNAL.md) (RW-1) |
 | Journal replay | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`) |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
