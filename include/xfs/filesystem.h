@@ -166,6 +166,29 @@ class XfsFilesystem {
   Result<size_t> OverwriteFileData(uint64_t ino, uint64_t offset,
                                    const void* buffer, size_t length);
 
+  // Full write path (RW-2): overwrites, fills holes, converts unwritten
+  // extents and extends EOF. Data is written and flushed before the metadata
+  // that makes it visible, and freshly allocated or newly visible bytes are
+  // never left as uninitialised disk contents (newly covered bytes outside the
+  // caller's range are zeroed). Crash contract: after replay the file is
+  // either in the old state or in the new one; an unfinished extension leaves
+  // an unwritten (zero-reading) extent, never garbage.
+  //
+  // `append` writes the bytes at EOF: the offset is resolved *under the
+  // mutation lock*, so concurrent appends cannot both compute the same EOF.
+  Result<size_t> WriteFileData(uint64_t ino, uint64_t offset,
+                               const void* buffer, size_t length,
+                               bool append = false);
+
+  // SetFileSize (ftruncate semantics):
+  //   - growing only moves the logical EOF; the new range is a hole and no
+  //     blocks are allocated. Bytes that would become visible over an existing
+  //     *written* extent are zeroed on disk first, like Linux does;
+  //   - shrinking removes the blocks from ceil(new_size / block_size) on,
+  //     frees them through the allocator, keeps a partially covered last
+  //     block and zeroes the part of it beyond the new size.
+  Result<XfsFileInfo> SetFileSize(uint64_t ino, uint64_t new_size);
+
   // ---- transactions and metadata mutations (read-write mounts only) ----
   // Begins a transaction at the current log position. The returned LSN is the
   // LSN of the record that will carry it; log items and the metadata buffers
@@ -228,6 +251,20 @@ class XfsFilesystem {
                                   const XfsTimestamp& atime,
                                   const XfsTimestamp& mtime,
                                   const XfsTimestamp& ctime);
+
+  // ---- inode and data fork write helpers (RW-2) ----
+  // Reads the complete on-disk inode image.
+  Result<std::vector<uint8_t>> ReadRawInode(uint64_t ino) const;
+  // Reads the inode, lets `mutate` change its raw bytes, then logs it (core +
+  // optional data fork region) and queues the write-back.
+  Status UpdateInodeInTransaction(
+      XfsTransaction& txn, uint64_t ino, uint32_t ilog_fields,
+      const std::vector<uint8_t>& fork_region,
+      const std::function<void(uint8_t* raw)>& mutate);
+  // Logs an already prepared inode image (the LSN and CRC are stamped here).
+  Status LogPreparedInode(XfsTransaction& txn, uint64_t ino,
+                          std::vector<uint8_t> inode, uint32_t ilog_fields,
+                          const std::vector<uint8_t>& fork_region);
 
   // ---- file data chunk cache ----
   // Reads are served in 256 KiB chunks so that one device read covers many

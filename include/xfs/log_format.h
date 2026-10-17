@@ -117,6 +117,45 @@ constexpr uint32_t kILogABRoot = 0x100;
 constexpr size_t kLogDinodeSize = 176;
 
 // ---------------------------------------------------------------------------
+// Buffer item (xfs_buf_log_format), host byte order
+// ---------------------------------------------------------------------------
+// | offset | field | notes |
+// |---|---|---|
+// | 0 | blf_type | XFS_LI_BUF |
+// | 2 | blf_size | 1 + number of contiguous logged regions |
+// | 4 | blf_flags | buffer type in bits 11..15 (XFS_BLFT_*), host order |
+// | 6 | blf_len | buffer length in 512-byte units |
+// | 8 | blf_blkno | daddr (512-byte units) |
+// | 16 | blf_map_size | number of used words of the data bitmap |
+// | 20 | blf_data_map[] | one bit per 128-byte chunk, host byte order |
+//
+// The logged chunks follow, one log operation per contiguous run of set bits.
+constexpr size_t kBufLogFormatSize = 20;
+constexpr size_t kBufMapOffset = 20;
+constexpr size_t kBufChunkSize = 128;  // XFS_BLF_CHUNK
+constexpr size_t kBufChunkShift = 7;   // XFS_BLF_SHIFT
+
+// XFS_BLFT_* buffer types (bits 11..15 of blf_flags), from xfs_log_format.h.
+constexpr uint16_t kBlftUnknown = 0;
+constexpr uint16_t kBlftBtree = 4;
+constexpr uint16_t kBlftAgf = 5;
+constexpr uint16_t kBlftAgfl = 6;
+constexpr uint16_t kBlftAgi = 7;
+constexpr uint16_t kBlftDino = 8;
+constexpr uint16_t kBlftSymlink = 9;
+constexpr uint16_t kBlftDirBlock = 10;
+constexpr uint16_t kBlftDirData = 11;
+constexpr uint16_t kBlftDirFree = 12;
+constexpr uint16_t kBlftDirLeaf1 = 13;
+constexpr uint16_t kBlftDirLeafn = 14;
+constexpr uint16_t kBlftDaNode = 15;
+constexpr uint16_t kBlftAttrLeaf = 16;
+constexpr uint16_t kBlftAttrRmt = 17;
+constexpr uint16_t kBlftSb = 18;
+constexpr size_t kBlftShift = 11;
+constexpr size_t kBlftMask = 0x1f;
+
+// ---------------------------------------------------------------------------
 // Clean-unmount record payload (xfs_unmount_log_format), 8 bytes
 // ---------------------------------------------------------------------------
 constexpr size_t kUnmountFormatSize = 8;

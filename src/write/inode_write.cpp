@@ -129,6 +129,123 @@ void StoreTimestampLE(uint8_t* field, const XfsTimestamp& ts) {
 
 }  // namespace
 
+Result<std::vector<uint8_t>> XfsFilesystem::ReadRawInode(uint64_t ino) const {
+  if (!geometry_.InoValid(ino)) {
+    return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  const uint64_t inode_offset = geometry_.InoToByteOffset(ino);
+  std::vector<uint8_t> inode(geometry_.inode_size, 0);
+  if (!device_->Read(inode_offset, inode.data(), inode.size())) {
+    return XFS_ERR(XfsError::kIoError, "failed to read inode")
+        .Ino(ino)
+        .Offset(inode_offset)
+        .Metadata("inode");
+  }
+  return inode;
+}
+
+Status XfsFilesystem::UpdateInodeInTransaction(
+    XfsTransaction& txn, uint64_t ino, uint32_t ilog_fields,
+    const std::vector<uint8_t>& fork_region,
+    const std::function<void(uint8_t* raw)>& mutate) {
+  auto raw = ReadRawInode(ino);
+  if (!raw.ok()) return raw.error();
+  std::vector<uint8_t> inode = std::move(raw.value());
+  XfsInode parsed;
+  Status s = ParseInode(inode.data(), inode.size(), geometry_, ino, &parsed);
+  if (!s.ok()) return s;
+  if (parsed.bigtime) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "cannot update a bigtime inode")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  mutate(inode.data());
+  return LogPreparedInode(txn, ino, std::move(inode), ilog_fields, fork_region);
+}
+
+Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
+                                       std::vector<uint8_t> inode,
+                                       uint32_t ilog_fields,
+                                       const std::vector<uint8_t>& fork_region) {
+  if (!geometry_.InoValid(ino)) {
+    return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  if (inode.size() != geometry_.inode_size) {
+    return XFS_ERR(XfsError::kInternal, "inode image has the wrong size")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  const uint64_t inode_offset = geometry_.InoToByteOffset(ino);
+  // The named buffer is the inode *cluster* (what xfs_imap does): replay reads
+  // it through the inode buffer verifier and applies the logged core at
+  // ilf_boffset inside it.
+  const uint64_t cluster_bytes = InodeClusterBytes(geometry_);
+  const uint64_t cluster_start = inode_offset - (inode_offset % cluster_bytes);
+  const uint64_t boffset = inode_offset - cluster_start;
+  const uint32_t agno = geometry_.InoAgno(ino);
+  const uint32_t cluster_agbno = geometry_.InoAgbno(ino) -
+                                 static_cast<uint32_t>(boffset /
+                                                       geometry_.block_size);
+  const uint32_t cluster_blocks =
+      static_cast<uint32_t>(cluster_bytes / geometry_.block_size);
+  if (cluster_blocks == 0 ||
+      cluster_agbno + cluster_blocks > geometry_.AgBlocksFor(agno)) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "inode cluster buffer is out of range")
+        .Ino(ino)
+        .Ag(agno)
+        .Metadata("inode");
+  }
+
+  std::vector<uint8_t> log_dinode;
+  CopyCoreToLogDinode(inode.data(), inode.size(), &log_dinode);
+
+  const bool with_region = !fork_region.empty();
+  uint32_t fields = lf::kILogCore | ilog_fields;
+  if (!with_region) {
+    // No data fork region to log (for example an empty extent list): drop the
+    // fork flag, exactly like xfs_inode_item_format does.
+    fields &= ~(lf::kILogDExt | lf::kILogDBRoot | lf::kILogDData);
+  }
+  std::vector<uint8_t> item_header(lf::kInodeLogFormatSize, 0);
+  PutLE16(&item_header, lf::kIlfType, lf::kItemInode);
+  PutLE16(&item_header, lf::kIlfSize,
+          static_cast<uint16_t>(with_region ? 3 : 2));
+  PutLE32(&item_header, lf::kIlfFields, fields);
+  PutLE16(&item_header, lf::kIlfAsize, 0);
+  PutLE16(&item_header, lf::kIlfDsize,
+          static_cast<uint16_t>(with_region ? fork_region.size() : 0));
+  PutLE64(&item_header, lf::kIlfIno, ino);
+  PutLE64(&item_header, lf::kIlfBlkno, cluster_start / 512);
+  PutLE32(&item_header, lf::kIlfLen,
+          static_cast<uint32_t>(cluster_bytes / 512));
+  PutLE32(&item_header, lf::kIlfBoffset, static_cast<uint32_t>(boffset));
+  txn.AddLogOp(std::move(item_header));
+  txn.AddLogOp(std::move(log_dinode));
+  if (with_region) txn.AddLogOp(fork_region);
+
+  // On-disk inode: the prepared image, with the transaction LSN and a fresh
+  // CRC (the fork bytes were written by the caller).
+  PutBE64(inode.data(), di::kLsn, txn.lsn());
+  UpdateXfsChecksum(inode.data(), inode.size(), di::kCrc);
+
+  TransactionWrite write;
+  write.offset = inode_offset;
+  write.data = std::move(inode);
+  write.ino = ino;
+  write.inode_metadata = true;
+  write.data_fork_changed =
+      (ilog_fields & (lf::kILogDExt | lf::kILogDBRoot | lf::kILogDData)) != 0;
+  write.what = "inode";
+  txn.AddWrite(std::move(write));
+  return OkStatus();
+}
+
 Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
                                                 const XfsTimestamp& atime,
                                                 const XfsTimestamp& mtime,
@@ -154,96 +271,13 @@ Status XfsFilesystem::UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino
                                                const XfsTimestamp& atime,
                                                const XfsTimestamp& mtime,
                                                const XfsTimestamp& ctime) {
-  if (!geometry_.InoValid(ino)) {
-    return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
-        .Ino(ino)
-        .Metadata("inode");
-  }
-  const uint64_t inode_offset = geometry_.InoToByteOffset(ino);
-  std::vector<uint8_t> inode(geometry_.inode_size, 0);
-  if (!device_->Read(inode_offset, inode.data(), inode.size())) {
-    return XFS_ERR(XfsError::kIoError, "failed to read inode")
-        .Ino(ino)
-        .Offset(inode_offset)
-        .Metadata("inode");
-  }
-  XfsInode parsed;
-  Status s =
-      ParseInode(inode.data(), inode.size(), geometry_, ino, &parsed);
-  if (!s.ok()) return s;
-  if (parsed.bigtime) {
-    // The timestamp encoding differs (64-bit nanoseconds); bigtime is refused
-    // for read-write mounts, so this is a bug or a policy hole, not a case to
-    // guess about.
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "cannot update timestamps of a bigtime inode")
-        .Ino(ino)
-        .Metadata("inode");
-  }
-
-  // Log item: one format header region plus the inode core region, exactly the
-  // two operations a Linux inode item is written as. The named buffer is the
-  // inode cluster (like xfs_imap): replay reads it through the inode buffer
-  // verifier and applies the logged core at ilf_boffset inside it.
-  const uint64_t cluster_bytes = InodeClusterBytes(geometry_);
-  const uint64_t cluster_start = inode_offset - (inode_offset % cluster_bytes);
-  const uint64_t boffset = inode_offset - cluster_start;
-  const uint32_t agno = geometry_.InoAgno(ino);
-  const uint32_t cluster_agbno = geometry_.InoAgbno(ino) -
-                                 static_cast<uint32_t>(boffset /
-                                                       geometry_.block_size);
-  const uint32_t cluster_blocks =
-      static_cast<uint32_t>(cluster_bytes / geometry_.block_size);
-  if (cluster_blocks == 0 ||
-      cluster_agbno + cluster_blocks > geometry_.AgBlocksFor(agno)) {
-    // The kernel's xfs_imap refuses this as well ("inode cluster out of
-    // range"): the last cluster of an AG must not run past its end.
-    return XFS_ERR(XfsError::kUnsupportedGeometry,
-                   "inode cluster buffer is out of range")
-        .Ino(ino)
-        .Ag(agno)
-        .Metadata("inode");
-  }
-
-  std::vector<uint8_t> log_dinode;
-  CopyCoreToLogDinode(inode.data(), inode.size(), &log_dinode);
-  StoreTimestampLE(log_dinode.data() + di::kAtime, atime);
-  StoreTimestampLE(log_dinode.data() + di::kMtime, mtime);
-  StoreTimestampLE(log_dinode.data() + di::kCtime, ctime);
-
-  std::vector<uint8_t> item_header(lf::kInodeLogFormatSize, 0);
-  PutLE16(&item_header, lf::kIlfType, lf::kItemInode);
-  // Number of logged regions of this item: the format header and the core
-  // (recovery uses it as ri_total, not as a byte or word count).
-  PutLE16(&item_header, lf::kIlfSize, 2);
-  PutLE32(&item_header, lf::kIlfFields, lf::kILogCore);
-  PutLE16(&item_header, lf::kIlfAsize, 0);
-  PutLE16(&item_header, lf::kIlfDsize, 0);
-  PutLE64(&item_header, lf::kIlfIno, ino);
-  PutLE64(&item_header, lf::kIlfBlkno,
-          static_cast<uint64_t>(cluster_start) / 512);  // daddr of the cluster
-  PutLE32(&item_header, lf::kIlfLen,
-          static_cast<uint32_t>(cluster_bytes / 512));
-  PutLE32(&item_header, lf::kIlfBoffset, static_cast<uint32_t>(boffset));
-  txn.AddLogOp(std::move(item_header));
-  txn.AddLogOp(std::move(log_dinode));
-
-  // On-disk inode: same core fields with the new times, the transaction LSN
-  // and a fresh CRC. Forks are preserved because the buffer is the raw inode.
-  StoreTimestampBE(inode.data() + di::kAtime, atime);
-  StoreTimestampBE(inode.data() + di::kMtime, mtime);
-  StoreTimestampBE(inode.data() + di::kCtime, ctime);
-  PutBE64(inode.data(), di::kLsn, txn.lsn());
-  UpdateXfsChecksum(inode.data(), inode.size(), di::kCrc);
-
-  TransactionWrite write;
-  write.offset = inode_offset;
-  write.data = std::move(inode);
-  write.ino = ino;
-  write.inode_metadata = true;
-  write.what = "inode";
-  txn.AddWrite(std::move(write));
-  return OkStatus();
+  return UpdateInodeInTransaction(
+      txn, ino, 0, {},
+      [&](uint8_t* raw) {
+        StoreTimestampBE(raw + di::kAtime, atime);
+        StoreTimestampBE(raw + di::kMtime, mtime);
+        StoreTimestampBE(raw + di::kCtime, ctime);
+      });
 }
 
 }  // namespace xfs

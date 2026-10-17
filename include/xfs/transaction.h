@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <vector>
 
 #include "xfs/error.h"
@@ -38,6 +39,9 @@ struct TransactionWrite {
   std::vector<uint8_t> data;    // complete new contents (LSN already stamped)
   uint64_t ino = 0;             // subject inode's cache entries (0 = none)
   bool inode_metadata = false;  // invalidate parsed inode + file info
+  // True when the inode's data fork changed (extent map): all parsed extent
+  // lists and file data chunks of that inode must be dropped as well.
+  bool data_fork_changed = false;
   const char* what = "metadata";
 };
 
@@ -60,9 +64,27 @@ class XfsTransaction {
   }
   void AddWrite(TransactionWrite write) { writes_.push_back(std::move(write)); }
 
+  // Adds one metadata buffer to the transaction as an XFS_LI_BUF item:
+  //   - stamps the transaction LSN (big-endian) at `lsn_offset` - the value the
+  //     kernel's buffer write verifier would store,
+  //   - recomputes the checksum at `crc_offset`,
+  //   - logs the whole buffer as one contiguous dirty region (a legal superset
+  //     of the kernel's dirty regions; replay copies chunk-for-chunk),
+  //   - queues the buffer write-back after the log record is durable.
+  // Adding the same device offset twice keeps the latest contents and logs the
+  // item once, so callers may re-queue a buffer they modified again.
+  Status AddMetadataBuffer(uint64_t offset, std::vector<uint8_t> data,
+                           uint16_t blf_type, size_t lsn_offset,
+                           size_t crc_offset, const char* what);
+
   const std::vector<LogOp>& ops() const { return ops_; }
   const std::vector<TransactionWrite>& writes() const { return writes_; }
   size_t log_bytes() const;
+  // Total size of the framed log record (header block + rounded data).
+  size_t record_bytes() const;
+  // False when the item list would produce a record larger than this writer
+  // can emit (32 KiB of data; bigger records need extension headers).
+  bool record_fits() const;
 
  private:
   friend class XfsFilesystem;
@@ -73,6 +95,13 @@ class XfsTransaction {
   bool started_ = false;
   std::vector<LogOp> ops_;  // items only; start/trans-header/commit added later
   std::vector<TransactionWrite> writes_;
+  // Logged buffer items by device offset (dedup for AddMetadataBuffer): the
+  // value is (first log op index, format size) so re-adding a buffer can
+  // replace the previously logged region instead of logging it twice.
+  struct LoggedBufferRef {
+    size_t op_index = 0;  // index into ops_ of the format header
+  };
+  std::map<uint64_t, LoggedBufferRef> logged_buffers_;
 };
 
 }  // namespace xfs
