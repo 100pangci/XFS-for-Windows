@@ -43,6 +43,18 @@ function Assert-Refused([scriptblock]$block, [string]$what) {
     Assert $threw "$what was not refused"
 }
 
+# WinFsp removes the mount point on unmount; wait until Windows has released
+# the drive letter before mounting again (or the second mount fails with
+# "letter already in use").
+function Wait-DriveReleased([string]$drive, [int]$timeoutSeconds = 30) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while (Test-Path "$drive\") {
+        if ((Get-Date) -gt $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+    return $true
+}
+
 $script:exe = (Resolve-Path $Xfswin).Path
 $script:pristine = (Resolve-Path $Image).Path
 $recipePath = (Resolve-Path $Recipe).Path
@@ -98,6 +110,8 @@ try {
     & $script:exe unmount $Drive 2>$null | Out-Null
     $proc.WaitForExit(30000) | Out-Null
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    # The read-write phase mounts the same drive letter.
+    Assert (Wait-DriveReleased $Drive) "drive letter $Drive was not released after the read-only phase"
 }
 
 # ---------------------------------------------------------------------------
@@ -250,3 +264,7 @@ if ($LASTEXITCODE -ne 0) { throw "xfswin check failed after the read-write test"
 "== summary: modified image =="
 Get-Item $modified | Select-Object FullName, Length
 "READ-WRITE WINDOWS ROUND TRIP COMPLETE: $modified"
+# The last commands are expected to be refusals only when the checks fail
+# (they throw); make the success case unambiguous for the CI shell.
+$global:LASTEXITCODE = 0
+exit 0
