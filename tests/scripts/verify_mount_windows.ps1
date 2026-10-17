@@ -83,11 +83,25 @@ try {
     Assert ($top.Count -eq $expectedTop.Count) `
         "root entry count $($top.Count) != manifest $($expectedTop.Count)"
     $names = $top | ForEach-Object { $_.Name }
+    $top | ForEach-Object {
+        "  entry: {0} attrs={1} size={2}" -f $_.Name, $_.Attributes, $_.Length
+    }
     foreach ($name in @('hello.txt', 'folder', '中文文件名.txt', 'large.bin',
                         'sparse.img', 'bigdir', 'fragmented.bin')) {
         Assert ($names -contains $name) "root listing missing $name"
     }
-    $bigdir = @(Get-ChildItem (Join-Path $mountPoint 'bigdir'))
+    "== bigdir resolution diagnostics =="
+    $bigdirPath = Join-Path $mountPoint 'bigdir'
+    $di = [System.IO.DirectoryInfo]::new($bigdirPath)
+    "DirectoryInfo.Exists: $($di.Exists)"
+    try {
+        $gi = Get-Item -LiteralPath $bigdirPath -Force -ErrorAction Stop
+        "Get-Item OK: $($gi.FullName) attrs=$($gi.Attributes)"
+    } catch {
+        "Get-Item failed: $($_.Exception.Message)"
+    }
+    cmd /c "dir `"$bigdirPath`" 2>&1" | Select-Object -First 8
+    $bigdir = @(Get-ChildItem $bigdirPath)
     $expectedBig = @($script:manifestEntries | Where-Object {
         $_.type -eq 'file' -and $_.path -like 'bigdir/*'
     })

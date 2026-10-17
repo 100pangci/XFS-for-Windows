@@ -249,7 +249,12 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
                            SIZE_T* security_descriptor_size) {
   AdapterState& state = *State(file_system);
   auto inode = ResolvePath(*state.fs, file_name);
-  if (!inode.ok()) return NtFromError(inode.error().code);
+  if (!inode.ok()) {
+    XFS_WARN("GetSecurityByName('" << WideToUtf8(file_name)
+                                    << "') failed: "
+                                    << inode.error().Format());
+    return NtFromError(inode.error().code);
+  }
   uint32_t attributes = FileAttributesFor(inode.value());
   if (NeedsSecurityOverflow(state, security_descriptor_size)) {
     if (file_attributes) *file_attributes = attributes;
@@ -270,7 +275,11 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
               PVOID* file_context, FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
   auto inode = ResolvePath(*state.fs, file_name);
-  if (!inode.ok()) return NtFromError(inode.error().code);
+  if (!inode.ok()) {
+    XFS_WARN("Open('" << WideToUtf8(file_name)
+                      << "') failed: " << inode.error().Format());
+    return NtFromError(inode.error().code);
+  }
   if ((create_options & FILE_DIRECTORY_FILE) && !inode.value().IsDir()) {
     return STATUS_NOT_A_DIRECTORY;
   }
