@@ -356,8 +356,16 @@ from the existing cache mutexes.
 unmount record, no buffered flush) at the named point. Points cover the data
 write, log write, metadata write and device flush phases; `<hit>` selects which
 occurrence crashes, so a specific transaction in a longer sequence can be
-targeted. The test then requires Linux to see either the state before or after
-that transaction - never in between.
+targeted.
+
+The matrix over every point runs on Windows
+(`tests/scripts/verify_crash_windows.ps1` + `tests/tools/rw_crash_check.py`)
+and the resulting images are replayed by Linux
+(`tests/scripts/verify_crash_linux.sh` + `tests/tools/rw_replay_check.py`).
+The contract: before the record is durable the old timestamps must be visible,
+after it the kernel must replay it and show the logged new ones, file data is
+old or new but never garbage, and the filesystem must stay clean. See
+`docs/TESTING.md` §5.
 
 ## WinFsp adapter contracts
 

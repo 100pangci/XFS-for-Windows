@@ -44,12 +44,12 @@ realtime device, no writes to existing filesystems.**
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
-| **Experimental read-write mount** | images only (`--rw-experimental`): overwrite bytes inside existing allocated data |
+| **Experimental read-write mount** | images only (`--rw-experimental`): overwrite bytes inside existing allocated data, timestamps through a metadata transaction |
 | Writing that grows a file, fills a hole or converts an unwritten extent | **not implemented** (refused, never guessed) |
 | create / delete / rename / mkdir / truncate / symlink | **not implemented** (refused) |
-| Writing metadata (timestamps, allocation, directories) | **not implemented**; the journal stays clean |
-| Journal writer (metadata transactions) | **not implemented**; format and plan in [docs/JOURNAL.md](docs/JOURNAL.md) (RW-1) |
-| Journal replay | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`) |
+| Journal writer (metadata transactions) | yes (RW-1): log records, inode items, clean unmount records; Linux replays them in CI |
+| Metadata written so far | inode `mtime`/`ctime` (with `di_lsn` and CRC) via `SetFileTimes`; nothing else |
+| Journal replay (reading a dirty log) | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`; Linux replays ours) |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
 
@@ -68,26 +68,37 @@ through `xfswin pwrite`) → Linux checks `xfs_repair -n`, regenerates the
 expected content independently and requires every other byte of every other
 file to be unchanged.
 
-## Read-write support (experimental, RW-0)
+RW-1 adds crash consistency to that: the write path is killed at every phase
+of a transaction (`XFSWIN_CRASH_AT`), and the resulting images are checked on
+Windows *before* replay and on Linux *after* it. Linux has to replay the log
+record this project wrote (or reject a torn one), the file must show either the
+old timestamps or the logged new ones, and `xfs_repair -n` must stay silent.
+See [docs/JOURNAL.md](docs/JOURNAL.md) and [docs/TESTING.md](docs/TESTING.md).
+
+## Read-write support (experimental, RW-0 data + RW-1 transactions)
 
 ```text
 xfswin mount test.img X: --rw-experimental   # image only; real disks stay read-only
 xfswin pwrite test.img /hello.bin 4096 --rw-experimental --text=hello
 ```
 
-Scope of this first milestone:
+Scope of this milestone:
 
 - **In-place overwrites only.** The write range must lie entirely inside
   extents that are already allocated *and* written. Anything that would need a
   metadata transaction is refused with a specific error: growing a file
   (`write would extend the file`), a hole (`write range covers a hole`), an
   unwritten/preallocated extent (`write range covers an unwritten extent`).
-  create/delete/rename/mkdir/truncate/symlink and Windows attribute or
-  timestamp changes are refused as well.
-- **No metadata is written.** XFS never journals file data, so this milestone
-  needs no transaction and leaves the log clean: Linux mounts the result
-  without replaying anything. Timestamps (`mtime`/`ctime`) are therefore *not*
-  updated yet - that is the first metadata transaction (RW-1).
+  create/delete/rename/mkdir/truncate/symlink are refused as well; Windows
+  attribute or timestamp changes are refused too (the core currently writes the
+  timestamps a write produces, nothing else).
+- **Data is not journalled, metadata is.** XFS never logs file data, so the
+  data write goes straight to the device. The inode change that a write
+  produces (`mtime`/`ctime`) goes through a real transaction (RW-1): the log
+  record is written and flushed first, then the inode buffer, then the log is
+  closed with an unmount record. Linux replays those records in CI
+  (`linux-verify-crash`), and a crash at any phase leaves either the old or the
+  new state - never in between.
 - **Allow-list mount policy.** A filesystem may be mounted read-write only if
   this build can maintain every structure it uses. finobt, rmapbt, reflink,
   sparse inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas,
@@ -196,10 +207,10 @@ destructive flag), `3` refused for safety reasons.
   `FSP_FSCTL_VOLUME_PARAMS::ReadOnlyVolume=1`, opens the block device
   read-only and rejects every write-path callback.
 - Read-write mounts are opt-in (`--rw-experimental`), image only, and restricted
-  to the RW-0 scope described above: in-place overwrites of existing allocated,
-  written data. They are an allow-list: a filesystem with features this build
-  cannot keep consistent is refused for read-write instead of being modified
-  best-effort.
+  to the scope described above: in-place overwrites of existing allocated,
+  written data plus the inode timestamps those writes produce. They are an
+  allow-list: a filesystem with features this build cannot keep consistent is
+  refused for read-write instead of being modified best-effort.
 - The core has no allocator, no inode allocator and no journal writer yet, so
   it cannot create, delete, rename, grow or shrink anything. The journal is
   only ever *read* (cleanliness check); a dirty log refuses mount.
@@ -286,7 +297,7 @@ src/core/            parser, verifier, geometry, directories, check, caches
 src/block/           image and Windows raw block devices
 src/mkfs/            geometry, superblock/AG/inode/log builders, formatter
 src/write/           read-write layer: policy, range mapping, in-place data
-                     writes, flush (transaction/journal code will live here)
+                     writes, transactions, log record writer, flush
 src/winfsp/          WinFsp adapter and mount host
 src/cli/             xfswin.exe
 tests/               unit + integration tests, fixture builder, scripts for
