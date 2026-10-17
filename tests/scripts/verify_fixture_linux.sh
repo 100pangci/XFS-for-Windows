@@ -63,7 +63,7 @@ cleanup() {
     rmdir "$mnt" 2>/dev/null || true
 }
 trap cleanup EXIT
-mount -o loop,ro "$img" "$mnt"
+mount -o loop,ro,nouuid "$img" "$mnt"
 ls -la "$mnt"
 python3 - "$mnt" <<'PY'
 import sys
