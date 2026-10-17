@@ -52,6 +52,21 @@ TEST(formatter_roundtrip) {
   // mkfs writes a nonzero realtime extent size even without an rt device.
   CHECK_EQ(fs.value()->superblock().rextsize, 1u);
   CHECK_EQ(fs.value()->superblock().rootino, 64u);
+  // The rt bitmap/summary inodes are allocated even without an rt device.
+  CHECK_EQ(fs.value()->superblock().rbmino, 65u);
+  CHECK_EQ(fs.value()->superblock().rsumino, 66u);
+  CHECK_EQ(fs.value()->superblock().icount, 64u);
+  CHECK_EQ(fs.value()->superblock().ifree, 61u);
+  {
+    auto rtb = fs.value()->OpenInode(65);
+    CHECK(rtb.ok());
+    CHECK(!rtb.value().IsDir());
+    CHECK_EQ(rtb.value().size, 0u);
+    auto rts = fs.value()->OpenInode(66);
+    CHECK(rts.ok());
+    CHECK(!rts.value().IsDir());
+    CHECK_EQ(rts.value().size, 0u);
+  }
 
   auto root = fs.value()->LookupPath("/");
   CHECK(root.ok());

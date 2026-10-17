@@ -143,16 +143,22 @@ chunk = 8 blocks, `inoalignmt = 4`:
     contain the remaining free extents (usually one; the inode chunk can
     split the free space into two when its alignment leaves a gap);
   - AGFL holds 4 blocks taken from the start of the free extent;
-  - AGF counts: `freeblks` = sum of free extents, `longest` = largest free
-    extent, `btreeblks = 2`, `flfirst=0`, `fllast=3`, `flcount=4`.
+  - AGF counts: `freeblks` = sum of free extents (AGFL excludes itself),
+    `longest` = largest free extent, `btreeblks = 0` (only btree roots exist,
+    and xfs_repair counts non-root btree blocks), `flfirst=0`, `fllast=3`,
+    `flcount=4`.
 - AG0 additionally has one inode chunk at block `prealloc + min_freelist`
-  (aligned): 64 zeroed inode cores (magic/version/gen/ino/uuid/CRC), with the
-  root inode fully populated at its start.
-- Root inode: mode `040755`, nlink 2, uid/gid 0, size 25, `LOCAL` format,
-  shortform entries `.` and `..` with offsets 96/112, both pointing to itself.
+  (aligned): 64 inode cores (magic/version/gen/ino/uuid/CRC). The root inode
+  (64) is fully populated, and inodes 65/66 are the realtime bitmap and
+  summary inodes that mkfs allocates even without a realtime device (S_IFREG,
+  nlink 1, size 0, `NEWRTBM` on the bitmap, sb_rbmino/rsumino point at them).
+- Root inode: mode `040755`, nlink 2, uid/gid 0, size 6, `LOCAL` format.
+  Shortform directories do not store `.`/`..`: they are implicit (the `.`
+  entry is the inode itself and `..` is the parent field in the header), so
+  the root directory contains just the empty shortform header.
 - Superblock counters are written exactly consistent with the AG headers
-  (`sb_fdblocks = Σ agf_freeblks`, `sb_icount=64`, `sb_ifree=63`), rather than
-  relying on lazy-counter reconciliation.
+  (`sb_fdblocks = Σ(agf_freeblks + agf_flcount)`, `sb_icount=64`,
+  `sb_ifree=61`), rather than relying on lazy-counter reconciliation.
 
 The formatter crosses the `xfs_ialloc_calc_rootino` formula, so the root
 inode lands where `xfs_repair` expects it for this geometry.

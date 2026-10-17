@@ -88,19 +88,47 @@ jobs:
           echo "=== sb fields ==="
           xfs_db -r -c 'sb 0' -c 'p rbmino rsumino rootino rextsize versionnum features_incompat features_ro_compat' /tmp/ref.img
           echo "=== root inode core ==="
-          xfs_db -r -c 'inode 64' -c 'p core' /tmp/ref.img
+          xfs_db -r -c 'inode 128' -c 'p core' /tmp/ref.img
           echo "=== root inode dir data ==="
-          xfs_db -r -c 'inode 64' -c 'p u' /tmp/ref.img
-          echo "=== inode 65 ==="
-          xfs_db -r -c 'inode 65' -c 'p core' /tmp/ref.img
-          echo "=== inode 66 ==="
-          xfs_db -r -c 'inode 66' -c 'p core' /tmp/ref.img
+          xfs_db -r -c 'inode 128' -c 'p u' /tmp/ref.img
+          echo "=== inode 129 (rt bitmap) ==="
+          xfs_db -r -c 'inode 129' -c 'p core' /tmp/ref.img
+          echo "=== inode 129 dir/attr ==="
+          xfs_db -r -c 'inode 129' -c 'p u' /tmp/ref.img || true
+          echo "=== inode 130 (rt summary) ==="
+          xfs_db -r -c 'inode 130' -c 'p core' /tmp/ref.img
+          echo "=== inode 131 (free inode core) ==="
+          xfs_db -r -c 'inode 131' -c 'p core' /tmp/ref.img
           echo "=== agi 0 ==="
           xfs_db -r -c 'agi 0' -c 'p count freecount root level' /tmp/ref.img
           echo "=== agf 0 ==="
           xfs_db -r -c 'agf 0' -c 'p freeblks longest btreeblks flcount flfirst fllast' /tmp/ref.img
-          echo "=== inode 64 check ==="
-          xfs_db -r -c 'inode 64' -c 'check' /tmp/ref.img || true
+          echo "=== inobt root ==="
+          xfs_db -r -c 'agi 0' -c 'addr root' -c 'p' /tmp/ref.img || true
+          echo "=== inode 128 check ==="
+          xfs_db -r -c 'inode 128' -c 'check' /tmp/ref.img || true
+          echo
+          echo "=== minimal-feature image (mirrors the Windows formatter profile) ==="
+          truncate -s 300M /tmp/ref-min.img
+          mkfs.xfs -f -m crc=1,finobt=0,rmapbt=0,reflink=0,bigtime=0,inobtcount=0 \
+              -i sparse=0 /tmp/ref-min.img
+          xfs_db -r -c 'sb 0' -c 'p rootino rbmino rsumino rextsize agblocks agcount blocks logstart logblocks versionnum' /tmp/ref-min.img
+          echo "=== min root inode core ==="
+          xfs_db -r -c 'inode 64' -c 'p core' /tmp/ref-min.img
+          echo "=== min root dir data ==="
+          xfs_db -r -c 'inode 64' -c 'p u' /tmp/ref-min.img
+          echo "=== min rt bitmap inode (65) ==="
+          xfs_db -r -c 'inode 65' -c 'p core' /tmp/ref-min.img
+          echo "=== min rt summary inode (66) ==="
+          xfs_db -r -c 'inode 66' -c 'p core' /tmp/ref-min.img
+          echo "=== min free inode (67) ==="
+          xfs_db -r -c 'inode 67' -c 'p core' /tmp/ref-min.img || true
+          echo "=== min agi 0 ==="
+          xfs_db -r -c 'agi 0' -c 'p count freecount root level' /tmp/ref-min.img
+          echo "=== min agf 0 ==="
+          xfs_db -r -c 'agf 0' -c 'p freeblks longest btreeblks flcount flfirst fllast' /tmp/ref-min.img
+          echo "=== min inobt root ==="
+          xfs_db -r -c 'agi 0' -c 'addr root' -c 'p' /tmp/ref-min.img || true
 
   # ---------------------------------------------------------------------------
   # Linux: verify the Windows-formatted image with the real xfsprogs, then

@@ -37,9 +37,12 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   std::memcpy(p + sb::kUuid, geo.uuid.data(), 16);
   PutBE64(p, sb::kLogstart, geo.logstart);
   PutBE64(p, sb::kRootino, geo.rootino);
-  // No realtime device: mkfs writes NULLFSINO for both rt inode fields.
-  PutBE64(p, sb::kRbmino, 0xffffffffffffffffULL);
-  PutBE64(p, sb::kRsumino, 0xffffffffffffffffULL);
+  // Even without a realtime device, mkfs allocates the realtime bitmap and
+  // summary inodes directly after the root inode and points the superblock at
+  // them (xfs_repair validates this unconditionally for non-rtgroup
+  // filesystems).
+  PutBE64(p, sb::kRbmino, geo.rootino + 1);
+  PutBE64(p, sb::kRsumino, geo.rootino + 2);
   // mkfs always writes a valid realtime extent size, even without an rt
   // device: max(1, XFS_MIN_RTEXTSIZE / blocksize).
   uint32_t rextsize = geo.block_size < 4096 ? (4096u >> geo.blocklog) : 1u;
@@ -70,9 +73,10 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   p[sb::kInprogress] = 0;
   p[sb::kImaxPct] = static_cast<uint8_t>(geo.imax_pct);
 
-  // One inode chunk (64 inodes), one of which is the allocated root inode.
+  // One inode chunk (64 inodes): the root directory plus the realtime bitmap
+  // and summary inodes are allocated, the rest are free.
   PutBE64(p, sb::kIcount, 64);
-  PutBE64(p, sb::kIfree, 63);
+  PutBE64(p, sb::kIfree, 61);
   PutBE64(p, sb::kFdblocks, geo.sb_fdblocks);
   PutBE64(p, sb::kFrextents, 0);
 

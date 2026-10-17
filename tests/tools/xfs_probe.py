@@ -103,6 +103,10 @@ def main(path: str) -> int:
     uuid = sb[32:48]
     logstart = u64(sb, 48)
     rootino = u64(sb, 56)
+    rbmino = u64(sb, 64)
+    rsumino = u64(sb, 72)
+    assert rbmino == rootino + 1, ("rt bitmap inode", rbmino)
+    assert rsumino == rootino + 2, ("rt summary inode", rsumino)
     agblocks = u32(sb, 84)
     agcount = u32(sb, 88)
     logblocks = u32(sb, 96)

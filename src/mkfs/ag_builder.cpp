@@ -93,7 +93,7 @@ void BuildAgiImage(const FormatGeometry& geo, const FormatGeometry::AgState& ag,
   PutBE32(p, agi::kCount, ag.has_inodes ? 64u : 0u);
   PutBE32(p, agi::kRoot, geo.ibt_block);
   PutBE32(p, agi::kLevel, 1);
-  PutBE32(p, agi::kFreecount, ag.has_inodes ? 63u : 0u);
+  PutBE32(p, agi::kFreecount, ag.has_inodes ? 61u : 0u);
   PutBE32(p, agi::kNewino, ag.has_inodes ? geo.rootino_agino : kNullAgino);
   PutBE32(p, agi::kDirino, ag.has_inodes ? geo.rootino_agino : kNullAgino);
   for (size_t i = 0; i < agi::kUnlinkedBuckets; ++i) {
@@ -174,8 +174,9 @@ void BuildInobtRoot(const FormatGeometry& geo,
     uint8_t* rec = buf->data() + bt::kSHeaderLenV5;
     uint32_t startino = ag.chunk_agbno << geo.inopblog;
     PutBE32(rec, 0, startino);       // ir_startino
-    PutBE32(rec, 4, 63);             // ir_freecount (full record format)
-    PutBE64(rec, 8, ~1ULL);          // ir_free: all free but the root inode
+    // Root directory plus rt bitmap/summary inodes are allocated.
+    PutBE32(rec, 4, 61);             // ir_freecount (full record format)
+    PutBE64(rec, 8, ~7ULL);          // ir_free: bits 0-2 used
   }
   FinishBtreeCrc(geo, buf);
 }
