@@ -243,13 +243,14 @@ file data) to keep them coherent.
 Cold listings still read every inode once (metadata must be correct); warm
 listings of a 4000-entry directory take tens of milliseconds.
 
-## Read-write support (RW-0)
+## Read-write support (RW-0: data, RW-1: transactions)
 
-Status: in-place overwrites of existing allocated, written data. Nothing else.
-Roadmap: RW-1 transaction framework + journal writer + timestamp updates,
-RW-2 allocator + extend/truncate, RW-3 inode allocation + create/unlink,
-RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw devices (VHD
-first).
+Status: in-place overwrites of existing allocated, written data, and metadata
+transactions through the journal (currently used for the inode timestamps a
+write produces). Nothing else.
+Roadmap: RW-2 allocator + extend/truncate, RW-3 inode allocation +
+create/unlink, RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw
+devices (VHD first). `docs/JOURNAL.md` is the reference for the log format.
 
 **Write path.** `XfsFilesystem::OverwriteFileData` (`src/write/file_data.cpp`):
 take the mutation lock, load the inode and its data-fork extent list, map the
@@ -262,11 +263,11 @@ unwritten extents are refused (`kWriteExtendsFile`, `kWriteNeedsAllocation`,
 this build does not implement yet. Immutable and append-only inodes are
 refused before anything is written.
 
-Because XFS never journals file data, this milestone writes no metadata at
-all: no inode fields, no AG headers, no log record. That is what makes
-`xfs_repair -n` and the Linux mount clean without any replay, and it is
-checked by a unit test that compares every metadata region byte for byte
-before and after a write.
+XFS never journals file data, so the data itself needs no transaction. The
+inode change that a write produces (mtime/ctime) does, and RW-1 runs exactly
+that: data write -> transaction (log record, then the inode) -> flush. A crash
+before the record is durable leaves the old timestamps, a crash after it leaves
+a dirty log the kernel replays; both are covered by the crash matrix.
 
 **Cache invalidation.** `include/xfs/cache.h` is the single source of truth.
 Every mutation builds a `CacheInvalidation` and calls
@@ -297,10 +298,45 @@ but a stale chunk can never be *published* and then served indefinitely.
 **Flush.** `XfsFilesystem::Flush` waits for in-flight mutations, then performs
 a durable device flush (`FlushFileBuffers` on Windows). A failed flush is an
 error; WinFsp's `Flush` maps it to `STATUS_IO_DEVICE_ERROR`, and unmounting
-flushes before the mount point disappears. Transaction commit and device flush
-are distinct concepts: with no transactions yet, a flush is exactly a device
-flush, and ordered-data ordering (`data -> metadata -> log -> flush`) arrives
-with RW-1.
+flushes before the mount point disappears. A transaction commit flushes on its
+own, in the order the log requires (see below); `Flush` is the durability
+barrier for everything else.
+
+**Transactions (RW-1).** `include/xfs/transaction.h` +
+`src/write/transaction.cpp`:
+
+```text
+XfsFilesystem::BeginTransaction -> XfsTransaction {tid, lsn, items, writes}
+        |  a mutation adds log items (host-order payloads) and the metadata
+        |  buffers that must not become visible before the record is durable
+        v
+CommitTransaction
+  1. frame the items (start op, transaction header, items, commit op) and
+     build the record: src/write/log_record.cpp
+  2. write the record header block and its data blocks, then flush
+  3. write the metadata buffers, then flush
+  4. advance the write position, mark the log dirty, invalidate caches
+WriteCleanUnmountRecord -> one unmount op at the head, then flush
+```
+
+The record format is the kernel's (see `docs/JOURNAL.md`): cycle-stamped data,
+CRC over the header plus the stamped data, `h_len` rounded to the log sector,
+`h_lsn` = (cycle, block), `h_tail_lsn` = the record's own LSN (every commit
+flushes its metadata before the next transaction, so nothing older can still
+need replaying), `h_prev_block` = the previous record's header block.
+
+The first mutation is `SetFileTimes` (`src/write/inode_write.cpp`): a single
+inode item, `xfs_inode_log_format` + `xfs_log_dinode` in host byte order,
+naming the inode *cluster* buffer exactly like `xfs_imap` does. The on-disk
+inode is rewritten with the new times, the transaction LSN and a fresh CRC.
+`OverwriteFileData` calls it inside its own transaction, so a successful write
+persists mtime/ctime like Linux does.
+
+**The log is left clean.** `WriteCleanUnmountRecord` runs at unmount (the CLI
+after a write, the WinFsp host when the mount point disappears) and is what
+lets the next mount - ours or Linux's - start without replaying anything. A
+crash between the two leaves a dirty log with a complete record, which is
+exactly the case the crash matrix makes the kernel replay.
 
 **WinFsp flags for read-write volumes.** `ReadOnlyVolume=0`,
 `FlushAndPurgeOnCleanup=1` (Windows must not serve stale pages after a write or
