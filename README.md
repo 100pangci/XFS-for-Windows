@@ -28,8 +28,8 @@ realtime device, no writes to existing filesystems.**
 
 | Feature | Status |
 |---|---|
-| Image files (`*.img`, `*.raw`) | yes, read + format |
-| `\\.\PhysicalDriveN` | yes, read + format (CI-verified on an attached VHD; Administrator required) |
+| Image files (`*.img`, `*.raw`) | yes, read + format + experimental in-place writes |
+| `\\.\PhysicalDriveN` | yes, read + format (CI-verified on an attached VHD; Administrator required); **read-only when mounted** |
 | `\\.\HarddiskVolumeX` | read yes; format refused in v1 |
 | Superblock + secondary superblocks | parse + CRC/UUID/geometry verify |
 | AGF / AGI / AGFL | parse + verify |
@@ -44,7 +44,10 @@ realtime device, no writes to existing filesystems.**
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
-| Writes to an existing XFS | **never** (read-only mount, write callbacks return `STATUS_MEDIA_WRITE_PROTECTED`) |
+| **Experimental read-write mount** | images only (`--rw-experimental`): overwrite bytes inside existing allocated data |
+| Writing that grows a file, fills a hole or converts an unwritten extent | **not implemented** (refused, never guessed) |
+| create / delete / rename / mkdir / truncate / symlink | **not implemented** (refused) |
+| Writing metadata (timestamps, allocation, directories) | **not implemented**; the journal stays clean |
 | Journal replay | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`) |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
@@ -56,6 +59,54 @@ writable copy), while the reader matches a Linux-written golden image
 names, symlinks). The WinFsp mount is installed and exercised on a Windows
 runner: volume reports `XFS` and read-only, file contents match, and
 create/delete/rename are refused.
+
+The experimental read-write path is verified as a full round trip: Windows
+formats an image → Linux populates it → Windows mounts it read-write,
+overwrites bytes in two files (once through the WinFsp `Write` callback, once
+through `xfswin pwrite`) → Linux checks `xfs_repair -n`, regenerates the
+expected content independently and requires every other byte of every other
+file to be unchanged.
+
+## Read-write support (experimental, RW-0)
+
+```text
+xfswin mount test.img X: --rw-experimental   # image only; real disks stay read-only
+xfswin pwrite test.img /hello.bin 4096 --rw-experimental --text=hello
+```
+
+Scope of this first milestone:
+
+- **In-place overwrites only.** The write range must lie entirely inside
+  extents that are already allocated *and* written. Anything that would need a
+  metadata transaction is refused with a specific error: growing a file
+  (`write would extend the file`), a hole (`write range covers a hole`), an
+  unwritten/preallocated extent (`write range covers an unwritten extent`).
+  create/delete/rename/mkdir/truncate/symlink and Windows attribute or
+  timestamp changes are refused as well.
+- **No metadata is written.** XFS never journals file data, so this milestone
+  needs no transaction and leaves the log clean: Linux mounts the result
+  without replaying anything. Timestamps (`mtime`/`ctime`) are therefore *not*
+  updated yet - that is the first metadata transaction (RW-1).
+- **Allow-list mount policy.** A filesystem may be mounted read-write only if
+  this build can maintain every structure it uses. finobt, rmapbt, reflink,
+  sparse inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas,
+  realtime devices, external logs, metadir, zoned and case-insensitive
+  directories are all refused for read-write (they remain readable), with the
+  blocking feature named in the error.
+- **Images only.** `\\.\PhysicalDriveN` and volumes refuse `--rw-experimental`
+  (exit code 3) until the writer has passed crash-consistency and
+  interoperability testing. `--rw` is not accepted yet either: it will be the
+  name of the finished feature.
+- **Cache coherency.** Windows' own file cache is flushed and purged on close
+  (`FlushAndPurgeOnCleanup`), file info is not cached, and the core drops the
+  affected data chunks through one central invalidation path with a per-inode
+  write generation, so a concurrent read can never resurrect stale bytes.
+- **Flush is real.** `FlushFileBuffers` failure is an error
+  (`STATUS_IO_DEVICE_ERROR`), never success; unmount flushes before the mount
+  point disappears.
+- **Crash injection** is built in from the start
+  (`XFSWIN_CRASH_AT=<point>[:<hit>]`) so crash-consistency can be tested
+  against Linux `mount` / `xfs_repair -n`.
 
 ## Requirements
 
@@ -104,13 +155,15 @@ xfswin ls test.img /                          # list a directory
 xfswin cat test.img /hello.txt                # stream file data to stdout
 xfswin stat test.img /hello.txt               # inode details
 xfswin mount test.img X:                      # read-only WinFsp mount
+xfswin mount test.img X: --rw-experimental    # writable mount (images only)
+xfswin pwrite test.img /hello.bin 0 --rw-experimental --text=hi
 xfswin unmount X:
 xfswin mount \\.\PhysicalDrive2 X:            # real disk (Administrator)
 xfswin mount \\.\HarddiskVolume11 E:\XFS      # a partition, as a directory mount
 ```
 
 Global options: `--verbose`, `--debug`, `--force-unsafe-ro`,
-`--yes-i-really-mean-it`.
+`--yes-i-really-mean-it`, `--rw-experimental`.
 
 Drive letters are per logon session: a letter created by an **elevated** process
 is not visible to the non-elevated Explorer session. Raw-device access itself
@@ -138,13 +191,19 @@ destructive flag), `3` refused for safety reasons.
 
 ### Read-only guarantees
 
-- Mounted filesystems always use `FSP_FSCTL_VOLUME_PARAMS::ReadOnlyVolume=1`
-  and every write-path callback returns `STATUS_MEDIA_WRITE_PROTECTED`.
-- The block device is opened read-only.
-- The core library exposes no write API for existing filesystems; the only
-  writer is `xfs::mkfs::Format`.
-- Dirty logs are detected and mount is refused unless `--force-unsafe-ro` is
-  given. This build never replays the log and never modifies it.
+- A read-only mount (the default) uses
+  `FSP_FSCTL_VOLUME_PARAMS::ReadOnlyVolume=1`, opens the block device
+  read-only and rejects every write-path callback.
+- Read-write mounts are opt-in (`--rw-experimental`), image only, and restricted
+  to the RW-0 scope described above: in-place overwrites of existing allocated,
+  written data. They are an allow-list: a filesystem with features this build
+  cannot keep consistent is refused for read-write instead of being modified
+  best-effort.
+- The core has no allocator, no inode allocator and no journal writer yet, so
+  it cannot create, delete, rename, grow or shrink anything. The journal is
+  only ever *read* (cleanliness check); a dirty log refuses mount.
+- `xfswin format` is still the only writer of a whole filesystem, and the only
+  path that can destroy existing data.
 
 ## Formatter profile (v1)
 
@@ -222,12 +281,15 @@ read files, close) against an image and validates buffer handling.
 
 ```
 include/xfs/         public core headers (no WinFsp, no Windows UI)
-src/core/            parser, verifier, geometry, directories, check
+src/core/            parser, verifier, geometry, directories, check, caches
 src/block/           image and Windows raw block devices
 src/mkfs/            geometry, superblock/AG/inode/log builders, formatter
+src/write/           read-write layer: policy, range mapping, in-place data
+                     writes, flush (transaction/journal code will live here)
 src/winfsp/          WinFsp adapter and mount host
 src/cli/             xfswin.exe
-tests/               unit + integration tests, scripts for Linux oracles
+tests/               unit + integration tests, fixture builder, scripts for
+                     Linux oracles and the independent Python probes
 reference/           upstream xfsprogs source (not built, gitignored)
 ```
 

@@ -12,9 +12,13 @@ CLI (xfswin.exe)                       WinFsp host
       \                                 /
        \                               /
         +---- XfsFilesystem ----------+
-                 |  (read-only public API)
+                 |  (public API)
                  v
-        core parser / verifier / check
+        core parser / verifier / check / caches
+                 |
+                 v
+          write layer (xfs/write.h)
+     policy -> range mapping -> device
                  |
                  v
              BlockDevice
@@ -26,8 +30,12 @@ CLI (xfswin.exe)                       WinFsp host
   `src/core/` includes WinFsp or user-interface headers.
 - The only Windows-specific code in the core library is the raw block device
   backend; the parser is portable C++20.
-- The formatter (`src/mkfs/`) is the only writer and is called only from
+- The formatter (`src/mkfs/`) creates whole filesystems and is called only from
   `xfswin format` after the CLI's destructive-operation guards.
+- `src/write/` holds the mutation layer. For RW-0 that is policy + range
+  mapping + in-place data writes + flush; the transaction/journal/allocator
+  work (RW-1 onwards) belongs next to it. The rule stays the same: WinFsp and
+  the CLI call the high-level mutation API, never inode/btree structures.
 
 ## Safety invariants
 
@@ -42,10 +50,21 @@ CLI (xfswin.exe)                       WinFsp host
 4. B+tree traversal has a hard depth cap, a visited-block set (cycle
    detection), sibling consistency checks, record-count bounds and pointer
    validation. Corrupt trees stop the walk.
-5. The filesystem is never written through the read API. Mounting opens the
-   device read-only and the WinFsp volume declares itself read-only.
+5. A read-only mount never writes: the device is opened read-only, the volume
+   declares itself read-only and every write callback is rejected.
 6. Dirty or unknown logs cause mount refusal by default. This build never
-   replays or modifies the journal.
+   replays the journal.
+7. A read-write mount is an allow-list (`CheckWritableProfile`): read-write is
+   permitted only if this build can maintain every structure the filesystem
+   uses. Features that are only *understood* (finobt, rmapbt, reflink, sparse
+   inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas, realtime,
+   external logs, metadir, zoned) are refused for read-write with the blocking
+   feature named, never updated best-effort.
+8. A mutation validates its whole effect before it writes anything
+   (`MapWrittenRange`): a partially valid range is refused as a whole, so a
+   failed request cannot leave half of it applied.
+9. Read-write mounting of real devices is refused in code (`--rw-experimental`
+   plus an image target), not by convention.
 
 ## On-disk numbering (important)
 
@@ -189,8 +208,10 @@ guard callbacks the FSD does not lock at all.
 
 ## Read-only caches
 
-The filesystem is never written while mounted, so inode parsing, directory
-contents and file data are cached:
+A read-only mount never writes, so inode parsing, directory contents and file
+data are cached for the whole mount. A read-write mount uses the same caches
+and relies on the invalidation rules below (and on the generation counter for
+file data) to keep them coherent.
 
 - `XfsFilesystem` caches up to 32k parsed inodes, up to 32k `XfsFileInfo`
   records, up to 8192 per-inode extent lists, and up to 128 directory listings
@@ -222,6 +243,86 @@ contents and file data are cached:
 Cold listings still read every inode once (metadata must be correct); warm
 listings of a 4000-entry directory take tens of milliseconds.
 
+## Read-write support (RW-0)
+
+Status: in-place overwrites of existing allocated, written data. Nothing else.
+Roadmap: RW-1 transaction framework + journal writer + timestamp updates,
+RW-2 allocator + extend/truncate, RW-3 inode allocation + create/unlink,
+RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw devices (VHD
+first).
+
+**Write path.** `XfsFilesystem::OverwriteFileData` (`src/write/file_data.cpp`):
+take the mutation lock, load the inode and its data-fork extent list, map the
+range with `MapWrittenRange`, then write each mapped run straight through the
+block device, then invalidate. The range rule is checked for the *whole*
+request first: every byte must be inside a written (not unwritten, not hole)
+extent, and `offset + length` must not exceed the inode size. Growth, holes and
+unwritten extents are refused (`kWriteExtendsFile`, `kWriteNeedsAllocation`,
+`kWriteNeedsConversion`) because each of them needs a metadata transaction
+this build does not implement yet. Immutable and append-only inodes are
+refused before anything is written.
+
+Because XFS never journals file data, this milestone writes no metadata at
+all: no inode fields, no AG headers, no log record. That is what makes
+`xfs_repair -n` and the Linux mount clean without any replay, and it is
+checked by a unit test that compares every metadata region byte for byte
+before and after a write.
+
+**Cache invalidation.** `include/xfs/cache.h` is the single source of truth.
+Every mutation builds a `CacheInvalidation` and calls
+`XfsFilesystem::InvalidateCaches`; no call site touches a cache directly, so a
+cache added later cannot be forgotten:
+
+| mutation | invalidation |
+|---|---|
+| overwrite data in place | `DataRange(ino, offset, length)` |
+| extend / truncate | `Extents(ino)` (inode + extents + all data chunks) |
+| timestamps / mode / nlink | `Inode(ino)` |
+| directory entry added/removed | `Directory(ino)` + parent inode |
+| inode allocate/free | `Inode(ino)` + chunk + data |
+| unknown / structural | `Everything()` |
+
+**Data cache coherency.** The file data cache stores whole 512 KiB chunks and
+can be read concurrently. Ordering rules:
+
+1. a mutation writes the device first, then bumps the inode's data generation,
+   then drops the affected chunks (all inside `InvalidateCaches`);
+2. a reader snapshots the generation *before* its device read and
+   `InsertDataChunk` refuses to publish a chunk whose generation is no longer
+   current (`LookupDataChunk` also rejects entries from an older generation).
+
+So a reader that raced with the writer either read the old or the new bytes -
+but a stale chunk can never be *published* and then served indefinitely.
+
+**Flush.** `XfsFilesystem::Flush` waits for in-flight mutations, then performs
+a durable device flush (`FlushFileBuffers` on Windows). A failed flush is an
+error; WinFsp's `Flush` maps it to `STATUS_IO_DEVICE_ERROR`, and unmounting
+flushes before the mount point disappears. Transaction commit and device flush
+are distinct concepts: with no transactions yet, a flush is exactly a device
+flush, and ordered-data ordering (`data -> metadata -> log -> flush`) arrives
+with RW-1.
+
+**WinFsp flags for read-write volumes.** `ReadOnlyVolume=0`,
+`FlushAndPurgeOnCleanup=1` (Windows must not serve stale pages after a write or
+after an external modification), `FileInfoTimeout=0` (no cached file info),
+and a security descriptor that actually allows writing. File attributes follow
+the volume and the POSIX mode bits: on a writable volume a 0644 file is
+writable, a 0444 file is reported read-only.
+
+**Locking model.** RW-0 uses one coarse `mutation_mutex_` for all mutations
+(correctness first; per-object locking comes once the writer is stable). It
+also orders "device write" against "cache publication" for concurrent readers,
+which is what the generation counter relies on. Reads stay lock-free apart
+from the existing cache mutexes.
+
+**Crash injection.** `include/xfs/crash.h` + `src/core/crash.cpp`:
+`XFSWIN_CRASH_AT=<point>[:<hit>]` terminates the process (no destructors, no
+unmount record, no buffered flush) at the named point. Points cover the data
+write, log write, metadata write and device flush phases; `<hit>` selects which
+occurrence crashes, so a specific transaction in a longer sequence can be
+targeted. The test then requires Linux to see either the state before or after
+that transaction - never in between.
+
 ## WinFsp adapter contracts
 
 Findings that the adapter must honor (all verified by the CI mount job):
@@ -240,9 +341,17 @@ Findings that the adapter must honor (all verified by the CI mount job):
   not clamp to `inode.size`; `ReadFileData` still clamps for regular reads.
 - `cat` must switch stdout to binary mode (`_setmode(_O_BINARY)`) or Windows
   translates every `\n` in file data to CRLF.
-- Write callbacks (`Create`, `Write`, `Overwrite`, `SetBasicInfo`,
-  `SetFileSize`, `CanDelete`, `Rename`, `SetSecurity`, `SetVolumeLabel`)
-  return `STATUS_MEDIA_WRITE_PROTECTED`.
+- Write callbacks that are not implemented yet (`Create`, `Overwrite`,
+  `SetBasicInfo`, `SetFileSize`, `CanDelete`, `Rename`, `SetSecurity`,
+  `SetVolumeLabel`) return `STATUS_MEDIA_WRITE_PROTECTED` on a read-only volume
+  and `STATUS_NOT_SUPPORTED` on a read-write one: calling a read-write volume
+  "write protected" would be false.
+- `Write` receives an offset for normal handles and a write-to-end flag for
+  append handles; append is refused in RW-0 instead of being turned into an
+  in-place write at the wrong offset.
+- A write that needs an allocation, a conversion or a size change is refused
+  (`STATUS_NOT_SUPPORTED`) and the refusal is logged with the core error; the
+  adapter never writes a partial result.
 - Drive letters are per logon session: a letter created by an elevated process
   is invisible to the user's Explorer session. Directory mount points are NTFS
   junctions and are visible across sessions, so elevated mounts should use
