@@ -6,8 +6,11 @@
 #include <filesystem>
 #include <iostream>
 #include <random>
+#include <string>
 
+#include "support/fixture_image.h"
 #include "test_util.h"
+#include "xfs/image_device.h"
 #include "xfs/log.h"
 
 namespace xfstest {
@@ -42,7 +45,70 @@ std::filesystem::path MakeTempImage(uint64_t size_bytes) {
 
 }  // namespace xfstest
 
-int main() {
+namespace {
+
+// Writes a fixture image (a consistent filesystem with one file) to `path`.
+// CI runs this and then verifies the image with Linux xfs_repair/mount and the
+// independent Python probe, so the fixture cannot "pass" by sharing a bug with
+// the reader.
+int MakeFixture(const std::string& path_string) {
+  const auto* p = reinterpret_cast<const char8_t*>(path_string.data());
+  std::filesystem::path path(std::u8string(p, path_string.size()));
+  std::string error;
+  auto device = xfs::ImageBlockDevice::Create(path, 300ull << 20, 512, &error);
+  if (!device) {
+    std::fprintf(stderr, "cannot create %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  xfstest::FixtureOptions options;
+  options.size_bytes = 300ull << 20;
+  options.uuid = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x47, 0x88,
+                  0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00};
+  xfstest::FixtureInfo info;
+  xfs::Status status = xfstest::BuildFixtureImage(*device, options, &info);
+  if (!status.ok()) {
+    std::fprintf(stderr, "fixture build failed: %s\n",
+                 status.error().Format().c_str());
+    device->Close();
+    return 1;
+  }
+  if (!device->Flush()) {
+    std::fprintf(stderr, "fixture flush failed: %s\n",
+                 device->LastError().c_str());
+    device->Close();
+    return 1;
+  }
+  device->Close();
+  std::printf(
+      "fixture: %s\n  block size : %llu\n  file       : /%s (inode %llu)\n"
+      "  size       : %llu bytes\n  extent     : fsb %llu, %llu blocks\n"
+      "  pattern   : byte(i) = ((i * 167) ^ (i >> 7) ^ 0x5A) & 0xFF\n",
+      path_string.c_str(), static_cast<unsigned long long>(info.block_size),
+      options.file_name.c_str(),
+      static_cast<unsigned long long>(info.file_ino),
+      static_cast<unsigned long long>(info.file_size),
+      static_cast<unsigned long long>(info.data_fsb),
+      static_cast<unsigned long long>(info.data_blocks));
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 3 && std::strcmp(argv[1], "--make-fixture") == 0) {
+    return MakeFixture(argv[2]);
+  }
+  if (argc >= 2 &&
+      (std::strcmp(argv[1], "--help") == 0 ||
+       std::strcmp(argv[1], "-h") == 0)) {
+    std::cout << "usage: xfs_tests [--make-fixture <image>]\n"
+                 "  no arguments: run the test suite\n"
+                 "  --make-fixture <image>: write a fixture image (one "
+                 "consistent filesystem with one file) for Linux verification\n";
+    return 0;
+  }
+
   xfs::log::SetLevel(xfs::log::Level::kError);
   auto& tests = xfstest::Registry();
   std::cout << "running " << tests.size() << " tests\n";

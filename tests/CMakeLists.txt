@@ -3,7 +3,10 @@
 # ---------------------------------------------------------------------------
 add_executable(xfs_tests
   test_main.cpp
+  support/fixture_image.cpp
+  support/fixture_device.cpp
   unit/unit_tests.cpp
+  unit/write_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )
