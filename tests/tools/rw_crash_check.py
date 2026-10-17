@@ -149,10 +149,10 @@ def check(image_path: str, pristine_path: str, ino: int, expect_times: str,
                 failures.append(
                     f"log record mtime {match['mtime']} does not match the "
                     f"inode's {state.mtime}")
-            if match["blkno"] * 512 != state.offset:
+            if match["blkno"] * 512 + match.get("boffset", 0) != state.offset:
                 failures.append(
-                    f"log record names block {match['blkno']} ({match['blkno'] * 512}), "
-                    f"inode is at {state.offset}")
+                    f"log record names block {match['blkno']} + offset "
+                    f"{match.get('boffset', 0)}, inode is at {state.offset}")
     elif times == "old" and state.lsn != old.lsn:
         failures.append("inode LSN changed but the timestamps did not")
 

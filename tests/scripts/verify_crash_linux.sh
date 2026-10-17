@@ -106,6 +106,10 @@ for img in "$crash_dir"/crash-*.img; do
     # crash state, not of the script.
     if ! mount -o loop,nouuid "$work/crash.img" "$mnt"; then
         echo "FAILED: the kernel could not mount the $point crash image" >&2
+        # The kernel's reason is only in dmesg; without it a failure here is
+        # undiagnosable from a CI log.
+        dmesg | tail -40 || true
+        python3 "$tools_dir/log_probe.py" "$img" --dump | head -40 || true
         failed=1
         cleanup
         trap - EXIT

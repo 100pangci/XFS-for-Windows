@@ -32,6 +32,27 @@ namespace {
 namespace di = ondisk::inode;
 namespace lf = logfmt;
 
+// Size of the inode cluster buffer the inode item names, exactly as the kernel
+// computes it (xfs_ialloc.c, xfs_inode_cluster_size / xfs_imap):
+//
+//   raw = XFS_INODE_BIG_CLUSTER_SIZE (8 KiB); on a v3 filesystem it scales
+//   with the inode size (inode_size / XFS_DINODE_MIN_SIZE) when the inode
+//   chunk alignment allows it, then it is floored to whole filesystem blocks
+//   (and to one block if it would be smaller).
+//
+// The item must describe the same buffer the kernel's own xfs_inode_item_format
+// describes: replay reads it, applies the logged core at ilf_boffset and writes
+// the buffer back.
+uint64_t InodeClusterBytes(const XfsGeometry& geo) {
+  constexpr uint64_t kBigClusterSize = 8192;   // XFS_INODE_BIG_CLUSTER_SIZE
+  constexpr uint64_t kMinInodeSize = 256;      // XFS_DINODE_MIN_SIZE
+  uint64_t raw = kBigClusterSize;
+  const uint64_t scaled = raw * (geo.inode_size / kMinInodeSize);
+  if (geo.ino_align >= scaled / geo.block_size) raw = scaled;
+  if (raw <= geo.block_size) return geo.block_size;
+  return (raw / geo.block_size) * geo.block_size;
+}
+
 // Field layout shared by the on-disk v3 inode core and the log dinode: same
 // offsets, different byte order (disk big-endian, log dinode host order).
 struct CoreField {
@@ -161,7 +182,29 @@ Status XfsFilesystem::UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino
   }
 
   // Log item: one format header region plus the inode core region, exactly the
-  // two operations a Linux inode item is written as.
+  // two operations a Linux inode item is written as. The named buffer is the
+  // inode cluster (like xfs_imap): replay reads it through the inode buffer
+  // verifier and applies the logged core at ilf_boffset inside it.
+  const uint64_t cluster_bytes = InodeClusterBytes(geometry_);
+  const uint64_t cluster_start = inode_offset - (inode_offset % cluster_bytes);
+  const uint64_t boffset = inode_offset - cluster_start;
+  const uint32_t agno = geometry_.InoAgno(ino);
+  const uint32_t cluster_agbno = geometry_.InoAgbno(ino) -
+                                 static_cast<uint32_t>(boffset /
+                                                       geometry_.block_size);
+  const uint32_t cluster_blocks =
+      static_cast<uint32_t>(cluster_bytes / geometry_.block_size);
+  if (cluster_blocks == 0 ||
+      cluster_agbno + cluster_blocks > geometry_.AgBlocksFor(agno)) {
+    // The kernel's xfs_imap refuses this as well ("inode cluster out of
+    // range"): the last cluster of an AG must not run past its end.
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "inode cluster buffer is out of range")
+        .Ino(ino)
+        .Ag(agno)
+        .Metadata("inode");
+  }
+
   std::vector<uint8_t> log_dinode;
   CopyCoreToLogDinode(inode.data(), inode.size(), &log_dinode);
   StoreTimestampLE(log_dinode.data() + di::kAtime, atime);
@@ -177,9 +220,11 @@ Status XfsFilesystem::UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino
   PutLE16(&item_header, lf::kIlfAsize, 0);
   PutLE16(&item_header, lf::kIlfDsize, 0);
   PutLE64(&item_header, lf::kIlfIno, ino);
-  PutLE64(&item_header, lf::kIlfBlkno, inode_offset / 512);
-  PutLE32(&item_header, lf::kIlfLen, 1);  // one 512-byte inode buffer
-  PutLE32(&item_header, lf::kIlfBoffset, 0);
+  PutLE64(&item_header, lf::kIlfBlkno,
+          static_cast<uint64_t>(cluster_start) / 512);  // daddr of the cluster
+  PutLE32(&item_header, lf::kIlfLen,
+          static_cast<uint32_t>(cluster_bytes / 512));
+  PutLE32(&item_header, lf::kIlfBoffset, static_cast<uint32_t>(boffset));
   txn.AddLogOp(std::move(item_header));
   txn.AddLogOp(std::move(log_dinode));
 
