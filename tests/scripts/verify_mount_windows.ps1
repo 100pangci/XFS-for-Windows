@@ -107,6 +107,8 @@ try {
         Assert ($names -contains $name) "root listing missing $name"
     }
     "== bigdir resolution diagnostics =="
+    $proc.Refresh()
+    "mount process after listing: HasExited=$($proc.HasExited) exit=$(if ($proc.HasExited) { '0x{0:X8}' -f $proc.ExitCode } else { 'running' })"
     $bigdirPath = Join-Path $mountPoint 'bigdir'
     $di = [System.IO.DirectoryInfo]::new($bigdirPath)
     "DirectoryInfo.Exists: $($di.Exists)"
@@ -199,6 +201,16 @@ try {
         "mount process did not exit after unmount; killing it"
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
+    $proc.Refresh()
+    "mount process final: HasExited=$($proc.HasExited) exit=$(if ($proc.HasExited) { '0x{0:X8}' -f $proc.ExitCode } else { 'running' })"
+    try {
+        Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-10)
+        } -ErrorAction Stop |
+            Where-Object { $_.Message -match 'xfswin' } |
+            Select-Object -First 2 |
+            ForEach-Object { "EVENT: $($_.Message)" }
+    } catch { "no application events" }
     if ($mounted -and (Test-Path $mountPoint)) {
         "warning: $mountPoint still present after unmount"
     }
