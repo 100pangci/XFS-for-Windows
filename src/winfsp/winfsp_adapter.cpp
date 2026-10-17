@@ -204,6 +204,15 @@ bool NeedsSecurityOverflow(AdapterState& state, SIZE_T* size) {
   return false;
 }
 
+// Temporary diagnostic: verifies the process heap after each callback so that
+// the first corrupting operation can be identified (0xC0000374 crashes).
+void HeapCheck(const char* where) {
+  XFS_DEBUG("heap check after " << where);
+  if (!HeapValidate(GetProcessHeap(), 0, nullptr)) {
+    XFS_WARN("HEAP CORRUPTION detected after " << where);
+  }
+}
+
 // Reads data for a regular file or a symlink (whose target is exposed as the
 // file content in this first version).
 Result<size_t> ReadInode(AdapterState& state, const XfsInode& inode,
@@ -236,6 +245,7 @@ NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM* file_system,
                        sizeof(volume_info->VolumeLabel));
   volume_info->VolumeLabelLength = static_cast<UINT16>(label_bytes);
   std::memcpy(volume_info->VolumeLabel, state.label.data(), label_bytes);
+  HeapCheck("GetVolumeInfo");
   return STATUS_SUCCESS;
 }
 
@@ -262,6 +272,7 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   }
   FillSecurity(state, security_descriptor, security_descriptor_size,
                file_attributes, attributes);
+  HeapCheck("GetSecurityByName");
   return STATUS_SUCCESS;
 }
 
@@ -291,6 +302,7 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   context->inode = std::move(inode.value());
   *file_context = context;
   FillFileInfo(state, context->inode, file_info);
+  HeapCheck("Open");
   return STATUS_SUCCESS;
 }
 
@@ -303,6 +315,7 @@ VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {}
 
 VOID Close(FSP_FILE_SYSTEM*, PVOID file_context) {
   delete static_cast<FileContext*>(file_context);
+  HeapCheck("Close");
 }
 
 NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
@@ -314,6 +327,7 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   auto read = ReadInode(state, context.inode, offset, buffer, length);
   if (!read.ok()) return NtFromError(read.error().code);
   *bytes_transferred = static_cast<ULONG>(read.value());
+  HeapCheck("Read");
   return STATUS_SUCCESS;
 }
 
@@ -331,6 +345,7 @@ NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   AdapterState& state = *State(file_system);
   const FileContext& context = *static_cast<const FileContext*>(file_context);
   FillFileInfo(state, context.inode, file_info);
+  HeapCheck("GetFileInfo");
   return STATUS_SUCCESS;
 }
 
@@ -361,6 +376,7 @@ NTSTATUS GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID,
   }
   FillSecurity(state, security_descriptor, security_descriptor_size, nullptr,
                FILE_ATTRIBUTE_READONLY);
+  HeapCheck("GetSecurity");
   return STATUS_SUCCESS;
 }
 
@@ -464,12 +480,14 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
     if (!resolve_info(child.ino, &inode)) continue;
     if (!AddOneDirectoryEntry(file_system, inode, child.name, buffer, length,
                               bytes_transferred)) {
+      HeapCheck("ReadDirectory-full");
       return STATUS_SUCCESS;
     }
   }
   // End-of-directory marker: tells the FSD the enumeration is complete (see
   // FspFileSystemAddDirInfo with a NULL DirInfo).
   FspFileSystemAddDirInfo(nullptr, buffer, length, bytes_transferred);
+  HeapCheck("ReadDirectory");
   return STATUS_SUCCESS;
 }
 
