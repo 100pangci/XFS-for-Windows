@@ -14,6 +14,10 @@ struct Options {
   bool debug = false;
   bool force_unsafe_ro = false;
   bool yes_i_really_mean_it = false;
+  // Read-write mounting is experimental and restricted to image files: the
+  // RW-0 writer can only overwrite existing allocated blocks, metadata
+  // mutations (timestamps, allocation) are not implemented yet.
+  bool rw_experimental = false;
 };
 
 // Runs the CLI. argv excludes the program name.

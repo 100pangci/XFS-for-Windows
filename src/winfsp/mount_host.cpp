@@ -35,22 +35,26 @@ bool StartsWith(std::string_view s, std::string_view prefix) {
 }
 
 std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
-                                        std::string* error) {
+                                        bool writable, std::string* error) {
   if (StartsWith(target, "\\\\") || StartsWith(target, "//")) {
-    return OpenRawDevice(Utf8ToWide(target), /*writable=*/false,
-                        /*exclusive=*/false, error);
+    return OpenRawDevice(Utf8ToWide(target), /*writable=*/writable,
+                        /*exclusive=*/writable, error);
   }
   const auto* p = reinterpret_cast<const char8_t*>(target.data());
   std::filesystem::path path = std::filesystem::path(std::u8string(p, target.size()));
-  auto dev = ImageBlockDevice::Open(path, /*writable=*/false, 512);
-  if (!dev && error) *error = "cannot open image: " + target;
+  std::string open_error;
+  auto dev = ImageBlockDevice::Open(path, writable, 512, &open_error);
+  if (!dev && error) {
+    *error = "cannot open image: " + target +
+             (open_error.empty() ? "" : " (" + open_error + ")");
+  }
   return dev;
 }
 
 }  // namespace
 
 int RunMountHost(const std::string& target, const std::string& drive,
-                 bool force_unsafe_ro, bool verbose) {
+                 bool force_unsafe_ro, bool verbose, bool read_write) {
   // Delay-loaded WinFsp runtime: fail cleanly if it is not available.
   HMODULE winfsp_dll = LoadLibraryW(L"winfsp-x64.dll");
   if (!winfsp_dll) {
@@ -65,13 +69,14 @@ int RunMountHost(const std::string& target, const std::string& drive,
   FreeLibrary(winfsp_dll);
 
   std::string error;
-  auto device = OpenTarget(target, &error);
+  auto device = OpenTarget(target, /*writable=*/read_write, &error);
   if (!device) {
     std::cerr << "error: " << error << "\n";
     return 1;
   }
   MountOptions options;
   options.force_unsafe_ro = force_unsafe_ro;
+  options.read_write = read_write;
   auto filesystem = XfsFilesystem::Mount(std::move(device), options);
   if (!filesystem.ok()) {
     std::cerr << "error: " << filesystem.error().Format() << "\n";
@@ -82,6 +87,7 @@ int RunMountHost(const std::string& target, const std::string& drive,
   config.mount_point = Utf8ToWide(drive);
   config.force_unsafe_ro = force_unsafe_ro;
   config.verbose = verbose;
+  config.read_write = read_write;
   Status status = RunMountedFilesystem(std::move(filesystem.value()), config);
   if (!status.ok()) {
     std::cerr << "error: " << status.error().Format() << "\n";
@@ -105,7 +111,9 @@ int StopMountHost(const std::string& drive) {
 #else
 
 namespace xfs::winfsp {
-int RunMountHost(const std::string&, const std::string&, bool, bool) { return 1; }
+int RunMountHost(const std::string&, const std::string&, bool, bool, bool) {
+  return 1;
+}
 int StopMountHost(const std::string&) { return 1; }
 }  // namespace xfs::winfsp
 

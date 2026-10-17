@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -44,7 +45,7 @@ constexpr const char* kVersion = "xfswin 0.1.0 (XFS v5 read-only + formatter)";
 
 void PrintUsage() {
   std::cout <<
-      "XFS for Windows - Windows-native XFS formatter and read-only driver\n"
+      "XFS for Windows - Windows-native XFS formatter and driver\n"
       "\n"
       "usage: xfswin <command> [options]\n"
       "\n"
@@ -56,8 +57,12 @@ void PrintUsage() {
       "  ls <device|image> <path>      list a directory\n"
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
       "  stat <device|image> <path>    show inode information\n"
+      "  pwrite <image> <path> <off>   overwrite bytes inside an existing file\n"
+      "      --rw-experimental [--text=<s> | --from=<file>]\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
-      "  mount <device|image> <X:>     mount read-only via WinFsp\n"
+      "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
+      "      --rw-experimental         writable mount (images only, in-place\n"
+      "                                overwrites of allocated data only)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -72,7 +77,8 @@ void PrintUsage() {
       "  xfswin check test.img\n"
       "  xfswin ls test.img /\n"
       "  xfswin cat \\\\.\\PhysicalDrive2 /etc/hostname\n"
-      "  xfswin mount test.img X:\n";
+      "  xfswin mount test.img X:\n"
+      "  xfswin mount test.img X: --rw-experimental\n";
 }
 
 std::string HumanBytes(uint64_t bytes) {
@@ -667,8 +673,16 @@ int CommandFormat(const std::string& target, const Options& options) {
 int CommandMount(const std::string& target, const std::string& drive,
                  const Options& options) {
 #ifdef XFSWIN_HAS_WINFSP
+  if (options.rw_experimental && IsRawDevicePath(target)) {
+    std::cerr << "error: writable mounting of real devices is not enabled in "
+                 "this version.\n"
+                 "       Read-write support is restricted to image files "
+                 "(--rw-experimental).\n";
+    return 3;
+  }
   return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
-                              options.verbose || options.debug);
+                              options.verbose || options.debug,
+                              options.rw_experimental);
 #else
   (void)target;
   (void)drive;
@@ -690,11 +704,129 @@ int CommandUnmount(const std::string& drive) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// pwrite: the same in-place write the WinFsp Write callback performs, without
+// a mount. This is what lets CI verify the write path against Linux oracles
+// on machines where the WinFsp driver is not installed.
+// ---------------------------------------------------------------------------
+int CommandPwrite(const std::string& target, const std::string& path,
+                  const std::string& offset_text, const std::string& text,
+                  const std::string& from_file, const Options& options) {
+  if (!options.rw_experimental) {
+    std::cerr << "error: pwrite modifies the image; pass --rw-experimental to "
+                 "confirm (this build only supports overwriting existing "
+                 "allocated data, images only)\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: pwrite is restricted to image files in this version; "
+                 "read-write support for real devices is not enabled yet\n";
+    return 3;
+  }
+  if (text.empty() == from_file.empty()) {
+    std::cerr << "error: pass exactly one data source: --text=<string> or "
+                 "--from=<file>\n";
+    return 1;
+  }
+  // Strict offset parsing: a typo must not silently become offset 0.
+  bool offset_ok = false;
+  uint64_t offset = 0;
+  if (!offset_text.empty()) {
+    const char* begin = offset_text.c_str();
+    char* end = nullptr;
+    int base = 10;
+    if (offset_text.size() > 2 && offset_text[0] == '0' &&
+        (offset_text[1] == 'x' || offset_text[1] == 'X')) {
+      base = 16;
+    }
+    offset = std::strtoull(begin, &end, base);
+    offset_ok = end != nullptr && *end == '\0' && end != begin;
+  }
+  if (!offset_ok) {
+    std::cerr << "error: <offset> must be a decimal or 0x-prefixed byte "
+                 "offset\n";
+    return 1;
+  }
+
+  std::vector<uint8_t> payload;
+  if (!text.empty()) {
+    payload.assign(text.begin(), text.end());
+  } else {
+    std::filesystem::path source = ToPath(from_file);
+    std::error_code ec;
+    uint64_t size = std::filesystem::file_size(source, ec);
+    if (ec || size == 0) {
+      std::cerr << "error: cannot read data file " << from_file << "\n";
+      return 1;
+    }
+    std::ifstream in(source, std::ios::binary);
+    if (!in) {
+      std::cerr << "error: cannot open data file " << from_file << "\n";
+      return 1;
+    }
+    payload.resize(static_cast<size_t>(size));
+    in.read(reinterpret_cast<char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    if (!in) {
+      std::cerr << "error: short read from " << from_file << "\n";
+      return 1;
+    }
+  }
+
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  if (inode.value().IsDir()) {
+    std::cerr << "error: " << path << " is a directory\n";
+    return 1;
+  }
+  auto written = fs.value()->OverwriteFileData(inode.value().ino, offset,
+                                              payload.data(), payload.size());
+  if (!written.ok()) {
+    PrintError(written.error());
+    if (written.error().code == XfsError::kWriteExtendsFile ||
+        written.error().code == XfsError::kWriteNeedsAllocation ||
+        written.error().code == XfsError::kWriteNeedsConversion) {
+      std::cerr << "note: this build can only overwrite bytes that are "
+                   "already allocated and written (no growth, no holes, no "
+                   "unwritten extents).\n";
+    }
+    return 1;
+  }
+  Status flush = fs.value()->Flush();
+  if (!flush.ok()) {
+    PrintError(flush.error());
+    return 1;
+  }
+  std::cout << "wrote " << written.value() << " bytes at offset " << offset
+            << " in " << path << " (inode " << inode.value().ino << ", size "
+            << inode.value().size << ")\n";
+  return 0;
+}
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
   Options options;
   std::vector<std::string> positional;
+  std::string pwrite_text;
+  std::string pwrite_from;
+  bool explicit_rw = false;
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
@@ -705,6 +837,14 @@ int Run(const std::vector<std::string>& args) {
       options.force_unsafe_ro = true;
     } else if (arg == "--yes-i-really-mean-it") {
       options.yes_i_really_mean_it = true;
+    } else if (arg == "--rw-experimental") {
+      options.rw_experimental = true;
+    } else if (arg == "--rw") {
+      explicit_rw = true;
+    } else if (StartsWith(arg, "--text=")) {
+      pwrite_text = arg.substr(7);
+    } else if (StartsWith(arg, "--from=")) {
+      pwrite_from = arg.substr(7);
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
       PrintUsage();
       return 0;
@@ -714,6 +854,19 @@ int Run(const std::vector<std::string>& args) {
     } else {
       positional.push_back(arg);
     }
+  }
+
+  // --rw is the eventual name for ordinary read-write mounting. It stays
+  // refused until the writer can also allocate, extend and delete: a
+  // half-working --rw would silently produce filesystems Linux rejects.
+  if (explicit_rw) {
+    std::cerr << "error: --rw is not enabled yet. Read-write support is "
+                 "experimental and limited to in-place overwrites of existing "
+                 "data; use\n"
+                 "       xfswin mount <image> <drive> --rw-experimental\n"
+                 "       (image files only; real devices stay read-only in "
+                 "this version)\n";
+    return 3;
   }
 
   log::SetLevel(options.debug ? log::Level::kDebug
@@ -769,6 +922,15 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandStat(positional[1], positional[2]);
   }
+  if (command == "pwrite") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin pwrite <image> <path> <offset> "
+                   "--rw-experimental [--text=<string> | --from=<file>]\n";
+      return 1;
+    }
+    return CommandPwrite(positional[1], positional[2], positional[3],
+                         pwrite_text, pwrite_from, options);
+  }
   if (command == "format") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin format <device|image> "
@@ -793,18 +955,27 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "selftest") {
     if (positional.size() != 2) {
-      std::cerr << "usage: xfswin selftest <device|image>\n";
+      std::cerr << "usage: xfswin selftest <device|image> "
+                   "[--rw-experimental]\n";
       return 1;
     }
 #ifdef XFSWIN_HAS_WINFSP
     {
+      if (options.rw_experimental && IsRawDevicePath(positional[1])) {
+        std::cerr << "error: the read-write self-test is restricted to image "
+                     "files\n";
+        return 3;
+      }
       std::string error;
-      auto dev = OpenTarget(positional[1], false, false, &error);
+      auto dev = OpenTarget(positional[1], options.rw_experimental, false,
+                            &error);
       if (!dev) {
         std::cerr << "error: " << error << "\n";
         return 1;
       }
-      auto fs = XfsFilesystem::Mount(std::move(dev), MountOptions{});
+      MountOptions mount_options;
+      mount_options.read_write = options.rw_experimental;
+      auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
       if (!fs.ok()) {
         PrintError(fs.error());
         return 1;
