@@ -57,12 +57,16 @@ void PrintUsage() {
       "  ls <device|image> <path>      list a directory\n"
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
       "  stat <device|image> <path>    show inode information\n"
-      "  pwrite <image> <path> <off>   overwrite bytes inside an existing file\n"
+      "  pwrite <image> <path> <off>   write bytes at an offset (may extend the\n"
       "      --rw-experimental [--text=<s> | --from=<file>]\n"
+      "  extend <image> <path> <size>  grow a file to <size> bytes by writing a\n"
+      "      --rw-experimental [--fill=0xNN]\n"
+      "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
+      "      --rw-experimental\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
-      "      --rw-experimental         writable mount (images only, in-place\n"
-      "                                overwrites of allocated data only)\n"
+      "      --rw-experimental         writable mount (images only; existing files\n"
+      "                                can be overwritten, extended, truncated)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -708,10 +712,25 @@ int CommandUnmount(const std::string& drive) {
 }
 
 // ---------------------------------------------------------------------------
-// pwrite: the same in-place write the WinFsp Write callback performs, without
-// a mount. This is what lets CI verify the write path against Linux oracles
-// on machines where the WinFsp driver is not installed.
+// pwrite: the same write the WinFsp Write callback performs, without a mount.
+// This is what lets CI verify the write path against Linux oracles on machines
+// where the WinFsp driver is not installed.
 // ---------------------------------------------------------------------------
+namespace {
+
+bool ParseU64(const std::string& text, uint64_t* out) {
+  if (text.empty()) return false;
+  const char* begin = text.c_str();
+  char* end = nullptr;
+  int base = 10;
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    base = 16;
+  }
+  *out = std::strtoull(begin, &end, base);
+  return end != nullptr && *end == '\0' && end != begin;
+}
+
+}  // namespace
 int CommandPwrite(const std::string& target, const std::string& path,
                   const std::string& offset_text, const std::string& text,
                   const std::string& from_file, const Options& options) {
@@ -798,19 +817,13 @@ int CommandPwrite(const std::string& target, const std::string& path,
     std::cerr << "error: " << path << " is a directory\n";
     return 1;
   }
-  auto written = fs.value()->OverwriteFileData(inode.value().ino, offset,
-                                              payload.data(), payload.size());
+  auto written = fs.value()->WriteFileData(inode.value().ino, offset,
+                                          payload.data(), payload.size());
   if (!written.ok()) {
     PrintError(written.error());
-    if (written.error().code == XfsError::kWriteExtendsFile ||
-        written.error().code == XfsError::kWriteNeedsAllocation ||
-        written.error().code == XfsError::kWriteNeedsConversion) {
-      std::cerr << "note: this build can only overwrite bytes that are "
-                   "already allocated and written (no growth, no holes, no "
-                   "unwritten extents).\n";
-    }
     return 1;
   }
+  auto info = fs.value()->GetFileInfo(inode.value().ino);
   // Close the journal with an unmount record, then push everything to stable
   // storage: the next mount (Linux or this build) must find a clean log.
   Status closed = fs.value()->WriteCleanUnmountRecord();
@@ -825,7 +838,135 @@ int CommandPwrite(const std::string& target, const std::string& path,
   }
   std::cout << "wrote " << written.value() << " bytes at offset " << offset
             << " in " << path << " (inode " << inode.value().ino << ", size "
-            << inode.value().size << ")\n";
+            << (info.ok() ? info.value().size : 0) << ")\n";
+  return 0;
+}
+
+// extend: grow a file to a given size by writing a deterministic pattern at the
+// old EOF. This is the user-visible form of the RW-2 write path (allocation +
+// extent map + size, all through transactions).
+int CommandExtend(const std::string& target, const std::string& path,
+                  const std::string& size_text, uint8_t fill,
+                  bool have_fill, const Options& options) {
+  if (!options.rw_experimental) {
+    std::cerr << "error: extend modifies the image; pass --rw-experimental\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: extend is restricted to image files in this version\n";
+    return 3;
+  }
+  uint64_t new_size = 0;
+  if (!ParseU64(size_text, &new_size)) {
+    std::cerr << "error: <size> must be a decimal or 0x-prefixed byte count\n";
+    return 1;
+  }
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  if (!inode.value().IsRegular()) {
+    std::cerr << "error: " << path << " is not a regular file\n";
+    return 1;
+  }
+  if (new_size <= inode.value().size) {
+    std::cerr << "error: file is already " << inode.value().size
+              << " bytes; extend needs a larger size\n";
+    return 1;
+  }
+  const uint64_t offset = inode.value().size;
+  std::vector<uint8_t> payload(static_cast<size_t>(new_size - offset));
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = have_fill
+                     ? fill
+                     : static_cast<uint8_t>(((offset + i) * 131u + 7u) & 0xFFu);
+  }
+  auto written = fs.value()->WriteFileData(inode.value().ino, offset,
+                                           payload.data(), payload.size());
+  if (!written.ok()) {
+    PrintError(written.error());
+    return 1;
+  }
+  auto info = fs.value()->GetFileInfo(inode.value().ino);
+  Status closed = fs.value()->WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return 1;
+  }
+  if (!fs.value()->Flush().ok()) {
+    std::cerr << "error: flush failed\n";
+    return 1;
+  }
+  std::cout << "extended " << path << " (inode " << inode.value().ino << ") to "
+            << (info.ok() ? info.value().size : new_size) << " bytes\n";
+  return 0;
+}
+
+// truncate: SetFileSize, in both directions.
+int CommandTruncate(const std::string& target, const std::string& path,
+                    const std::string& size_text, const Options& options) {
+  if (!options.rw_experimental) {
+    std::cerr << "error: truncate modifies the image; pass --rw-experimental\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: truncate is restricted to image files in this "
+                 "version\n";
+    return 3;
+  }
+  uint64_t new_size = 0;
+  if (!ParseU64(size_text, &new_size)) {
+    std::cerr << "error: <size> must be a decimal or 0x-prefixed byte count\n";
+    return 1;
+  }
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto info = fs.value()->SetFileSize(inode.value().ino, new_size);
+  if (!info.ok()) {
+    PrintError(info.error());
+    return 1;
+  }
+  Status closed = fs.value()->WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return 1;
+  }
+  if (!fs.value()->Flush().ok()) {
+    std::cerr << "error: flush failed\n";
+    return 1;
+  }
+  std::cout << "resized " << path << " (inode " << inode.value().ino << ") to "
+            << info.value().size << " bytes\n";
   return 0;
 }
 
@@ -836,6 +977,8 @@ int Run(const std::vector<std::string>& args) {
   std::vector<std::string> positional;
   std::string pwrite_text;
   std::string pwrite_from;
+  uint8_t extend_fill = 0;
+  bool have_fill = false;
   bool explicit_rw = false;
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
@@ -855,6 +998,14 @@ int Run(const std::vector<std::string>& args) {
       pwrite_text = arg.substr(7);
     } else if (StartsWith(arg, "--from=")) {
       pwrite_from = arg.substr(7);
+    } else if (StartsWith(arg, "--fill=")) {
+      uint64_t value = 0;
+      if (!ParseU64(arg.substr(7), &value) || value > 0xFF) {
+        std::cerr << "error: --fill must be a byte value (e.g. --fill=0x5A)\n";
+        return 1;
+      }
+      extend_fill = static_cast<uint8_t>(value);
+      have_fill = true;
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
       PrintUsage();
       return 0;
@@ -940,6 +1091,24 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandPwrite(positional[1], positional[2], positional[3],
                          pwrite_text, pwrite_from, options);
+  }
+  if (command == "extend") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin extend <image> <path> <new-size> "
+                   "--rw-experimental [--fill=0xNN]\n";
+      return 1;
+    }
+    return CommandExtend(positional[1], positional[2], positional[3],
+                         extend_fill, have_fill, options);
+  }
+  if (command == "truncate") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin truncate <image> <path> <new-size> "
+                   "--rw-experimental\n";
+      return 1;
+    }
+    return CommandTruncate(positional[1], positional[2], positional[3],
+                           options);
   }
   if (command == "format") {
     if (positional.size() != 2) {

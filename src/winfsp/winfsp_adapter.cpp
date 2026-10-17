@@ -147,6 +147,7 @@ NTSTATUS NtFromError(XfsError code) {
     case XfsError::kWriteExtendsFile:
     case XfsError::kWriteNeedsAllocation:
     case XfsError::kWriteNeedsConversion: return STATUS_NOT_SUPPORTED;
+    case XfsError::kNoSpace: return STATUS_DISK_FULL;
     case XfsError::kDirtyLog:
     case XfsError::kNeedsRepair: return STATUS_VOLUME_DIRTY;
     case XfsError::kBadCrc:
@@ -301,6 +302,35 @@ void FillFileInfo(AdapterState& state, const XfsFileInfo& inode,
                   FSP_FSCTL_FILE_INFO* info) {
   FillFileInfoCore(state, inode.mode, inode.nblocks, inode.size, inode.atime,
                    inode.mtime, inode.ctime, inode.crtime, inode.ino, info);
+}
+
+// Replaces a node's cached inode and extent list after a mutation. The core
+// invalidated its caches when the transaction committed; re-reading here gives
+// WinFsp the new size, timestamp and extent map.
+void RefreshNode(AdapterState& state, uint64_t node_id) {
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  auto it = state.nodes.find(node_id);
+  if (it == state.nodes.end()) return;
+  auto inode = state.fs->OpenInode(it->second->inode->ino);
+  if (!inode.ok()) {
+    XFS_ERROR("RefreshNode: cannot reload inode: " << inode.error().Format());
+    return;
+  }
+  auto fresh = std::make_shared<const XfsInode>(std::move(inode.value()));
+  it->second->inode = fresh;
+  if (fresh->IsRegular()) {
+    auto extents = std::make_shared<std::vector<XfsExtent>>();
+    Status s = LoadDataForkExtents(state.fs->device(), state.fs->geometry(),
+                                   *fresh, extents.get());
+    if (!s.ok()) {
+      XFS_ERROR("RefreshNode: cannot reload extents: " << s.error().Format());
+      return;
+    }
+    it->second->extents =
+        std::shared_ptr<const std::vector<XfsExtent>>(std::move(extents));
+  } else {
+    it->second->extents.reset();
+  }
 }
 
 void FillSecurity(AdapterState& state, PSECURITY_DESCRIPTOR buffer,
@@ -461,9 +491,9 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, BOOLEAN, UINT64,
 
 VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {
   // Nothing to do: deletes are refused (CanDelete), so a delete-on-close
-  // handle can never exist, and SetFileSize/SetAllocationSize are refused as
-  // well, so no allocation cleanup is pending. When those operations land
-  // (RW-2/RW-3) this is where the delete-on-close and the purge of cached
+  // handle can never exist, and SetFileSize only changes the on-disk state of
+  // an existing file, so no pending allocation cleanup exists either. When
+  // delete lands (RW-3) this is where delete-on-close and the purge of cached
   // pages must be handled.
 }
 
@@ -515,21 +545,18 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
     // v1 exposes the link target as file content; that is a read-only view.
     return STATUS_NOT_SUPPORTED;
   }
-  if (write_to_end) {
-    // Append semantics: Windows opened the handle with FILE_APPEND_DATA and
-    // expects the write to land at EOF (and to grow the file if needed).
-    return STATUS_NOT_SUPPORTED;
-  }
   if (length == 0) {
     FillFileInfo(state, *node->inode, file_info);
     return STATUS_SUCCESS;
   }
 
-  // The core validates the range against the file's *current* extents and
-  // writes through the block device; it refuses growth, holes and unwritten
-  // extents (see MapWrittenRange).
-  auto written = state.fs->OverwriteFileData(node->inode->ino, offset, buffer,
-                                            length);
+  // The core validates the range and may allocate, convert unwritten extents and
+  // move EOF; everything below goes through one transaction per phase (see
+  // XfsFilesystem::WriteFileData). Write-to-end (append handles) is resolved
+  // inside the core under its mutation lock, so concurrent appends cannot lose
+  // bytes.
+  auto written = state.fs->WriteFileData(node->inode->ino, offset, buffer,
+                                         length, write_to_end != FALSE);
   if (!written.ok()) {
     XFS_DEBUG("Write(ino=" << node->inode->ino << ", offset=" << offset
                            << ", length=" << length
@@ -539,7 +566,9 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
   if (bytes_transferred) {
     *bytes_transferred = static_cast<ULONG>(written.value());
   }
-  FillFileInfo(state, *node->inode, file_info);
+  RefreshNode(state, NodeId(file_context));
+  auto refreshed = LookupNode(state, file_context);
+  if (refreshed) FillFileInfo(state, *refreshed->inode, file_info);
   return STATUS_SUCCESS;
 }
 
@@ -575,10 +604,31 @@ NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, UINT64,
   return NotImplementedWrite(*State(file_system));
 }
 
-NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID, UINT64, BOOLEAN,
-                     FSP_FSCTL_FILE_INFO*) {
-  // Truncate/extend needs the extent tree and the allocator (RW-2).
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
+                     UINT64 new_size, BOOLEAN set_allocation_size,
+                     FSP_FSCTL_FILE_INFO* file_info) {
+  AdapterState& state = *State(file_system);
+  auto node = LookupNode(state, file_context);
+  if (!node) return STATUS_INVALID_HANDLE;
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
+  if (set_allocation_size) {
+    // No preallocation: the allocation size is advisory on this volume, so a
+    // larger request is accepted as-is and the on-disk size is untouched
+    // (Windows falls back to SetFileSize for SetEndOfFile).
+    FillFileInfo(state, *node->inode, file_info);
+    return STATUS_SUCCESS;
+  }
+  auto info = state.fs->SetFileSize(node->inode->ino, new_size);
+  if (!info.ok()) {
+    XFS_DEBUG("SetFileSize(ino=" << node->inode->ino << ", size=" << new_size
+                                 << ") refused: " << info.error().Format());
+    return NtFromError(info.error().code);
+  }
+  RefreshNode(state, NodeId(file_context));
+  auto refreshed = LookupNode(state, file_context);
+  if (refreshed) FillFileInfo(state, *refreshed->inode, file_info);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR) {
@@ -1015,14 +1065,27 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       }
       check(Flush(&fake, ctx, &fi) == STATUS_SUCCESS, "rw selftest: Flush");
 
-      // Writing past EOF must be refused without changing anything.
-      ULONG refused = 0;
-      uint8_t byte = 0xEE;
+      // RW-2: writing past EOF grows the file and allocates blocks.
+      ULONG grown = 0;
+      std::vector<uint8_t> tail(64, 0x5A);
       NTSTATUS beyond =
-          Write(&fake, ctx, &byte, before.size(), 1, FALSE, FALSE, &refused,
-                &fi);
-      check(beyond != STATUS_SUCCESS, "rw selftest: write past EOF allowed");
-      check(refused == 0, "rw selftest: refused write reported bytes");
+          Write(&fake, ctx, tail.data(), before.size(), 64, FALSE, FALSE,
+                &grown, &fi);
+      check(beyond == STATUS_SUCCESS, "rw selftest: write past EOF");
+      check(grown == 64, "rw selftest: grown write length");
+      check(fi.FileSize == before.size() + 64, "rw selftest: grown size");
+
+      // ... and SetFileSize shrinks it again (freeing the new blocks).
+      check(SetFileSize(&fake, ctx, before.size(), FALSE, &fi) == STATUS_SUCCESS,
+            "rw selftest: SetFileSize shrink");
+      check(fi.FileSize == before.size(), "rw selftest: shrunk size");
+      // Growing only moves the EOF: the new range reads as zeros.
+      check(SetFileSize(&fake, ctx, before.size() + 8192, FALSE, &fi) ==
+                STATUS_SUCCESS,
+            "rw selftest: SetFileSize grow");
+      check(fi.FileSize == before.size() + 8192, "rw selftest: grown size 2");
+      check(SetFileSize(&fake, ctx, before.size(), FALSE, &fi) == STATUS_SUCCESS,
+            "rw selftest: SetFileSize shrink 2");
 
       // Re-open (fresh node: re-reads inode and extents) and compare.
       Close(&fake, ctx);
