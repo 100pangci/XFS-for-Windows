@@ -7,6 +7,7 @@ add_executable(xfs_tests
   support/fixture_device.cpp
   unit/unit_tests.cpp
   unit/write_tests.cpp
+  unit/journal_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )

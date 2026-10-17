@@ -337,10 +337,26 @@ TEST(write_overwrites_in_place_and_persists) {
     CHECK(fs.ok());
     if (!fs.ok()) return;
     CHECK(fs.value()->writable());
+    auto before = fs.value()->GetFileInfo(file_ino);
+    CHECK(before.ok());
     auto written = fs.value()->OverwriteFileData(file_ino, offset,
                                                  overlay.data(), overlay.size());
     CHECK(written.ok());
     CHECK_EQ(written.value(), overlay.size());
+    // RW-1: a successful data write stamps mtime/ctime through a metadata
+    // transaction (the data itself is not journalled).
+    auto after = fs.value()->GetFileInfo(file_ino);
+    CHECK(after.ok());
+    CHECK_EQ(after.value().size, file_size);
+    if (before.ok() && after.ok()) {
+      if (after.value().mtime.sec == before.value().mtime.sec &&
+          after.value().mtime.nsec == before.value().mtime.nsec) {
+        ::xfstest::Fail(__FILE__, __LINE__, "mtime was not updated");
+      }
+    }
+    // Unmount properly: the log must end with a clean-unmount record, otherwise
+    // the next mount sees a dirty journal.
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
     CHECK(fs.value()->Flush().ok());
   }
 
@@ -366,15 +382,14 @@ TEST(write_overwrites_in_place_and_persists) {
                                      std::to_string(i));
       }
     }
-    // Size, blocks and timestamps are metadata: a data write must not change
-    // them (no transaction was run).
+    // Size and block counts are unchanged: only the timestamps were logged.
     auto info = fs.value()->GetFileInfo(file_ino);
     CHECK(info.ok());
     CHECK_EQ(info.value().size, file_size);
   }
 }
 
-TEST(write_does_not_touch_metadata) {
+TEST(write_updates_only_inode_and_log) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
   const auto& pristine = fixture.pristine();
@@ -387,39 +402,69 @@ TEST(write_does_not_touch_metadata) {
   CHECK(fs.ok());
   if (!fs.ok()) return;
   const XfsGeometry& geo = fs.value()->geometry();
+  const uint64_t inode_offset = geo.InoToByteOffset(file_ino);
   std::vector<uint8_t> overlay(4096, 0x5A);
   auto written = fs.value()->OverwriteFileData(file_ino, 8192, overlay.data(),
                                                overlay.size());
   CHECK(written.ok());
   CHECK(fs.value()->Flush().ok());
 
-  // Everything that is metadata must be byte-identical to the pristine image:
-  // AG headers and btree roots, the inode chunk, the superblocks and the log.
-  // A data-only write that changed any of these would have to be journalled
-  // first (XFS metadata is only written through transactions).
-  auto expect_same = [&](uint64_t offset, uint64_t length, const char* what) {
-    if (offset + length > pristine.size()) {
-      ::xfstest::Fail(__FILE__, __LINE__, std::string("region out of range: ") + what);
+  // RW-1: exactly the file data, its inode and the log may change. Everything
+  // else - AG headers, btree roots, the other inode slots, the superblock
+  // copies - must be byte-identical to the pristine image, because it can only
+  // be modified through a transaction that this write did not run.
+  const uint64_t data_start = geo.FsbToByte(fixture.info().data_fsb);
+  const uint64_t data_end =
+      data_start + fixture.info().data_blocks * geo.block_size;
+  const uint64_t log_start = geo.FsbToByte(geo.logstart);
+  const uint64_t log_end = log_start + 64 * 1024;
+  auto allowed_change = [&](uint64_t offset) {
+    if (offset >= data_start && offset < data_end) return true;      // data
+    if (offset >= inode_offset && offset < inode_offset + geo.inode_size)
+      return true;                                                   // inode
+    // Log: the mkfs clean record (blocks 0-1) must stay untouched; our
+    // transaction record starts at block 2.
+    if (offset >= log_start + 1024 && offset < log_end) return true;
+    return false;
+  };
+  for (uint64_t offset = 0; offset + 512 <= pristine.size(); offset += 512) {
+    if (std::memcmp(memory->bytes().data() + offset, pristine.data() + offset,
+                    static_cast<size_t>(512)) == 0) {
+      continue;
     }
+    if (!allowed_change(offset)) {
+      ::xfstest::Fail(__FILE__, __LINE__,
+                      "unexpected change outside data/inode/log at device "
+                      "offset " + std::to_string(offset));
+      break;
+    }
+  }
+  // The mkfs clean-unmount record itself and every superblock copy are intact.
+  auto expect_same = [&](uint64_t offset, uint64_t length, const char* what) {
     if (std::memcmp(memory->bytes().data() + offset, pristine.data() + offset,
                     static_cast<size_t>(length)) != 0) {
       ::xfstest::Fail(__FILE__, __LINE__,
            std::string("metadata region changed: ") + what);
     }
   };
-  expect_same(0, 64 * 1024, "AG0 headers and btree roots");
-  expect_same(geo.InoToByteOffset(file_ino) & ~(uint64_t{16384} - 1),
-              64 * 1024, "inode chunk");
+  expect_same(log_start, 1024, "mkfs clean log record");
   for (uint32_t ag = 0; ag < geo.agcount; ++ag) {
     expect_same(geo.AgByteOffset(ag), geo.sector_size, "superblock copy");
   }
-  expect_same(geo.FsbToByte(geo.logstart), 4096, "log header");
+  // The inode itself did change (times, di_lsn, CRC), and it must still parse.
+  CHECK(std::memcmp(memory->bytes().data() + inode_offset,
+                    pristine.data() + inode_offset,
+                    static_cast<size_t>(geo.inode_size)) != 0);
+  auto reparsed = fs.value()->OpenInode(file_ino);
+  CHECK(reparsed.ok());
+  if (reparsed.ok()) {
+    CHECK_EQ(reparsed.value().size, fixture.info().file_size);
+    CHECK_EQ(reparsed.value().nextents, 1u);
+  }
 
   // ... while the file data did change on the device.
-  auto inode = fs.value()->OpenInode(file_ino);
-  CHECK(inode.ok());
   std::vector<XfsExtent> extents;
-  CHECK(LoadDataForkExtents(*memory, geo, inode.value(), &extents).ok());
+  CHECK(LoadDataForkExtents(*memory, geo, reparsed.value(), &extents).ok());
   CHECK_EQ(extents.size(), 1u);
   const uint64_t device_offset = geo.FsbToByte(extents[0].startblock) + 8192;
   CHECK_EQ(memory->bytes()[device_offset], 0x5A);

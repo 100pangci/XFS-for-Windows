@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "xfs/inode.h"
 
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -47,6 +48,17 @@ XfsTimestamp DecodeTimestamp(const uint8_t* field, bool bigtime) {
     ts.sec = static_cast<int32_t>(GetBE32(field));
     ts.nsec = GetBE32(field + 4);
   }
+  return ts;
+}
+
+XfsTimestamp CurrentTimestamp() {
+  using namespace std::chrono;
+  const auto since_epoch = system_clock::now().time_since_epoch();
+  const auto secs = duration_cast<seconds>(since_epoch);
+  XfsTimestamp ts;
+  ts.sec = secs.count();
+  ts.nsec = static_cast<uint32_t>(
+      duration_cast<nanoseconds>(since_epoch - secs).count());
   return ts;
 }
 

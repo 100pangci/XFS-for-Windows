@@ -31,6 +31,9 @@ add_library(xfs_core STATIC
   write/policy.cpp
   write/range.cpp
   write/file_data.cpp
+  write/log_record.cpp
+  write/transaction.cpp
+  write/inode_write.cpp
   write/flush.cpp
   win_name_map.cpp
 )

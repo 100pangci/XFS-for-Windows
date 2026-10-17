@@ -8,9 +8,11 @@
 // MapWrittenRange), the device write happens through the block device, and the
 // affected cache entries are dropped through the central invalidation path.
 //
-// No metadata is touched, so this write needs no transaction and no journal
-// record: XFS never journals file data. That is also what keeps the log clean,
-// which is why Linux needs no replay after this kind of write.
+// RW-1 addition: a successful write also updates mtime/ctime, exactly like a
+// Linux write. The data itself is still not journalled (XFS never journals file
+// data); the inode change goes through a metadata transaction after the data
+// has reached the device (ordered mode), so a crash leaves either the old
+// timestamp or the new one, never a half-written log record.
 #include "xfs/filesystem.h"
 
 #include "xfs/crash.h"
@@ -85,6 +87,24 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
   InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
   XFS_EXT_DEBUG("wrote " << written << " bytes at " << offset << " in inode "
                          << ino << " (" << mappings.size() << " extents)");
+
+  // Metadata transaction for mtime/ctime (ordered mode: the data write above
+  // is not journalled, the inode change is). atime intentionally unchanged.
+  const XfsTimestamp now = CurrentTimestamp();
+  auto txn = BeginTransaction();
+  if (!txn.ok()) {
+    XFS_ERROR("data written, timestamp update failed: "
+              << txn.error().Format());
+    return txn.error();
+  }
+  Status status = UpdateTimesInTransaction(
+      txn.value(), ino, inode.value().atime, now, now);
+  if (status.ok()) status = CommitTransaction(txn.value());
+  if (!status.ok()) {
+    XFS_ERROR("data written, timestamp update failed: "
+              << status.error().Format());
+    return status.error();
+  }
   return written;
 }
 

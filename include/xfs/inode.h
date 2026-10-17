@@ -86,4 +86,7 @@ Result<XfsInode> ReadInode(BlockDevice& dev, const XfsGeometry& geo,
 // Decodes an on-disk timestamp field.
 XfsTimestamp DecodeTimestamp(const uint8_t* field, bool bigtime);
 
+// Current wall-clock time, for metadata updates.
+XfsTimestamp CurrentTimestamp();
+
 }  // namespace xfs

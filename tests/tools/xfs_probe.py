@@ -316,7 +316,9 @@ def main(path: str) -> int:
     assert data[9] & 0x20, "log unmount flag"
     assert u32(bytes(data), 4) == 8, "unmount record length"
     assert len(data) >= 20
-    assert u16(bytes(data), 12) == 0x556E, "unmount magic"
+    # Host byte order, like the kernel writes it; recovery never reads it.
+    assert struct.unpack_from("<H", bytes(data), 12)[0] == 0x556E, \
+        "unmount magic"
     print(f"log OK at byte {log_offset}: clean unmount record, cycle={cycle}")
 
     print("ALL STRUCTURAL CHECKS PASSED")

@@ -1255,10 +1255,15 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
   g_stop_event = nullptr;
   FspFileSystemStopDispatcher(winfsp);
-  // Clean unmount: push everything this process wrote to stable storage
-  // before the mount point disappears. A failed flush is reported (the
-  // filesystem itself stays consistent; only durability is at risk).
+  // Clean unmount: close the journal with an unmount record and push
+  // everything this process wrote to stable storage before the mount point
+  // disappears. A failure is reported (the filesystem itself stays consistent;
+  // only durability is at risk).
   if (config.read_write) {
+    Status closed = state->fs->WriteCleanUnmountRecord();
+    if (!closed.ok()) {
+      XFS_ERROR("unmount journal close failed: " << closed.error().Format());
+    }
     Status flushed = state->fs->Flush();
     if (!flushed.ok()) {
       XFS_ERROR("unmount flush failed: " << flushed.error().Format());
