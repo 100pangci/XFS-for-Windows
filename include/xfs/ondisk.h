@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - on-disk format definitions (XFS v5 / crc=1).
 //
 // All layouts here follow the public XFS on-disk format. Fields are accessed

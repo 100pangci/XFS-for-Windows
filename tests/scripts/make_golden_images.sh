@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 # XFS for Windows - generate golden images with the real Linux mkfs.xfs.
 #
 #   sudo tests/scripts/make_golden_images.sh [output-dir] [--ci]

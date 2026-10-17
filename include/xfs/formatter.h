@@ -1,3 +1,6 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - formatter (mkfs) interface.
 //
 // The formatter creates a brand new XFS v5 filesystem (crc=1, internal log,

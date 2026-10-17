@@ -234,5 +234,13 @@ Third-party components:
   This project links against the SDK if present and does not redistribute the
   WinFsp driver.
 
-The license of this project itself has not been chosen yet; add the intended
-license before distributing binaries.
+## License
+
+This project is licensed under the **Mozilla Public License 2.0** (MPL-2.0);
+see [LICENSE](LICENSE). Source files carry the standard MPL Exhibit A notice.
+
+MPL-2.0 is file-level copyleft: you may combine this code with other licenses
+(including proprietary code and GPL code in separate files) as long as
+modifications to the MPL-covered files stay under the MPL. No GPL-licensed
+upstream code was copied; the xfsprogs/kernel sources are used as a
+specification only.

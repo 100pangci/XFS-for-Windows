@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 name: CI
 
 on:
@@ -302,3 +306,62 @@ jobs:
             -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
             -Image "golden\populated.img" `
             -Manifest "golden\populated.manifest.json"
+
+  # ---------------------------------------------------------------------------
+  # Raw device path (Case C): attach a fixed VHD as a real disk and format it
+  # through \\.\PhysicalDriveN with the same backend used for real hardware.
+  # ---------------------------------------------------------------------------
+  windows-rawdevice-vhd:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: Format a real (virtual) disk through the PhysicalDrive path
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_raw_device_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -VhdPath "$PWD\vhd\xfswin.vhd" `
+            -SizeMB 512
+
+      - name: Upload the VHD (raw payload for Linux verification)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rawdevice-vhd
+          path: vhd/xfswin.vhd
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the filesystem written through the raw device path. A fixed
+  # VHD is raw data followed by a 512-byte footer; strip it and run xfs_repair.
+  # ---------------------------------------------------------------------------
+  linux-verify-rawdevice:
+    needs: windows-rawdevice-vhd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rawdevice-vhd
+          path: vhd
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Strip the VHD footer and verify with the real xfsprogs
+        run: |
+          size=$(stat -c %s vhd/xfswin.vhd)
+          head -c $((size - 512)) vhd/xfswin.vhd > rawdevice.img
+          ls -l rawdevice.img
+          sudo bash tests/scripts/verify_windows_image_linux.sh rawdevice.img
