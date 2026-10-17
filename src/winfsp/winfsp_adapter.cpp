@@ -277,8 +277,9 @@ void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
                       FSP_FSCTL_FILE_INFO* info) {
   std::memset(info, 0, sizeof(*info));
   info->FileAttributes = FileAttributesFor(state, mode);
-  // di_nblocks is in 512-byte units (basic blocks), not filesystem blocks.
-  info->AllocationSize = nblocks * 512;
+  // di_nblocks counts filesystem blocks: the kernel adds bmap extent lengths
+  // to i_nblocks directly and xfs_repair recomputes it the same way.
+  info->AllocationSize = nblocks * state.fs->geometry().block_size;
   info->FileSize = (mode & 0170000) == 0040000 ? 0 : size;
   info->CreationTime = ToFileTime(crtime);
   info->LastAccessTime = ToFileTime(atime);

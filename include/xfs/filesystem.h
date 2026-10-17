@@ -51,7 +51,7 @@ struct XfsFileInfo {
   uint32_t projid = 0;
   uint32_t nlink = 0;
   uint64_t size = 0;
-  uint64_t nblocks = 0;
+  uint64_t nblocks = 0;  // filesystem blocks used (di_nblocks)
   uint32_t nextents = 0;
   uint32_t anextents = 0;
   XfsTimestamp atime, mtime, ctime, crtime;
