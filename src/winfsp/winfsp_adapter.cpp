@@ -944,7 +944,13 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   params.ReadOnlyVolume = 1;
   params.PersistentAcls = 0;
   params.PostCleanupWhenModifiedOnly = 1;
-  params.FlushAndPurgeOnCleanup = 1;
+  // Do NOT set FlushAndPurgeOnCleanup: that flag purges a file's cached pages
+  // on every close. Windows does not retain this volume's data in its cache
+  // (re-reads go back to the raw device at device speed), but purging would
+  // additionally penalize memory-mapped access. A read-only volume never has
+  // dirty data to flush. When read-write support arrives this must flip back
+  // to 1 together with explicit cache invalidation on writes.
+  params.FlushAndPurgeOnCleanup = 0;
   wcscpy_s(params.FileSystemName,
            sizeof(params.FileSystemName) / sizeof(WCHAR), L"XFS");
 
