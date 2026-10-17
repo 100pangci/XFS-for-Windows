@@ -40,6 +40,12 @@ const char* ToString(XfsError code) {
     case XfsError::kNameTooLong: return "name too long";
     case XfsError::kReadOnlyVolume: return "volume is read-only";
     case XfsError::kNotMounted: return "not mounted";
+    case XfsError::kWriteExtendsFile:
+      return "write would extend the file";
+    case XfsError::kWriteNeedsAllocation:
+      return "write range covers a hole";
+    case XfsError::kWriteNeedsConversion:
+      return "write range covers an unwritten extent";
     case XfsError::kInternal: return "internal error";
   }
   return "unknown error";

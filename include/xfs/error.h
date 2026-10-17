@@ -64,6 +64,12 @@ enum class XfsError : uint32_t {
   kReadOnlyVolume,
   kNotMounted,
 
+  // Read-write mutation limitations (this build has no allocator yet, so a
+  // write can only land in blocks that are already allocated and written).
+  kWriteExtendsFile,      // the range would move EOF
+  kWriteNeedsAllocation,  // the range covers a hole
+  kWriteNeedsConversion,  // the range covers an unwritten (preallocated) extent
+
   kInternal,
 };
 

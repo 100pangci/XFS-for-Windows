@@ -9,12 +9,14 @@
 #include "xfs/ag.h"
 #include "xfs/btree.h"
 #include "xfs/crc32c.h"
+#include "xfs/crash.h"
 #include "xfs/endian.h"
 #include "xfs/extent.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
 #include "xfs/symlink.h"
 #include "xfs/verifier.h"
+#include "xfs/write.h"
 
 namespace xfs {
 namespace {
@@ -107,6 +109,7 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   fs->geometry_ = std::move(geo);
   fs->options_ = options;
   fs->device_ = std::move(device);
+  fs->writable_ = false;
 
   // Whitespace in the label: pad with spaces, not NULs (mkfs does this).
   XFS_SB_INFO("XFS v5 filesystem, uuid=" << FormatUuid(fs->superblock_.uuid));
@@ -146,6 +149,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   }
 
   // Log cleanliness.
+  LogState log_state = LogState::kUnknown;
+  bool log_checked = false;
   if (options.check_log) {
     auto log = CheckLogClean(*fs->device_, fs->geometry_, fs->superblock_);
     if (!log.ok()) {
@@ -153,6 +158,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
       fs->warnings_.push_back("log check failed: " + log.error().message);
     } else {
       const LogCheckResult& r = log.value();
+      log_checked = true;
+      log_state = r.state;
       if (r.state == LogState::kClean || r.state == LogState::kEmpty) {
         XFS_SB_INFO("log is " << ToString(r.state) << " (" << r.detail << ")");
       } else {
@@ -170,6 +177,36 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
             "); mounting read-only with --force-unsafe-ro");
       }
     }
+  }
+
+  // Read-write mounts are an allow-list: writable device, clean log, and
+  // exactly the feature profile this build can modify. A refusal is an error
+  // (never a silent read-only mount), so the caller decides what to do.
+  if (options.read_write) {
+    if (!fs->device_->Info().writable) {
+      return XFS_ERR(XfsError::kReadOnlyVolume,
+                     "read-write mount requested but the device was opened "
+                     "read-only")
+          .Metadata("mount");
+    }
+    if (!log_checked || (log_state != LogState::kClean &&
+                         log_state != LogState::kEmpty)) {
+      return XFS_ERR(XfsError::kDirtyLog,
+                     "read-write mounts require a clean log; this build does "
+                     "not replay the journal yet. Mount read-only, or let "
+                     "Linux replay the log first.")
+          .Metadata("log");
+    }
+    Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+    if (!profile.ok()) {
+      auto error = profile.error();
+      error.message +=
+          " (read-only access is unaffected; mount without the read-write "
+          "option)";
+      return error;
+    }
+    fs->writable_ = true;
+    XFS_SB_INFO("mounted read-write: " << WritableProfileSummary(fs->superblock_));
   }
 
   for (const auto& w : fs->warnings_) XFS_WARN(w);
@@ -209,8 +246,7 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
   // Read a whole 16 KiB inode chunk once; a directory full of files usually
   // has many inodes in the same chunk, so this cuts device reads ~32x.
   const uint64_t inode_off = geometry_.InoToByteOffset(ino);
-  constexpr uint64_t kChunkBytes = 16384;
-  const uint64_t chunk_start = inode_off & ~(kChunkBytes - 1);
+  const uint64_t chunk_start = inode_off & ~(kInodeChunkBytes - 1);
   std::shared_ptr<const std::vector<uint8_t>> chunk;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -219,7 +255,7 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
   }
   if (!chunk) {
     const uint64_t dev_size = device_->Size();
-    uint64_t len = kChunkBytes;
+    uint64_t len = kInodeChunkBytes;
     if (chunk_start + len > dev_size) {
       len = dev_size > chunk_start ? dev_size - chunk_start : 0;
     }
@@ -373,25 +409,9 @@ Result<size_t> XfsFilesystem::ReadFile(
   std::shared_ptr<const std::vector<XfsExtent>> owned_extents;
   const std::vector<XfsExtent>* extents = cached_extents;
   if (!extents) {
-    {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      auto it = extent_cache_.find(inode.ino);
-      if (it != extent_cache_.end()) owned_extents = it->second;
-    }
-    if (!owned_extents) {
-      auto loaded = std::make_shared<std::vector<XfsExtent>>();
-      Status s = LoadDataForkExtents(*device_, geometry_, inode, loaded.get());
-      if (!s.ok()) return s.error();
-      {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        constexpr size_t kMaxCachedExtentLists = 8192;
-        if (extent_cache_.size() >= kMaxCachedExtentLists) {
-          extent_cache_.clear();
-        }
-        extent_cache_.emplace(inode.ino, loaded);
-      }
-      owned_extents = std::move(loaded);
-    }
+    auto loaded = LoadExtentsCached(inode);
+    if (!loaded.ok()) return loaded.error();
+    owned_extents = std::move(loaded.value());
     extents = owned_extents.get();
   }
   // Large requests read straight into the caller's buffer: routing them
@@ -416,6 +436,10 @@ Result<size_t> XfsFilesystem::ReadFile(
     const uint64_t chunk_len =
         std::min<uint64_t>(kDataChunkBytes, size - chunk_start);
 
+    // Snapshot the data generation before touching the device: a concurrent
+    // write bumps it, which makes both this lookup and the later insert
+    // refuse the chunk (see InsertDataChunk).
+    const uint64_t generation = DataGeneration(inode.ino);
     auto data = LookupDataChunk(inode.ino, chunk_index);
     if (!data) {
       auto loaded =
@@ -424,7 +448,8 @@ Result<size_t> XfsFilesystem::ReadFile(
                                loaded->data(), loaded->size(), extents);
       if (!read.ok()) return read.error();
       loaded->resize(read.value());
-      data = InsertDataChunk(inode.ino, chunk_index, std::move(loaded));
+      data = InsertDataChunk(inode.ino, chunk_index, std::move(loaded),
+                             generation);
     }
 
     const size_t in_chunk = static_cast<size_t>(offset - chunk_start);
@@ -437,31 +462,84 @@ Result<size_t> XfsFilesystem::ReadFile(
   return total;
 }
 
+Result<std::shared_ptr<const std::vector<XfsExtent>>>
+XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = extent_cache_.find(inode.ino);
+    if (it != extent_cache_.end()) return it->second;
+  }
+  auto loaded = std::make_shared<std::vector<XfsExtent>>();
+  Status s = LoadDataForkExtents(*device_, geometry_, inode, loaded.get());
+  if (!s.ok()) return s.error();
+  std::shared_ptr<const std::vector<XfsExtent>> shared(loaded);
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    constexpr size_t kMaxCachedExtentLists = 8192;
+    if (extent_cache_.size() >= kMaxCachedExtentLists) extent_cache_.clear();
+    // A concurrent mutation may have replaced the extent list between the
+    // lookup above and the insert here; keep whichever entry is already there
+    // (the invalidation that replaced it knows about the newer state).
+    auto existing = extent_cache_.find(inode.ino);
+    if (existing != extent_cache_.end()) return existing->second;
+    extent_cache_.emplace(inode.ino, shared);
+  }
+  return shared;
+}
+
+uint64_t XfsFilesystem::DataGeneration(uint64_t ino) const {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  auto it = data_generation_.find(ino);
+  return it == data_generation_.end() ? 0 : it->second;
+}
+
 std::shared_ptr<const AlignedBuffer> XfsFilesystem::LookupDataChunk(
     uint64_t ino, uint64_t chunk) const {
   const DataCacheKey key{ino, chunk};
   std::lock_guard<std::mutex> lock(data_mutex_);
   auto it = data_cache_.find(key);
   if (it == data_cache_.end()) return nullptr;
+  auto gen = data_generation_.find(ino);
+  const uint64_t current = gen == data_generation_.end() ? 0 : gen->second;
+  if (it->second.generation != current) {
+    // Written after this chunk was read: drop it instead of serving it.
+    data_cache_bytes_ -= it->second.data->size();
+    data_lru_.erase(it->second.lru);
+    data_cache_.erase(it);
+    return nullptr;
+  }
   data_lru_.splice(data_lru_.begin(), data_lru_, it->second.lru);
   it->second.lru = data_lru_.begin();
   return it->second.data;
 }
 
 std::shared_ptr<const AlignedBuffer> XfsFilesystem::InsertDataChunk(
-    uint64_t ino, uint64_t chunk,
-    std::shared_ptr<const AlignedBuffer> data) const {
+    uint64_t ino, uint64_t chunk, std::shared_ptr<const AlignedBuffer> data,
+    uint64_t generation) const {
   const DataCacheKey key{ino, chunk};
   std::lock_guard<std::mutex> lock(data_mutex_);
+  auto gen = data_generation_.find(ino);
+  const uint64_t current = gen == data_generation_.end() ? 0 : gen->second;
+  if (generation != current) {
+    // The data changed while this chunk was being read; publishing it would
+    // put stale bytes back into the cache. The caller still gets the buffer it
+    // read (it is what the device held at some point during this call).
+    return data;
+  }
   auto existing = data_cache_.find(key);
   if (existing != data_cache_.end()) {
-    data_lru_.splice(data_lru_.begin(), data_lru_, existing->second.lru);
-    existing->second.lru = data_lru_.begin();
-    return existing->second.data;
+    if (existing->second.generation == current) {
+      data_lru_.splice(data_lru_.begin(), data_lru_, existing->second.lru);
+      existing->second.lru = data_lru_.begin();
+      return existing->second.data;
+    }
+    data_cache_bytes_ -= existing->second.data->size();
+    data_lru_.erase(existing->second.lru);
+    data_cache_.erase(existing);
   }
   data_lru_.push_front(key);
   data_cache_bytes_ += data->size();
-  data_cache_.emplace(key, DataCacheEntry{data, data_lru_.begin()});
+  data_cache_.emplace(key, DataCacheEntry{data, current, data_lru_.begin()});
   while (data_cache_bytes_ > kDataCacheMaxBytes && !data_lru_.empty()) {
     const DataCacheKey victim = data_lru_.back();
     data_lru_.pop_back();
@@ -472,6 +550,37 @@ std::shared_ptr<const AlignedBuffer> XfsFilesystem::InsertDataChunk(
     }
   }
   return data;
+}
+
+void XfsFilesystem::DropDataChunks(uint64_t ino, uint64_t byte_offset,
+                                   uint64_t byte_length, bool drop_all) const {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  // Bumping the generation is what actually makes older chunks unusable; the
+  // erase below is hygiene (it frees memory and forces a fresh device read).
+  // Callers must have written the device *before* calling this.
+  ++data_generation_[ino];
+  const uint64_t current = data_generation_[ino];
+  const uint64_t first_chunk = byte_offset / kDataChunkBytes;
+  const uint64_t last_chunk =
+      byte_length == 0
+          ? UINT64_MAX
+          : (byte_offset + byte_length - 1) / kDataChunkBytes;
+  for (auto it = data_cache_.begin(); it != data_cache_.end();) {
+    const DataCacheKey& key = it->first;
+    if (key.ino != ino) {
+      ++it;
+      continue;
+    }
+    const bool in_range = drop_all || byte_length == 0 ||
+                          (key.chunk >= first_chunk && key.chunk <= last_chunk);
+    if (!in_range && it->second.generation == current) {
+      ++it;
+      continue;
+    }
+    data_cache_bytes_ -= it->second.data->size();
+    data_lru_.erase(it->second.lru);
+    it = data_cache_.erase(it);
+  }
 }
 
 Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
