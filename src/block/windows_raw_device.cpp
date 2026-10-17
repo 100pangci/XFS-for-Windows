@@ -112,6 +112,10 @@ WindowsRawBlockDevice::~WindowsRawBlockDevice() { Close(); }
 std::unique_ptr<WindowsRawBlockDevice> WindowsRawBlockDevice::Open(
     const std::wstring& path, bool writable, bool exclusive,
     std::string* error) {
+  // Raw volume/disk handles require sector-aligned offsets, lengths and
+  // buffers, so every request goes through sector alignment (with a bounce
+  // buffer when the caller's buffer is not aligned). Callers that want the
+  // fast path allocate 4 KiB-aligned buffers (see AlignedBuffer).
   DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING;
   if (writable) flags |= FILE_FLAG_WRITE_THROUGH;
   DWORD share = exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE);
@@ -216,12 +220,12 @@ bool WindowsRawBlockDevice::RawReadAligned(uint64_t aligned_offset,
   DWORD read = 0;
   if (!ReadFile(impl_->handle, buffer, static_cast<DWORD>(size), &read,
                 &overlapped)) {
-    last_error_ = "raw read failed: " + WinErrorString(GetLastError());
+    SetError("raw read failed: " + WinErrorString(GetLastError()));
     return false;
   }
   if (read != size) {
-    last_error_ = "raw short read (" + std::to_string(read) + " of " +
-                  std::to_string(size) + ")";
+    SetError("raw short read (" + std::to_string(read) + " of " +
+                  std::to_string(size) + ")");
     return false;
   }
   return true;
@@ -235,11 +239,11 @@ bool WindowsRawBlockDevice::RawWriteAligned(uint64_t aligned_offset,
   DWORD written = 0;
   if (!WriteFile(impl_->handle, buffer, static_cast<DWORD>(size), &written,
                  &overlapped)) {
-    last_error_ = "raw write failed: " + WinErrorString(GetLastError());
+    SetError("raw write failed: " + WinErrorString(GetLastError()));
     return false;
   }
   if (written != size) {
-    last_error_ = "raw short write";
+    SetError("raw short write");
     return false;
   }
   return true;
@@ -250,7 +254,7 @@ bool WindowsRawBlockDevice::ReadExact(uint64_t offset, void* buffer,
   const uint32_t sector = info_.logical_sector_size;
   if (size == 0) return true;
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
-    last_error_ = "read out of bounds";
+    SetError("read out of bounds");
     return false;
   }
   uint8_t* out = static_cast<uint8_t*>(buffer);
@@ -280,11 +284,11 @@ bool WindowsRawBlockDevice::WriteExact(uint64_t offset, const void* buffer,
   const uint32_t sector = info_.logical_sector_size;
   if (size == 0) return true;
   if (!writable_) {
-    last_error_ = "device opened read-only";
+    SetError("device opened read-only");
     return false;
   }
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
-    last_error_ = "write out of bounds";
+    SetError("write out of bounds");
     return false;
   }
   uint8_t* in = const_cast<uint8_t*>(static_cast<const uint8_t*>(buffer));
@@ -311,8 +315,9 @@ bool WindowsRawBlockDevice::WriteExact(uint64_t offset, const void* buffer,
 }
 
 bool WindowsRawBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
+  std::shared_lock<std::shared_mutex> lock(io_mutex_);
   if (impl_->handle == INVALID_HANDLE_VALUE) {
-    last_error_ = "device not open";
+    SetError("device not open");
     return false;
   }
   return ReadExact(offset, buffer, size);
@@ -320,20 +325,22 @@ bool WindowsRawBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
 
 bool WindowsRawBlockDevice::Write(uint64_t offset, const void* buffer,
                                   size_t size) {
+  std::unique_lock<std::shared_mutex> lock(io_mutex_);
   if (impl_->handle == INVALID_HANDLE_VALUE) {
-    last_error_ = "device not open";
+    SetError("device not open");
     return false;
   }
   return WriteExact(offset, buffer, size);
 }
 
 bool WindowsRawBlockDevice::Flush() {
+  std::unique_lock<std::shared_mutex> lock(io_mutex_);
   if (impl_->handle == INVALID_HANDLE_VALUE) {
-    last_error_ = "device not open";
+    SetError("device not open");
     return false;
   }
   if (!FlushFileBuffers(impl_->handle)) {
-    last_error_ = "FlushFileBuffers failed: " + WinErrorString(GetLastError());
+    SetError("FlushFileBuffers failed: " + WinErrorString(GetLastError()));
     return false;
   }
   return true;

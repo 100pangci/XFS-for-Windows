@@ -4,6 +4,7 @@
 #include "xfs/log.h"
 
 #include <iostream>
+#include <mutex>
 
 namespace xfs::log {
 namespace {
@@ -30,6 +31,8 @@ void SetOutputStream(std::ostream* stream) { g_out = stream ? stream : &std::cer
 
 void WriteLine(Level level, const std::string& text) {
   if (!Enabled(level)) return;
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
   *g_out << "[" << LevelName(level) << "] " << text << "\n";
   g_out->flush();
 }

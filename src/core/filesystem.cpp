@@ -355,37 +355,123 @@ Result<size_t> XfsFilesystem::ReadFile(uint64_t ino, uint64_t offset,
                                        void* buffer, size_t length) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
-  if (inode.value().IsDir()) {
+  return ReadFile(inode.value(), nullptr, offset, buffer, length);
+}
+
+Result<size_t> XfsFilesystem::ReadFile(
+    const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
+    uint64_t offset, void* buffer, size_t length) const {
+  if (inode.IsDir()) {
     return XFS_ERR(XfsError::kNotRegularFile, "cannot ReadFile a directory")
-        .Ino(ino);
+        .Ino(inode.ino);
   }
 
-  if (inode.value().format == di::kFormatLocal) {
-    return ReadFileData(*device_, geometry_, inode.value(), offset, buffer,
-                        length);
+  if (inode.format == di::kFormatLocal) {
+    return ReadFileData(*device_, geometry_, inode, offset, buffer, length);
   }
 
-  std::shared_ptr<const std::vector<XfsExtent>> extents;
-  {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = extent_cache_.find(ino);
-    if (it != extent_cache_.end()) extents = it->second;
-  }
+  std::shared_ptr<const std::vector<XfsExtent>> owned_extents;
+  const std::vector<XfsExtent>* extents = cached_extents;
   if (!extents) {
-    auto loaded = std::make_shared<std::vector<XfsExtent>>();
-    Status s =
-        LoadDataForkExtents(*device_, geometry_, inode.value(), loaded.get());
-    if (!s.ok()) return s.error();
     {
       std::lock_guard<std::mutex> lock(cache_mutex_);
-      constexpr size_t kMaxCachedExtentLists = 8192;
-      if (extent_cache_.size() >= kMaxCachedExtentLists) extent_cache_.clear();
-      extent_cache_.emplace(ino, loaded);
+      auto it = extent_cache_.find(inode.ino);
+      if (it != extent_cache_.end()) owned_extents = it->second;
     }
-    extents = std::move(loaded);
+    if (!owned_extents) {
+      auto loaded = std::make_shared<std::vector<XfsExtent>>();
+      Status s = LoadDataForkExtents(*device_, geometry_, inode, loaded.get());
+      if (!s.ok()) return s.error();
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        constexpr size_t kMaxCachedExtentLists = 8192;
+        if (extent_cache_.size() >= kMaxCachedExtentLists) {
+          extent_cache_.clear();
+        }
+        extent_cache_.emplace(inode.ino, loaded);
+      }
+      owned_extents = std::move(loaded);
+    }
+    extents = owned_extents.get();
   }
-  return ReadFileData(*device_, geometry_, inode.value(), offset, buffer,
-                      length, extents.get());
+  // Large requests read straight into the caller's buffer: routing them
+  // through the chunk cache would add a full memory copy per chunk and evict
+  // cached thumbnail data.
+  if (length >= kDataChunkBytes) {
+    return ReadFileData(*device_, geometry_, inode, offset, buffer, length,
+                        extents);
+  }
+
+  // Serve from the 256 KiB chunk cache: a thumbnail decoder issues many small
+  // reads against the same few files; the first read fetches a whole chunk
+  // (read-ahead) and repeat reads are pure memory copies.
+  uint8_t* out = static_cast<uint8_t*>(buffer);
+  size_t total = 0;
+  const uint64_t size = inode.size;
+  while (total < length && offset < size) {
+    const size_t want = static_cast<size_t>(
+        std::min<uint64_t>(length - total, size - offset));
+    const uint64_t chunk_index = offset / kDataChunkBytes;
+    const uint64_t chunk_start = chunk_index * kDataChunkBytes;
+    const uint64_t chunk_len =
+        std::min<uint64_t>(kDataChunkBytes, size - chunk_start);
+
+    auto data = LookupDataChunk(inode.ino, chunk_index);
+    if (!data) {
+      auto loaded =
+          std::make_shared<AlignedBuffer>(static_cast<size_t>(chunk_len));
+      auto read = ReadFileData(*device_, geometry_, inode, chunk_start,
+                               loaded->data(), loaded->size(), extents);
+      if (!read.ok()) return read.error();
+      loaded->resize(read.value());
+      data = InsertDataChunk(inode.ino, chunk_index, std::move(loaded));
+    }
+
+    const size_t in_chunk = static_cast<size_t>(offset - chunk_start);
+    if (in_chunk >= data->size()) break;  // safety: never spin
+    const size_t n = std::min<size_t>(want, data->size() - in_chunk);
+    std::memcpy(out + total, data->data() + in_chunk, n);
+    total += n;
+    offset += n;
+  }
+  return total;
+}
+
+std::shared_ptr<const AlignedBuffer> XfsFilesystem::LookupDataChunk(
+    uint64_t ino, uint64_t chunk) const {
+  const DataCacheKey key{ino, chunk};
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  auto it = data_cache_.find(key);
+  if (it == data_cache_.end()) return nullptr;
+  data_lru_.splice(data_lru_.begin(), data_lru_, it->second.lru);
+  it->second.lru = data_lru_.begin();
+  return it->second.data;
+}
+
+std::shared_ptr<const AlignedBuffer> XfsFilesystem::InsertDataChunk(
+    uint64_t ino, uint64_t chunk,
+    std::shared_ptr<const AlignedBuffer> data) const {
+  const DataCacheKey key{ino, chunk};
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  auto existing = data_cache_.find(key);
+  if (existing != data_cache_.end()) {
+    data_lru_.splice(data_lru_.begin(), data_lru_, existing->second.lru);
+    existing->second.lru = data_lru_.begin();
+    return existing->second.data;
+  }
+  data_lru_.push_front(key);
+  data_cache_bytes_ += data->size();
+  data_cache_.emplace(key, DataCacheEntry{data, data_lru_.begin()});
+  while (data_cache_bytes_ > kDataCacheMaxBytes && !data_lru_.empty()) {
+    const DataCacheKey victim = data_lru_.back();
+    data_lru_.pop_back();
+    auto victim_it = data_cache_.find(victim);
+    if (victim_it != data_cache_.end()) {
+      data_cache_bytes_ -= victim_it->second.data->size();
+      data_cache_.erase(victim_it);
+    }
+  }
+  return data;
 }
 
 Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {

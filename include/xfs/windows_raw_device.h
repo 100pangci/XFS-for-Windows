@@ -14,6 +14,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -77,6 +79,16 @@ class WindowsRawBlockDevice final : public BlockDevice {
 
  private:
   WindowsRawBlockDevice() = default;
+
+  // I/O concurrency: reads execute concurrently (ReadFile with explicit
+  // OVERLAPPED offsets is thread-safe), writes are exclusive. last_error_ has
+  // its own lock so error reporting never races with concurrent readers.
+  mutable std::shared_mutex io_mutex_;
+  mutable std::mutex error_mutex_;
+  void SetError(const std::string& message) const {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    last_error_ = message;
+  }
 
   bool RawReadAligned(uint64_t aligned_offset, void* buffer, size_t size);
   bool RawWriteAligned(uint64_t aligned_offset, const void* buffer,

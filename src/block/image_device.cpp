@@ -68,6 +68,7 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Create(
 }
 
 bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
   if (!file_.is_open()) {
     last_error_ = "image not open";
     return false;
@@ -89,6 +90,7 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
 
 bool ImageBlockDevice::Write(uint64_t offset, const void* buffer,
                              size_t size) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
   if (!file_.is_open()) {
     last_error_ = "image not open";
     return false;

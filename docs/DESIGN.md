@@ -175,17 +175,22 @@ errors as `error: <kind> [<metadata>]: <detail> AG=.. fsb=0x..`.
 
 ## Threading
 
-The core has no global mutable state. `XfsFilesystem` reads are const, but
-`ImageBlockDevice` uses a shared stream; the WinFsp host therefore installs
-WinFsp's built-in operation guard (`FspFileSystemSetOperationGuard` with
-`FspFileSystemOpEnter/OpLeave` plus the COARSE strategy) so that every
-callback runs serialized. Setting only the strategy is not enough: without the
+The core has no global mutable state. `XfsFilesystem` reads are const and all
+caches are mutex-protected. `WindowsRawBlockDevice` allows concurrent reads
+(shared mutex; `ReadFile` with explicit `OVERLAPPED` offsets is thread-safe)
+and serializes writes (formatting) exclusively; `ImageBlockDevice` serializes
+its stream accesses. The WinFsp host installs WinFsp's built-in operation guard
+(`FspFileSystemSetOperationGuard` with `FspFileSystemOpEnter/OpLeave`) using
+the **FINE** strategy: namespace operations take a shared lock while reads,
+writes, `GetFileInfo` and security queries run fully in parallel, so
+multithreaded readers (Explorer thumbnails, media players, copies) do not queue
+behind one global lock. Setting only the strategy is not enough: without the
 guard callbacks the FSD does not lock at all.
 
 ## Read-only caches
 
-The filesystem is never written while mounted, so inode parsing and directory
-contents are cached:
+The filesystem is never written while mounted, so inode parsing, directory
+contents and file data are cached:
 
 - `XfsFilesystem` caches up to 32k parsed inodes, up to 32k `XfsFileInfo`
   records, up to 8192 per-inode extent lists, and up to 128 directory listings
@@ -193,13 +198,23 @@ contents are cached:
   Inodes are read in 16 KiB chunks (32 inodes at a time), so a directory with
   tens of thousands of files costs hundreds of device reads instead of tens of
   thousands.
-- `ReadFileData` parses the data fork once per call and walks the cached
-  extent list; the previous implementation re-parsed it for every mapped chunk
-  (O(extents^2) on fragmented files).
+- File data is cached in 4 KiB-aligned 512 KiB chunks (512 MiB LRU budget).
+  A chunk miss reads the whole chunk (read-ahead for thumbnail/metadata
+  decoders, which issue many small reads); repeats are pure memory copies.
+  Requests of 512 KiB or more bypass the cache and read straight through, so
+  large sequential I/O neither pays an extra copy nor evicts the cache.
+  Alignment matters: raw volume/disk handles require sector-aligned buffers,
+  and aligned chunk storage avoids the device layer's bounce buffer.
+- `ReadFileData` parses the data fork once per call and walks the given extent
+  list; the adapter parses each regular file's extents once at `Open` and keeps
+  them in the file node, so reads never walk the BMBT or the extent cache.
 - The WinFsp adapter caches the sorted Windows-name child list per directory
   (64 directories / 256k entries). WinFsp asks for one page at a time with a
   marker; without the cache every page would re-list, re-map and re-sort the
   whole directory.
+- The adapter resolves each path once (memoized path -> inode, 32k entries):
+  Windows queries security and then opens the same file, and revisits files
+  across refreshes.
 - `LookupName` uses the cached directory index, so resolving
   `usr/lib64/libfoo.so` costs a hash lookup instead of re-reading the parent
   directory for every path component.

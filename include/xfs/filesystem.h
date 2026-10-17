@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,6 +56,33 @@ struct XfsFileInfo {
 enum class CheckStatus { kOk, kWarning, kCorrupt, kUnsupported };
 
 const char* ToString(CheckStatus status);
+
+// A heap buffer whose start is 4 KiB-aligned. Raw volume/disk handles require
+// sector-aligned buffers, so storing file-data chunks in aligned memory lets
+// device reads go straight into the cache without a bounce-buffer copy.
+class AlignedBuffer {
+ public:
+  explicit AlignedBuffer(size_t size)
+      : size_(size), storage_(new uint8_t[size + kAlignment]) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(storage_.get());
+    data_ = reinterpret_cast<uint8_t*>(
+        (base + kAlignment - 1) & ~static_cast<uintptr_t>(kAlignment - 1));
+  }
+  AlignedBuffer(const AlignedBuffer&) = delete;
+  AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+  uint8_t* data() { return data_; }
+  const uint8_t* data() const { return data_; }
+  size_t size() const { return size_; }
+  void resize(size_t size) { size_ = size; }  // logical size; capacity is fixed
+
+  static constexpr size_t kAlignment = 4096;
+
+ private:
+  size_t size_;
+  std::unique_ptr<uint8_t[]> storage_;
+  uint8_t* data_ = nullptr;
+};
 
 struct CheckItem {
   std::string name;
@@ -104,6 +132,11 @@ class XfsFilesystem {
   Result<XfsDirEntry> LookupName(uint64_t dir_ino, std::string_view name) const;
   Result<size_t> ReadFile(uint64_t ino, uint64_t offset, void* buffer,
                           size_t length) const;
+  // Fast path: the caller already holds the inode (and may hold its cached
+  // extent list); skips the inode cache and extent-cache lookups.
+  Result<size_t> ReadFile(const XfsInode& inode,
+                          const std::vector<XfsExtent>* cached_extents,
+                          uint64_t offset, void* buffer, size_t length) const;
   Result<std::string> ReadSymlink(uint64_t ino) const;
   Result<XfsFileInfo> GetFileInfo(uint64_t ino) const;
 
@@ -121,6 +154,34 @@ class XfsFilesystem {
     std::unordered_map<std::string, size_t> index;
   };
   void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
+
+  // ---- file data chunk cache ----
+  // Reads are served in 256 KiB chunks so that one device read covers many
+  // small reads (thumbnail/metadata decoders) and repeated reads never touch
+  // the device again. A global byte budget bounds memory use; eviction is LRU.
+  struct DataCacheKey {
+    uint64_t ino = 0;
+    uint64_t chunk = 0;
+    bool operator==(const DataCacheKey& other) const {
+      return ino == other.ino && chunk == other.chunk;
+    }
+  };
+  struct DataCacheKeyHash {
+    size_t operator()(const DataCacheKey& key) const {
+      uint64_t h = key.ino * 0x9e3779b97f4a7c15ull;
+      h ^= key.chunk + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      return static_cast<size_t>(h);
+    }
+  };
+  struct DataCacheEntry {
+    std::shared_ptr<const AlignedBuffer> data;
+    std::list<DataCacheKey>::iterator lru;
+  };
+  std::shared_ptr<const AlignedBuffer> LookupDataChunk(uint64_t ino,
+                                                       uint64_t chunk) const;
+  std::shared_ptr<const AlignedBuffer> InsertDataChunk(
+      uint64_t ino, uint64_t chunk,
+      std::shared_ptr<const AlignedBuffer> data) const;
 
   std::unique_ptr<BlockDevice> device_;
   XfsSuperblock superblock_;
@@ -140,6 +201,14 @@ class XfsFilesystem {
       extent_cache_;
   mutable std::unordered_map<uint64_t, DirCache> dir_cache_;
   mutable size_t dir_cache_entries_ = 0;
+
+  static constexpr uint64_t kDataChunkBytes = 512 * 1024;
+  static constexpr size_t kDataCacheMaxBytes = 512ull * 1024 * 1024;
+  mutable std::mutex data_mutex_;
+  mutable std::unordered_map<DataCacheKey, DataCacheEntry, DataCacheKeyHash>
+      data_cache_;
+  mutable std::list<DataCacheKey> data_lru_;  // front = most recently used
+  mutable size_t data_cache_bytes_ = 0;
 };
 
 }  // namespace xfs

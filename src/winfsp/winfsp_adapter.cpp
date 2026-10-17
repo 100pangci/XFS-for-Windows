@@ -30,6 +30,8 @@ typedef NTSTATUS* PNTSTATUS;
 #include <vector>
 
 #include "xfs/log.h"
+#include "xfs/ondisk.h"
+#include "xfs/extent.h"
 #include "xfs/win_name_map.h"
 
 namespace xfs::winfsp {
@@ -69,13 +71,23 @@ struct AdapterState {
   // Nodes are keyed by inode number and reference counted; the last Close
   // destroys the node.
   struct FileNode {
-    XfsInode inode;
+    // Shared, immutable inode record: callbacks hold this instead of copying
+    // the whole inode (with its fork vectors) on every operation.
+    std::shared_ptr<const XfsInode> inode;
+    // Data-fork extent list, parsed once at open for regular files so reads
+    // never re-walk the BMBT.
+    std::shared_ptr<const std::vector<XfsExtent>> extents;
     uint32_t refcount = 0;
   };
   std::mutex node_mutex;
   std::unordered_map<uint64_t, uint64_t> node_by_inode;
-  std::unordered_map<uint64_t, std::unique_ptr<FileNode>> nodes;
+  std::unordered_map<uint64_t, std::shared_ptr<FileNode>> nodes;
   uint64_t next_node_id = 1;
+
+  // Resolved WinFsp path -> inode number. Explorer queries security and then
+  // opens the same file, and revisits files across refreshes; this turns the
+  // repeated path walk into one hash lookup.
+  std::unordered_map<std::wstring, uint64_t> path_inode_cache;
 
   // Sorted (Windows name, inode) children per directory. Directory contents
   // are immutable for this read-only mount, so this is built once per
@@ -91,13 +103,13 @@ uint64_t NodeId(PVOID context) {
 }
 
 // Copies the inode behind a live file node. Returns false for stale nodes.
-bool LookupNode(AdapterState& state, PVOID context, XfsInode* out) {
-  if (!context) return false;
+std::shared_ptr<AdapterState::FileNode> LookupNode(AdapterState& state,
+                                                   PVOID context) {
+  if (!context) return nullptr;
   std::lock_guard<std::mutex> lock(state.node_mutex);
   auto it = state.nodes.find(NodeId(context));
-  if (it == state.nodes.end()) return false;
-  *out = it->second->inode;
-  return true;
+  if (it == state.nodes.end()) return nullptr;
+  return it->second;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +205,30 @@ Result<XfsInode> ResolvePath(XfsFilesystem& fs, PWSTR file_name) {
   return current;
 }
 
+// Path resolution front-end for the WinFsp callbacks: memoizes full paths so
+// repeated opens of the same file skip the component walk.
+Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
+  const std::wstring key = file_name ? file_name : L"";
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto it = state.path_inode_cache.find(key);
+    if (it != state.path_inode_cache.end()) {
+      auto inode = state.fs->OpenInode(it->second);
+      if (inode.ok()) return inode;
+    }
+  }
+  auto inode = ResolvePath(*state.fs, file_name);
+  if (inode.ok()) {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    constexpr size_t kMaxPathCacheEntries = 32768;
+    if (state.path_inode_cache.size() >= kMaxPathCacheEntries) {
+      state.path_inode_cache.clear();
+    }
+    state.path_inode_cache.emplace(key, inode.value().ino);
+  }
+  return inode;
+}
+
 uint64_t ToFileTime(const XfsTimestamp& ts) {
   constexpr int64_t kEpochOffset = 11644473600LL;  // 1601 -> 1970 seconds
   int64_t sec = ts.sec + kEpochOffset;
@@ -268,6 +304,7 @@ bool NeedsSecurityOverflow(AdapterState& state, SIZE_T* size) {
 // Reads data for a regular file or a symlink (whose target is exposed as the
 // file content in this first version).
 Result<size_t> ReadInode(AdapterState& state, const XfsInode& inode,
+                         const std::vector<XfsExtent>* extents,
                          uint64_t offset, void* buffer, size_t length) {
   if (inode.IsSymlink()) {
     auto target = state.fs->ReadSymlink(inode.ino);
@@ -278,7 +315,7 @@ Result<size_t> ReadInode(AdapterState& state, const XfsInode& inode,
     std::memcpy(buffer, target.value().data() + offset, to_copy);
     return to_copy;
   }
-  return state.fs->ReadFile(inode.ino, offset, buffer, length);
+  return state.fs->ReadFile(inode, extents, offset, buffer, length);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +346,7 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
                            PSECURITY_DESCRIPTOR security_descriptor,
                            SIZE_T* security_descriptor_size) {
   AdapterState& state = *State(file_system);
-  auto inode = ResolvePath(*state.fs, file_name);
+  auto inode = ResolvePathCached(state, file_name);
   if (!inode.ok()) {
     // Expected for speculative lookups (e.g. Windows probing \autorun.inf).
     XFS_DEBUG("GetSecurityByName('" << WideToUtf8(file_name)
@@ -336,7 +373,7 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
               UINT32 create_options, UINT32 /*granted_access*/,
               PVOID* file_context, FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
-  auto inode = ResolvePath(*state.fs, file_name);
+  auto inode = ResolvePathCached(state, file_name);
   if (!inode.ok()) {
     XFS_DEBUG("Open('" << WideToUtf8(file_name)
                        << "') failed: " << inode.error().Format());
@@ -348,24 +385,35 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   if ((create_options & FILE_NON_DIRECTORY_FILE) && inode.value().IsDir()) {
     return STATUS_FILE_IS_A_DIRECTORY;
   }
-  XfsInode node = std::move(inode.value());
-  FillFileInfo(state, node, file_info);
+  auto node = std::make_shared<const XfsInode>(std::move(inode.value()));
+  FillFileInfo(state, *node, file_info);
+  // Parse the data fork once per open: reads then never re-walk the extent
+  // list or the BMBT.
+  std::shared_ptr<const std::vector<XfsExtent>> extents;
+  if (node->IsRegular() && node->format != ondisk::inode::kFormatLocal) {
+    auto loaded = std::make_shared<std::vector<XfsExtent>>();
+    if (LoadDataForkExtents(state.fs->device(), state.fs->geometry(), *node,
+                            loaded.get())
+            .ok()) {
+      extents = std::move(loaded);
+    }
+  }
   uint64_t id;
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
-    auto index = state.node_by_inode.find(node.ino);
+    auto index = state.node_by_inode.find(node->ino);
     if (index != state.node_by_inode.end()) {
       // Same file already open: reuse its node and take another reference.
       id = index->second;
       ++state.nodes[id]->refcount;
     } else {
       id = state.next_node_id++;
-      auto entry = std::make_unique<AdapterState::FileNode>();
-      entry->inode = std::move(node);
+      auto entry = std::make_shared<AdapterState::FileNode>();
+      entry->inode = node;
+      entry->extents = std::move(extents);
       entry->refcount = 1;
-      uint64_t ino = entry->inode.ino;
       state.nodes.emplace(id, std::move(entry));
-      state.node_by_inode.emplace(ino, id);
+      state.node_by_inode.emplace(node->ino, id);
     }
   }
   *file_context = reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
@@ -388,7 +436,7 @@ VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   auto it = state.nodes.find(NodeId(file_context));
   if (it == state.nodes.end()) return;
   if (0 == --it->second->refcount) {
-    state.node_by_inode.erase(it->second->inode.ino);
+    state.node_by_inode.erase(it->second->inode->ino);
     state.nodes.erase(it);
   }
 }
@@ -397,13 +445,14 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
               PVOID buffer, UINT64 offset, ULONG length,
               PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
-  XfsInode node;
-  if (!LookupNode(state, file_context, &node)) {
+  auto node = LookupNode(state, file_context);
+  if (!node) {
     XFS_DEBUG("Read: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
-  if (node.IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
-  auto read = ReadInode(state, node, offset, buffer, length);
+  if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
+  auto read =
+      ReadInode(state, *node->inode, node->extents.get(), offset, buffer, length);
   if (!read.ok()) return NtFromError(read.error().code);
   *bytes_transferred = static_cast<ULONG>(read.value());
   return STATUS_SUCCESS;
@@ -421,12 +470,12 @@ NTSTATUS Flush(FSP_FILE_SYSTEM*, PVOID, FSP_FSCTL_FILE_INFO*) {
 NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                      FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
-  XfsInode node;
-  if (!LookupNode(state, file_context, &node)) {
+  auto node = LookupNode(state, file_context);
+  if (!node) {
     XFS_DEBUG("GetFileInfo: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
-  FillFileInfo(state, node, file_info);
+  FillFileInfo(state, *node->inode, file_info);
   return STATUS_SUCCESS;
 }
 
@@ -486,12 +535,12 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                        PWSTR /*pattern*/, PWSTR marker, PVOID buffer,
                        ULONG length, PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
-  XfsInode context;
-  if (!LookupNode(state, file_context, &context)) {
+  auto context = LookupNode(state, file_context);
+  if (!context) {
     XFS_DEBUG("ReadDirectory: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
-  if (!context.IsDir()) return STATUS_NOT_A_DIRECTORY;
+  if (!context->inode->IsDir()) return STATUS_NOT_A_DIRECTORY;
   *bytes_transferred = 0;
 
   // Sorted Windows-name children, built once per directory and reused for
@@ -500,11 +549,11 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   std::shared_ptr<const std::vector<DirChild>> children;
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
-    auto it = state.dir_children.find(context.ino);
+    auto it = state.dir_children.find(context->inode->ino);
     if (it != state.dir_children.end()) children = it->second;
   }
   if (!children) {
-    auto entries = state.fs->ListDirectory(context.ino);
+    auto entries = state.fs->ListDirectory(context->inode->ino);
     if (!entries.ok()) return NtFromError(entries.error().code);
     auto built = std::make_shared<std::vector<DirChild>>();
     built->reserve(entries.value().size());
@@ -532,7 +581,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
         state.dir_children_entries = 0;
       }
       state.dir_children_entries += built->size();
-      state.dir_children.emplace(context.ino, built);
+      state.dir_children.emplace(context->inode->ino, built);
     }
     children = std::move(built);
   }
@@ -557,7 +606,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   };
 
   // Dot entries (only for non-root directories; the FSD handles root ".").
-  if (context.ino != state.fs->RootInode()) {
+  if (context->inode->ino != state.fs->RootInode()) {
     uint64_t parent_ino = 0;
     bool have_parent = false;
     for (bool parent_entry : {false, true}) {
@@ -568,14 +617,14 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
       }
       if (parent_entry) {
         if (!have_parent) {
-          auto parent = state.fs->LookupName(context.ino, "..");
+          auto parent = state.fs->LookupName(context->inode->ino, "..");
           if (!parent.ok()) continue;
           parent_ino = parent.value().ino;
           have_parent = true;
         }
         if (!add_entry(parent_ino, wname)) return STATUS_SUCCESS;
       } else {
-        if (!add_entry(context.ino, wname)) return STATUS_SUCCESS;
+        if (!add_entry(context->inode->ino, wname)) return STATUS_SUCCESS;
       }
     }
   }
@@ -934,14 +983,15 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
                        std::to_string(static_cast<uint32_t>(status)) + ")");
   }
   winfsp->UserContext = state.get();
-  // Install WinFsp's built-in operation guard and serialize every operation.
-  // The core is not thread-safe (shared block device state), so the FSD must
-  // hold its exclusive lock around all callbacks; setting only the strategy
-  // is not enough (EnterOperation is NULL by default and skips locking).
+  // Install WinFsp's built-in operation guard with the fine-grained strategy:
+  // namespace operations take a shared lock, while reads/writes/getinfo run
+  // fully in parallel. The core caches are mutex-protected and block-device
+  // I/O is serialized inside the device objects, so concurrent reads scale to
+  // multiple threads instead of queueing behind one global lock.
   FspFileSystemSetOperationGuard(winfsp, FspFileSystemOpEnter,
                                  FspFileSystemOpLeave);
   FspFileSystemSetOperationGuardStrategy(
-      winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE);
+      winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
 
   status = FspFileSystemSetMountPoint(winfsp,
                                       const_cast<PWSTR>(config.mount_point.c_str()));

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 
 #include "xfs/block_device.h"
 
@@ -37,6 +38,7 @@ class ImageBlockDevice final : public BlockDevice {
   ImageBlockDevice() = default;
 
   std::fstream file_;
+  mutable std::mutex io_mutex_;
   DeviceInfo info_;
   std::filesystem::path path_;
 };
