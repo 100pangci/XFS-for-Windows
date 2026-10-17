@@ -1,0 +1,412 @@
+#include "xfs/extent.h"
+
+#include <algorithm>
+#include <cstring>
+
+#include "xfs/btree.h"
+#include "xfs/endian.h"
+#include "xfs/log.h"
+#include "xfs/verifier.h"
+
+namespace xfs {
+namespace {
+
+namespace di = ondisk::inode;
+namespace bt = ondisk::btree;
+
+constexpr uint64_t kStartBlockMaskBits = 15 + 20;
+constexpr uint64_t kStartBlockValueBits = 17;
+constexpr uint64_t kStartBlockMask =
+    (((1ULL << kStartBlockMaskBits) - 1) << kStartBlockValueBits);
+
+bool IsNullStartBlock(uint64_t sb) {
+  return (sb & kStartBlockMask) == kStartBlockMask;
+}
+
+XfsExtent ToExtent(const uint8_t* rec) {
+  ondisk::BmbtRec r = ondisk::DecodeBmbtRec(GetBE64(rec), GetBE64(rec + 8));
+  XfsExtent e;
+  e.startoff = r.startoff;
+  e.startblock = r.startblock;
+  e.blockcount = r.blockcount;
+  e.unwritten = r.unwritten;
+  return e;
+}
+
+Status ValidateExtentList(const XfsGeometry& geo, const XfsInode& inode,
+                          std::vector<XfsExtent>& extents) {
+  uint64_t prev_end = 0;
+  for (size_t i = 0; i < extents.size(); ++i) {
+    const XfsExtent& e = extents[i];
+    if (e.blockcount == 0) {
+      return XFS_ERR(XfsError::kCorruptExtent, "zero-length extent")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Actual(e.startoff);
+    }
+    if (e.startoff > ondisk::kBmbtMaxStartoff) {
+      return XFS_ERR(XfsError::kCorruptExtent, "extent startoff out of range")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Actual(e.startoff);
+    }
+    if (i > 0 && e.startoff < prev_end) {
+      return XFS_ERR(XfsError::kCorruptExtent,
+                     "extents overlap or are out of order")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Expected(prev_end)
+          .Actual(e.startoff);
+    }
+    if (IsNullStartBlock(e.startblock)) {
+      return XFS_ERR(XfsError::kCorruptExtent,
+                     "on-disk extent has delayed-allocation startblock")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Actual(e.startblock);
+    }
+    if (e.startblock >= geo.dblocks ||
+        e.blockcount > geo.dblocks - e.startblock) {
+      return XFS_ERR(XfsError::kCorruptExtent,
+                     "extent points outside the filesystem")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Actual(e.startblock);
+    }
+    if (!geo.FsbRangeValid(e.startblock, e.blockcount)) {
+      return XFS_ERR(XfsError::kCorruptExtent,
+                     "extent crosses an allocation group boundary or points "
+                     "outside the filesystem")
+          .Ino(inode.ino)
+          .Metadata("extent")
+          .Actual(e.startblock);
+    }
+    prev_end = e.startoff + e.blockcount;
+  }
+  return OkStatus();
+}
+
+Status LoadExtentsFormat(const XfsGeometry& geo, const XfsInode& inode,
+                         std::vector<XfsExtent>* out) {
+  if (static_cast<uint64_t>(inode.nextents) * 16 > inode.data_fork.size()) {
+    return XFS_ERR(XfsError::kCorruptInode,
+                   "data fork extent count exceeds fork size")
+        .Ino(inode.ino)
+        .Metadata("inode")
+        .Expected(inode.data_fork.size() / 16)
+        .Actual(inode.nextents);
+  }
+  out->reserve(inode.nextents);
+  for (uint32_t i = 0; i < inode.nextents; ++i) {
+    out->push_back(ToExtent(inode.data_fork.data() + i * 16));
+  }
+  return ValidateExtentList(geo, inode, *out);
+}
+
+Status LoadBtreeFormat(BlockDevice& dev, const XfsGeometry& geo,
+                       const XfsInode& inode, std::vector<XfsExtent>* out,
+                       uint64_t cap) {
+  if (inode.data_fork.size() < bt::kBmdrSize) {
+    return XFS_ERR(XfsError::kCorruptInode, "bmbt fork too small")
+        .Ino(inode.ino)
+        .Metadata("inode");
+  }
+  uint16_t root_level = GetBE16(inode.data_fork.data(), 0);
+  uint16_t root_numrecs = GetBE16(inode.data_fork.data(), 2);
+  const size_t fork_size = inode.data_fork.size();
+  const size_t node_maxrecs =
+      (fork_size - bt::kBmdrSize) / (bt::kBmbtKeySize + bt::kBmbtPtrSize);
+  const size_t leaf_maxrecs = (fork_size - bt::kBmdrSize) / bt::kBmbtRecSize;
+
+  std::vector<XfsExtent> extents;
+
+  if (root_level == 0) {
+    // Root itself is a leaf: records live in the fork.
+    if (root_numrecs == 0 || root_numrecs > leaf_maxrecs) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "bmbt root leaf record count invalid")
+          .Ino(inode.ino)
+          .Metadata("inode")
+          .Expected(leaf_maxrecs)
+          .Actual(root_numrecs);
+    }
+    for (uint16_t i = 0; i < root_numrecs; ++i) {
+      extents.push_back(
+          ToExtent(inode.data_fork.data() + bt::kBmdrSize + i * 16));
+    }
+  } else {
+    if (root_numrecs == 0 || root_numrecs > node_maxrecs) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "bmbt root node record count invalid")
+          .Ino(inode.ino)
+          .Metadata("inode")
+          .Expected(node_maxrecs)
+          .Actual(root_numrecs);
+    }
+
+    BtreeSpec spec;
+    spec.name = "bmbt";
+    spec.format = BtreeFormat::kLong;
+    spec.block_size = geo.block_size;
+    spec.key_size = bt::kBmbtKeySize;
+    spec.ptr_size = bt::kBmbtPtrSize;
+    spec.rec_size = bt::kBmbtRecSize;
+    spec.magic = ondisk::kBmapCrcMagic;
+    spec.max_depth = bt::kMaxTraversalLevels;
+    spec.null_ptr = 0xffffffffffffffffull;
+    spec.expected_owner = inode.ino;
+    spec.owner_size = 8;
+    spec.uuid = geo.meta_uuid;
+    spec.sb_lsn = 0;
+    spec.ptr_to_daddr = [&](uint64_t fsb, uint64_t* daddr) {
+      if (!geo.FsbValid(fsb)) return false;
+      *daddr = geo.FsbToByte(fsb) / 512;
+      return true;
+    };
+
+    BtreeWalkCallbacks cb;
+    cb.read_block = [&](uint64_t fsb, std::vector<uint8_t>* buf) -> bool {
+      if (!geo.FsbValid(fsb)) return false;
+      buf->resize(geo.block_size);
+      return dev.Read(geo.FsbToByte(fsb), buf->data(), geo.block_size);
+    };
+    cb.ptr_in_range = [&](uint64_t ptr) {
+      return ptr != spec.null_ptr && geo.FsbValid(ptr);
+    };
+    cb.visit = [&](uint64_t /*fsb*/, const BtreeBlockMeta& meta,
+                   const uint8_t* buf) -> Status {
+      if (meta.level != 0) return OkStatus();
+      for (uint16_t i = 0; i < meta.numrecs; ++i) {
+        extents.push_back(ToExtent(BtreeLeafRec(buf, meta, spec, i)));
+        if (extents.size() > cap) {
+          return XFS_ERR(XfsError::kUnsupportedGeometry,
+                         "file has too many extents for this build")
+              .Ino(inode.ino)
+              .Metadata("bmbt");
+        }
+      }
+      return OkStatus();
+    };
+    cb.check_siblings = true;
+
+    // Root children: keys at 4 + i*8, pointers at 4 + maxrecs*8 + i*8.
+    const uint8_t* ptrs =
+        inode.data_fork.data() + bt::kBmdrSize + node_maxrecs * 8;
+    const uint8_t* keys = inode.data_fork.data() + bt::kBmdrSize;
+
+    // Walk each child subtree in order, checking the root keys match the
+    // first key of each child.
+    uint64_t prev_key = 0;
+    bool first_child = true;
+    auto original_visit = cb.visit;
+    cb.visit = [&](uint64_t fsb, const BtreeBlockMeta& meta,
+                   const uint8_t* buf) -> Status {
+      if (first_child) {
+        first_child = false;
+        if (meta.level + 1 != root_level) {
+          return XFS_ERR(XfsError::kCorruptInode,
+                         "bmbt root level does not match child level")
+              .Ino(inode.ino)
+              .Metadata("bmbt")
+              .Expected(root_level - 1)
+              .Actual(meta.level);
+        }
+      }
+      return original_visit(fsb, meta, buf);
+    };
+    for (uint16_t i = 0; i < root_numrecs; ++i) {
+      uint64_t key = GetBE64(keys + i * 8);
+      if (i > 0 && key < prev_key) {
+        return XFS_ERR(XfsError::kCorruptInode,
+                       "bmbt root keys out of order")
+            .Ino(inode.ino)
+            .Metadata("bmbt");
+      }
+      prev_key = key;
+      uint64_t child = GetBE64(ptrs + i * 8);
+      if (child == spec.null_ptr) {
+        return XFS_ERR(XfsError::kCorruptInode, "bmbt root has null child")
+            .Ino(inode.ino)
+            .Metadata("bmbt")
+            .Actual(i);
+      }
+      // Verify the first leaf record of the subtree has startoff >= key
+      // (the key is the smallest record in the subtree), and order is
+      // maintained across subtrees via ValidateExtentList below.
+      Status s = WalkBtree(spec, child, cb);
+      if (!s.ok()) return s;
+      if (!extents.empty() && extents.back().startoff < key) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "bmbt root key exceeds records in its subtree")
+            .Ino(inode.ino)
+            .Metadata("bmbt")
+            .Expected(extents.back().startoff)
+            .Actual(key);
+      }
+    }
+  }
+
+  Status s = ValidateExtentList(geo, inode, extents);
+  if (!s.ok()) return s;
+  if (extents.size() != inode.nextents) {
+    XFS_WARN("inode " << inode.ino << ": di_nextents=" << inode.nextents
+                      << " but enumerated " << extents.size() << " extents");
+  }
+  *out = std::move(extents);
+  return OkStatus();
+}
+
+}  // namespace
+
+Status LoadDataForkExtents(BlockDevice& dev, const XfsGeometry& geo,
+                           const XfsInode& inode, std::vector<XfsExtent>* out,
+                           uint64_t cap) {
+  out->clear();
+  switch (inode.format) {
+    case di::kFormatExtents:
+      return LoadExtentsFormat(geo, inode, out);
+    case di::kFormatBtree:
+      return LoadBtreeFormat(dev, geo, inode, out, cap);
+    case di::kFormatLocal:
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "local format has no extent list")
+          .Ino(inode.ino)
+          .Metadata("inode");
+    case di::kFormatDev:
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "device node has no extent list")
+          .Ino(inode.ino)
+          .Metadata("inode");
+    default:
+      return XFS_ERR(XfsError::kCorruptInode, "unexpected fork format")
+          .Ino(inode.ino)
+          .Metadata("inode")
+          .Actual(inode.format);
+  }
+}
+
+Result<XfsFileMapping> MapFileOffset(BlockDevice& dev, const XfsGeometry& geo,
+                                     const XfsInode& inode,
+                                     uint64_t file_offset) {
+  XfsFileMapping m;
+  if (file_offset >= inode.size) {
+    return XFS_ERR(XfsError::kOutOfRange, "offset is past end of file")
+        .Ino(inode.ino)
+        .Offset(file_offset)
+        .Expected(inode.size);
+  }
+  uint64_t file_block = file_offset >> geo.block_log;
+
+  std::vector<XfsExtent> extents;
+  Status s = LoadDataForkExtents(dev, geo, inode, &extents);
+  if (!s.ok()) return s.error();
+
+  // Largest extent whose startoff <= file_block.
+  size_t lo = 0, hi = extents.size();
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (extents[mid].startoff <= file_block) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  uint64_t file_blocks_total = (inode.size + geo.block_size - 1) >> geo.block_log;
+  if (lo == 0) {
+    m.is_hole = true;
+    m.block_offset = 0;
+    m.block_count = extents.empty() ? file_blocks_total : extents[0].startoff;
+    if (m.block_count <= file_block) m.block_count = file_block + 1;
+    return m;
+  }
+  const XfsExtent& e = extents[lo - 1];
+  if (file_block >= e.EndBlock()) {
+    m.is_hole = true;
+    m.block_offset = e.EndBlock();
+    uint64_t next_start =
+        lo < extents.size() ? extents[lo].startoff : file_blocks_total;
+    if (next_start <= file_block) next_start = file_block + 1;
+    m.block_count = next_start - e.EndBlock();
+    return m;
+  }
+  m.is_hole = false;
+  m.is_unwritten = e.unwritten;
+  m.fs_block = e.startblock + (file_block - e.startoff);
+  m.block_offset = e.startoff;
+  m.block_count = e.blockcount;
+  return m;
+}
+
+Status ReadLocalData(const XfsInode& inode, uint64_t offset, void* buffer,
+                     size_t len, size_t* bytes_read) {
+  *bytes_read = 0;
+  if (offset >= inode.size) return OkStatus();
+  uint64_t avail = inode.size - offset;
+  size_t to_copy = static_cast<size_t>(std::min<uint64_t>(avail, len));
+  if (offset + to_copy > inode.data_fork.size()) {
+    return XFS_ERR(XfsError::kCorruptInode, "local data extends past fork")
+        .Ino(inode.ino)
+        .Metadata("inode");
+  }
+  std::memcpy(buffer, inode.data_fork.data() + offset, to_copy);
+  *bytes_read = to_copy;
+  return OkStatus();
+}
+
+Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
+                            const XfsInode& inode, uint64_t file_offset,
+                            void* buffer, size_t len) {
+  if (inode.format == di::kFormatLocal) {
+    size_t copied = 0;
+    Status s = ReadLocalData(inode, file_offset, buffer, len, &copied);
+    if (!s.ok()) return s.error();
+    return copied;
+  }
+  if (inode.format != di::kFormatExtents && inode.format != di::kFormatBtree) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "inode has no readable data fork")
+        .Ino(inode.ino)
+        .Actual(inode.format);
+  }
+
+  uint8_t* out = static_cast<uint8_t*>(buffer);
+  size_t total = 0;
+  while (total < len && file_offset < inode.size) {
+    size_t want = static_cast<size_t>(
+        std::min<uint64_t>(len - total, inode.size - file_offset));
+    auto mapping = MapFileOffset(dev, geo, inode, file_offset);
+    if (!mapping.ok()) return mapping.error();
+    const XfsFileMapping& m = mapping.value();
+
+    uint64_t offset_in_block = file_offset & (geo.block_size - 1);
+    size_t chunk;
+    if (m.is_hole) {
+      chunk = static_cast<size_t>(
+          std::min<uint64_t>(want, geo.block_size - offset_in_block));
+      std::memset(out + total, 0, chunk);
+    } else {
+      uint64_t extent_offset_blocks =
+          (file_offset >> geo.block_log) - m.block_offset;
+      uint64_t extent_remaining_bytes =
+          (m.block_count - extent_offset_blocks) * geo.block_size -
+          offset_in_block;
+      chunk =
+          static_cast<size_t>(std::min<uint64_t>(want, extent_remaining_bytes));
+      if (m.is_unwritten) {
+        std::memset(out + total, 0, chunk);
+      } else {
+        uint64_t read_off = geo.FsbToByte(m.fs_block) + offset_in_block;
+        if (!dev.Read(read_off, out + total, chunk)) {
+          return XFS_ERR(XfsError::kIoError, "failed to read file data")
+              .Ino(inode.ino)
+              .Offset(read_off);
+        }
+      }
+    }
+    total += chunk;
+    file_offset += chunk;
+  }
+  return total;
+}
+
+}  // namespace xfs

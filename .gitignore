@@ -1,0 +1,18 @@
+# Build output
+build*/
+out/
+CMakeUserPresets.json
+
+# Reference material (xfsprogs source etc.) - never part of the product
+reference/
+
+# Test artifacts
+tests/images/*.img
+tests/images/*.bin
+*.log
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db

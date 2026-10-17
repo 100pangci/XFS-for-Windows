@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONFIG: RelWithDebInfo
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows: build, unit/integration tests, formatter round-trip, structural
+  # probe, and artifacts for the Linux verification job.
+  # ---------------------------------------------------------------------------
+  windows-build-test:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (no WinFsp SDK needed here)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_CONFIG
+
+      - name: Unit and integration tests
+        shell: pwsh
+        run: ctest --test-dir build -C $env:BUILD_CONFIG --output-on-failure
+
+      - name: Format an image and validate it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          New-Item -ItemType Directory -Force out | Out-Null
+          & $exe mkimage out\windows.img 300M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
+          & $exe format out\windows.img --yes-i-really-mean-it
+          if ($LASTEXITCODE -ne 0) { throw "format failed" }
+          & $exe info out\windows.img
+          & $exe check out\windows.img --verbose
+          if ($LASTEXITCODE -ne 0) { throw "check failed" }
+          & $exe ls out\windows.img /
+          if ($LASTEXITCODE -ne 0) { throw "ls failed" }
+
+      - name: Independent structural probe (Python)
+        shell: pwsh
+        run: python tests/tools/xfs_probe.py out/windows.img
+
+      - name: Upload xfswin.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfswin-exe
+          path: build/src/${{ env.BUILD_CONFIG }}/xfswin.exe
+          if-no-files-found: error
+
+      - name: Upload Windows-formatted image
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-image
+          path: out/windows.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux: verify the Windows-formatted image with the real xfsprogs, then
+  # create a populated golden image written by Linux for the reader test.
+  # ---------------------------------------------------------------------------
+  linux-verify-windows:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-image
+          path: images
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Probe and verify the Windows-formatted image
+        run: |
+          ls -l images/windows.img
+          sudo bash tests/scripts/verify_windows_image_linux.sh images/windows.img
+
+      - name: Create populated golden image (Linux mkfs + kernel)
+        env:
+          GOLDEN_POPULATED_SIZE: 512M
+          GOLDEN_LARGE_MB: "32"
+          GOLDEN_SPARSE_SIZE: 128M
+          GOLDEN_BIGDIR_COUNT: "5000"
+          GOLDEN_FRAG_COUNT: "300"
+        run: |
+          sudo -E bash tests/scripts/make_golden_images.sh golden --ci
+          ls -lh golden
+
+      - name: Upload Linux golden image
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-golden
+          path: |
+            golden/populated.img
+            golden/populated.manifest.json
+            golden/golden-summary.txt
+            golden/populated.ls.txt
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows reader against the Linux-created golden image: differential test
+  # of listing, Unicode names, file data (sha256), sparse files, extent btree,
+  # symlinks and consistency checking.
+  # ---------------------------------------------------------------------------
+  windows-read-linux-image:
+    needs: linux-verify-windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-golden
+          path: golden
+
+      - name: Reader differential test
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_reader_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -Image "golden\populated.img" `
+            -Manifest "golden\populated.manifest.json"
+
+  # ---------------------------------------------------------------------------
+  # WinFsp mount: install the runtime, build with the SDK, mount the Linux
+  # image read-only and verify reads, write rejection and clean unmount.
+  # ---------------------------------------------------------------------------
+  windows-mount:
+    needs: linux-verify-windows
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-golden
+          path: golden
+
+      - name: Install WinFsp runtime and extract the SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+          $p = Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$PWD\sdk") -Wait -PassThru
+          "sdk extract exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "WinFsp SDK extraction failed with $($p.ExitCode)" }
+          Get-ChildItem "$PWD\sdk" | Select-Object Name
+          if (-not (Test-Path "$PWD\sdk\DYNAMIC\inc\winfsp\winfsp.h")) {
+            throw "SDK layout unexpected: DYNAMIC/inc/winfsp/winfsp.h not found"
+          }
+
+      - name: Build with WinFsp support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_WINFSP_ROOT="$PWD\sdk\DYNAMIC"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config $env:BUILD_CONFIG
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Provide winfsp-x64.dll next to the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem 'C:\Program Files (x86)\WinFsp' -Recurse -Filter 'winfsp-x64.dll' |
+                 Select-Object -First 1
+          if (-not $dll) { throw "winfsp-x64.dll not found after installation" }
+          "using $($dll.FullName)"
+          Copy-Item $dll.FullName "build\src\$env:BUILD_CONFIG\"
+
+      - name: Mount and verify read-only semantics
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_mount_windows.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Image "golden\populated.img" `
+            -Manifest "golden\populated.manifest.json"
