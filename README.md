@@ -40,12 +40,20 @@ realtime device, no writes to existing filesystems.**
 | Remote and inline symlinks | read (target returned) |
 | Multi-block directories | read |
 | Internal log cleanliness check | yes; replay is **not** implemented |
-| WinFsp read-only mount | implemented, needs WinFsp runtime installed |
+| WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
 | Writes to an existing XFS | **never** (read-only mount, write callbacks return `STATUS_MEDIA_WRITE_PROTECTED`) |
 | Journal replay | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`) |
 | XFS v4, external log, realtime, parent pointers, metadir, zoned | rejected with a clear error |
+
+Both directions are verified on real systems by CI: the Windows-formatted
+image passes Linux `xfs_db`, `xfs_repair -n` and loop mounts (read-only and a
+writable copy), while the reader matches a Linux-written golden image
+(sha256 manifest, 5000-entry directory, sparse file, extent btree, Unicode
+names, symlinks). The WinFsp mount is installed and exercised on a Windows
+runner: volume reports `XFS` and read-only, file contents match, and
+create/delete/rename are refused.
 
 ## Requirements
 
@@ -139,7 +147,13 @@ Fixed, conservative profile that Linux mounts natively:
   written as a clean log with an unmount record
 - AG count/size from the mkfs `calc_default_ag_geometry` rules (4 AGs for
   most sizes)
-- one 64-inode chunk in AG0 containing the root directory inode
+- one 64-inode chunk in AG0 containing the root directory inode 64, the
+  realtime bitmap inode (65) and the realtime summary inode (66) that mkfs
+  always allocates (even without a realtime device)
+- empty shortform root directory (XFS shortform directories do not store
+  `.`/`..`; they are implicit), root inode CRC over the whole inode
+- AGFL blocks counted as free in `sb_fdblocks` (they are excluded from
+  `agf_freeblks`), `agf_btreeblks = 0` for a fresh filesystem
 - no finobt, rmapbt, reflink, sparse inodes, bigtime, NREXT64, parent
   pointers or metadir (all optional features are off)
 
@@ -180,8 +194,17 @@ mount → check round-trip, and corruption detection (superblock, inode, AGF,
 bnode/inode btrees, log).
 
 Linux verification of Windows-created images and generation of golden images
-from Linux are scripted in `tests/scripts/`; see `docs/TESTING.md`. Those
-steps require a Linux environment (see the note there).
+from Linux are scripted in `tests/scripts/`; see `docs/TESTING.md`. In CI they
+run on Linux runners and feed the Windows reader/mount jobs.
+
+The WinFsp adapter can also be exercised without the driver:
+
+```powershell
+build\src\RelWithDebInfo\xfswin.exe selftest tests\images\populated.img
+```
+
+This drives the real adapter callbacks (open, read directory with markers,
+read files, close) against an image and validates buffer handling.
 
 ## Code layout
 

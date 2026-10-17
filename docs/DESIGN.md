@@ -172,5 +172,31 @@ errors as `error: <kind> [<metadata>]: <detail> AG=.. fsb=0x..`.
 ## Threading
 
 The core has no global mutable state. `XfsFilesystem` reads are const, but
-`ImageBlockDevice` uses a shared stream; the WinFsp host therefore uses the
-coarse operation guard strategy so callbacks are serialized.
+`ImageBlockDevice` uses a shared stream; the WinFsp host therefore installs
+WinFsp's built-in operation guard (`FspFileSystemSetOperationGuard` with
+`FspFileSystemOpEnter/OpLeave` plus the COARSE strategy) so that every
+callback runs serialized. Setting only the strategy is not enough: without the
+guard callbacks the FSD does not lock at all.
+
+## WinFsp adapter contracts
+
+Findings that the adapter must honor (all verified by the CI mount job):
+
+- `FileContext` is a *file node*, not a per-open descriptor: opening the same
+  file while it is open anywhere must return the same value, and `Close` is
+  called once per `Open` — including after a failed `Overwrite` (which WinFsp
+  treats as a context release). The adapter therefore keys nodes by inode
+  number, reference counts them, and destroys the node on the last `Close`.
+  Freeing a raw pointer in `Close` double-frees and corrupts the heap.
+- Directory enumeration must end with `FspFileSystemAddDirInfo(nullptr, ...)`;
+  without the end-of-directory marker the FSD reports the directory as corrupt
+  or keeps re-reading it.
+- Directory leaf/free blocks live at `XFS_DIR2_LEAF_OFFSET` (32 GiB) and
+  `XFS_DIR2_FREE_OFFSET` (64 GiB) logical file offsets. Extent mapping must
+  not clamp to `inode.size`; `ReadFileData` still clamps for regular reads.
+- `cat` must switch stdout to binary mode (`_setmode(_O_BINARY)`) or Windows
+  translates every `\n` in file data to CRLF.
+- Write callbacks (`Create`, `Write`, `Overwrite`, `SetBasicInfo`,
+  `SetFileSize`, `CanDelete`, `Rename`, `SetSecurity`, `SetVolumeLabel`)
+  return `STATUS_MEDIA_WRITE_PROTECTED`.
+

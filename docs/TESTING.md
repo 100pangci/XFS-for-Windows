@@ -152,24 +152,29 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs four jobs:
+Every push runs five jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
    suite, formats a 300 MiB image, runs `xfswin check`, and cross-checks the
    image with the independent Python probe. Uploads `xfswin.exe` and the
    Windows-formatted image.
-2. **linux-verify-windows** (ubuntu-24.04): takes the Windows-formatted image
+2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
+   `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
+   output) for comparison against the formatter.
+3. **linux-verify-windows** (ubuntu-24.04): takes the Windows-formatted image
    and runs the real `xfs_db` + `xfs_repair -n` + loop mounts (read-only and a
    writable copy). Then it creates a *populated golden image* using Linux
    `mkfs.xfs` and the kernel (Unicode names, large file, sparse file, extent
    btree, 5000-entry directory, symlink, hardlink) plus a sha256 manifest.
-3. **windows-read-linux-image**: runs `xfswin check` and compares directory
+4. **windows-read-linux-image**: runs `xfswin check` and compares directory
    listings, sizes, sha256 hashes, sparse/large file contents and symlink
    targets against the Linux-generated manifest (differential test).
-4. **windows-mount**: installs the WinFsp runtime, builds with the WinFsp SDK,
-   mounts the Linux image at `X:`, verifies reads/hashes/Unicode names, and
-   asserts that create/delete/rename/mkdir are rejected as write-protected
-   before unmounting.
+5. **windows-mount**: installs the WinFsp runtime, builds with the WinFsp SDK,
+   runs `xfswin selftest` (adapter callbacks without the driver), then mounts
+   the Linux image at `X:`, verifies reads/hashes/Unicode names, and asserts
+   that create/delete/rename/mkdir are rejected as write-protected before
+   unmounting.
 
 This is the environment-independent version of the Linux/WinFsp acceptance
-checks; see the jobs for the exact commands.
+checks; see the jobs for the exact commands. All five jobs are green on the
+current `main`.
