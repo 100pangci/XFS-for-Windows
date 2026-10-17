@@ -52,27 +52,33 @@ struct AdapterState {
   std::u16string label;
   uint16_t sector_size = 512;
   uint16_t sectors_per_allocation_unit = 8;
-  // File contexts are identified by a monotonically increasing id (never
-  // reused). WinFsp may call Close twice for one open: once when a failed
-  // Overwrite releases the context and again when the handle is torn down.
-  // Close is therefore idempotent and the map (not the raw pointer) owns the
-  // inode data.
-  std::mutex context_mutex;
-  std::unordered_map<uint64_t, XfsInode> contexts;
-  uint64_t next_context_id = 1;
+
+  // WinFsp's default FileContext model is a "file node": opening the same file
+  // must return the same node value for as long as it is open anywhere, and
+  // Close may be called once per Open (including for a failed Overwrite).
+  // Nodes are keyed by inode number and reference counted; the last Close
+  // destroys the node.
+  struct FileNode {
+    XfsInode inode;
+    uint32_t refcount = 0;
+  };
+  std::mutex node_mutex;
+  std::unordered_map<uint64_t, uint64_t> node_by_inode;
+  std::unordered_map<uint64_t, std::unique_ptr<FileNode>> nodes;
+  uint64_t next_node_id = 1;
 };
 
-uint64_t ContextId(PVOID context) {
+uint64_t NodeId(PVOID context) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
 }
 
-// Copies the inode for a live file context. Returns false for stale contexts.
-bool LookupContext(AdapterState& state, PVOID context, XfsInode* out) {
+// Copies the inode behind a live file node. Returns false for stale nodes.
+bool LookupNode(AdapterState& state, PVOID context, XfsInode* out) {
   if (!context) return false;
-  std::lock_guard<std::mutex> lock(state.context_mutex);
-  auto it = state.contexts.find(ContextId(context));
-  if (it == state.contexts.end()) return false;
-  *out = it->second;
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  auto it = state.nodes.find(NodeId(context));
+  if (it == state.nodes.end()) return false;
+  *out = it->second->inode;
   return true;
 }
 
@@ -272,9 +278,10 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   AdapterState& state = *State(file_system);
   auto inode = ResolvePath(*state.fs, file_name);
   if (!inode.ok()) {
-    XFS_WARN("GetSecurityByName('" << WideToUtf8(file_name)
-                                    << "') failed: "
-                                    << inode.error().Format());
+    // Expected for speculative lookups (e.g. Windows probing \autorun.inf).
+    XFS_DEBUG("GetSecurityByName('" << WideToUtf8(file_name)
+                                     << "') failed: "
+                                     << inode.error().Format());
     return NtFromError(inode.error().code);
   }
   uint32_t attributes = FileAttributesFor(inode.value());
@@ -312,11 +319,22 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   FillFileInfo(state, node, file_info);
   uint64_t id;
   {
-    std::lock_guard<std::mutex> lock(state.context_mutex);
-    id = state.next_context_id++;
-    state.contexts.emplace(id, std::move(node));
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto index = state.node_by_inode.find(node.ino);
+    if (index != state.node_by_inode.end()) {
+      // Same file already open: reuse its node and take another reference.
+      id = index->second;
+      ++state.nodes[id]->refcount;
+    } else {
+      id = state.next_node_id++;
+      auto entry = std::make_unique<AdapterState::FileNode>();
+      entry->inode = std::move(node);
+      entry->refcount = 1;
+      uint64_t ino = entry->inode.ino;
+      state.nodes.emplace(id, std::move(entry));
+      state.node_by_inode.emplace(ino, id);
+    }
   }
-  XFS_WARN("open id=" << id << " '" << WideToUtf8(file_name) << "'");
   *file_context = reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
   return STATUS_SUCCESS;
 }
@@ -331,11 +349,15 @@ VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {}
 VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   AdapterState& state = *State(file_system);
   if (!file_context) return;
-  // Idempotent: WinFsp closes a context on a failed Overwrite and then closes
-  // it again when the handle is torn down.
-  std::lock_guard<std::mutex> lock(state.context_mutex);
-  XFS_WARN("close id=" << ContextId(file_context));
-  state.contexts.erase(ContextId(file_context));
+  // One reference per Open. The node is destroyed when the last one goes away
+  // (idempotent for repeated Close of the same node).
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  auto it = state.nodes.find(NodeId(file_context));
+  if (it == state.nodes.end()) return;
+  if (0 == --it->second->refcount) {
+    state.node_by_inode.erase(it->second->inode.ino);
+    state.nodes.erase(it);
+  }
 }
 
 NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
@@ -343,8 +365,8 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
               PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
   XfsInode node;
-  if (!LookupContext(state, file_context, &node)) {
-    XFS_WARN("Read: stale context id=" << ContextId(file_context));
+  if (!LookupNode(state, file_context, &node)) {
+    XFS_DEBUG("Read: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   if (node.IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
@@ -367,8 +389,8 @@ NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                      FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
   XfsInode node;
-  if (!LookupContext(state, file_context, &node)) {
-    XFS_WARN("GetFileInfo: stale context id=" << ContextId(file_context));
+  if (!LookupNode(state, file_context, &node)) {
+    XFS_DEBUG("GetFileInfo: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   FillFileInfo(state, node, file_info);
@@ -432,8 +454,8 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                        ULONG length, PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
   XfsInode context;
-  if (!LookupContext(state, file_context, &context)) {
-    XFS_WARN("ReadDirectory: stale context id=" << ContextId(file_context));
+  if (!LookupNode(state, file_context, &context)) {
+    XFS_DEBUG("ReadDirectory: stale file node " << NodeId(file_context));
     return STATUS_INVALID_HANDLE;
   }
   if (!context.IsDir()) return STATUS_NOT_A_DIRECTORY;
