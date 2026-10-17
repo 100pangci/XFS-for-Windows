@@ -77,22 +77,44 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
           Copy-Item out\fixture.img out\fixture-write.img
+          # Refusals are the expected result and carry a nonzero exit code.
+          # pwsh reports the status of the last native command as the step's
+          # exit code, so every expected failure resets it explicitly.
+          function Assert-Refused([int]$ExpectedCode, [string]$What, [scriptblock]$Block) {
+            & $Block
+            $actual = $LASTEXITCODE
+            if ($actual -ne $ExpectedCode) {
+              throw "$What`: expected exit code $ExpectedCode, got $actual"
+            }
+            $global:LASTEXITCODE = 0
+            Write-Output "$What`: refused as expected (exit $actual)"
+          }
+
+          # In-place overwrite inside the fixture file's allocated extent.
           & $exe pwrite out\fixture-write.img /hello.bin 100 --rw-experimental --text=OVERWRITTEN
           if ($LASTEXITCODE -ne 0) { throw "pwrite failed" }
-          # A write that would need an allocation must be refused.
-          & $exe pwrite out\fixture-write.img /hello.bin 32765 --rw-experimental --text=toolong
-          if ($LASTEXITCODE -eq 0) { throw "pwrite past EOF was not refused" }
-          # Growth, holes and unwritten extents are out of scope.
           & $exe pwrite out\fixture-write.img /hello.bin 0 --rw-experimental --text=x
           if ($LASTEXITCODE -ne 0) { throw "pwrite in place failed" }
           & $exe check out\fixture-write.img
           if ($LASTEXITCODE -ne 0) { throw "check failed after pwrite" }
-          # Without the confirmation flag nothing may be written.
-          & $exe pwrite out\fixture-write.img /hello.bin 0 --text=x
-          if ($LASTEXITCODE -ne 3) { throw "pwrite without --rw-experimental must exit 3" }
-          # Read-write mounting of a real device stays refused.
-          & $exe mount \\.\PhysicalDrive0 Y: --rw-experimental
-          if ($LASTEXITCODE -ne 3) { throw "rw mount of a raw device must exit 3" }
+          & $exe cat out\fixture-write.img /hello.bin | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "cat failed after pwrite" }
+
+          # Growth needs an allocation transaction; writes without the
+          # confirmation flag and reads-write mounts of real devices are
+          # refused; the refusal must not change the image.
+          Assert-Refused 1 "write past EOF" {
+            & $exe pwrite out\fixture-write.img /hello.bin 32765 --rw-experimental --text=toolong
+          }
+          Assert-Refused 3 "write without --rw-experimental" {
+            & $exe pwrite out\fixture-write.img /hello.bin 0 --text=x
+          }
+          Assert-Refused 3 "read-write mount of a raw device" {
+            & $exe mount \\.\PhysicalDrive0 Y: --rw-experimental
+          }
+          & $exe check out\fixture-write.img
+          if ($LASTEXITCODE -ne 0) { throw "check failed after refused writes" }
+          Write-Output "in-place write checks passed"
 
       - name: Upload xfswin.exe
         uses: actions/upload-artifact@v4
