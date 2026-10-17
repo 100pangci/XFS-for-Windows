@@ -69,6 +69,7 @@ enum class XfsError : uint32_t {
   kWriteExtendsFile,      // the range would move EOF
   kWriteNeedsAllocation,  // the range covers a hole
   kWriteNeedsConversion,  // the range covers an unwritten (preallocated) extent
+  kNoSpace,               // an allocation could not be satisfied
 
   kInternal,
 };

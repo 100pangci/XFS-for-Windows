@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "xfs/crash.h"
+#include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/log.h"
@@ -28,9 +29,10 @@ namespace {
 namespace lf = logfmt;
 
 // Room reserved at BeginTransaction so the record never has to be split across
-// the physical end of the log: header block + data blocks of a small
-// transaction. The actual size is checked again at commit.
-constexpr uint32_t kReservedRecordBlocks = 16;  // 8 KiB of data
+// the physical end of the log: header block + the largest record we can build
+// (32 KiB of data, the limit before extended headers would be needed) + slack.
+// The actual size is checked again at commit.
+constexpr uint32_t kReservedRecordBlocks = 70;  // ~35 KiB of log space
 
 std::string TxnText(const XfsTransaction& txn, const char* what) {
   return std::string(what) + " tid=" + std::to_string(txn.tid()) +
@@ -57,6 +59,99 @@ size_t XfsTransaction::log_bytes() const {
   bytes += (lf::kOpHeaderSize) + (lf::kOpHeaderSize + lf::kTransHeaderSize) +
            (lf::kOpHeaderSize);
   return bytes;
+}
+
+size_t XfsTransaction::record_bytes() const {
+  return lf::kRecordHeaderSize + RoundUp64(log_bytes(), lf::kCycleBlockSize);
+}
+
+bool XfsTransaction::record_fits() const {
+  return RoundUp64(log_bytes(), lf::kCycleBlockSize) <= lf::kHeaderCycleBytes;
+}
+
+Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
+                                         std::vector<uint8_t> data,
+                                         uint16_t blf_type, size_t lsn_offset,
+                                         size_t crc_offset,
+                                         const char* what) {
+  if (data.empty() || data.size() % 512 != 0 || data.size() > 0xffffull * 512) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "metadata buffer length must be a multiple of 512 bytes")
+        .Offset(offset)
+        .Metadata(what ? what : "metadata");
+  }
+  if (lsn_offset + 8 > data.size() || crc_offset + 4 > data.size()) {
+    return XFS_ERR(XfsError::kInternal,
+                   "metadata buffer too small for its lsn/crc fields")
+        .Offset(offset)
+        .Metadata(what ? what : "metadata");
+  }
+  if (offset % 512 != 0) {
+    return XFS_ERR(XfsError::kInternal,
+                   "metadata buffer is not sector aligned")
+        .Offset(offset)
+        .Metadata(what ? what : "metadata");
+  }
+
+  // On-disk LSN and CRC, exactly what the kernel's write verifier would stamp
+  // when it flushes this buffer for our transaction.
+  PutBE64(data.data(), lsn_offset, lsn_);
+  UpdateXfsChecksum(data.data(), data.size(), crc_offset);
+
+  // One buffer log format header plus the whole buffer as one contiguous run
+  // of 128-byte chunks. `blf_size` counts the format plus the run(s).
+  const size_t chunks = data.size() / lf::kBufChunkSize;
+  const size_t map_words = (chunks + 31) / 32;
+  std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
+  StoreLE16(format.data() + 0, lf::kItemBuf);
+  StoreLE16(format.data() + 2, 2);
+  StoreLE16(format.data() + 4,
+            static_cast<uint16_t>(blf_type << lf::kBlftShift));
+  StoreLE16(format.data() + 6, static_cast<uint16_t>(data.size() / 512));
+  StoreLE32(format.data() + 8, static_cast<uint32_t>(offset / 512));
+  StoreLE32(format.data() + 12,
+            static_cast<uint32_t>((offset / 512) >> 32));
+  StoreLE32(format.data() + 16, static_cast<uint32_t>(map_words));
+  for (size_t i = 0; i < chunks; ++i) {
+    // Host byte order bitmap (the kernel reads it with xfs_next_bit): bit i of
+    // word i/32, least significant bit first.
+    format[lf::kBufMapOffset + (i / 32) * 4 + (i % 32) / 8] |=
+        static_cast<uint8_t>(1u << (i % 8));
+  }
+
+  // Replace a previous item for the same buffer (the caller re-dirtied it): the
+  // log carries the final contents, once. A buffer always has the same size, so
+  // the two operations can be replaced in place without shifting other items.
+  auto existing = logged_buffers_.find(offset);
+  if (existing != logged_buffers_.end()) {
+    const size_t index = existing->second.op_index;
+    ops_[index] = LogOp(0, std::move(format));
+    ops_[index + 1] = LogOp(0, std::move(data));
+    for (TransactionWrite& write : writes_) {
+      if (write.offset == offset) {
+        write.data = ops_[index + 1].payload;
+        write.what = what ? what : "metadata";
+        return OkStatus();
+      }
+    }
+    TransactionWrite replacement;
+    replacement.offset = offset;
+    replacement.data = ops_[index + 1].payload;
+    replacement.what = what ? what : "metadata";
+    writes_.push_back(std::move(replacement));
+    return OkStatus();
+  }
+  const size_t op_index = ops_.size();
+  AddLogOp(std::move(format));
+  AddLogOp(std::move(data));
+  logged_buffers_[offset] = LoggedBufferRef{op_index};
+
+  TransactionWrite write;
+  write.offset = offset;
+  write.data = ops_[op_index + 1].payload;
+  write.what = what ? what : "metadata";
+  writes_.push_back(std::move(write));
+  return OkStatus();
 }
 
 Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
@@ -220,7 +315,9 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
 
   for (const TransactionWrite& write : txn.writes_) {
     if (write.inode_metadata && write.ino != 0) {
-      InvalidateCaches(CacheInvalidation::Inode(write.ino));
+      InvalidateCaches(write.data_fork_changed
+                           ? CacheInvalidation::Extents(write.ino)
+                           : CacheInvalidation::Inode(write.ino));
     }
   }
   XFS_TRACE("transaction committed: tid=" << txn.tid() << " lsn=0x" << std::hex

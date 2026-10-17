@@ -649,6 +649,76 @@ struct InodeCounts {
   uint64_t records = 0;
 };
 
+// Recomputes di_nblocks from the extent map (data extents plus bmbt blocks),
+// the same value xfs_repair checks.
+Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
+                           const XfsInode& inode, uint64_t* out) {
+  std::vector<XfsExtent> extents;
+  Status s = LoadDataForkExtents(dev, geo, inode, &extents);
+  if (!s.ok()) return s;
+  uint64_t blocks = 0;
+  for (const XfsExtent& e : extents) blocks += e.blockcount;
+  if (inode.format != di::kFormatBtree) {
+    *out = blocks;
+    return OkStatus();
+  }
+  if (inode.data_fork.size() < bt::kBmdrSize) {
+    return XFS_ERR(XfsError::kCorruptInode, "bmbt fork too small")
+        .Ino(inode.ino)
+        .Metadata("inode");
+  }
+  const uint16_t root_level = GetBE16(inode.data_fork.data(), 0);
+  const uint16_t root_numrecs = GetBE16(inode.data_fork.data(), 2);
+  const size_t node_maxrecs =
+      (inode.data_fork.size() - bt::kBmdrSize) / (bt::kBmbtKeySize + bt::kBmbtPtrSize);
+  BtreeSpec spec;
+  spec.name = "bmbt";
+  spec.format = BtreeFormat::kLong;
+  spec.block_size = geo.block_size;
+  spec.key_size = bt::kBmbtKeySize;
+  spec.ptr_size = bt::kBmbtPtrSize;
+  spec.rec_size = bt::kBmbtRecSize;
+  spec.magic = ondisk::kBmapCrcMagic;
+  spec.max_depth = bt::kMaxTraversalLevels;
+  spec.null_ptr = ~0ull;
+  spec.expected_owner = inode.ino;
+  spec.owner_size = 8;
+  spec.uuid = geo.meta_uuid;
+  spec.ptr_to_daddr = [&](uint64_t fsb, uint64_t* daddr) {
+    if (!geo.FsbValid(fsb)) return false;
+    *daddr = geo.FsbToByte(fsb) / 512;
+    return true;
+  };
+  uint64_t bmbt_blocks = 0;
+  BtreeWalkCallbacks cb;
+  cb.read_block = [&](uint64_t fsb, std::vector<uint8_t>* buf) {
+    if (!geo.FsbValid(fsb)) return false;
+    buf->resize(geo.block_size);
+    return dev.Read(geo.FsbToByte(fsb), buf->data(), buf->size());
+  };
+  cb.ptr_in_range = [&](uint64_t ptr) {
+    return ptr != spec.null_ptr && geo.FsbValid(ptr);
+  };
+  cb.visit = [&](uint64_t, const BtreeBlockMeta&, const uint8_t*) -> Status {
+    ++bmbt_blocks;
+    return OkStatus();
+  };
+  for (uint16_t i = 0; i < root_numrecs; ++i) {
+    const uint64_t ptr = GetBE64(inode.data_fork.data(),
+                                 bt::kBmdrSize + node_maxrecs * 8 + i * 8);
+    if (ptr == spec.null_ptr) {
+      return XFS_ERR(XfsError::kCorruptInode, "bmbt root has a null child")
+          .Ino(inode.ino)
+          .Metadata("inode");
+    }
+    s = WalkBtree(spec, ptr, cb);
+    if (!s.ok()) return s;
+  }
+  (void)root_level;
+  *out = blocks + bmbt_blocks;
+  return OkStatus();
+}
+
 }  // namespace
 
 CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
@@ -717,8 +787,10 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
       }
       const XfsAgf& agf = headers.value().agf;
       const XfsAgi& agi = headers.value().agi;
-      // sb_fdblocks includes AGFL-reserved blocks; AGF freeblks excludes them.
-      total_free += agf.freeblks + agf.flcount;
+      // sb_fdblocks includes AGFL-reserved blocks and the non-root free space
+      // btree blocks (the kernel's fdblocks = freeblks + flcount + btreeblks
+      // identity, also used by xfs_initialize_perag_data and xfs_repair).
+      total_free += agf.freeblks + agf.flcount + agf.btreeblks;
       total_icount += agi.count;
       total_ifree += agi.freecount;
 
@@ -753,11 +825,13 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         FreeSpaceCounts bno;
         uint32_t last_end = 0;
         bool first = true;
+        uint32_t bno_blocks = 0;
         BtreeWalkCallbacks cb;
         cb.read_block = read_ag_block;
         cb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
         cb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
                        const uint8_t* buf) -> Status {
+          ++bno_blocks;
           if (meta.level != 0) return OkStatus();
           for (uint16_t i = 0; i < meta.numrecs; ++i) {
             const uint8_t* rec = BtreeLeafRec(buf, meta, bnobt, i);
@@ -819,11 +893,13 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         FreeSpaceCounts cnt_counts;
         uint32_t last_count = 0;
         bool cnt_first = true;
+        uint32_t cnt_blocks = 0;
         BtreeWalkCallbacks ccb;
         ccb.read_block = read_ag_block;
         ccb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
         ccb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
                         const uint8_t* buf) -> Status {
+          ++cnt_blocks;
           if (meta.level != 0) return OkStatus();
           for (uint16_t i = 0; i < meta.numrecs; ++i) {
             const uint8_t* rec = BtreeLeafRec(buf, meta, cnt, i);
@@ -861,6 +937,20 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                      CheckStatus::kCorrupt,
                      "cntbt total " + std::to_string(cnt_counts.blocks) +
                          " != bnobt total " + std::to_string(bno.blocks));
+        }
+        // agf_btreeblks is the number of non-root free space btree blocks of
+        // both trees (xfs_repair counts exactly these).
+        if (s.ok()) {
+          const uint32_t counted_btreeblks =
+              (bno_blocks > 0 ? bno_blocks - 1 : 0) +
+              (cnt_blocks > 0 ? cnt_blocks - 1 : 0);
+          if (agf.btreeblks != counted_btreeblks) {
+            report.Add("AG" + std::to_string(agno) + " btree blocks",
+                       CheckStatus::kCorrupt,
+                       "agf_btreeblks " + std::to_string(agf.btreeblks) +
+                           " != counted " +
+                           std::to_string(counted_btreeblks));
+          }
         }
 
         // inobt.
@@ -1028,7 +1118,24 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                          inode.error().Format());
               ++bad;
               if (bad > 8) break;
+              continue;
             }
+            uint64_t expected_blocks = 0;
+            Status blocks = ExpectedInodeBlocks(dev, geo, inode.value(),
+                                                &expected_blocks);
+            if (!blocks.ok()) {
+              report.Add("root entry '" + e.name + "' nblocks",
+                         CheckStatus::kCorrupt, blocks.error().Format());
+              ++bad;
+            } else if (inode.value().nblocks != expected_blocks) {
+              report.Add("root entry '" + e.name + "' nblocks",
+                         CheckStatus::kCorrupt,
+                         "di_nblocks " + std::to_string(inode.value().nblocks) +
+                             " != data extents + bmbt blocks " +
+                             std::to_string(expected_blocks));
+              ++bad;
+            }
+            if (bad > 8) break;
           }
         }
       }

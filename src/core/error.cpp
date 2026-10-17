@@ -46,6 +46,7 @@ const char* ToString(XfsError code) {
       return "write range covers a hole";
     case XfsError::kWriteNeedsConversion:
       return "write range covers an unwritten extent";
+    case XfsError::kNoSpace: return "no space left";
     case XfsError::kInternal: return "internal error";
   }
   return "unknown error";
