@@ -32,10 +32,11 @@ CLI (xfswin.exe)                       WinFsp host
   backend; the parser is portable C++20.
 - The formatter (`src/mkfs/`) creates whole filesystems and is called only from
   `xfswin format` after the CLI's destructive-operation guards.
-- `src/write/` holds the mutation layer. For RW-0 that is policy + range
-  mapping + in-place data writes + flush; the transaction/journal/allocator
-  work (RW-1 onwards) belongs next to it. The rule stays the same: WinFsp and
-  the CLI call the high-level mutation API, never inode/btree structures.
+- `src/write/` holds the mutation layer: policy + range mapping + in-place
+  data writes (RW-0), the transaction/journal writer (RW-1), and the block
+  allocator + data fork editor (RW-2, `docs/ALLOCATOR.md`). The rule stays the
+  same: WinFsp and the CLI call the high-level mutation API, never inode/btree
+  structures.
 
 ## Safety invariants
 
@@ -60,9 +61,12 @@ CLI (xfswin.exe)                       WinFsp host
    inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas, realtime,
    external logs, metadir, zoned) are refused for read-write with the blocking
    feature named, never updated best-effort.
-8. A mutation validates its whole effect before it writes anything
+8. A fast-path mutation validates its whole effect before it writes anything
    (`MapWrittenRange`): a partially valid range is refused as a whole, so a
-   failed request cannot leave half of it applied.
+   failed request cannot leave half of it applied. Multi-transaction
+   operations (RW-2 writes and truncates) are sequenced so that every
+   intermediate state on disk - including after a crash between two
+   transactions - is a legal XFS state this build and Linux both accept.
 9. Read-write mounting of real devices is refused in code (`--rw-experimental`
    plus an image target), not by convention.
 
@@ -243,31 +247,53 @@ file data) to keep them coherent.
 Cold listings still read every inode once (metadata must be correct); warm
 listings of a 4000-entry directory take tens of milliseconds.
 
-## Read-write support (RW-0: data, RW-1: transactions)
+## Read-write support (RW-0: data, RW-1: transactions, RW-2: allocator)
 
-Status: in-place overwrites of existing allocated, written data, and metadata
-transactions through the journal (currently used for the inode timestamps a
-write produces). Nothing else.
-Roadmap: RW-2 allocator + extend/truncate, RW-3 inode allocation +
-create/unlink, RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw
-devices (VHD first). `docs/JOURNAL.md` is the reference for the log format.
+Status: an existing regular file can be overwritten in place, extended and
+truncated. Every metadata change (inode, allocator, free-space btrees,
+superblock counters) goes through the journal as a real transaction, and every
+block allocation/free is done through the RW-2 allocator. Nothing else:
+create/unlink/rename/mkdir/symlink still require the inode allocator and
+directory updates.
+Roadmap: RW-3 inode allocation + create/unlink, RW-4 rename/hardlink/symlink,
+RW-5 journal replay, RW-6 raw devices (VHD first). `docs/JOURNAL.md` is the
+reference for the log format, `docs/ALLOCATOR.md` for the allocator and the
+data fork editor.
 
-**Write path.** `XfsFilesystem::OverwriteFileData` (`src/write/file_data.cpp`):
-take the mutation lock, load the inode and its data-fork extent list, map the
-range with `MapWrittenRange`, then write each mapped run straight through the
-block device, then invalidate. The range rule is checked for the *whole*
-request first: every byte must be inside a written (not unwritten, not hole)
-extent, and `offset + length` must not exceed the inode size. Growth, holes and
-unwritten extents are refused (`kWriteExtendsFile`, `kWriteNeedsAllocation`,
-`kWriteNeedsConversion`) because each of them needs a metadata transaction
-this build does not implement yet. Immutable and append-only inodes are
-refused before anything is written.
+**Write path.** `XfsFilesystem::WriteFileData` (`src/write/file_write.cpp`) is
+the single entry point for `pwrite`/WinFsp `Write`/append:
+
+- *Fast path* (`OverwriteFileData` policy, `src/write/file_data.cpp`): if the
+  whole range is inside existing written extents and EOF does not move, the
+  range is mapped with `MapWrittenRange` (the *whole* request must be valid;
+  a partially valid range is refused as a whole), each mapped run is written
+  straight through the block device and the caches are invalidated. Immutable
+  and append-only inodes are refused before anything is written.
+- *General path* (RW-2): a write that needs allocation, a conversion from an
+  unwritten extent, or an EOF extension is handled with the ordering described
+  in `docs/ALLOCATOR.md` §5: transaction 1 allocates every hole as an
+  *unwritten* extent and updates the inode (size unchanged), then the data is
+  written block by block (freshly allocated blocks are composed from zeros,
+  preserved old written content and the caller's bytes - never uninitialised
+  disk contents) and flushed, then transaction 2 converts the written range
+  and moves `di_size` together with the data. A crash can therefore only show
+  the old size, zero-reading bytes beyond the old EOF, or the complete new
+  state.
+
+`SetFileSize` either just moves the logical EOF (growing: the new range is a
+hole; an existing written extent that would become visible is zeroed and
+flushed first, like `xfs_zero_range`), or zeroes the tail of the partially kept
+block, removes the extents beyond `ceil(new_size / blocksize)`, frees their
+data blocks and updates `di_size`/`di_nblocks` in bounded transactions - the
+rolling-truncate scheme of `xfs_itruncate_extents_flags`, where a crash in the
+middle leaves a smaller extent map with the old size (a legal state).
 
 XFS never journals file data, so the data itself needs no transaction. The
-inode change that a write produces (mtime/ctime) does, and RW-1 runs exactly
-that: data write -> transaction (log record, then the inode) -> flush. A crash
-before the record is durable leaves the old timestamps, a crash after it leaves
-a dirty log the kernel replays; both are covered by the crash matrix.
+metadata a write produces (timestamps, size, extent map, allocator) does, and
+RW-1/RW-2 run exactly that: data write -> flush -> transaction (log record,
+then metadata) -> flush. A crash before the record is durable leaves the old
+state, a crash after it leaves a dirty log the kernel replays; both are covered
+by the crash matrix.
 
 **Cache invalidation.** `include/xfs/cache.h` is the single source of truth.
 Every mutation builds a `CacheInvalidation` and calls
@@ -332,6 +358,28 @@ inode is rewritten with the new times, the transaction LSN and a fresh CRC.
 `OverwriteFileData` calls it inside its own transaction, so a successful write
 persists mtime/ctime like Linux does.
 
+RW-2 extends the same transaction with metadata buffers and fork regions:
+
+- every modified allocator buffer (AGF, AGFL, bnobt/cntbt blocks, superblock)
+  is added as an `XFS_LI_BUF` item (`XfsTransaction::AddMetadataBuffer`): the
+  buffer's on-disk LSN and CRC are stamped *before* logging (what the kernel's
+  write verifiers do), the whole buffer is logged as one region, and items are
+  deduplicated by device offset so one transaction logs each buffer once;
+- the inode item carries `XFS_ILOG_CORE | XFS_ILOG_DEXT` (packed extent
+  records) or `XFS_ILOG_CORE | XFS_ILOG_DBROOT` (the in-core in-fork btree
+  root) when the data fork changed, exactly like `xfs_inode_item_format`;
+- a fork region on the inode item marks the transaction write as
+  `data_fork_changed`, which is what drives the `Extents(ino)` invalidation
+  below;
+- buffer writes happen only after the record is durable, and replay skips a
+  buffer whose on-disk LSN is newer than the record being replayed
+  (`xlog_recover_get_buf_lsn`), so write-back order between transactions does
+  not matter.
+
+The log record size is bounded (this writer emits no extension headers): one
+transaction may produce at most 32 KiB of log data, and allocator/btree work
+that would exceed the bound is refused before anything is written.
+
 **The log is left clean.** `WriteCleanUnmountRecord` runs at unmount (the CLI
 after a write, the WinFsp host when the mount point disappears) and is what
 lets the next mount - ours or Linux's - start without replaying anything. A
@@ -345,11 +393,12 @@ and a security descriptor that actually allows writing. File attributes follow
 the volume and the POSIX mode bits: on a writable volume a 0644 file is
 writable, a 0444 file is reported read-only.
 
-**Locking model.** RW-0 uses one coarse `mutation_mutex_` for all mutations
-(correctness first; per-object locking comes once the writer is stable). It
-also orders "device write" against "cache publication" for concurrent readers,
-which is what the generation counter relies on. Reads stay lock-free apart
-from the existing cache mutexes.
+**Locking model.** RW-0 through RW-2 use one coarse `mutation_mutex_` for all
+mutations (correctness first; per-object locking comes once the writer is
+stable). It also orders "device write" against "cache publication" for
+concurrent readers, which is what the generation counter relies on; parallel
+writes to the same file serialize on it, and appends resolve EOF inside it.
+Reads stay lock-free apart from the existing cache mutexes.
 
 **Crash injection.** `include/xfs/crash.h` + `src/core/crash.cpp`:
 `XFSWIN_CRASH_AT=<point>[:<hit>]` terminates the process (no destructors, no
@@ -366,6 +415,15 @@ The contract: before the record is durable the old timestamps must be visible,
 after it the kernel must replay it and show the logged new ones, file data is
 old or new but never garbage, and the filesystem must stay clean. See
 `docs/TESTING.md` §5.
+
+RW-2 doubles the matrix across an extend and a truncate
+(`verify_crash_rw2_windows.ps1`, `verify_crash_rw2_linux.sh`): every point
+inside both write transactions, the data write, the flushes and the truncate
+transactions is killed, the image is checked *before* replay on Windows
+(`rw2_crash_check.py`: WAL contents, size, content contract) and again *after*
+replay on Linux (`rw2_crash_replay_check.py` + `xfs_repair -n`). Every crash
+image must replay to a legal old or new state: no exposed uninitialised bytes,
+no negative/garbage free-block counters, and a filesystem the kernel mounts.
 
 ## WinFsp adapter contracts
 
@@ -386,16 +444,24 @@ Findings that the adapter must honor (all verified by the CI mount job):
 - `cat` must switch stdout to binary mode (`_setmode(_O_BINARY)`) or Windows
   translates every `\n` in file data to CRLF.
 - Write callbacks that are not implemented yet (`Create`, `Overwrite`,
-  `SetBasicInfo`, `SetFileSize`, `CanDelete`, `Rename`, `SetSecurity`,
-  `SetVolumeLabel`) return `STATUS_MEDIA_WRITE_PROTECTED` on a read-only volume
-  and `STATUS_NOT_SUPPORTED` on a read-write one: calling a read-write volume
+  `SetBasicInfo`, `CanDelete`, `Rename`, `SetSecurity`, `SetVolumeLabel`)
+  return `STATUS_MEDIA_WRITE_PROTECTED` on a read-only volume and
+  `STATUS_NOT_SUPPORTED` on a read-write one: calling a read-write volume
   "write protected" would be false.
 - `Write` receives an offset for normal handles and a write-to-end flag for
-  append handles; append is refused in RW-0 instead of being turned into an
-  in-place write at the wrong offset.
-- A write that needs an allocation, a conversion or a size change is refused
-  (`STATUS_NOT_SUPPORTED`) and the refusal is logged with the core error; the
-  adapter never writes a partial result.
+  append handles; the append offset is resolved inside the core under its
+  mutation lock (`WriteFileData(..., append=true)`), so a concurrent append
+  cannot overwrite the previous one's bytes.
+- `Write` may allocate, convert unwritten extents and move EOF (RW-2). A
+  refusal is logged with the core error and the adapter never writes a partial
+  result; out-of-space maps to `STATUS_DISK_FULL` (`kNoSpace`).
+- `SetFileSize` is the truncate/extend entry (`SetEndOfFile`); the adapter
+  refreshes the node's cached inode and extent list afterwards (`RefreshNode`),
+  so the next `GetFileInfo`/read sees the new size and map. A
+  `SetAllocationSize` request is accepted as advisory without preallocating.
+- `Cleanup` stays empty: deletes are refused, so there is no delete-on-close
+  work; file size changes need no pending-allocation repair (Windows retries
+  through the same callbacks after a failure).
 - Drive letters are per logon session: a letter created by an elevated process
   is invisible to the user's Explorer session. Directory mount points are NTFS
   junctions and are visible across sessions, so elevated mounts should use
