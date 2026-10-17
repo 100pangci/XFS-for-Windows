@@ -139,7 +139,9 @@ def main(path: str) -> int:
 
     meta_uuid = sbsect[248:264]
     if not (incompat & (1 << 2)):  # META_UUID not set
-        assert meta_uuid == uuid
+        # The kernel derives the metadata uuid from sb_uuid and never writes
+        # sb_meta_uuid to disk in this case.
+        assert meta_uuid == b"\x00" * 16, meta_uuid
 
     print(f"superblock OK: block={blocksize} sector={sectsize} "
           f"inode={inodesize} agcount={agcount} agblocks={agblocks}")
@@ -270,7 +272,9 @@ def main(path: str) -> int:
     assert inode[4] == 3, "root inode version"
     check_crc(inode, 100, "root inode")
     assert u64(inode, 152) == rootino, "root inode number"
-    assert inode[160:176] == meta_uuid, "root inode uuid"
+    # di_uuid carries the metadata uuid, which equals sb_uuid when the
+    # META_UUID incompat feature is not set.
+    assert inode[160:176] == uuid, "root inode uuid"
     mode = u16(inode, 2)
     size = u64(inode, 56)
     fmt = inode[5]

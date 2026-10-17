@@ -118,7 +118,7 @@ void InitRtMetadataInode(const FormatGeometry& geo, uint8_t* core, uint64_t ino,
   PutBE64(core, di::kCtime, ts);
   PutBE64(core, di::kCrtime, ts);
   if (bitmap) {
-    PutBE16(core, di::kFlags, 0x1000);  // XFS_DIFLAG_NEWRTBM
+    PutBE16(core, di::kFlags, 0x0004);  // XFS_DIFLAG_NEWRTBM
   }
   PutBE64(core, di::kIno, ino);
   std::memcpy(core + di::kUuid, geo.meta_uuid.data(), 16);

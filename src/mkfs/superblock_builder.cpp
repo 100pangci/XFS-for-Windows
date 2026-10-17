@@ -106,7 +106,10 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   PutBE32(p, sb::kSpinoAlign, 0);
   PutBE64(p, sb::kPquotino, 0);
   PutBE64(p, sb::kLsn, 0);
-  std::memcpy(p + sb::kMetaUuid, geo.meta_uuid.data(), 16);
+  // sb_meta_uuid is only written when XFS_SB_FEAT_INCOMPAT_META_UUID is set;
+  // without it the kernel derives the metadata uuid from sb_uuid and the
+  // on-disk field stays zero (xfs_repair rejects garbage past sb_lsn).
+  std::memset(p + sb::kMetaUuid, 0, 16);
 
   UpdateXfsChecksum(p, geo.sector_size, sb::kCrc);
 }

@@ -129,6 +129,16 @@ jobs:
           xfs_db -r -c 'agf 0' -c 'p freeblks longest btreeblks flcount flfirst fllast' /tmp/ref-min.img
           echo "=== min inobt root ==="
           xfs_db -r -c 'agi 0' -c 'addr root' -c 'p' /tmp/ref-min.img || true
+          echo
+          echo "=== raw sb bytes 240..272 (both images) ==="
+          od -A d -t x1 -j 240 -N 32 /tmp/ref.img
+          od -A d -t x1 -j 240 -N 32 /tmp/ref-min.img
+          echo
+          echo "=== xfs_repair -n on real mkfs images ==="
+          set +e
+          xfs_repair -n /tmp/ref.img; echo "repair(default) exit=$?"
+          xfs_repair -n /tmp/ref-min.img; echo "repair(minimal) exit=$?"
+          set -e
 
   # ---------------------------------------------------------------------------
   # Linux: verify the Windows-formatted image with the real xfsprogs, then
