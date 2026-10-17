@@ -222,8 +222,12 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
     if (error) *error = "file not found: " + target;
     return nullptr;
   }
-  auto dev = ImageBlockDevice::Open(path, writable, 512);
-  if (!dev && error) *error = "cannot open image: " + target;
+  std::string open_error;
+  auto dev = ImageBlockDevice::Open(path, writable, 512, &open_error);
+  if (!dev && error) {
+    *error = "cannot open image: " + target +
+             (open_error.empty() ? "" : " (" + open_error + ")");
+  }
   return dev;
 }
 
