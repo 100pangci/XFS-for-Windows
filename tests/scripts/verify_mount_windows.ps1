@@ -75,6 +75,22 @@ try {
     Assert (($vi | Out-String) -match 'XFS') "volume file system name is not XFS"
 
     # -----------------------------------------------------------------------
+    # Path resolution smoke test (nested opens)
+    # -----------------------------------------------------------------------
+    "== path resolution smoke test =="
+    foreach ($p in @("${Drive}\", "${Drive}\hello.txt", "${Drive}\folder",
+                     "${Drive}\bigdir", "${Drive}\fragdir",
+                     "${Drive}\sparse.img")) {
+        try {
+            $i = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+            "  OK   $p ($($i.Attributes))"
+        } catch {
+            "  FAIL $p : $($_.Exception.Message)"
+        }
+        "  mount alive: $(-not $proc.HasExited)"
+    }
+
+    # -----------------------------------------------------------------------
     # Directory listing and attributes
     # -----------------------------------------------------------------------
     "== directory listing =="

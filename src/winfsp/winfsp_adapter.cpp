@@ -593,6 +593,12 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
                        std::to_string(static_cast<uint32_t>(status)) + ")");
   }
   winfsp->UserContext = state.get();
+  // Install WinFsp's built-in operation guard and serialize every operation.
+  // The core is not thread-safe (shared block device state), so the FSD must
+  // hold its exclusive lock around all callbacks; setting only the strategy
+  // is not enough (EnterOperation is NULL by default and skips locking).
+  FspFileSystemSetOperationGuard(winfsp, FspFileSystemOpEnter,
+                                 FspFileSystemOpLeave);
   FspFileSystemSetOperationGuardStrategy(
       winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE);
 
