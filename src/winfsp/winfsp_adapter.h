@@ -30,6 +30,11 @@ Status RequestUnmount(const std::wstring& drive);
 
 bool IsValidDriveLetter(const std::wstring& drive);
 
+// Drives the adapter callbacks directly (without a WinFsp driver or mount) to
+// validate buffer handling: open/list directories and files, read data and
+// verify the process heap after every step. Used by `xfswin selftest`.
+int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem);
+
 }  // namespace xfs::winfsp
 
 #endif  // XFSWIN_HAS_WINFSP

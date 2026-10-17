@@ -17,7 +17,10 @@ typedef NTSTATUS* PNTSTATUS;
 #include <sddl.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 #include <cwchar>
 #include <vector>
 
@@ -54,6 +57,11 @@ struct AdapterState {
 struct FileContext {
   XfsInode inode;
 };
+
+// Temporary diagnostic: tracks live file contexts to catch double Close /
+// bogus pointers (heap corruption investigation).
+std::mutex g_context_mutex;
+std::unordered_set<PVOID> g_live_contexts;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -302,6 +310,10 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   if (!context) return STATUS_INSUFFICIENT_RESOURCES;
   context->inode = std::move(inode.value());
   *file_context = context;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mutex);
+    g_live_contexts.insert(context);
+  }
   FillFileInfo(state, context->inode, file_info);
   HeapCheck("Open");
   return STATUS_SUCCESS;
@@ -315,6 +327,16 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64,
 VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {}
 
 VOID Close(FSP_FILE_SYSTEM*, PVOID file_context) {
+  bool known = true;
+  {
+    std::lock_guard<std::mutex> lock(g_context_mutex);
+    known = 0 != g_live_contexts.erase(file_context);
+  }
+  if (!known) {
+    XFS_WARN("Close: unknown or already-freed file context " << file_context);
+    HeapCheck("Close-unknown");
+    return;
+  }
   delete static_cast<FileContext*>(file_context);
   HeapCheck("Close");
 }
@@ -419,6 +441,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 
   auto entries = state.fs->ListDirectory(context.inode.ino);
   if (!entries.ok()) return NtFromError(entries.error().code);
+  HeapCheck("ReadDirectory.ListDirectory");
 
   struct Child {
     std::u16string name;
@@ -438,6 +461,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   }
   std::sort(children.begin(), children.end(),
             [](const Child& a, const Child& b) { return a.name < b.name; });
+  HeapCheck("ReadDirectory.children");
 
   auto resolve_info = [&](uint64_t ino, XfsInode* out) -> bool {
     auto inode = state.fs->OpenInode(ino);
@@ -524,6 +548,161 @@ bool IsDriveLetterLike(const std::wstring& drive) {
 
 bool IsValidDriveLetter(const std::wstring& drive) {
   return IsDriveLetterLike(drive);
+}
+
+int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
+  if (!filesystem) {
+    std::fprintf(stderr, "selftest: no filesystem\n");
+    return 1;
+  }
+  int failures = 0;
+  auto check = [&](bool cond, const char* what) {
+    if (!cond) {
+      std::fprintf(stderr, "SELFTEST FAIL: %s\n", what);
+      ++failures;
+    }
+    return cond;
+  };
+
+  AdapterState state;
+  state.fs = std::move(filesystem);
+  const XfsGeometry& geo = state.fs->geometry();
+  const XfsSuperblock& sb = state.fs->superblock();
+  state.sector_size = 512;
+  state.sectors_per_allocation_unit =
+      static_cast<uint16_t>(std::max<uint32_t>(1, geo.block_size / 512));
+  state.label = Utf8ToUtf16(sb.label.data());
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          L"O:BAG:BAD:(A;;FR;;;WD)", SDDL_REVISION_1,
+          &state.security_descriptor, &state.security_descriptor_size)) {
+    std::fprintf(stderr, "selftest: security descriptor failed\n");
+    return 1;
+  }
+
+  FSP_FILE_SYSTEM fake{};
+  fake.UserContext = &state;
+
+  const wchar_t* dirs[] = {L"\\", L"\\folder", L"\\fragdir"};
+  const wchar_t* files[] = {L"\\hello.txt", L"\\large.bin", L"\\sparse.img",
+                            L"\\folder\\link"};
+  std::vector<uint8_t> dir_buffer(64 * 1024);
+  std::vector<uint8_t> read_buffer(128 * 1024);
+  std::vector<uint8_t> sd_buffer(1024);
+  std::wstring marker;
+
+  auto enumerate = [&](PVOID ctx, const char* what) {
+    size_t total = 0;
+    marker.clear();
+    bool first = true;
+    for (int guard = 0; guard < 10000; ++guard) {
+      ULONG transferred = 0;
+      NTSTATUS st = ReadDirectory(
+          &fake, ctx, nullptr,
+          first ? nullptr : const_cast<PWSTR>(marker.c_str()), dir_buffer.data(),
+          static_cast<ULONG>(dir_buffer.size()), &transferred);
+      if (!check(st == STATUS_SUCCESS, "ReadDirectory status")) break;
+      if (transferred == 0) break;
+      size_t pos = 0;
+      std::wstring last;
+      bool end_marker = false;
+      while (pos + 2 <= transferred) {
+        uint16_t rec_size =
+            *reinterpret_cast<const uint16_t*>(dir_buffer.data() + pos);
+        if (rec_size == 0) {
+          end_marker = true;
+          break;
+        }
+        if (rec_size < sizeof(FSP_FSCTL_DIR_INFO) ||
+            pos + rec_size > transferred) {
+          check(false, "directory record size out of range");
+          break;
+        }
+        const auto* di =
+            reinterpret_cast<const FSP_FSCTL_DIR_INFO*>(dir_buffer.data() +
+                                                        pos);
+        size_t chars =
+            (rec_size - sizeof(FSP_FSCTL_DIR_INFO)) / sizeof(char16_t);
+        last.assign(di->FileNameBuf, di->FileNameBuf + chars);
+        pos += (rec_size + 7u) & ~size_t{7u};
+        ++total;
+      }
+      if (end_marker) break;
+      if (last.empty()) {
+        check(false, "no marker progress");
+        break;
+      }
+      marker = last;
+      first = false;
+    }
+    std::fprintf(stderr, "selftest: %s -> %zu entries\n", what, total);
+  };
+
+  const int kIterations = 20;
+  for (int iter = 0; iter < kIterations; ++iter) {
+    FSP_FSCTL_VOLUME_INFO vi{};
+    check(GetVolumeInfo(&fake, &vi) == STATUS_SUCCESS, "GetVolumeInfo");
+    check(vi.TotalSize == geo.dblocks * geo.block_size, "volume size");
+
+    for (const wchar_t* dir : dirs) {
+      UINT32 attrs = 0;
+      check(GetSecurityByName(&fake, const_cast<PWSTR>(dir), &attrs, nullptr,
+                              nullptr) == STATUS_SUCCESS,
+            "GetSecurityByName attrs");
+      SIZE_T sd_size = sd_buffer.size();
+      check(GetSecurityByName(&fake, const_cast<PWSTR>(dir), &attrs,
+                              sd_buffer.data(), &sd_size) == STATUS_SUCCESS,
+            "GetSecurityByName sd");
+
+      PVOID ctx = nullptr;
+      FSP_FSCTL_FILE_INFO fi{};
+      if (!check(Open(&fake, const_cast<PWSTR>(dir), FILE_DIRECTORY_FILE, 0,
+                      &ctx, &fi) == STATUS_SUCCESS,
+                 "Open directory")) {
+        continue;
+      }
+      check((fi.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+            "directory attribute");
+      enumerate(ctx, "dir");
+      check(GetFileInfo(&fake, ctx, &fi) == STATUS_SUCCESS, "GetFileInfo dir");
+      Close(&fake, ctx);
+    }
+
+    for (const wchar_t* file : files) {
+      PVOID ctx = nullptr;
+      FSP_FSCTL_FILE_INFO fi{};
+      if (!check(Open(&fake, const_cast<PWSTR>(file), 0, 0, &ctx, &fi) ==
+                     STATUS_SUCCESS,
+                 "Open file")) {
+        continue;
+      }
+      ULONG transferred = 0;
+      check(Read(&fake, ctx, read_buffer.data(), 0,
+                 static_cast<ULONG>(read_buffer.size()),
+                 &transferred) == STATUS_SUCCESS,
+            "Read file");
+      check(GetFileInfo(&fake, ctx, &fi) == STATUS_SUCCESS, "GetFileInfo file");
+      Close(&fake, ctx);
+    }
+
+    if (iter < 3) {
+      PVOID ctx = nullptr;
+      FSP_FSCTL_FILE_INFO fi{};
+      if (check(Open(&fake, const_cast<PWSTR>(L"\\bigdir"),
+                     FILE_DIRECTORY_FILE, 0, &ctx, &fi) == STATUS_SUCCESS,
+                "Open bigdir")) {
+        enumerate(ctx, "bigdir");
+        Close(&fake, ctx);
+      }
+    }
+
+    check(HeapValidate(GetProcessHeap(), 0, nullptr), "heap valid");
+    if (failures) break;
+  }
+
+  LocalFree(state.security_descriptor);
+  std::fprintf(stderr, "selftest: %s (%d failures)\n",
+               failures ? "FAILED" : "PASSED", failures);
+  return failures ? 1 : 0;
 }
 
 Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,

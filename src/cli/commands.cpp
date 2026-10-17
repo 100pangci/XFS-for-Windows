@@ -31,6 +31,7 @@
 
 #ifdef XFSWIN_HAS_WINFSP
 #include "winfsp/mount_host.h"
+#include "winfsp/winfsp_adapter.h"
 #endif
 
 namespace xfs::cli {
@@ -781,6 +782,31 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandUnmount(positional[1]);
+  }
+  if (command == "selftest") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin selftest <device|image>\n";
+      return 1;
+    }
+#ifdef XFSWIN_HAS_WINFSP
+    {
+      std::string error;
+      auto dev = OpenTarget(positional[1], false, false, &error);
+      if (!dev) {
+        std::cerr << "error: " << error << "\n";
+        return 1;
+      }
+      auto fs = XfsFilesystem::Mount(std::move(dev), MountOptions{});
+      if (!fs.ok()) {
+        PrintError(fs.error());
+        return 1;
+      }
+      return xfs::winfsp::RunAdapterSelfTest(std::move(fs.value()));
+    }
+#else
+    std::cerr << "error: this build has no WinFsp support\n";
+    return 1;
+#endif
   }
 
   std::cerr << "unknown command: " << command << "\n\n";
