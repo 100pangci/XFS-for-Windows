@@ -672,7 +672,9 @@ int CommandFormat(const std::string& target, const Options& options) {
 
 int CommandMount(const std::string& target, const std::string& drive,
                  const Options& options) {
-#ifdef XFSWIN_HAS_WINFSP
+  // Safety policy, enforced regardless of whether this build has WinFsp:
+  // read-write mounting is restricted to image files until the writer has
+  // passed crash-consistency and interoperability testing.
   if (options.rw_experimental && IsRawDevicePath(target)) {
     std::cerr << "error: writable mounting of real devices is not enabled in "
                  "this version.\n"
@@ -680,6 +682,7 @@ int CommandMount(const std::string& target, const std::string& drive,
                  "(--rw-experimental).\n";
     return 3;
   }
+#ifdef XFSWIN_HAS_WINFSP
   return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
                               options.verbose || options.debug,
                               options.rw_experimental);
