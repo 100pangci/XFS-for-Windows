@@ -288,6 +288,13 @@ jobs:
           "using $($dll.FullName)"
           Copy-Item $dll.FullName "build\src\$env:BUILD_CONFIG\"
 
+      - name: Adapter self-test (no driver required)
+        shell: pwsh
+        run: |
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe selftest "golden\populated.img"
+          if ($LASTEXITCODE -ne 0) { throw "adapter selftest failed" }
+
       - name: Mount and verify read-only semantics
         shell: pwsh
         run: |

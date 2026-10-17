@@ -19,9 +19,9 @@ typedef NTSTATUS* PNTSTATUS;
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
-#include <unordered_set>
 #include <cwchar>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "xfs/log.h"
@@ -52,16 +52,29 @@ struct AdapterState {
   std::u16string label;
   uint16_t sector_size = 512;
   uint16_t sectors_per_allocation_unit = 8;
+  // File contexts are identified by a monotonically increasing id (never
+  // reused). WinFsp may call Close twice for one open: once when a failed
+  // Overwrite releases the context and again when the handle is torn down.
+  // Close is therefore idempotent and the map (not the raw pointer) owns the
+  // inode data.
+  std::mutex context_mutex;
+  std::unordered_map<uint64_t, XfsInode> contexts;
+  uint64_t next_context_id = 1;
 };
 
-struct FileContext {
-  XfsInode inode;
-};
+uint64_t ContextId(PVOID context) {
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
+}
 
-// Temporary diagnostic: tracks live file contexts to catch double Close /
-// bogus pointers (heap corruption investigation).
-std::mutex g_context_mutex;
-std::unordered_set<PVOID> g_live_contexts;
+// Copies the inode for a live file context. Returns false for stale contexts.
+bool LookupContext(AdapterState& state, PVOID context, XfsInode* out) {
+  if (!context) return false;
+  std::lock_guard<std::mutex> lock(state.context_mutex);
+  auto it = state.contexts.find(ContextId(context));
+  if (it == state.contexts.end()) return false;
+  *out = it->second;
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -212,15 +225,6 @@ bool NeedsSecurityOverflow(AdapterState& state, SIZE_T* size) {
   return false;
 }
 
-// Temporary diagnostic: verifies the process heap after each callback so that
-// the first corrupting operation can be identified (0xC0000374 crashes).
-void HeapCheck(const char* where) {
-  std::fprintf(stderr, "[heap] validate after %s\n", where);
-  std::fflush(stderr);
-  if (!HeapValidate(GetProcessHeap(), 0, nullptr)) {
-    XFS_WARN("HEAP CORRUPTION detected after " << where);
-  }
-}
 
 // Reads data for a regular file or a symlink (whose target is exposed as the
 // file content in this first version).
@@ -254,7 +258,6 @@ NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM* file_system,
                        sizeof(volume_info->VolumeLabel));
   volume_info->VolumeLabelLength = static_cast<UINT16>(label_bytes);
   std::memcpy(volume_info->VolumeLabel, state.label.data(), label_bytes);
-  HeapCheck("GetVolumeInfo");
   return STATUS_SUCCESS;
 }
 
@@ -281,7 +284,6 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   }
   FillSecurity(state, security_descriptor, security_descriptor_size,
                file_attributes, attributes);
-  HeapCheck("GetSecurityByName");
   return STATUS_SUCCESS;
 }
 
@@ -296,8 +298,8 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   AdapterState& state = *State(file_system);
   auto inode = ResolvePath(*state.fs, file_name);
   if (!inode.ok()) {
-    XFS_WARN("Open('" << WideToUtf8(file_name)
-                      << "') failed: " << inode.error().Format());
+    XFS_DEBUG("Open('" << WideToUtf8(file_name)
+                       << "') failed: " << inode.error().Format());
     return NtFromError(inode.error().code);
   }
   if ((create_options & FILE_DIRECTORY_FILE) && !inode.value().IsDir()) {
@@ -306,16 +308,15 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   if ((create_options & FILE_NON_DIRECTORY_FILE) && inode.value().IsDir()) {
     return STATUS_FILE_IS_A_DIRECTORY;
   }
-  auto* context = new (std::nothrow) FileContext();
-  if (!context) return STATUS_INSUFFICIENT_RESOURCES;
-  context->inode = std::move(inode.value());
-  *file_context = context;
+  XfsInode node = std::move(inode.value());
+  FillFileInfo(state, node, file_info);
+  uint64_t id;
   {
-    std::lock_guard<std::mutex> lock(g_context_mutex);
-    g_live_contexts.insert(context);
+    std::lock_guard<std::mutex> lock(state.context_mutex);
+    id = state.next_context_id++;
+    state.contexts.emplace(id, std::move(node));
   }
-  FillFileInfo(state, context->inode, file_info);
-  HeapCheck("Open");
+  *file_context = reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
   return STATUS_SUCCESS;
 }
 
@@ -326,31 +327,27 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64,
 
 VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {}
 
-VOID Close(FSP_FILE_SYSTEM*, PVOID file_context) {
-  bool known = true;
-  {
-    std::lock_guard<std::mutex> lock(g_context_mutex);
-    known = 0 != g_live_contexts.erase(file_context);
-  }
-  if (!known) {
-    XFS_WARN("Close: unknown or already-freed file context " << file_context);
-    HeapCheck("Close-unknown");
-    return;
-  }
-  delete static_cast<FileContext*>(file_context);
-  HeapCheck("Close");
+VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
+  AdapterState& state = *State(file_system);
+  if (!file_context) return;
+  // Idempotent: WinFsp closes a context on a failed Overwrite and then closes
+  // it again when the handle is torn down.
+  std::lock_guard<std::mutex> lock(state.context_mutex);
+  state.contexts.erase(ContextId(file_context));
 }
 
 NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
               PVOID buffer, UINT64 offset, ULONG length,
               PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
-  const FileContext& context = *static_cast<const FileContext*>(file_context);
-  if (context.inode.IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
-  auto read = ReadInode(state, context.inode, offset, buffer, length);
+  XfsInode node;
+  if (!LookupContext(state, file_context, &node)) {
+    return STATUS_INVALID_HANDLE;
+  }
+  if (node.IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
+  auto read = ReadInode(state, node, offset, buffer, length);
   if (!read.ok()) return NtFromError(read.error().code);
   *bytes_transferred = static_cast<ULONG>(read.value());
-  HeapCheck("Read");
   return STATUS_SUCCESS;
 }
 
@@ -366,9 +363,11 @@ NTSTATUS Flush(FSP_FILE_SYSTEM*, PVOID, FSP_FSCTL_FILE_INFO*) {
 NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                      FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
-  const FileContext& context = *static_cast<const FileContext*>(file_context);
-  FillFileInfo(state, context.inode, file_info);
-  HeapCheck("GetFileInfo");
+  XfsInode node;
+  if (!LookupContext(state, file_context, &node)) {
+    return STATUS_INVALID_HANDLE;
+  }
+  FillFileInfo(state, node, file_info);
   return STATUS_SUCCESS;
 }
 
@@ -399,7 +398,6 @@ NTSTATUS GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID,
   }
   FillSecurity(state, security_descriptor, security_descriptor_size, nullptr,
                FILE_ATTRIBUTE_READONLY);
-  HeapCheck("GetSecurity");
   return STATUS_SUCCESS;
 }
 
@@ -429,8 +427,11 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                        PWSTR /*pattern*/, PWSTR marker, PVOID buffer,
                        ULONG length, PULONG bytes_transferred) {
   AdapterState& state = *State(file_system);
-  const FileContext& context = *static_cast<const FileContext*>(file_context);
-  if (!context.inode.IsDir()) return STATUS_NOT_A_DIRECTORY;
+  XfsInode context;
+  if (!LookupContext(state, file_context, &context)) {
+    return STATUS_INVALID_HANDLE;
+  }
+  if (!context.IsDir()) return STATUS_NOT_A_DIRECTORY;
   *bytes_transferred = 0;
 
   // Fixed ordering: ".", "..", then children sorted by Windows name. The
@@ -439,9 +440,8 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                                       : std::u16string();
   bool marker_seen = marker == nullptr;
 
-  auto entries = state.fs->ListDirectory(context.inode.ino);
+  auto entries = state.fs->ListDirectory(context.ino);
   if (!entries.ok()) return NtFromError(entries.error().code);
-  HeapCheck("ReadDirectory.ListDirectory");
 
   struct Child {
     std::u16string name;
@@ -461,7 +461,6 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   }
   std::sort(children.begin(), children.end(),
             [](const Child& a, const Child& b) { return a.name < b.name; });
-  HeapCheck("ReadDirectory.children");
 
   auto resolve_info = [&](uint64_t ino, XfsInode* out) -> bool {
     auto inode = state.fs->OpenInode(ino);
@@ -475,16 +474,16 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   };
 
   // Dot entries (only for non-root directories; the FSD handles root ".").
-  if (context.inode.ino != state.fs->RootInode()) {
+  if (context.ino != state.fs->RootInode()) {
     for (bool parent_entry : {false, true}) {
       std::u16string wname = parent_entry ? u".." : u".";
       if (!marker_seen) {
         if (wname == marker_name) marker_seen = true;
         continue;
       }
-      XfsInode target = context.inode;
+      XfsInode target = context;
       if (parent_entry) {
-        auto parent = state.fs->LookupName(context.inode.ino, "..");
+        auto parent = state.fs->LookupName(context.ino, "..");
         if (!parent.ok() || !resolve_info(parent.value().ino, &target)) {
           continue;
         }
@@ -505,14 +504,12 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
     if (!resolve_info(child.ino, &inode)) continue;
     if (!AddOneDirectoryEntry(file_system, inode, child.name, buffer, length,
                               bytes_transferred)) {
-      HeapCheck("ReadDirectory-full");
       return STATUS_SUCCESS;
     }
   }
   // End-of-directory marker: tells the FSD the enumeration is complete (see
   // FspFileSystemAddDirInfo with a NULL DirInfo).
   FspFileSystemAddDirInfo(nullptr, buffer, length, bytes_transferred);
-  HeapCheck("ReadDirectory");
   return STATUS_SUCCESS;
 }
 

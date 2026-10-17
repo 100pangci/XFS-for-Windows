@@ -75,19 +75,14 @@ try {
     Assert (($vi | Out-String) -match 'XFS') "volume file system name is not XFS"
 
     # -----------------------------------------------------------------------
-    # Path resolution smoke test (nested opens)
+    # Nested path resolution
     # -----------------------------------------------------------------------
-    "== path resolution smoke test =="
+    "== path resolution =="
     foreach ($p in @("${Drive}\", "${Drive}\hello.txt", "${Drive}\folder",
                      "${Drive}\bigdir", "${Drive}\fragdir",
                      "${Drive}\sparse.img")) {
-        try {
-            $i = Get-Item -LiteralPath $p -Force -ErrorAction Stop
-            "  OK   $p ($($i.Attributes))"
-        } catch {
-            "  FAIL $p : $($_.Exception.Message)"
-        }
-        "  mount alive: $(-not $proc.HasExited)"
+        $i = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+        "  OK $p ($($i.Attributes))"
     }
 
     # -----------------------------------------------------------------------
@@ -99,27 +94,11 @@ try {
     Assert ($top.Count -eq $expectedTop.Count) `
         "root entry count $($top.Count) != manifest $($expectedTop.Count)"
     $names = $top | ForEach-Object { $_.Name }
-    $top | ForEach-Object {
-        "  entry: {0} attrs={1} size={2}" -f $_.Name, $_.Attributes, $_.Length
-    }
     foreach ($name in @('hello.txt', 'folder', '中文文件名.txt', 'large.bin',
                         'sparse.img', 'bigdir', 'fragmented.bin')) {
         Assert ($names -contains $name) "root listing missing $name"
     }
-    "== bigdir resolution diagnostics =="
-    $proc.Refresh()
-    "mount process after listing: HasExited=$($proc.HasExited) exit=$(if ($proc.HasExited) { '0x{0:X8}' -f $proc.ExitCode } else { 'running' })"
-    $bigdirPath = Join-Path $mountPoint 'bigdir'
-    $di = [System.IO.DirectoryInfo]::new($bigdirPath)
-    "DirectoryInfo.Exists: $($di.Exists)"
-    try {
-        $gi = Get-Item -LiteralPath $bigdirPath -Force -ErrorAction Stop
-        "Get-Item OK: $($gi.FullName) attrs=$($gi.Attributes)"
-    } catch {
-        "Get-Item failed: $($_.Exception.Message)"
-    }
-    cmd /c "dir `"$bigdirPath`" 2>&1" | Select-Object -First 8
-    $bigdir = @(Get-ChildItem $bigdirPath)
+    $bigdir = @(Get-ChildItem (Join-Path $mountPoint 'bigdir'))
     $expectedBig = @($script:manifestEntries | Where-Object {
         $_.type -eq 'file' -and $_.path -like 'bigdir/*'
     })
@@ -202,15 +181,11 @@ try {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
     $proc.Refresh()
-    "mount process final: HasExited=$($proc.HasExited) exit=$(if ($proc.HasExited) { '0x{0:X8}' -f $proc.ExitCode } else { 'running' })"
-    try {
-        Get-WinEvent -FilterHashtable @{
-            LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-10)
-        } -ErrorAction Stop |
-            Where-Object { $_.Message -match 'xfswin' } |
-            Select-Object -First 2 |
-            ForEach-Object { "EVENT: $($_.Message)" }
-    } catch { "no application events" }
+    $exitText = if ($proc.HasExited) { '0x{0:X8}' -f $proc.ExitCode } else { 'running' }
+    "mount process final: exit=$exitText"
+    if ($proc.HasExited -and $proc.ExitCode -ne 0) {
+        "WARNING: mount host exited with a non-zero code"
+    }
     if ($mounted -and (Test-Path $mountPoint)) {
         "warning: $mountPoint still present after unmount"
     }
