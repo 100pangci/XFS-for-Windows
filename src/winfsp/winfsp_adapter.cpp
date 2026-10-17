@@ -207,7 +207,8 @@ bool NeedsSecurityOverflow(AdapterState& state, SIZE_T* size) {
 // Temporary diagnostic: verifies the process heap after each callback so that
 // the first corrupting operation can be identified (0xC0000374 crashes).
 void HeapCheck(const char* where) {
-  XFS_DEBUG("heap check after " << where);
+  std::fprintf(stderr, "[heap] validate after %s\n", where);
+  std::fflush(stderr);
   if (!HeapValidate(GetProcessHeap(), 0, nullptr)) {
     XFS_WARN("HEAP CORRUPTION detected after " << where);
   }
