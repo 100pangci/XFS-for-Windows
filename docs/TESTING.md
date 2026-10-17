@@ -152,7 +152,7 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs five jobs:
+Every push runs seven jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
    suite, formats a 300 MiB image, runs `xfswin check`, and cross-checks the
@@ -174,7 +174,15 @@ Every push runs five jobs:
    the Linux image at `X:`, verifies reads/hashes/Unicode names, and asserts
    that create/delete/rename/mkdir are rejected as write-protected before
    unmounting.
+6. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+   VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
+   with the raw device backend, reads it back with `info`/`check`/`ls`, and
+   detaches it. Uploads the VHD.
+7. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+   from the artifact and runs the full Linux verification (`xfs_db`,
+   `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
+   through the raw device path -- the CI stand-in for Case C hardware.
 
 This is the environment-independent version of the Linux/WinFsp acceptance
-checks; see the jobs for the exact commands. All five jobs are green on the
+checks; see the jobs for the exact commands. All seven jobs are green on the
 current `main`.

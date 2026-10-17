@@ -1,6 +1,7 @@
 # XFS for Windows
 
 [![CI](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml/badge.svg)](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
 
 A Windows-native XFS tool: format XFS v5 filesystems and read existing ones,
 including a read-only WinFsp mount as a normal drive letter. No WSL, no Linux
@@ -28,7 +29,7 @@ realtime device, no writes to existing filesystems.**
 | Feature | Status |
 |---|---|
 | Image files (`*.img`, `*.raw`) | yes, read + format |
-| `\\.\PhysicalDriveN` | yes, read + format (Administrator required) |
+| `\\.\PhysicalDriveN` | yes, read + format (CI-verified on an attached VHD; Administrator required) |
 | `\\.\HarddiskVolumeX` | read yes; format refused in v1 |
 | Superblock + secondary superblocks | parse + CRC/UUID/geometry verify |
 | AGF / AGI / AGFL | parse + verify |
@@ -175,9 +176,10 @@ log must fit inside one AG).
   kept internally and shown by `xfswin stat`.
 - `xfswin check` is not `xfs_repair`: it verifies structure and CRCs but never
   fixes anything.
-- Leaf/node directory formats are implemented but currently exercise only
-  the code paths covered by unit tests; golden images from Linux are the next
-  validation step. See `docs/TESTING.md`.
+- Real hardware (`\\.\PhysicalDriveN`) is exercised in CI by attaching a fixed
+  VHD as a blank disk, formatting it through the raw device path and verifying
+  the result with Linux `xfs_repair -n` and mounts. A spare physical disk is
+  otherwise only needed for hands-on testing.
 
 ## Testing
 
