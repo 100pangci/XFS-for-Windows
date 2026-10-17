@@ -100,12 +100,19 @@ jobs:
           & $exe cat out\fixture-write.img /hello.bin | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "cat failed after pwrite" }
 
-          # Growth needs an allocation transaction; writes without the
-          # confirmation flag and reads-write mounts of real devices are
-          # refused; the refusal must not change the image.
-          Assert-Refused 1 "write past EOF" {
-            & $exe pwrite out\fixture-write.img /hello.bin 32765 --rw-experimental --text=toolong
-          }
+          # RW-2: writing past EOF grows the file through a real allocation
+          # transaction, and truncate sets the size back.
+          & $exe pwrite out\fixture-write.img /hello.bin 32768 --rw-experimental --text=GROWN
+          if ($LASTEXITCODE -ne 0) { throw "growing write failed" }
+          & $exe truncate out\fixture-write.img /hello.bin 32000 --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "truncate failed" }
+          & $exe check out\fixture-write.img
+          if ($LASTEXITCODE -ne 0) { throw "check failed after growth/truncate" }
+          python tests/tools/rw2_probe.py out/fixture-write.img --quiet
+          if ($LASTEXITCODE -ne 0) { throw "the independent oracle rejected the image" }
+
+          # Writes without the confirmation flag and read-write mounts of real
+          # devices are refused; the refusal must not change the image.
           Assert-Refused 3 "write without --rw-experimental" {
             & $exe pwrite out\fixture-write.img /hello.bin 0 --text=x
           }
@@ -125,11 +132,43 @@ jobs:
             -WorkDir "crash"
           if ($LASTEXITCODE -ne 0) { throw "crash matrix failed" }
 
+      - name: RW-2 round-trip images (extend / truncate / reuse / btree)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw2_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "rw2"
+          if ($LASTEXITCODE -ne 0) { throw "RW-2 round-trip image generation failed" }
+
+      - name: RW-2 crash matrix (allocator + extent map + size)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_rw2_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "crash-rw2"
+          if ($LASTEXITCODE -ne 0) { throw "RW-2 crash matrix failed" }
+
       - name: Upload the crash images
         uses: actions/upload-artifact@v4
         with:
           name: rw-crash
           path: crash/
+          if-no-files-found: error
+
+      - name: Upload the RW-2 round-trip images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw2-images
+          path: rw2/
+          if-no-files-found: error
+
+      - name: Upload the RW-2 crash images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw2-crash
+          path: crash-rw2/
           if-no-files-found: error
 
       - name: Upload xfswin.exe
@@ -504,6 +543,115 @@ jobs:
         run: |
           ls -l crash | head -20
           sudo bash tests/scripts/verify_crash_linux.sh crash crash/pristine.img
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the RW-2 round trip: file extension, truncate, reuse of
+  # freed blocks, a btree-format extent map, and reverse interoperability (the
+  # kernel writes to a Windows-extended file).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw2:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw2-images
+          path: rw2
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Mount, replay and verify every RW-2 image
+        run: |
+          ls -l rw2
+          sudo bash tests/scripts/verify_rw2_linux.sh rw2
+
+      - name: Upload the reverse-interoperability image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw2-reverse
+          path: rw2/reverse.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux replays every RW-2 crash image: extend and truncate, every crash
+  # point, both transactions of an extend. The kernel must see the old or the
+  # new state, and xfs_repair -n must stay silent.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw2-crash:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw2-crash
+          path: crash-rw2
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Replay and verify every RW-2 crash window
+        run: |
+          ls -l crash-rw2 | head -20
+          sudo bash tests/scripts/verify_crash_rw2_linux.sh crash-rw2
+
+  # ---------------------------------------------------------------------------
+  # Windows reads back the image Linux appended to: the reverse direction of
+  # interoperability for an extended file.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw2-reverse:
+    needs: linux-verify-rw2
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw2-reverse
+          path: rw2
+
+      - name: Read the Linux-modified image with xfswin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "bin\xfswin.exe"
+          python tests/tools/rw2_probe.py rw2/reverse.img --inode 67
+          if ($LASTEXITCODE -ne 0) { throw "oracle rejected the reverse image" }
+          # Start-Process redirects the child's stdout handle, so the binary
+          # output is byte-exact on every PowerShell version (a pipeline or `>`
+          # may decode and re-encode native output).
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList @('cat', 'rw2\reverse.img', '/hello.bin') `
+            -RedirectStandardOutput 'reverse.bin' -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "cat failed on the reverse image ($($proc.ExitCode))"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes("reverse.bin")
+          if ($bytes.Length -ne 45019) {
+            throw "reverse image size $($bytes.Length) != 45019"
+          }
+          $tail = [System.Text.Encoding]::ASCII.GetString(
+            $bytes, $bytes.Length - 19, 19)
+          if ($tail -ne 'LINUX-AFTER-WINDOWS') {
+            throw "tail is '$tail', expected LINUX-AFTER-WINDOWS"
+          }
+          Write-Output "reverse interoperability verified: $($bytes.Length) bytes"
 
   # ---------------------------------------------------------------------------
   # Raw device path (Case C): attach a fixed VHD as a real disk and format it

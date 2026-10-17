@@ -44,11 +44,12 @@ realtime device, no writes to existing filesystems.**
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
-| **Experimental read-write mount** | images only (`--rw-experimental`): overwrite bytes inside existing allocated data, timestamps through a metadata transaction |
-| Writing that grows a file, fills a hole or converts an unwritten extent | **not implemented** (refused, never guessed) |
-| create / delete / rename / mkdir / truncate / symlink | **not implemented** (refused) |
-| Journal writer (metadata transactions) | yes (RW-1): log records, inode items, clean unmount records; Linux replays them in CI |
-| Metadata written so far | inode `mtime`/`ctime` (with `di_lsn` and CRC) via `SetFileTimes`; nothing else |
+| **Experimental read-write mount** | images only (`--rw-experimental`): existing regular files can be overwritten, extended and truncated through real transactions |
+| Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
+| Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
+| create / delete / rename / mkdir / symlink | **not implemented** (refused) |
+| Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
+| Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt and the superblock free block counter |
 | Journal replay (reading a dirty log) | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`; Linux replays ours) |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
@@ -75,30 +76,45 @@ record this project wrote (or reject a torn one), the file must show either the
 old timestamps or the logged new ones, and `xfs_repair -n` must stay silent.
 See [docs/JOURNAL.md](docs/JOURNAL.md) and [docs/TESTING.md](docs/TESTING.md).
 
-## Read-write support (experimental, RW-0 data + RW-1 transactions)
+RW-2 adds the block allocator and the data fork editor:
+[`docs/ALLOCATOR.md`](docs/ALLOCATOR.md) describes the on-disk rules, the
+transaction integration and the conservative limits. The Linux CI job
+`linux-verify-rw2` mounts Windows-extended, Windows-truncated, block-reusing and
+btree-format images, verifies their bytes through the kernel, runs
+`xfs_repair -n`, then appends to the extended file so the next Windows job can
+read the result back (reverse interoperability). `linux-verify-rw2-crash`
+replays every crash window of an extend and a truncate.
+
+## Read-write support (experimental, RW-2: overwrite, extend, truncate)
 
 ```text
 xfswin mount test.img X: --rw-experimental   # image only; real disks stay read-only
 xfswin pwrite test.img /hello.bin 4096 --rw-experimental --text=hello
+xfswin extend test.img /hello.bin 45000 --rw-experimental
+xfswin truncate test.img /hello.bin 20000 --rw-experimental
 ```
 
 Scope of this milestone:
 
-- **In-place overwrites only.** The write range must lie entirely inside
-  extents that are already allocated *and* written. Anything that would need a
-  metadata transaction is refused with a specific error: growing a file
-  (`write would extend the file`), a hole (`write range covers a hole`), an
-  unwritten/preallocated extent (`write range covers an unwritten extent`).
-  create/delete/rename/mkdir/truncate/symlink are refused as well; Windows
-  attribute or timestamp changes are refused too (the core currently writes the
-  timestamps a write produces, nothing else).
-- **Data is not journalled, metadata is.** XFS never logs file data, so the
-  data write goes straight to the device. The inode change that a write
-  produces (`mtime`/`ctime`) goes through a real transaction (RW-1): the log
-  record is written and flushed first, then the inode buffer, then the log is
-  closed with an unmount record. Linux replays those records in CI
-  (`linux-verify-crash`), and a crash at any phase leaves either the old or the
-  new state - never in between.
+- **Existing regular files only.** A file can be overwritten, extended and
+  truncated, and every block allocation/free goes through a transaction. The
+  file must already exist: create/delete/rename/mkdir/symlink are refused (they
+  need the inode allocator and directory updates, RW-3).
+- **Allocator and extent map.** `src/write/alloc.cpp` maintains the AGF, AGFL,
+  bnobt and cntbt (allocate, free, split, merge, tree splits, superblock
+  counters) inside the transaction. `src/write/bmap.cpp` maintains the inode's
+  data fork (extents format and bmap btree, including the conversions Linux
+  requires). See [docs/ALLOCATOR.md](docs/ALLOCATOR.md).
+- **Crash safety by construction.** An extension first allocates *unwritten*
+  extents (a transaction), writes the data and flushes, then converts the
+  written range and sets the size (a second transaction). A crash can therefore
+  only leave zeros beyond the old EOF, never stale disk contents; a shrink
+  zeroes the tail of a partially kept block before the metadata commits. Every
+  committed record replays atomically on Linux, including the allocator
+  metadata and the superblock counters.
+- **Accounting is exact.** `sb_fdblocks = Σ(agf_freeblks + agf_flcount +
+  agf_btreeblks)` after every operation, which is what the kernel's
+  `xfs_initialize_perag_data` and `xfs_repair` recompute.
 - **Allow-list mount policy.** A filesystem may be mounted read-write only if
   this build can maintain every structure it uses. finobt, rmapbt, reflink,
   sparse inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas,
@@ -111,8 +127,14 @@ Scope of this milestone:
   name of the finished feature.
 - **Cache coherency.** Windows' own file cache is flushed and purged on close
   (`FlushAndPurgeOnCleanup`), file info is not cached, and the core drops the
-  affected data chunks through one central invalidation path with a per-inode
-  write generation, so a concurrent read can never resurrect stale bytes.
+  affected data chunks, inode, file info and extent list through one central
+  invalidation path with a per-inode write generation, so a concurrent read can
+  never resurrect stale bytes.
+- **Limits.** A single truncate is split over multiple transactions (like
+  Linux's rolling truncate) when it would remove more than ~48 extents; a
+  transaction that would produce more than 32 KiB of log data is refused before
+  anything is written. There is no reflink/rmap/finobt support, and a
+  multi-level free-space tree is only collapsed one leaf at a time.
 - **Flush is real.** `FlushFileBuffers` failure is an error
   (`STATUS_IO_DEVICE_ERROR`), never success; unmount flushes before the mount
   point disappears.
@@ -207,13 +229,15 @@ destructive flag), `3` refused for safety reasons.
   `FSP_FSCTL_VOLUME_PARAMS::ReadOnlyVolume=1`, opens the block device
   read-only and rejects every write-path callback.
 - Read-write mounts are opt-in (`--rw-experimental`), image only, and restricted
-  to the scope described above: in-place overwrites of existing allocated,
-  written data plus the inode timestamps those writes produce. They are an
-  allow-list: a filesystem with features this build cannot keep consistent is
-  refused for read-write instead of being modified best-effort.
-- The core has no allocator, no inode allocator and no journal writer yet, so
-  it cannot create, delete, rename, grow or shrink anything. The journal is
-  only ever *read* (cleanliness check); a dirty log refuses mount.
+  to the scope described above: an existing regular file can be overwritten,
+  extended and truncated, including the block allocations, extent map and
+  allocator metadata those operations need. They are an allow-list: a
+  filesystem with features this build cannot keep consistent is refused for
+  read-write instead of being modified best-effort.
+- Namespace changes are still refused: the core has no inode allocator, so it
+  cannot create, delete, rename, mkdir or create symlinks. The journal is only
+  ever *read* on mount (cleanliness check); a dirty log refuses mount (Linux
+  replays logs written by this build).
 - `xfswin format` is still the only writer of a whole filesystem, and the only
   path that can destroy existing data.
 

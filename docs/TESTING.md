@@ -49,11 +49,12 @@ python tests\tools\xfs_probe.py build\smoke.img
 It must print `ALL STRUCTURAL CHECKS PASSED`. This catches bugs where the C++
 reader and writer share a wrong assumption.
 
-## Read-write tests (RW-0 data, RW-1 transactions)
+## Read-write tests (RW-0 data, RW-1 transactions, RW-2 allocator)
 
 The write path is the same core code for the CLI and for WinFsp, so it is
 tested in layers. RW-1 added the journal, so the layers now include a log
-format oracle and a crash matrix that Linux replays.
+format oracle and a crash matrix that Linux replays. RW-2 adds the allocator
+and the extent map; every layer below runs on it as well.
 
 ### 1. Unit and integration tests (no driver, no Linux)
 
@@ -71,6 +72,27 @@ cache invalidation, the mount policy and the crash-injection configuration
   the inode LSN equals the newest log record's LSN,
 - write-ahead ordering observed through a recording device: file data, then
   log header, log data, flush, then the inode, then flush.
+
+RW-2 adds `tests/unit/rw2_tests.cpp`, all against the real fixture image and a
+fresh remount afterwards:
+
+- append one block, a multi-block append, a sparse extension (the gap must be
+  a hole and free-block accounting must only change for the written blocks);
+- writing into a hole inside the file without changing the size;
+- truncate shrink (blocks return to the allocator), truncate grow (no
+  allocation, zeros), truncate to zero (`nextents`/`nblocks` = 0), and the
+  zeroing of the partially kept last block (a later extension can only see
+  zeros);
+- reuse: truncating the file frees its extent, and the next allocation is
+  carved out of the merged free extent;
+- the extent map converting to btree format at 22 extents and back to extents
+  format when the truncate drops below the fork capacity, with `di_nblocks`
+  counting data *and* bmbt blocks;
+- the allocator counters after mixed allocate/free operations.
+
+Every one of these images is also checked by `xfswin check`, which now also
+recomputes `di_nblocks` from the extent map and the bmbt blocks, and verifies
+`agf_btreeblks` against the number of non-root free-space btree blocks.
 
 The images come from `tests/support/fixture_image.cpp`, which builds a
 *consistent* filesystem with one allocated file on top of the real formatter:
@@ -97,22 +119,29 @@ CI against the Linux-populated and golden images.
 
 ```powershell
 xfswin pwrite test.img /hello.bin 4096 --rw-experimental --from=overlay.bin
+xfswin extend test.img /hello.bin 45000 --rw-experimental
+xfswin truncate test.img /hello.bin 20000 --rw-experimental
 xfswin check test.img
+python tests\tools\rw2_probe.py test.img --inode 67
 ```
 
-`pwrite` performs the same core write the WinFsp `Write` callback does (in
-place, image only, requires `--rw-experimental`), so CI can verify writes
-against Linux oracles without the WinFsp driver.
+`pwrite`, `extend` and `truncate` perform the same core mutations the WinFsp
+callbacks do (image only, require `--rw-experimental`), so CI can verify writes
+against Linux oracles without the WinFsp driver. `pwrite` supports growth now;
+`extend` writes the deterministic pattern `((offset * 131) + 7) & 0xFF` (or a
+`--fill=0xNN` constant) past EOF; `truncate` is `SetFileSize`.
 
 ### 3. WinFsp read-write mount
 
 Without a driver, `xfswin selftest <image> --rw-experimental` drives the real
-callbacks (open, write, flush, re-open, read back) and checks that a write past
-EOF is refused. With a driver,
+callbacks (open, write, flush, re-open, read back), then writes past EOF,
+shrinks the file, grows it sparsely and shrinks it again, verifying the size and
+the data through a fresh node. With a driver,
 `tests/scripts/verify_mount_rw_windows.ps1` mounts the image read-write,
 overwrites bytes in a file through WinFsp, verifies the read-back, asserts that
-create/delete/rename/mkdir/truncate/append/writes-past-EOF/writes-to-0444-files
-are all refused, then writes a second overlay through `xfswin pwrite` and runs
+namespace operations (create/delete/rename/mkdir) and writes to 0444 files are
+refused, exercises growth, append handles and `SetEndOfFile` shrink/grow on an
+existing file, then writes a second overlay through `xfswin pwrite` and runs
 `xfswin check`.
 
 ### 4. Linux interoperability round trip (CI)
@@ -275,16 +304,17 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs nine jobs:
+Every push runs twelve jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
-   suite (including the journal tests), formats a 300 MiB image, runs `xfswin
-   check`, cross-checks the image with the independent Python probe, builds the
-   fixture image (one allocated file) and probes it, exercises the CLI write
-   path (`pwrite`, refusals, `check` after the write), and runs the crash
-   matrix (`verify_crash_windows.ps1`), uploading the crash images for the
-   replay job. Uploads `xfswin.exe`, the Windows-formatted image, the fixture
-   image and the crash images.
+   suite (including the journal and allocator tests), formats a 300 MiB image,
+   runs `xfswin check`, cross-checks the image with the independent Python
+   probe, builds the fixture image (one allocated file) and probes it,
+   exercises the CLI write path (`pwrite`, growth, truncate, refusals, `check`
+   after the writes), generates the RW-2 round-trip images
+   (`verify_rw2_windows.ps1`) and runs both crash matrices
+   (`verify_crash_windows.ps1`, `verify_crash_rw2_windows.ps1`), uploading
+   every image for the Linux jobs.
 2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
    `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
    output) for comparison against the formatter.
@@ -305,8 +335,10 @@ Every push runs nine jobs:
    reads/hashes/Unicode names, asserts that create/delete/rename/mkdir are
    rejected as write-protected, then mounts the read-write image with
    `--rw-experimental`, overwrites bytes through the WinFsp `Write` callback,
-   asserts the RW-0 refusals, writes a second overlay through `xfswin pwrite`
-   and uploads the modified image.
+   exercises growth, append handles and `SetEndOfFile` on an existing file,
+   asserts that namespace operations and writes to 0444 files stay refused,
+   writes a second overlay through `xfswin pwrite` and uploads the modified
+   image.
 6. **linux-verify-rw** (ubuntu-24.04): verifies the read-write round trip:
    `xfs_repair -n` must stay clean, the two modified files must match the
    content regenerated by `tests/tools/rw_content.py` with the overlays
@@ -318,14 +350,27 @@ Every push runs nine jobs:
    which makes the kernel *replay* the log record this project wrote, and
    requires the window contract from `docs/TESTING.md` §5 (old timestamps
    before the record is durable, the logged new ones after it, data old or new,
-   a clean log afterwards and `xfs_repair -n` silence).8. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
-   VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
-   with the raw device backend, reads it back with `info`/`check`/`ls`, and
-   detaches it. Uploads the VHD.
-9. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
-   from the artifact and runs the full Linux verification (`xfs_db`,
-   `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
-   through the raw device path -- the CI stand-in for Case C hardware.
+   a clean log afterwards and `xfs_repair -n` silence).
+8. **linux-verify-rw2** (ubuntu-24.04): mounts the Windows-extended,
+   Windows-truncated, block-reusing and btree-format images (allocator and
+   extent-map mutations), verifies their content through the kernel and with
+   the independent `rw2_probe.py`, requires `xfs_repair -n` silence, then
+   appends to the extended file so the reverse job can read it back.
+9. **linux-verify-rw2-crash** (ubuntu-24.04): replays every crash window of an
+   extend and a truncate (`verify_crash_rw2_linux.sh`) and requires a legal old
+   or new state with a clean log and clean repair.
+10. **windows-verify-rw2-reverse** (windows-2022): reads the image Linux
+    appended to with `xfswin cat` and checks the size and tail bytes - the
+    reverse direction of interoperability (Linux continues writing, Windows
+    reads it back).
+11. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+    VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
+    with the raw device backend, reads it back with `info`/`check`/`ls`, and
+    detaches it. Uploads the VHD.
+12. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+    from the artifact and runs the full Linux verification (`xfs_db`,
+    `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
+    through the raw device path -- the CI stand-in for Case C hardware.
 
 This is the environment-independent version of the Linux/WinFsp acceptance
 checks; see the jobs for the exact commands.
