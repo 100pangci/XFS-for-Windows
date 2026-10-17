@@ -46,7 +46,8 @@ realtime device, no writes to existing filesystems.**
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
 | Writes to an existing XFS | **never** (read-only mount, write callbacks return `STATUS_MEDIA_WRITE_PROTECTED`) |
 | Journal replay | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`) |
-| XFS v4, external log, realtime, parent pointers, metadir, zoned | rejected with a clear error |
+| Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
+| XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
 
 Both directions are verified on real systems by CI: the Windows-formatted
 image passes Linux `xfs_db`, `xfs_repair -n` and loop mounts (read-only and a
@@ -105,10 +106,19 @@ xfswin stat test.img /hello.txt               # inode details
 xfswin mount test.img X:                      # read-only WinFsp mount
 xfswin unmount X:
 xfswin mount \\.\PhysicalDrive2 X:            # real disk (Administrator)
+xfswin mount \\.\HarddiskVolume11 E:\XFS      # a partition, as a directory mount
 ```
 
 Global options: `--verbose`, `--debug`, `--force-unsafe-ro`,
 `--yes-i-really-mean-it`.
+
+Drive letters are per logon session: a letter created by an **elevated** process
+is not visible to the non-elevated Explorer session. Raw-device access itself
+requires Administrator, so for real disks prefer a **directory mount point**
+(an NTFS junction, visible across sessions), e.g.
+`xfswin mount \\.\HarddiskVolume11 E:\XFS`, or map the directory with `subst`
+from your own session (`subst G: E:\XFS`). `scripts\find-xfs-volumes.ps1`
+(elevated) lists XFS partitions and their `\\.\HarddiskVolumeN` paths.
 
 Exit codes: `0` success, `1` error, `2` dry-run (format without the
 destructive flag), `3` refused for safety reasons.

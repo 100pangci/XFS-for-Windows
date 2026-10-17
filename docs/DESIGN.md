@@ -84,9 +84,13 @@ Feature policy:
 
 - Supported incompat features: `FTYPE`, `SPINODES`, `META_UUID`, `BIGTIME`,
   `NREXT64`, `EXCHRANGE` (no on-disk impact for reading).
+- `PARENT` (parent pointers) is accepted read-only: the directory and inode
+  layouts are unchanged; parent pointers are stored as private `parent`
+  xattrs (parent inode + generation) in each child's attribute fork, which the
+  reader never parses and the mount never writes.
 - Accepted ro-compat features (read-only safe): `FINOBT`, `RMAPBT`,
   `REFLINK`, `INOBTCNT`.
-- Rejected: `NEEDSREPAIR`, `PARENT`, `METADIR`, `ZONED`, `ZONE_GAPS`,
+- Rejected: `NEEDSREPAIR`, `METADIR`, `ZONED`, `ZONE_GAPS`,
   unknown incompat bits, unknown v4-era version/features2 bits, `asciici`
   (case-insensitive) directories.
 - Rejected geometry for v1: external log, realtime device, XFS v4.
@@ -199,4 +203,17 @@ Findings that the adapter must honor (all verified by the CI mount job):
 - Write callbacks (`Create`, `Write`, `Overwrite`, `SetBasicInfo`,
   `SetFileSize`, `CanDelete`, `Rename`, `SetSecurity`, `SetVolumeLabel`)
   return `STATUS_MEDIA_WRITE_PROTECTED`.
+- Drive letters are per logon session: a letter created by an elevated process
+  is invisible to the user's Explorer session. Directory mount points are NTFS
+  junctions and are visible across sessions, so elevated mounts should use
+  them (`mount <dev> E:\XFS`).
+- A directory mount point must **not** pre-exist: WinFsp creates it with
+  `FILE_FLAG_DELETE_ON_CLOSE` and removes it on unmount. The adapter deletes an
+  existing empty directory first and refuses non-empty ones.
+- A drive letter that is already mapped (network drive, `subst`, another
+  volume) is refused up front via `GetLogicalDrives`; WinFsp would otherwise
+  report success while the letter still resolves to the existing device.
+- Unmount signalling uses a named event derived from a hash of the normalized
+  mount point (directory paths contain backslashes, which are invalid in
+  event names).
 

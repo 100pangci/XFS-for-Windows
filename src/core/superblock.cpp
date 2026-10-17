@@ -229,6 +229,7 @@ Status ParseSuperblockBuffer(const uint8_t* buf, size_t len, bool verify_crc,
   f.bigtime = (sb.features_incompat & ondisk::kIncompatBigtime) != 0;
   f.nrext64 = (sb.features_incompat & ondisk::kIncompatNrext64) != 0;
   f.exchrange = (sb.features_incompat & ondisk::kIncompatExchrange) != 0;
+  f.parent = (sb.features_incompat & ondisk::kIncompatParent) != 0;
   f.finobt = (sb.features_ro_compat & ondisk::kRoCompatFinobt) != 0;
   f.rmapbt = (sb.features_ro_compat & ondisk::kRoCompatRmapbt) != 0;
   f.reflink = (sb.features_ro_compat & ondisk::kRoCompatReflink) != 0;
@@ -571,12 +572,7 @@ Status CheckMountable(const XfsSuperblock& sb) {
         .Metadata("superblock")
         .Actual(sb.features.incompat_unknown);
   }
-  if (sb.features_incompat & ondisk::kIncompatParent) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "PARENT (parent pointers) filesystems are not supported "
-                   "by this build")
-        .Metadata("superblock");
-  }
+
   if (sb.features_incompat & ondisk::kIncompatMetadir) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "METADIR (metadata directories) filesystems are not "

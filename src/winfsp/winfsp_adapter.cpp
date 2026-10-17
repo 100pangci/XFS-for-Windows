@@ -23,6 +23,8 @@ typedef NTSTATUS* PNTSTATUS;
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
+#include <filesystem>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -554,12 +556,26 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD) {
   return TRUE;
 }
 
-std::wstring StopEventName(const std::wstring& drive) {
-  wchar_t letter = drive.empty() ? L'X' : drive[0];
-  if (letter >= L'a' && letter <= L'z') letter = letter - L'a' + L'A';
-  std::wstring name = L"Local\\xfswin.mount.";
-  name.push_back(letter);
-  return name;
+std::wstring NormalizeMountPoint(const std::wstring& mount_point) {
+  std::wstring s = mount_point;
+  while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+  for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+  return s;
+}
+
+// Named events live in Local\ and must be stable between mount and unmount but
+// unique per mount point. Drive letters and directories both map to a hash.
+std::wstring StopEventName(const std::wstring& mount_point) {
+  const std::wstring s = NormalizeMountPoint(mount_point);
+  uint64_t h = 1469598103934665603ull;  // FNV-1a 64-bit
+  for (wchar_t c : s) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ull;
+  }
+  wchar_t buf[48] = {};
+  swprintf_s(buf, L"Local\\xfswin.mount.%016llX",
+             static_cast<unsigned long long>(h));
+  return buf;
 }
 
 bool IsDriveLetterLike(const std::wstring& drive) {
@@ -569,6 +585,15 @@ bool IsDriveLetterLike(const std::wstring& drive) {
   wchar_t c = drive[0];
   return ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z')) &&
          drive[1] == L':';
+}
+
+// Absolute directory mount point such as E:\XFS (WinFsp junctions).
+bool IsDirectoryMountPoint(const std::wstring& mount_point) {
+  if (mount_point.size() < 4) return false;
+  const wchar_t c = mount_point[0];
+  const bool letter = ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'));
+  return letter && mount_point[1] == L':' &&
+         (mount_point[2] == L'\\' || mount_point[2] == L'/');
 }
 
 }  // namespace
@@ -737,9 +762,45 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   if (!filesystem) {
     return XFS_ERR(XfsError::kInvalidArgument, "no filesystem to mount");
   }
-  if (!IsDriveLetterLike(config.mount_point)) {
+  const bool directory_mount = IsDirectoryMountPoint(config.mount_point);
+  if (!directory_mount && !IsDriveLetterLike(config.mount_point)) {
     return XFS_ERR(XfsError::kInvalidArgument,
-                   "mount point must be a drive letter like X:");
+                   "mount point must be a drive letter (X:) or an absolute "
+                   "directory (e.g. E:\\XFS)");
+  }
+
+  if (directory_mount) {
+    // WinFsp creates the directory mount point itself (with DELETE_ON_CLOSE),
+    // so it must not exist yet. Accept an existing *empty* directory by
+    // removing it; refuse anything else. Directory mount points live on NTFS
+    // and are visible across sessions, unlike drive letters created from an
+    // elevated process.
+    std::error_code ec;
+    if (std::filesystem::exists(config.mount_point, ec)) {
+      if (ec || !std::filesystem::is_empty(config.mount_point, ec) || ec) {
+        return XFS_ERR(XfsError::kAlreadyExists,
+                       "mount directory already exists and is not empty: " +
+                           WideToUtf8(config.mount_point));
+      }
+      std::filesystem::remove(config.mount_point, ec);
+      if (ec) {
+        return XFS_ERR(XfsError::kIoError,
+                       "cannot remove empty mount directory " +
+                           WideToUtf8(config.mount_point));
+      }
+    }
+  } else {
+    // Refuse to mount over an existing drive letter (network mapping, subst,
+    // another volume, ...). WinFsp would otherwise report success while the
+    // letter still resolves to the existing device.
+    const DWORD drives = GetLogicalDrives();
+    const int letter = towupper(config.mount_point[0]) - L'A';
+    if (letter >= 0 && letter < 26 && (drives & (1u << letter)) != 0) {
+      return XFS_ERR(XfsError::kAlreadyExists,
+                     "drive letter " + WideToUtf8(config.mount_point) +
+                         " is already in use; choose a free letter")
+          .Actual(static_cast<uint32_t>(letter));
+    }
   }
 
   auto state = std::make_unique<AdapterState>();
@@ -870,16 +931,16 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   return OkStatus();
 }
 
-Status RequestUnmount(const std::wstring& drive) {
-  if (!IsValidDriveLetter(drive)) {
+Status RequestUnmount(const std::wstring& mount_point) {
+  if (mount_point.empty()) {
     return XFS_ERR(XfsError::kInvalidArgument,
-                   "expected a drive letter (e.g. X:)");
+                   "expected a drive letter (X:) or a mount directory");
   }
-  std::wstring event_name = StopEventName(drive);
+  std::wstring event_name = StopEventName(mount_point);
   HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, event_name.c_str());
   if (!event) {
     return XFS_ERR(XfsError::kNotMounted,
-                   "no running xfswin mount found for this drive letter");
+                   "no running xfswin mount found for this mount point");
   }
   SetEvent(event);
   CloseHandle(event);

@@ -22,6 +22,9 @@ struct XfsFeatures {
   bool bigtime = false;
   bool nrext64 = false;
   bool exchrange = false;
+  // Parent pointers only add per-entry parent xattrs in the attribute fork;
+  // the directory and inode layouts are unchanged, so read-only access is safe.
+  bool parent = false;
   // ro-compat (safe to read, ignored on write)
   bool finobt = false;
   bool rmapbt = false;

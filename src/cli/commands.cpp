@@ -264,7 +264,8 @@ void PrintGeometry(const XfsSuperblock& sb, const XfsGeometry& geo) {
             << " rmapbt=" << flags_on(sb.features.rmapbt)
             << " reflink=" << flags_on(sb.features.reflink)
             << " bigtime=" << flags_on(sb.features.bigtime)
-            << " nrext64=" << flags_on(sb.features.nrext64) << "\n";
+            << " nrext64=" << flags_on(sb.features.nrext64)
+            << " parent=" << flags_on(sb.features.parent) << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -774,14 +775,14 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "mount") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin mount <device|image> <drive-letter>\n";
+      std::cerr << "usage: xfswin mount <device|image> <drive-letter|directory>\n";
       return 1;
     }
     return CommandMount(positional[1], positional[2], options);
   }
   if (command == "unmount") {
     if (positional.size() != 2) {
-      std::cerr << "usage: xfswin unmount <drive-letter>\n";
+      std::cerr << "usage: xfswin unmount <drive-letter|directory>\n";
       return 1;
     }
     return CommandUnmount(positional[1]);
