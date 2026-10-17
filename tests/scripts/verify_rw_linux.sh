@@ -80,7 +80,10 @@ if grep -qiE 'corruption|fatal|dirty|would fix|ALERT|valuable metadata' "$repair
 fi
 rm -f "$repair_log"
 
-# Mount both images read-only and compare every file.
+# Mount both images read-only and compare every file. The modified image is a
+# copy of the pristine one, so both carry the same filesystem UUID; XFS refuses
+# to mount a second filesystem with a duplicate UUID unless "nouuid" is given
+# (the standard option for snapshots/clones).
 pristine_mnt="$(mktemp -d)"
 modified_mnt="$(mktemp -d)"
 cleanup() {
@@ -89,8 +92,14 @@ cleanup() {
     rmdir "$pristine_mnt" "$modified_mnt" 2>/dev/null || true
 }
 trap cleanup EXIT
-mount -o loop,ro "$pristine" "$pristine_mnt"
-mount -o loop,ro "$modified" "$modified_mnt"
+if ! mount -o loop,ro,nouuid "$pristine" "$pristine_mnt"; then
+    echo "FAILED: cannot mount the pristine image" >&2
+    exit 1
+fi
+if ! mount -o loop,ro,nouuid "$modified" "$modified_mnt"; then
+    echo "FAILED: cannot mount the modified image" >&2
+    exit 1
+fi
 
 echo "== documented content with the overlays applied =="
 python3 "$tools_dir/rw_content.py" verify "$modified_mnt" --with-overlays
