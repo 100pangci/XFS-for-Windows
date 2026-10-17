@@ -64,6 +64,9 @@ struct AdapterState {
   std::u16string label;
   uint16_t sector_size = 512;
   uint16_t sectors_per_allocation_unit = 8;
+  // Read-write volume: the Write/Flush callbacks are live and the file
+  // attributes must not claim that everything is read-only.
+  bool read_write = false;
 
   // WinFsp's default FileContext model is a "file node": opening the same file
   // must return the same node value for as long as it is open anywhere, and
@@ -93,6 +96,11 @@ struct AdapterState {
   // are immutable for this read-only mount, so this is built once per
   // directory and reused by every ReadDirectory page (WinFsp re-enters with a
   // marker for each page) and by repeated Explorer enumerations.
+  //
+  // On a read-write mount directory mutations are not implemented yet, so the
+  // same "built once" rule holds; the first mutation added later must
+  // invalidate this cache (and the core caches) through
+  // XfsFilesystem::InvalidateCaches plus a drop of this per-directory list.
   std::unordered_map<uint64_t, std::shared_ptr<const std::vector<DirChild>>>
       dir_children;
   size_t dir_children_entries = 0;
@@ -129,10 +137,16 @@ NTSTATUS NtFromError(XfsError code) {
     case XfsError::kNameTooLong: return STATUS_OBJECT_NAME_INVALID;
     case XfsError::kInvalidArgument: return STATUS_INVALID_PARAMETER;
     case XfsError::kPermissionDenied: return STATUS_ACCESS_DENIED;
+    case XfsError::kReadOnlyVolume: return STATUS_MEDIA_WRITE_PROTECTED;
     case XfsError::kIoError:
     case XfsError::kShortRead: return STATUS_IO_DEVICE_ERROR;
     case XfsError::kUnsupportedFeature:
     case XfsError::kUnsupportedGeometry: return STATUS_NOT_SUPPORTED;
+    // RW-0 write limitations: the target range needs an allocation or a
+    // conversion transaction that this build does not implement yet.
+    case XfsError::kWriteExtendsFile:
+    case XfsError::kWriteNeedsAllocation:
+    case XfsError::kWriteNeedsConversion: return STATUS_NOT_SUPPORTED;
     case XfsError::kDirtyLog:
     case XfsError::kNeedsRepair: return STATUS_VOLUME_DIRTY;
     case XfsError::kBadCrc:
@@ -236,10 +250,24 @@ uint64_t ToFileTime(const XfsTimestamp& ts) {
   return static_cast<uint64_t>(sec) * 10000000ULL + ts.nsec / 100;
 }
 
-uint32_t FileAttributesFor(uint16_t mode) {
-  uint32_t attributes = FILE_ATTRIBUTE_READONLY;
+uint32_t FileAttributesFor(const AdapterState& state, uint16_t mode) {
+  uint32_t attributes = 0;
   if ((mode & 0170000) == 0040000) attributes |= FILE_ATTRIBUTE_DIRECTORY;
+  // Read-only volume: everything is read-only (the volume really is). On a
+  // writable volume the POSIX write bits decide, so a 0644 file can be
+  // written while a 0444 file stays read-only. XFS immutable/append-only
+  // inodes are handled (and refused) in the write path itself.
+  if (!state.read_write || (mode & 0222) == 0) {
+    attributes |= FILE_ATTRIBUTE_READONLY;
+  }
   return attributes;
+}
+
+// Write callbacks that are not implemented yet. On a read-only volume they
+// report write protection (that is what is true); on a read-write volume they
+// must not claim the media is protected, so they report "not supported".
+NTSTATUS NotImplementedWrite(const AdapterState& state) {
+  return state.read_write ? STATUS_NOT_SUPPORTED : STATUS_MEDIA_WRITE_PROTECTED;
 }
 
 void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
@@ -248,9 +276,9 @@ void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
                       const XfsTimestamp& crtime, uint64_t ino,
                       FSP_FSCTL_FILE_INFO* info) {
   std::memset(info, 0, sizeof(*info));
-  info->FileAttributes = FileAttributesFor(mode);
-  info->AllocationSize =
-      nblocks * static_cast<uint64_t>(state.fs->geometry().block_size);
+  info->FileAttributes = FileAttributesFor(state, mode);
+  // di_nblocks is in 512-byte units (basic blocks), not filesystem blocks.
+  info->AllocationSize = nblocks * 512;
   info->FileSize = (mode & 0170000) == 0040000 ? 0 : size;
   info->CreationTime = ToFileTime(crtime);
   info->LastAccessTime = ToFileTime(atime);
@@ -337,8 +365,8 @@ NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM* file_system,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS SetVolumeLabel(FSP_FILE_SYSTEM*, PWSTR, FSP_FSCTL_VOLUME_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+NTSTATUS SetVolumeLabel(FSP_FILE_SYSTEM* file_system, PWSTR, FSP_FSCTL_VOLUME_INFO*) {
+  return NotImplementedWrite(*State(file_system));
 }
 
 NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
@@ -354,7 +382,7 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
                                      << inode.error().Format());
     return NtFromError(inode.error().code);
   }
-  uint32_t attributes = FileAttributesFor(inode.value().mode);
+  uint32_t attributes = FileAttributesFor(state, inode.value().mode);
   if (NeedsSecurityOverflow(state, security_descriptor_size)) {
     if (file_attributes) *file_attributes = attributes;
     return STATUS_BUFFER_OVERFLOW;
@@ -364,9 +392,11 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS Create(FSP_FILE_SYSTEM*, PWSTR, UINT32, UINT32, UINT32,
+NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR, UINT32, UINT32, UINT32,
                 PSECURITY_DESCRIPTOR, UINT64, PVOID*, FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+  // Creating files needs the inode allocator and a directory transaction
+  // (RW-3); until then even a read-write mount refuses it.
+  return NotImplementedWrite(*State(file_system));
 }
 
 NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
@@ -420,12 +450,21 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS Overwrite(FSP_FILE_SYSTEM*, PVOID, UINT32, BOOLEAN, UINT64,
+NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, BOOLEAN, UINT64,
                    FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+  // FILE_OVERWRITE / FILE_SUPERSEDE on an existing file: Windows expects the
+  // file to be truncated. That is a SetFileSize(0) transaction, not available
+  // yet.
+  return NotImplementedWrite(*State(file_system));
 }
 
-VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {}
+VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {
+  // Nothing to do: deletes are refused (CanDelete), so a delete-on-close
+  // handle can never exist, and SetFileSize/SetAllocationSize are refused as
+  // well, so no allocation cleanup is pending. When those operations land
+  // (RW-2/RW-3) this is where the delete-on-close and the purge of cached
+  // pages must be handled.
+}
 
 VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   AdapterState& state = *State(file_system);
@@ -458,12 +497,61 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS Write(FSP_FILE_SYSTEM*, PVOID, PVOID, UINT64, ULONG, BOOLEAN, BOOLEAN,
-               PULONG, FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
+               UINT64 offset, ULONG length, BOOLEAN write_to_end,
+               BOOLEAN /*constrained_io*/, PULONG bytes_transferred,
+               FSP_FSCTL_FILE_INFO* file_info) {
+  AdapterState& state = *State(file_system);
+  auto node = LookupNode(state, file_context);
+  if (!node) {
+    XFS_DEBUG("Write: stale file node " << NodeId(file_context));
+    return STATUS_INVALID_HANDLE;
+  }
+  if (bytes_transferred) *bytes_transferred = 0;
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
+  if (node->inode->IsSymlink()) {
+    // v1 exposes the link target as file content; that is a read-only view.
+    return STATUS_NOT_SUPPORTED;
+  }
+  if (write_to_end) {
+    // Append semantics: Windows opened the handle with FILE_APPEND_DATA and
+    // expects the write to land at EOF (and to grow the file if needed).
+    return STATUS_NOT_SUPPORTED;
+  }
+  if (length == 0) {
+    FillFileInfo(state, *node->inode, file_info);
+    return STATUS_SUCCESS;
+  }
+
+  // The core validates the range against the file's *current* extents and
+  // writes through the block device; it refuses growth, holes and unwritten
+  // extents (see MapWrittenRange).
+  auto written = state.fs->OverwriteFileData(node->inode->ino, offset, buffer,
+                                            length);
+  if (!written.ok()) {
+    XFS_DEBUG("Write(ino=" << node->inode->ino << ", offset=" << offset
+                           << ", length=" << length
+                           << ") refused: " << written.error().Format());
+    return NtFromError(written.error().code);
+  }
+  if (bytes_transferred) {
+    *bytes_transferred = static_cast<ULONG>(written.value());
+  }
+  FillFileInfo(state, *node->inode, file_info);
+  return STATUS_SUCCESS;
 }
 
-NTSTATUS Flush(FSP_FILE_SYSTEM*, PVOID, FSP_FSCTL_FILE_INFO*) {
+NTSTATUS Flush(FSP_FILE_SYSTEM* file_system, PVOID, FSP_FSCTL_FILE_INFO*) {
+  AdapterState& state = *State(file_system);
+  // Flush means "make what we have written durable". With only in-place data
+  // writes there is no pending transaction and no dirty metadata, so this is
+  // a device flush; a failure must be reported, never swallowed.
+  Status status = state.fs->Flush();
+  if (!status.ok()) {
+    XFS_ERROR("flush failed: " << status.error().Format());
+    return STATUS_IO_DEVICE_ERROR;
+  }
   return STATUS_SUCCESS;
 }
 
@@ -479,39 +567,46 @@ NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM*, PVOID, UINT32, UINT64, UINT64, UINT64,
-                      UINT64, FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, UINT64,
+                      UINT64, UINT64, UINT64, FSP_FSCTL_FILE_INFO*) {
+  // Timestamps and Windows attributes are not stored on disk yet: on XFS they
+  // live in the inode and changing them needs a metadata transaction (RW-1).
+  return NotImplementedWrite(*State(file_system));
 }
 
-NTSTATUS SetFileSize(FSP_FILE_SYSTEM*, PVOID, UINT64, BOOLEAN,
+NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID, UINT64, BOOLEAN,
                      FSP_FSCTL_FILE_INFO*) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+  // Truncate/extend needs the extent tree and the allocator (RW-2).
+  return NotImplementedWrite(*State(file_system));
 }
 
-NTSTATUS CanDelete(FSP_FILE_SYSTEM*, PVOID, PWSTR) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR) {
+  return NotImplementedWrite(*State(file_system));
 }
 
-NTSTATUS Rename(FSP_FILE_SYSTEM*, PVOID, PWSTR, PWSTR, BOOLEAN) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR, PWSTR, BOOLEAN) {
+  return NotImplementedWrite(*State(file_system));
 }
 
-NTSTATUS GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID,
+NTSTATUS GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                      PSECURITY_DESCRIPTOR security_descriptor,
                      SIZE_T* security_descriptor_size) {
   AdapterState& state = *State(file_system);
+  auto node = LookupNode(state, file_context);
+  const uint16_t mode = node ? node->inode->mode : static_cast<uint16_t>(0100644);
   if (NeedsSecurityOverflow(state, security_descriptor_size)) {
     return STATUS_BUFFER_OVERFLOW;
   }
   FillSecurity(state, security_descriptor, security_descriptor_size, nullptr,
-               FILE_ATTRIBUTE_READONLY);
+               FileAttributesFor(state, mode));
   return STATUS_SUCCESS;
 }
 
-NTSTATUS SetSecurity(FSP_FILE_SYSTEM*, PVOID, SECURITY_INFORMATION,
+NTSTATUS SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID, SECURITY_INFORMATION,
                      PSECURITY_DESCRIPTOR) {
-  return STATUS_MEDIA_WRITE_PROTECTED;
+  // POSIX modes are not translated into Windows ACLs; changing a security
+  // descriptor would require a metadata transaction.
+  return NotImplementedWrite(*State(file_system));
 }
 
 bool AddOneDirectoryEntry(FSP_FILE_SYSTEM* file_system,
@@ -711,6 +806,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
     std::fprintf(stderr, "selftest: no filesystem\n");
     return 1;
   }
+  const bool read_write = filesystem->writable();
   int failures = 0;
   auto check = [&](bool cond, const char* what) {
     if (!cond) {
@@ -722,6 +818,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
   AdapterState state;
   state.fs = std::move(filesystem);
+  state.read_write = read_write;
   const XfsGeometry& geo = state.fs->geometry();
   const XfsSuperblock& sb = state.fs->superblock();
   state.sector_size = 512;
@@ -740,11 +837,17 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
   const wchar_t* dirs[] = {L"\\", L"\\folder", L"\\fragdir"};
   const wchar_t* files[] = {L"\\hello.txt", L"\\large.bin", L"\\sparse.img",
-                            L"\\folder\\link"};
+                            L"\\folder\\link", L"\\hello.bin", L"\\big.bin"};
   std::vector<uint8_t> dir_buffer(64 * 1024);
   std::vector<uint8_t> read_buffer(128 * 1024);
   std::vector<uint8_t> sd_buffer(1024);
   std::wstring marker;
+  // The self-test drives callbacks; it does not verify image contents (the
+  // mount script does that with the manifest). Names that do not exist in a
+  // given image are skipped, but at least one directory and one file must
+  // have been exercised.
+  size_t opened_dirs = 0;
+  size_t opened_files = 0;
 
   auto enumerate = [&](PVOID ctx, const char* what) {
     size_t total = 0;
@@ -801,9 +904,10 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
     for (const wchar_t* dir : dirs) {
       UINT32 attrs = 0;
-      check(GetSecurityByName(&fake, const_cast<PWSTR>(dir), &attrs, nullptr,
-                              nullptr) == STATUS_SUCCESS,
-            "GetSecurityByName attrs");
+      NTSTATUS sec = GetSecurityByName(&fake, const_cast<PWSTR>(dir), &attrs,
+                                       nullptr, nullptr);
+      if (sec == STATUS_OBJECT_NAME_NOT_FOUND) continue;
+      check(sec == STATUS_SUCCESS, "GetSecurityByName attrs");
       SIZE_T sd_size = sd_buffer.size();
       check(GetSecurityByName(&fake, const_cast<PWSTR>(dir), &attrs,
                               sd_buffer.data(), &sd_size) == STATUS_SUCCESS,
@@ -816,6 +920,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
                  "Open directory")) {
         continue;
       }
+      ++opened_dirs;
       check((fi.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
             "directory attribute");
       enumerate(ctx, "dir");
@@ -826,11 +931,10 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
     for (const wchar_t* file : files) {
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
-      if (!check(Open(&fake, const_cast<PWSTR>(file), 0, 0, &ctx, &fi) ==
-                     STATUS_SUCCESS,
-                 "Open file")) {
-        continue;
-      }
+      NTSTATUS opened = Open(&fake, const_cast<PWSTR>(file), 0, 0, &ctx, &fi);
+      if (opened == STATUS_OBJECT_NAME_NOT_FOUND) continue;
+      if (!check(opened == STATUS_SUCCESS, "Open file")) continue;
+      ++opened_files;
       ULONG transferred = 0;
       check(Read(&fake, ctx, read_buffer.data(), 0,
                  static_cast<ULONG>(read_buffer.size()),
@@ -840,12 +944,21 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       Close(&fake, ctx);
     }
 
+    if (iter == 0) {
+      check(opened_dirs >= 1, "at least one directory was opened");
+      check(opened_files >= 1, "at least one file was read");
+      std::fprintf(stderr, "selftest: exercised %zu directories, %zu files\n",
+                   opened_dirs, opened_files);
+    }
+
     if (iter < 3) {
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
-      if (check(Open(&fake, const_cast<PWSTR>(L"\\bigdir"),
-                     FILE_DIRECTORY_FILE, 0, &ctx, &fi) == STATUS_SUCCESS,
-                "Open bigdir")) {
+      NTSTATUS opened = Open(&fake, const_cast<PWSTR>(L"\\bigdir"),
+                             FILE_DIRECTORY_FILE, 0, &ctx, &fi);
+      if (opened == STATUS_OBJECT_NAME_NOT_FOUND) {
+        // Not every image has the large directory; skip it.
+      } else if (check(opened == STATUS_SUCCESS, "Open bigdir")) {
         enumerate(ctx, "bigdir");
         Close(&fake, ctx);
       }
@@ -853,6 +966,98 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
     check(HeapValidate(GetProcessHeap(), 0, nullptr), "heap valid");
     if (failures) break;
+  }
+
+  // Read-write self-test: overwrite bytes inside an existing file through the
+  // real callbacks and verify them (this is the driver-free coverage of the
+  // Write/Flush path).
+  if (read_write && !failures) {
+    const wchar_t* candidates[] = {L"\\hello.bin", L"\\hello.txt",
+                                   L"\\folder\\test.bin", L"\\large.bin",
+                                   L"\\big.bin"};
+    for (const wchar_t* candidate : candidates) {
+      PVOID ctx = nullptr;
+      FSP_FSCTL_FILE_INFO fi{};
+      if (Open(&fake, const_cast<PWSTR>(candidate), 0, 0, &ctx, &fi) !=
+          STATUS_SUCCESS) {
+        continue;
+      }
+      if (fi.FileSize < 8192 || fi.FileAttributes & FILE_ATTRIBUTE_READONLY) {
+        Close(&fake, ctx);
+        continue;
+      }
+      std::vector<uint8_t> before(static_cast<size_t>(fi.FileSize));
+      ULONG transferred = 0;
+      if (Read(&fake, ctx, before.data(), 0,
+               static_cast<ULONG>(before.size()), &transferred) !=
+              STATUS_SUCCESS ||
+          transferred != before.size()) {
+        check(false, "rw selftest: cannot read the whole file");
+        Close(&fake, ctx);
+        break;
+      }
+      // Overwrite the middle of the first block, inside an allocated extent.
+      const UINT64 write_offset = 1024;
+      std::vector<uint8_t> overlay(512);
+      for (size_t i = 0; i < overlay.size(); ++i) {
+        overlay[i] = static_cast<uint8_t>(0x30 + (i & 0x3F));
+      }
+      ULONG written = 0;
+      NTSTATUS status =
+          Write(&fake, ctx, overlay.data(), write_offset,
+                static_cast<ULONG>(overlay.size()), FALSE, FALSE, &written,
+                &fi);
+      if (!check(status == STATUS_SUCCESS, "rw selftest: Write") ||
+          !check(written == overlay.size(), "rw selftest: Write length")) {
+        Close(&fake, ctx);
+        break;
+      }
+      check(Flush(&fake, ctx, &fi) == STATUS_SUCCESS, "rw selftest: Flush");
+
+      // Writing past EOF must be refused without changing anything.
+      ULONG refused = 0;
+      uint8_t byte = 0xEE;
+      NTSTATUS beyond =
+          Write(&fake, ctx, &byte, before.size(), 1, FALSE, FALSE, &refused,
+                &fi);
+      check(beyond != STATUS_SUCCESS, "rw selftest: write past EOF allowed");
+      check(refused == 0, "rw selftest: refused write reported bytes");
+
+      // Re-open (fresh node: re-reads inode and extents) and compare.
+      Close(&fake, ctx);
+      ctx = nullptr;
+      if (!check(Open(&fake, const_cast<PWSTR>(candidate), 0, 0, &ctx, &fi) ==
+                     STATUS_SUCCESS,
+                 "rw selftest: re-open")) {
+        break;
+      }
+      std::vector<uint8_t> after(static_cast<size_t>(fi.FileSize));
+      transferred = 0;
+      if (!check(Read(&fake, ctx, after.data(), 0,
+                      static_cast<ULONG>(after.size()), &transferred) ==
+                     STATUS_SUCCESS,
+                 "rw selftest: re-read")) {
+        Close(&fake, ctx);
+        break;
+      }
+      bool mismatch = after.size() != before.size();
+      for (size_t i = 0; !mismatch && i < after.size(); ++i) {
+        const uint8_t expected =
+            (i >= write_offset && i < write_offset + overlay.size())
+                ? overlay[i - write_offset]
+                : before[i];
+        mismatch = after[i] != expected;
+      }
+      check(!mismatch, "rw selftest: written bytes did not read back");
+      if (!mismatch) {
+        std::fprintf(stderr,
+                     "selftest: read-write overlay at offset %llu in %ls "
+                     "verified through the Write callback\n",
+                     static_cast<unsigned long long>(write_offset), candidate);
+      }
+      Close(&fake, ctx);
+      break;
+    }
   }
 
   LocalFree(state.security_descriptor);
@@ -909,19 +1114,28 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
 
   auto state = std::make_unique<AdapterState>();
   state->fs = std::move(filesystem);
+  state->read_write = config.read_write;
   const XfsGeometry& geo = state->fs->geometry();
   const XfsSuperblock& sb = state->fs->superblock();
+  if (state->read_write && !state->fs->writable()) {
+    return XFS_ERR(XfsError::kInternal,
+                   "read-write mount requested for a read-only filesystem");
+  }
 
   state->sector_size = 512;
   state->sectors_per_allocation_unit =
       static_cast<uint16_t>(std::max<uint32_t>(1, geo.block_size / 512));
   state->label = Utf8ToUtf16(sb.label.data());
 
-  // Read-only access for everyone (POSIX ACLs are preserved internally but
-  // not translated into Windows ACLs in this version).
+  // Read-only: read access for everyone (POSIX ACLs are preserved internally
+  // but not translated into Windows ACLs in this version). Read-write: full
+  // access for everyone, so applications can actually write; the POSIX mode
+  // bits still decide per file (a 0444 file is reported read-only).
+  const wchar_t* sddl =
+      state->read_write ? L"O:BAG:BAD:(A;;FA;;;WD)" : L"O:BAG:BAD:(A;;FR;;;WD)";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-          L"O:BAG:BAD:(A;;FR;;;WD)", SDDL_REVISION_1,
-          &state->security_descriptor, &state->security_descriptor_size)) {
+          sddl, SDDL_REVISION_1, &state->security_descriptor,
+          &state->security_descriptor_size)) {
     return XFS_ERR(XfsError::kInternal,
                    "failed to build the volume security descriptor");
   }
@@ -937,20 +1151,22 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   params.VolumeSerialNumber =
       static_cast<uint32_t>(sb.uuid[0] | (sb.uuid[1] << 8) |
                             (sb.uuid[2] << 16) | (sb.uuid[3] << 24));
-  params.FileInfoTimeout = 1000;
+  // Caching policy. Read-only data never changes, so file info can be cached
+  // for a second. On a writable volume file info must not go stale in
+  // Windows' cache after our own writes, so it is not cached at all.
+  params.FileInfoTimeout = state->read_write ? 0 : 1000;
   params.CaseSensitiveSearch = 1;
   params.CasePreservedNames = 1;
   params.UnicodeOnDisk = 1;
-  params.ReadOnlyVolume = 1;
+  params.ReadOnlyVolume = state->read_write ? 0 : 1;
   params.PersistentAcls = 0;
   params.PostCleanupWhenModifiedOnly = 1;
-  // Do NOT set FlushAndPurgeOnCleanup: that flag purges a file's cached pages
-  // on every close. Windows does not retain this volume's data in its cache
-  // (re-reads go back to the raw device at device speed), but purging would
-  // additionally penalize memory-mapped access. A read-only volume never has
-  // dirty data to flush. When read-write support arrives this must flip back
-  // to 1 together with explicit cache invalidation on writes.
-  params.FlushAndPurgeOnCleanup = 0;
+  // FlushAndPurgeOnCleanup makes the FSD flush and purge the file's cached
+  // pages on every close. A read-only volume never has dirty data, so it was
+  // off (it only penalizes memory-mapped access). A writable volume needs it:
+  // without it Windows can serve stale cached pages after our own write and
+  // after an external modification of the same image.
+  params.FlushAndPurgeOnCleanup = state->read_write ? 1 : 0;
   wcscpy_s(params.FileSystemName,
            sizeof(params.FileSystemName) / sizeof(WCHAR), L"XFS");
 
@@ -1021,9 +1237,13 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   g_stop_event = stop_event;
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
-  XFS_INFO("mounted XFS read-only at " << WideToUtf8(config.mount_point)
-                                       << " (uuid " << FormatUuid(sb.uuid)
-                                       << ")");
+  XFS_INFO("mounted XFS " << (config.read_write ? "read-write" : "read-only")
+                          << " at " << WideToUtf8(config.mount_point)
+                          << " (uuid " << FormatUuid(sb.uuid) << ")");
+  if (config.read_write) {
+    XFS_WARN("read-write mount: experimental; in-place overwrites of existing "
+             "allocated data only (no create, delete, rename or size change)");
+  }
   if (stop_event) {
     WaitForSingleObject(stop_event, INFINITE);
   } else {
@@ -1034,6 +1254,15 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
   g_stop_event = nullptr;
   FspFileSystemStopDispatcher(winfsp);
+  // Clean unmount: push everything this process wrote to stable storage
+  // before the mount point disappears. A failed flush is reported (the
+  // filesystem itself stays consistent; only durability is at risk).
+  if (config.read_write) {
+    Status flushed = state->fs->Flush();
+    if (!flushed.ok()) {
+      XFS_ERROR("unmount flush failed: " << flushed.error().Format());
+    }
+  }
   FspFileSystemRemoveMountPoint(winfsp);
   FspFileSystemDelete(winfsp);
   if (stop_event) CloseHandle(stop_event);

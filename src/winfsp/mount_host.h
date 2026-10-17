@@ -8,10 +8,15 @@
 
 namespace xfs::winfsp {
 
-// Mounts `target` (image or raw device) read-only at `drive` (e.g. "X:").
-// Blocks until unmounted. Returns a process exit code.
+// Mounts `target` (image or raw device) at `drive` (e.g. "X:"). Blocks until
+// unmounted. Returns a process exit code.
+//
+// `read_write` requests a writable mount. Callers must have validated the
+// target: the CLI only allows read-write for image files, never for raw
+// devices (see xfswin mount --rw-experimental). A read-write mount opens the
+// image writable and mounts the filesystem with the writable profile check.
 int RunMountHost(const std::string& target, const std::string& drive,
-                 bool force_unsafe_ro, bool verbose);
+                 bool force_unsafe_ro, bool verbose, bool read_write);
 
 // Signals a running mount of `drive` to stop. Returns a process exit code.
 int StopMountHost(const std::string& drive);
