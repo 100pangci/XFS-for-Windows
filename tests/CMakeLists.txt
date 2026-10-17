@@ -8,6 +8,7 @@ add_executable(xfs_tests
   unit/unit_tests.cpp
   unit/write_tests.cpp
   unit/journal_tests.cpp
+  unit/rw2_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )

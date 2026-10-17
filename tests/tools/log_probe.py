@@ -387,6 +387,10 @@ def decode_inode_item(rec: Record, index: int):
         item["core_size"] = le64(core, DINODE_SIZE_FIELD)
         item["core_nblocks"] = le64(core, DINODE_NBLOCKS)
         item["core_ino"] = le64(core, DINODE_INO)
+        item["core_format"] = core[5]
+        item["core_nextents"] = le32(core, 76)
+    if item["regions"] >= 3 and index + 2 < len(rec.ops):
+        item["region"] = rec.ops[index + 2].payload
     return item
 
 
@@ -512,7 +516,10 @@ def main(argv) -> int:
 
     if dump or as_json:
         summary.pop("newest", None)
-        print(json.dumps(summary, indent=1))
+        print(json.dumps(
+            summary, indent=1,
+            default=lambda value: value.hex()
+            if isinstance(value, (bytes, bytearray)) else str(value)))
     else:
         print(f"{image_path}: log state {summary['state']}, "
               f"{len(summary['records'])} complete record(s), "
