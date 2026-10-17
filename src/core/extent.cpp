@@ -289,12 +289,11 @@ Result<XfsFileMapping> MapFileOffset(BlockDevice& dev, const XfsGeometry& geo,
                                      const XfsInode& inode,
                                      uint64_t file_offset) {
   XfsFileMapping m;
-  if (file_offset >= inode.size) {
-    return XFS_ERR(XfsError::kOutOfRange, "offset is past end of file")
-        .Ino(inode.ino)
-        .Offset(file_offset)
-        .Expected(inode.size);
-  }
+  // Note: file_offset is NOT bounded by inode.size. Directory leaf/free
+  // blocks live at huge logical offsets (XFS_DIR2_LEAF_OFFSET = 32 GiB,
+  // XFS_DIR2_FREE_OFFSET = 64 GiB) and are mapped by real extents; the data
+  // fork is the authority. Callers that read file data clamp to inode.size
+  // themselves; directory callers detect corruption via the block magic.
   uint64_t file_block = file_offset >> geo.block_log;
 
   std::vector<XfsExtent> extents;

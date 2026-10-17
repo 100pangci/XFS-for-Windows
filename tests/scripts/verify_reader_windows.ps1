@@ -17,12 +17,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
+# Native commands (xfswin) print UTF-8; make PowerShell decode/encode captured
+# console output as UTF-8 so Unicode names compare correctly.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 function Assert([bool]$condition, [string]$message) {
     if (-not $condition) { throw "ASSERT FAILED: $message" }
 }
 
 function Get-Entry([string]$path) {
-    $entry = $script:manifest | Where-Object { $_.path -eq $path } | Select-Object -First 1
+    $entry = $script:manifestEntries | Where-Object { $_.path -eq $path } | Select-Object -First 1
     Assert ($null -ne $entry) "manifest entry missing: $path"
     return $entry
 }
@@ -38,8 +44,8 @@ function Extract-Path([string]$xfsPath, [string]$outFile) {
 $script:exe = (Resolve-Path $Xfswin).Path
 $script:image = (Resolve-Path $Image).Path
 $manifestPath = (Resolve-Path $Manifest).Path
-$script:manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-"manifest entries: $($script:manifest.Count)"
+$script:manifestEntries = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+"manifest entries: $($script:manifestEntries.Count)"
 
 # ---------------------------------------------------------------------------
 # Consistency check
@@ -56,7 +62,7 @@ if ($LASTEXITCODE -ne 0) {
 "== directory listings =="
 $rootList = @(& $script:exe ls $script:image /)
 Assert ($LASTEXITCODE -eq 0) "ls / failed"
-$expectedRoot = @($script:manifest | Where-Object {
+$expectedRoot = @($script:manifestEntries | Where-Object {
     $_.path -notlike '*/*'
 })
 Assert ($rootList.Count -eq $expectedRoot.Count) `
@@ -70,7 +76,7 @@ foreach ($name in @('hello.txt', 'folder', '中文文件名.txt', 'large.bin',
     Assert ($rootNames -contains $name) "root listing missing $name"
 }
 
-$bigdirEntries = @($script:manifest | Where-Object {
+$bigdirEntries = @($script:manifestEntries | Where-Object {
     $_.type -eq 'file' -and $_.path -like 'bigdir/*'
 })
 $bigdirList = @(& $script:exe ls $script:image /bigdir)
@@ -83,7 +89,7 @@ Assert ($bigdirList.Count -eq $bigdirEntries.Count) `
 # File contents (sha256) - includes sparse, large and extent-btree files
 # ---------------------------------------------------------------------------
 "== file contents =="
-$temp = Join-Path $env:RUNNER_TEMP ('xfswin-cat-' + [guid]::NewGuid().ToString('N') + '.bin')
+$temp = Join-Path $tempDir ('xfswin-cat-' + [guid]::NewGuid().ToString('N') + '.bin')
 try {
     foreach ($rel in @('hello.txt', 'folder/test.bin', 'large.bin',
                        'sparse.img', 'fragmented.bin', '中文文件名.txt',
@@ -104,7 +110,7 @@ try {
 # ---------------------------------------------------------------------------
 "== symlink =="
 $linkEntry = Get-Entry 'folder/link'
-$tempLink = Join-Path $env:RUNNER_TEMP ('xfswin-link-' + [guid]::NewGuid().ToString('N') + '.txt')
+$tempLink = Join-Path $tempDir ('xfswin-link-' + [guid]::NewGuid().ToString('N') + '.txt')
 try {
     Extract-Path '/folder/link' $tempLink
     $target = (Get-Content $tempLink -Raw).TrimEnd("`r", "`n")

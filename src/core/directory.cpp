@@ -49,15 +49,11 @@ class DirIo {
     Status s = CheckMapped(file_byte_offset, &block_addr);
     if (!s.ok()) return s.error();
     std::vector<uint8_t> buf(dir_blk_size_);
-    auto read =
-        ReadFileData(dev_, geo_, inode_, file_byte_offset, buf.data(), buf.size());
-    if (!read.ok()) return read.error();
-    if (read.value() != buf.size()) {
-      return XFS_ERR(XfsError::kCorruptDirectory, "short read of dir block")
-          .Ino(inode_.ino)
-          .Metadata(what)
-          .Offset(file_byte_offset);
-    }
+    // Read through the extent mapping directly. Directory leaf/free blocks
+    // live at huge logical offsets (32/64 GiB) beyond inode.size, which the
+    // size-clamped ReadFileData would reject.
+    s = ReadMappedRange(file_byte_offset, buf.data(), buf.size());
+    if (!s.ok()) return s.error();
 
     // Identity: magic/crc/uuid/blkno/lsn/owner differ per block type.
     V5MetaCheck check;
@@ -118,6 +114,30 @@ class DirIo {
     }
     if (dev_byte_offset) {
       *dev_byte_offset = geo_.FsbToByte(mp.fs_block);
+    }
+    return OkStatus();
+  }
+
+  // Reads len bytes at a directory file offset through the extent mapping.
+  // Unlike ReadFileData this does not clamp to inode.size, because directory
+  // leaf/free blocks live at 32/64 GiB logical offsets.
+  Status ReadMappedRange(uint64_t file_byte_offset, uint8_t* out, size_t len) {
+    auto m = MapFileOffset(dev_, geo_, inode_, file_byte_offset);
+    if (!m.ok()) return m.error();
+    const XfsFileMapping& mp = m.value();
+    if (mp.is_hole || mp.is_unwritten) {
+      return XFS_ERR(XfsError::kCorruptDirectory,
+                     mp.is_hole ? "directory block is a hole"
+                                : "directory block is unwritten")
+          .Ino(inode_.ino)
+          .Offset(file_byte_offset);
+    }
+    uint64_t dev_off = geo_.FsbToByte(mp.fs_block) +
+                       (file_byte_offset & (geo_.block_size - 1));
+    if (!dev_.Read(dev_off, out, len)) {
+      return XFS_ERR(XfsError::kIoError, "failed to read directory block")
+          .Ino(inode_.ino)
+          .Offset(dev_off);
     }
     return OkStatus();
   }

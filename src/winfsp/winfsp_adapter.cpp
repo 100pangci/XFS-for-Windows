@@ -49,6 +49,9 @@ struct AdapterState {
   std::u16string label;
   uint16_t sector_size = 512;
   uint16_t sectors_per_allocation_unit = 8;
+  // Unique WinFsp volume device path; must stay alive for the lifetime of the
+  // file system object.
+  std::wstring device_path;
 };
 
 struct FileContext {
@@ -568,8 +571,14 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   interface.ReadDirectory = ReadDirectory;
 
   FSP_FILE_SYSTEM* winfsp = nullptr;
-  PWSTR device_path = const_cast<PWSTR>(L"");
-  NTSTATUS status = FspFileSystemCreate(device_path, &params, &interface, &winfsp);
+  // WinFsp uses this path to name the volume device object; it must be unique
+  // per mounted filesystem. An empty path collides with other WinFsp volumes
+  // (STATUS_OBJECT_NAME_COLLISION).
+  state->device_path =
+      L"\\XFS\\xfswin-" + std::to_wstring(GetCurrentProcessId());
+  NTSTATUS status = FspFileSystemCreate(
+      const_cast<PWSTR>(state->device_path.c_str()), &params, &interface,
+      &winfsp);
   if (status != STATUS_SUCCESS) {
     LocalFree(state->security_descriptor);
     return XFS_ERR(XfsError::kInternal,

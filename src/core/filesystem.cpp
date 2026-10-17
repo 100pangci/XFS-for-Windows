@@ -332,15 +332,21 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
       }
       ++checked;
       const XfsSuperblock& s = sb2.value();
-      bool same = s.uuid == superblock_.uuid && s.blocksize == superblock_.blocksize &&
+      // Like xfs_repair's compare_sb: only the geometry fields must match.
+      // Counters, version numbers, root inode, feature bits and other fields
+      // may legitimately differ in secondary copies.
+      bool same = s.blocksize == superblock_.blocksize &&
                   s.dblocks == superblock_.dblocks &&
+                  s.rblocks == superblock_.rblocks &&
+                  s.rextents == superblock_.rextents &&
+                  s.logstart == superblock_.logstart &&
+                  s.rextsize == superblock_.rextsize &&
                   s.agblocks == superblock_.agblocks &&
                   s.agcount == superblock_.agcount &&
-                  s.inodesize == superblock_.inodesize &&
-                  s.rootino == superblock_.rootino &&
-                  s.logstart == superblock_.logstart &&
+                  s.rbmblocks == superblock_.rbmblocks &&
                   s.logblocks == superblock_.logblocks &&
-                  s.features_incompat == superblock_.features_incompat;
+                  s.sectsize == superblock_.sectsize &&
+                  s.inodesize == superblock_.inodesize;
       if (!same) {
         report.Add("superblock AG" + std::to_string(agno),
                    CheckStatus::kWarning,

@@ -2,6 +2,9 @@
 
 #include <windows.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -439,6 +442,9 @@ int CommandLs(const std::string& target, const std::string& path) {
 }
 
 int CommandCat(const std::string& target, const std::string& path) {
+  // Windows stdio defaults to text mode, which would translate every '\n' in
+  // file data to CRLF; file contents must be byte-exact.
+  _setmode(_fileno(stdout), _O_BINARY);
   std::string error;
   auto dev = OpenTarget(target, false, false, &error);
   if (!dev) {

@@ -17,12 +17,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
 function Assert([bool]$condition, [string]$message) {
     if (-not $condition) { throw "ASSERT FAILED: $message" }
 }
 
 function Get-Entry([string]$path) {
-    $entry = $script:manifest | Where-Object { $_.path -eq $path } | Select-Object -First 1
+    $entry = $script:manifestEntries | Where-Object { $_.path -eq $path } | Select-Object -First 1
     Assert ($null -ne $entry) "manifest entry missing: $path"
     return $entry
 }
@@ -30,11 +31,11 @@ function Get-Entry([string]$path) {
 $script:exe = (Resolve-Path $Xfswin).Path
 $script:image = (Resolve-Path $Image).Path
 $manifestPath = (Resolve-Path $Manifest).Path
-$script:manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$script:manifestEntries = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 
 $mountPoint = "$Drive\"
-$outLog = Join-Path $env:RUNNER_TEMP 'xfswin-mount.out'
-$errLog = Join-Path $env:RUNNER_TEMP 'xfswin-mount.err'
+$outLog = Join-Path $tempDir 'xfswin-mount.out'
+$errLog = Join-Path $tempDir 'xfswin-mount.err'
 
 # Clear any stale mount from a previous step.
 & $script:exe unmount $Drive 2>$null | Out-Null
@@ -78,7 +79,7 @@ try {
     # -----------------------------------------------------------------------
     "== directory listing =="
     $top = @(Get-ChildItem $mountPoint)
-    $expectedTop = @($script:manifest | Where-Object { $_.path -notlike '*/*' })
+    $expectedTop = @($script:manifestEntries | Where-Object { $_.path -notlike '*/*' })
     Assert ($top.Count -eq $expectedTop.Count) `
         "root entry count $($top.Count) != manifest $($expectedTop.Count)"
     $names = $top | ForEach-Object { $_.Name }
@@ -87,7 +88,7 @@ try {
         Assert ($names -contains $name) "root listing missing $name"
     }
     $bigdir = @(Get-ChildItem (Join-Path $mountPoint 'bigdir'))
-    $expectedBig = @($script:manifest | Where-Object {
+    $expectedBig = @($script:manifestEntries | Where-Object {
         $_.type -eq 'file' -and $_.path -like 'bigdir/*'
     })
     Assert ($bigdir.Count -eq $expectedBig.Count) `
