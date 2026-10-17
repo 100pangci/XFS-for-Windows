@@ -195,7 +195,7 @@ try {
         "OK $($overlaySpec.path) matches the expected content"
     }
 
-    "== RW-0 scope: unsupported operations must be refused =="
+    "== RW-2 scope: existing files can grow and shrink, namespace stays read-only =="
     $helloPath = Join-Path $mountPoint 'hello.bin'
     $subPath = Join-Path $mountPoint 'sub'
 
@@ -204,35 +204,52 @@ try {
     Assert-Refused { Remove-Item -LiteralPath $helloPath } "delete file"
     Assert-Refused { Rename-Item -LiteralPath (Join-Path $mountPoint 'ro.txt') -NewName 'renamed.txt' } "rename file"
     Assert-Refused {
-        # Truncate / extend: growth is not implemented.
-        $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-        try { $s.SetLength(1024) } finally { $s.Close() }
-    } "truncate (SetEndOfFile)"
-    Assert-Refused {
-        # Write past EOF.
-        $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-        try {
-            $size = $s.Length
-            $s.Seek($size, 'Begin') | Out-Null
-            $s.Write($overlayBytes, 0, 16)
-            $s.Flush($true)
-        } finally { $s.Close() }
-    } "write past EOF"
-    Assert-Refused {
-        # Append handle (WriteToEndOfFile).
-        $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Append,
-            [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        try {
-            $s.Write($overlayBytes, 0, 16)
-            $s.Flush($true)
-        } finally { $s.Close() }
-    } "append write"
-    Assert-Refused {
         # A 0444 file stays read-only on disk.
         [System.IO.File]::WriteAllText((Join-Path $mountPoint 'ro.txt'), 'nope')
     } "write to a read-only file"
+
+    # Growth, append and shrink of an existing regular file are RW-2 features.
+    $helloBefore = [System.IO.File]::ReadAllBytes($helloPath)
+    $helloSize = $helloBefore.Length
+    $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $s.Seek($helloSize, 'Begin') | Out-Null
+        $s.Write($overlayBytes, 0, 16)
+        $s.Flush($true)
+        Assert ($s.Length -eq ($helloSize + 16)) "write past EOF did not grow the file"
+        $s.SetLength($helloSize)
+        Assert ($s.Length -eq $helloSize) "SetLength did not shrink the file"
+    } finally { $s.Close() }
+    $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Append,
+        [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $s.Write($overlayBytes, 0, 16)
+        $s.Flush($true)
+        Assert ($s.Length -eq ($helloSize + 16)) "append handle did not grow the file"
+    } finally { $s.Close() }
+    $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try { $s.SetLength($helloSize) } finally { $s.Close() }
+
+    # Shrink below EOF and grow again: the range in between is a hole (zeros).
+    $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $s.SetLength(1000)
+        Assert ($s.Length -eq 1000) "truncate to 1000 failed"
+        $s.SetLength($helloSize)
+        Assert ($s.Length -eq $helloSize) "grow back failed"
+    } finally { $s.Close() }
+    # Put the original tail back so the independent content check below still
+    # compares against the recipe (the gap had become a hole on purpose).
+    $s = [System.IO.File]::Open($helloPath, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $s.Seek(1000, 'Begin') | Out-Null
+        $s.Write($helloBefore, 1000, $helloSize - 1000)
+        $s.Flush($true)
+    } finally { $s.Close() }
 
     # The refusals must not have changed anything.
     foreach ($overlaySpec in $recipeData.overlays) {

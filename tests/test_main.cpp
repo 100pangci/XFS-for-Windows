@@ -99,21 +99,38 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--make-fixture") == 0) {
     return MakeFixture(argv[2]);
   }
+  std::string filter;
+  if (argc == 2 && std::strncmp(argv[1], "--filter=", 9) == 0) {
+    filter = argv[1] + 9;
+  }
   if (argc >= 2 &&
       (std::strcmp(argv[1], "--help") == 0 ||
        std::strcmp(argv[1], "-h") == 0)) {
-    std::cout << "usage: xfs_tests [--make-fixture <image>]\n"
+    std::cout << "usage: xfs_tests [--make-fixture <image>] "
+                 "[--filter=<substring>]\n"
                  "  no arguments: run the test suite\n"
                  "  --make-fixture <image>: write a fixture image (one "
-                 "consistent filesystem with one file) for Linux verification\n";
+                 "consistent filesystem with one file) for Linux verification\n"
+                 "  --filter=<substring>: only run tests whose name contains "
+                 "the substring\n";
     return 0;
   }
 
   xfs::log::SetLevel(xfs::log::Level::kError);
   auto& tests = xfstest::Registry();
-  std::cout << "running " << tests.size() << " tests\n";
+  if (filter.empty()) {
+    std::cout << "running " << tests.size() << " tests\n";
+  } else {
+    std::cout << "running tests matching '" << filter << "'\n";
+  }
   int failed = 0;
+  int ran = 0;
   for (const auto& test : tests) {
+    if (!filter.empty() &&
+        std::string(test.name).find(filter) == std::string::npos) {
+      continue;
+    }
+    ++ran;
     try {
       test.fn();
       std::cout << "  [ OK ] " << test.name << "\n";
@@ -122,6 +139,7 @@ int main(int argc, char** argv) {
       ++failed;
     }
   }
-  std::cout << (failed == 0 ? "all tests passed\n" : "TESTS FAILED\n");
+  std::cout << (failed == 0 ? "all tests passed" : "TESTS FAILED") << " ("
+            << ran << " tests run)\n";
   return failed == 0 ? 0 : 1;
 }
