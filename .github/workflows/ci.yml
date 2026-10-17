@@ -256,6 +256,17 @@ jobs:
             throw "SDK layout unexpected: DYNAMIC/inc/winfsp/winfsp.h not found"
           }
 
+      - name: Verify the WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-Service | Where-Object { $_.Name -match 'winfsp' } | Format-Table Name,Status -AutoSize
+          sc.exe query winfsp
+          sc.exe query WinFsp.Launcher
+          Get-Item 'C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll' |
+            Select-Object FullName,Length
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root
+
       - name: Build with WinFsp support
         shell: pwsh
         run: |
