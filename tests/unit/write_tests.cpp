@@ -238,6 +238,17 @@ TEST(writable_profile_allow_list) {
   allowed.features.meta_uuid = true;
   CHECK(CheckWritableProfile(allowed, MakeGeometry(allowed)).ok());
 
+  // "No quota inode" is encoded as 0 (mkfs) or as NULLFSINO, all ones (what a
+  // mounted kernel writes back); neither means quota is enabled.
+  XfsSuperblock no_quota = sb;
+  no_quota.uquotino = ~0ull;
+  no_quota.gquotino = ~0ull;
+  no_quota.pquotino = ~0ull;
+  CHECK(CheckWritableProfile(no_quota, MakeGeometry(no_quota)).ok());
+  XfsSuperblock quota_inode = sb;
+  quota_inode.uquotino = 70;
+  CHECK(!CheckWritableProfile(quota_inode, MakeGeometry(quota_inode)).ok());
+
   // Geometry-level refusals.
   struct Case {
     const char* what;

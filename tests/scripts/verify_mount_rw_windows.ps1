@@ -55,13 +55,21 @@ function Wait-DriveReleased([string]$drive, [int]$timeoutSeconds = 30) {
     return $true
 }
 
+# A mount point that already resolves (a real volume, a subst drive, a network
+# mapping) must be refused up front: the mount host refuses it, and waiting for
+# the path to appear would otherwise "succeed" immediately and read the wrong
+# disk.
+function Assert-DriveFree([string]$drive) {
+    Assert (-not (Test-Path "$drive\")) "$drive is already in use; choose a free drive letter"
+}
+
 $script:exe = (Resolve-Path $Xfswin).Path
 $script:pristine = (Resolve-Path $Image).Path
 $recipePath = (Resolve-Path $Recipe).Path
 $overlayPath = (Resolve-Path $Overlay).Path
-$recipe = Get-Content $recipePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$recipeData = Get-Content $recipePath -Raw -Encoding UTF8 | ConvertFrom-Json
 $overlayBytes = [System.IO.File]::ReadAllBytes($overlayPath)
-Assert ($overlayBytes.Length -eq [int]$recipe.overlay_size) "overlay size"
+Assert ($overlayBytes.Length -eq [int]$recipeData.overlay_size) "overlay size"
 
 $workDirPath = Join-Path (Split-Path -Parent $script:pristine) 'rw-work'
 if (Test-Path $workDirPath) { Remove-Item $workDirPath -Recurse -Force }
@@ -70,9 +78,10 @@ $modified = Join-Path $workDirPath 'rw-modified.img'
 Copy-Item $script:pristine $modified
 
 $mountPoint = "$Drive\"
-# Clear any stale mount from a previous step.
+# Clear any stale mount from a previous step, then require a free letter.
 & $script:exe unmount $Drive 2>$null | Out-Null
 Start-Sleep -Milliseconds 300
+Assert-DriveFree $Drive
 
 # ---------------------------------------------------------------------------
 # Read the pristine contents of the overlay files through a read-only mount so
@@ -95,8 +104,12 @@ try {
         if ((Get-Date) -gt $deadline) { throw "timed out waiting for $mountPoint" }
         Start-Sleep -Milliseconds 500
     }
+    if ($proc.HasExited) {
+        Get-Content $errLog -ErrorAction SilentlyContinue
+        throw "read-only mount failed with code $($proc.ExitCode)"
+    }
     Start-Sleep -Seconds 1
-    foreach ($overlaySpec in $recipe.overlays) {
+    foreach ($overlaySpec in $recipeData.overlays) {
         $winPath = Join-Path $mountPoint ($overlaySpec.path -replace '/', '\')
         $bytes = [System.IO.File]::ReadAllBytes($winPath)
         Assert ($bytes.Length -gt ([int]$overlaySpec.offset + $overlayBytes.Length)) `
@@ -117,6 +130,7 @@ try {
 # ---------------------------------------------------------------------------
 # Read-write mount.
 # ---------------------------------------------------------------------------
+Assert-DriveFree $Drive
 $outLog = Join-Path $tempDir 'xfswin-rw.out'
 $errLog = Join-Path $tempDir 'xfswin-rw.err'
 $proc = Start-Process -FilePath $script:exe `
@@ -136,6 +150,11 @@ try {
         if ((Get-Date) -gt $deadline) { throw "timed out waiting for $mountPoint" }
         Start-Sleep -Milliseconds 500
     }
+    if ($proc.HasExited) {
+        Get-Content $outLog -ErrorAction SilentlyContinue
+        Get-Content $errLog -ErrorAction SilentlyContinue
+        throw "read-write mount failed with code $($proc.ExitCode)"
+    }
     $mounted = $true
     Start-Sleep -Seconds 1
 
@@ -145,7 +164,7 @@ try {
     Assert (($vi | Out-String) -match 'XFS') "volume file system name is not XFS"
 
     "== overlay through the WinFsp Write callback =="
-    foreach ($overlaySpec in $recipe.overlays) {
+    foreach ($overlaySpec in $recipeData.overlays) {
         if ($overlaySpec.via -ne 'winfsp') { continue }
         $winPath = Join-Path $mountPoint ($overlaySpec.path -replace '/', '\')
         $stream = [System.IO.File]::Open($winPath,
@@ -162,7 +181,7 @@ try {
     }
 
     "== read back through the mount =="
-    foreach ($overlaySpec in $recipe.overlays) {
+    foreach ($overlaySpec in $recipeData.overlays) {
         if ($overlaySpec.via -ne 'winfsp') { continue }
         $winPath = Join-Path $mountPoint ($overlaySpec.path -replace '/', '\')
         $bytes = [System.IO.File]::ReadAllBytes($winPath)
@@ -216,7 +235,7 @@ try {
     } "write to a read-only file"
 
     # The refusals must not have changed anything.
-    foreach ($overlaySpec in $recipe.overlays) {
+    foreach ($overlaySpec in $recipeData.overlays) {
         if ($overlaySpec.via -ne 'winfsp') { continue }
         $winPath = Join-Path $mountPoint ($overlaySpec.path -replace '/', '\')
         $bytes = [System.IO.File]::ReadAllBytes($winPath)
@@ -250,7 +269,7 @@ try {
 # The CLI write path (`xfswin pwrite`) and the structural check.
 # ---------------------------------------------------------------------------
 "== overlay through xfswin pwrite =="
-foreach ($overlaySpec in $recipe.overlays) {
+foreach ($overlaySpec in $recipeData.overlays) {
     if ($overlaySpec.via -ne 'pwrite') { continue }
     & $script:exe pwrite $modified "/$($overlaySpec.path)" "$($overlaySpec.offset)" `
         --rw-experimental --from=$overlayPath
@@ -262,9 +281,10 @@ foreach ($overlaySpec in $recipe.overlays) {
 if ($LASTEXITCODE -ne 0) { throw "xfswin check failed after the read-write test" }
 
 "== summary: modified image =="
-Get-Item $modified | Select-Object FullName, Length
+"path: $modified"
+"size: $((Get-Item $modified).Length) bytes"
 "READ-WRITE WINDOWS ROUND TRIP COMPLETE: $modified"
-# The last commands are expected to be refusals only when the checks fail
-# (they throw); make the success case unambiguous for the CI shell.
+# Expected refusals set $LASTEXITCODE during the checks; make the success case
+# unambiguous for the CI shell (a real failure throws before reaching here).
 $global:LASTEXITCODE = 0
 exit 0
