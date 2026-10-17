@@ -62,7 +62,7 @@ if ! xfs_repair -n "$img" > "$outdir/rw-repair.log" 2>&1; then
     exit 1
 fi
 cat "$outdir/rw-repair.log"
-if grep -qiE 'corruption|fatal|would fix' "$outdir/rw-repair.log"; then
+if grep -qiE 'corruption|fatal|dirty|would fix|ALERT|valuable metadata' "$outdir/rw-repair.log"; then
     echo "FAILED: xfs_repair -n found problems" >&2
     exit 1
 fi

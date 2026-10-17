@@ -27,8 +27,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Image,
     [Parameter(Mandatory = $true)][string]$Recipe,
     [Parameter(Mandatory = $true)][string]$Overlay,
-    [string]$Drive = 'X:',
-    [string]$WorkDir = 'rw'
+    [string]$Drive = 'X:'
 )
 
 $ErrorActionPreference = 'Stop'
