@@ -37,36 +37,16 @@ struct SfDirContent {
 };
 
 SfDirContent BuildRootDirSf(const FormatGeometry& geo) {
-  // Entry offsets use the "data block" offset space (xfs_dir2 geometry).
-  uint32_t data_first_offset =
-      static_cast<uint32_t>(d::kData3HeaderSize) +
-      static_cast<uint32_t>(d::DataEntrySize(1, true)) +
-      static_cast<uint32_t>(d::DataEntrySize(2, true));
-
+  // XFS shortform directories do not store "." or "..": the parent inode is
+  // part of the shortform header and "." is the inode itself. The root
+  // directory therefore contains just the 6-byte header.
   SfDirContent out;
   uint8_t hdr[6] = {};
-  hdr[d::kSfHdrCount] = 2;
+  hdr[d::kSfHdrCount] = 0;
   hdr[d::kSfHdrI8Count] = 0;
   PutBE32(hdr, d::kSfHdrParent, static_cast<uint32_t>(geo.rootino));
   out.data.assign(hdr, hdr + 6);
-
-  auto add_entry = [&](const char* name, uint8_t namelen, uint16_t offset) {
-    uint8_t ent[16];
-    std::memset(ent, 0, sizeof(ent));
-    ent[d::kSfEntNamelen] = namelen;
-    PutBE16(ent, d::kSfEntOffset, offset);
-    std::memcpy(ent + d::kSfEntName, name, namelen);
-    ent[d::kSfEntName + namelen] = d::kFtDir;  // ftype
-    PutBE32(ent, d::kSfEntName + namelen + 1,
-            static_cast<uint32_t>(geo.rootino));
-    size_t entsize = d::kSfEntName + namelen + 1 + 4;
-    out.data.insert(out.data.end(), ent, ent + entsize);
-  };
-  add_entry(".", 1, static_cast<uint16_t>(data_first_offset));
-  add_entry("..", 2,
-            static_cast<uint16_t>(data_first_offset +
-                                  d::DataEntrySize(1, true)));
-  out.size = out.data.size();
+  out.size = 6;
   return out;
 }
 
@@ -84,7 +64,8 @@ void InitRootInode(const FormatGeometry& geo, uint8_t* core, uint32_t gen,
   PutBE32(core, di::kNextents, 0);
   PutBE16(core, di::kAnextents, 0);
   core[di::kForkoff] = 0;
-  core[di::kAformat] = 0;
+  // No attribute fork, but the attribute format is still EXTENTS (like mkfs).
+  core[di::kAformat] = di::kFormatExtents;
   PutBE32(core, di::kGen, gen);
   PutBE32(core, di::kNextUnlinked, kNullAgino);
   PutBE64(core, di::kSize, sf.size);

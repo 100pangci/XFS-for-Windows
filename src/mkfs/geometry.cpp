@@ -289,6 +289,9 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
     for (const auto& extent : ag.free_extents) {
       total_free += extent.count;
     }
+    // sb_fdblocks counts AGFL blocks as free as well (they are reserved but
+    // still free); AGF freeblks excludes them.
+    total_free += ag.agfl.size();
     geo.ags.push_back(std::move(ag));
   }
 

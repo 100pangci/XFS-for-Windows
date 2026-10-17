@@ -368,7 +368,8 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
       }
       const XfsAgf& agf = headers.value().agf;
       const XfsAgi& agi = headers.value().agi;
-      total_free += agf.freeblks;
+      // sb_fdblocks includes AGFL-reserved blocks; AGF freeblks excludes them.
+      total_free += agf.freeblks + agf.flcount;
       total_icount += agi.count;
       total_ifree += agi.freecount;
 

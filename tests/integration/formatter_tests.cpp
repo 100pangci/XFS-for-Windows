@@ -57,7 +57,7 @@ TEST(formatter_roundtrip) {
   CHECK(root.ok());
   CHECK(root.value().IsDir());
   CHECK_EQ(root.value().nlink, 2u);
-  CHECK_EQ(root.value().size, 25u);
+  CHECK_EQ(root.value().size, 6u);
 
   auto entries = fs.value()->ListDirectory(root.value().ino);
   CHECK(entries.ok());

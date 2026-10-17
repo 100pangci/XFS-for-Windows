@@ -173,7 +173,7 @@ def main(path: str) -> int:
         btreeblks = u32(agf, 60)
         assert flfirst < (sectsize - 36) // 4
         assert fllast < (sectsize - 36) // 4
-        assert btreeblks == 2, btreeblks
+        assert btreeblks == 0, btreeblks
 
         agi = img.read(ag_base + 2 * sectsize, sectsize)
         assert u32(agi, 0) == AGI_MAGIC, f"AG{agno} AGI magic"
@@ -245,7 +245,7 @@ def main(path: str) -> int:
             assert ino_numrecs == 0
             print(f"AG{agno}: free={freeblks} AGFL={flcount} (no inodes)")
 
-        total_free += freeblks
+        total_free += freeblks + flcount
         total_icount += agi_count
         total_ifree += agi_free
         agf_list.append(agf)
@@ -274,26 +274,16 @@ def main(path: str) -> int:
     assert mode == 0o040755, oct(mode)
     assert fmt == 1, "shortform dir"
     assert nlink == 2
-    assert size == 25, size
+    # Shortform directories do not store "." / ".."; the root directory is
+    # just the 6-byte header (count=0, i8count=0, parent=rootino).
+    assert size == 6, size
+    assert inode[83] == 2, ("aformat should be EXTENTS", inode[83])
     fork = inode[176:176 + size]
-    assert fork[0] == 2 and fork[1] == 0, "sf count/i8count"
+    assert fork[0] == 0 and fork[1] == 0, "sf count/i8count"
     assert u32(fork, 2) == rootino, "sf parent"
-    expected_names = {b".", b".."}
-    got = set()
-    pos = 6
-    while pos < len(fork):
-        namelen = fork[pos]
-        name = fork[pos + 3:pos + 3 + namelen]
-        ftype = fork[pos + 3 + namelen]
-        inum = u32(fork, pos + 3 + namelen + 1)
-        got.add(name)
-        assert inum == rootino, (name, inum)
-        assert ftype == 2, (name, ftype)
-        pos += 3 + namelen + 1 + 4
-    assert got == expected_names, got
-    assert pos == len(fork), (pos, len(fork))
+    assert len(fork) == 6, len(fork)
     print(f"root inode OK at byte {inode_offset}: mode=040755 nlink=2 "
-          f"size=25 entries={sorted(n.decode() for n in got)}")
+          f"size=6 empty shortform root")
 
     # ---- log ----
     log_agno = logstart >> agblklog

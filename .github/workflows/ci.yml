@@ -72,6 +72,37 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # Diagnostic job: dump the layout produced by the distro's real mkfs.xfs so
+  # the formatter can be compared against a live reference.
+  # ---------------------------------------------------------------------------
+  linux-reference-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Dump a fresh mkfs.xfs layout
+        run: |
+          set -x
+          mkfs.xfs -V
+          truncate -s 300M /tmp/ref.img
+          mkfs.xfs -f /tmp/ref.img
+          echo "=== sb fields ==="
+          xfs_db -r -c 'sb 0' -c 'p rbmino rsumino rootino rextsize versionnum features_incompat features_ro_compat' /tmp/ref.img
+          echo "=== root inode core ==="
+          xfs_db -r -c 'inode 64' -c 'p core' /tmp/ref.img
+          echo "=== root inode dir data ==="
+          xfs_db -r -c 'inode 64' -c 'p u' /tmp/ref.img
+          echo "=== inode 65 ==="
+          xfs_db -r -c 'inode 65' -c 'p core' /tmp/ref.img
+          echo "=== inode 66 ==="
+          xfs_db -r -c 'inode 66' -c 'p core' /tmp/ref.img
+          echo "=== agi 0 ==="
+          xfs_db -r -c 'agi 0' -c 'p count freecount root level' /tmp/ref.img
+          echo "=== agf 0 ==="
+          xfs_db -r -c 'agf 0' -c 'p freeblks longest btreeblks flcount flfirst fllast' /tmp/ref.img
+          echo "=== inode 64 check ==="
+          xfs_db -r -c 'inode 64' -c 'check' /tmp/ref.img || true
+
+  # ---------------------------------------------------------------------------
   # Linux: verify the Windows-formatted image with the real xfsprogs, then
   # create a populated golden image written by Linux for the reader test.
   # ---------------------------------------------------------------------------

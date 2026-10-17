@@ -260,11 +260,13 @@ Status ParseShortform(const XfsInode& inode, bool has_ftype,
     return XFS_ERR(XfsError::kCorruptDirectory, "shortform dir header too big")
         .Ino(inode.ino);
   }
-  if (i8count > count) {
+  if (i8count > count + 1) {
+    // The parent inode may itself require an 8-byte number, so i8count can
+    // exceed the number of stored entries by one (empty root directories).
     return XFS_ERR(XfsError::kCorruptDirectory,
                    "shortform i8count exceeds entry count")
         .Ino(inode.ino)
-        .Expected(count)
+        .Expected(count + 1)
         .Actual(i8count);
   }
   uint64_t parent = 0;
@@ -273,7 +275,21 @@ Status ParseShortform(const XfsInode& inode, bool has_ftype,
   } else {
     parent = GetBE64(fork.data() + d::kSfHdrParent);
   }
-  (void)parent;
+
+  // "." and ".." are implicit in shortform directories: "." is the inode
+  // itself, ".." is the parent stored in the header. They are not entries.
+  XfsDirEntry dot;
+  dot.name = ".";
+  dot.ino = inode.ino;
+  dot.ftype = d::kFtDir;
+  Status synthetic = emit(dot);
+  if (!synthetic.ok()) return synthetic;
+  XfsDirEntry dotdot;
+  dotdot.name = "..";
+  dotdot.ino = parent;
+  dotdot.ftype = d::kFtDir;
+  synthetic = emit(dotdot);
+  if (!synthetic.ok()) return synthetic;
 
   size_t off = hdr_size;
   for (uint32_t i = 0; i < count; ++i) {

@@ -240,7 +240,7 @@ TEST(shortform_directory_list_and_lookup) {
   // Build the shortform content manually.
   std::vector<uint8_t> fork;
   fork.resize(6, 0);
-  fork[0] = 3;      // count
+  fork[0] = 2;      // count (no stored "." / "..")
   fork[1] = 0;      // i8count
   PutBE32(fork.data(), 2, 64);  // parent
   auto add = [&](const char* name, size_t len, uint32_t ino) {
@@ -252,7 +252,6 @@ TEST(shortform_directory_list_and_lookup) {
     fork[off + 3 + len] = ondisk::dir::kFtRegFile;
     PutBE32(fork.data(), off + 3 + len + 1, ino);
   };
-  add(".", 1, 64);
   add("hello.txt", 9, 65);
   {
     const char* unicode_name = reinterpret_cast<const char*>(u8"中文.txt");
@@ -273,7 +272,14 @@ TEST(shortform_directory_list_and_lookup) {
     return OkStatus();
   });
   CHECK(s.ok());
-  CHECK_EQ(names.size(), 3u);
+  CHECK_EQ(names.size(), 4u);  // synthetic "." and ".." + 2 entries
+
+  auto self = LookupName(*dev, geo, inode, ".");
+  CHECK(self.ok());
+  CHECK_EQ(self.value().ino, 64u);
+  auto parent = LookupName(*dev, geo, inode, "..");
+  CHECK(parent.ok());
+  CHECK_EQ(parent.value().ino, 64u);
 
   auto found = LookupName(*dev, geo, inode, "hello.txt");
   CHECK(found.ok());

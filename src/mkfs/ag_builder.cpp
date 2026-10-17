@@ -73,7 +73,9 @@ void BuildAgfImage(const FormatGeometry& geo, const FormatGeometry::AgState& ag,
   }
   PutBE32(p, agf::kFreeblks, free_blocks);
   PutBE32(p, agf::kLongest, longest);
-  PutBE32(p, agf::kBtreeblks, 2);
+  // xfs_repair counts free-space btree blocks except the roots; a fresh
+  // filesystem has only roots, so this counter is zero.
+  PutBE32(p, agf::kBtreeblks, 0);
   std::memcpy(p + agf::kUuid, geo.meta_uuid.data(), 16);
   PutBE64(p, agf::kLsn, 0);
   UpdateXfsChecksum(p, geo.sector_size, agf::kCrc);
