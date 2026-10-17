@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,7 @@
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
 #include "xfs/superblock.h"
+#include "xfs/transaction.h"
 
 namespace xfs {
 
@@ -157,8 +159,37 @@ class XfsFilesystem {
   // inode size (see MapWrittenRange for the exact range rule). Returns the
   // number of bytes written; on failure nothing is guaranteed to be intact
   // beyond the reported error, but no metadata was touched either.
+  //
+  // A successful write also updates mtime/ctime through a metadata
+  // transaction (RW-1), exactly like a Linux write: the data itself is not
+  // journalled, the inode change is.
   Result<size_t> OverwriteFileData(uint64_t ino, uint64_t offset,
                                    const void* buffer, size_t length);
+
+  // ---- transactions and metadata mutations (read-write mounts only) ----
+  // Begins a transaction at the current log position. The returned LSN is the
+  // LSN of the record that will carry it; log items and the metadata buffers
+  // they describe must store that LSN. Callers must serialize mutations (the
+  // built-in paths do, through RunTransaction).
+  Result<XfsTransaction> BeginTransaction();
+  // Commits a transaction: log record + flush, then metadata + flush, then
+  // cache invalidation. A failed build (before commit) writes nothing.
+  Status CommitTransaction(XfsTransaction& txn);
+  // Begins a transaction, lets `build` fill it, and commits it under the
+  // filesystem mutation lock. This is the entry point mutations use.
+  Status RunTransaction(
+      const std::function<Status(XfsTransaction&)>& build);
+
+  // Sets the inode's atime/mtime/ctime in one transaction (RW-1's first
+  // metadata mutation). Returns the updated file info.
+  Result<XfsFileInfo> SetFileTimes(uint64_t ino, const XfsTimestamp& atime,
+                                   const XfsTimestamp& mtime,
+                                   const XfsTimestamp& ctime);
+
+  // Writes the clean-unmount log record. Must be called before an unmount so
+  // the next mount (Linux or this build) finds a clean log; it is a no-op on a
+  // read-only mount or when the log is already clean.
+  Status WriteCleanUnmountRecord();
 
   // Flushes pending writes to stable storage. Returns failure if the device
   // flush fails: callers (WinFsp Flush, clean unmount) must not report
@@ -189,6 +220,14 @@ class XfsFilesystem {
   // Shared between reads and writes so both see the same extents.
   Result<std::shared_ptr<const std::vector<XfsExtent>>> LoadExtentsCached(
       const XfsInode& inode) const;
+
+  // Updates atime/mtime/ctime inside an open transaction (the caller holds the
+  // mutation lock and owns the transaction). Shared by the public
+  // SetFileTimes and by the data write path.
+  Status UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino,
+                                  const XfsTimestamp& atime,
+                                  const XfsTimestamp& mtime,
+                                  const XfsTimestamp& ctime);
 
   // ---- file data chunk cache ----
   // Reads are served in 256 KiB chunks so that one device read covers many
@@ -241,6 +280,17 @@ class XfsFilesystem {
   // locking once the writer is stable). Also orders "device write" against
   // "cache publication" for concurrent readers.
   mutable std::mutex mutation_mutex_;
+
+  // ---- journal state (read-write writer) ----
+  // Next log write position. Scanned from the log on first use; kept in memory
+  // while the filesystem is mounted and invalidated after a clean-unmount
+  // record so the next mutation rescans.
+  bool log_position_valid_ = false;
+  LogPosition log_position_;
+  // True when this mount wrote at least one record that is not an unmount
+  // record (i.e. the log needs a clean-unmount record before we let go).
+  bool log_dirty_ = false;
+  uint32_t next_tid_ = 1;
 
   mutable std::mutex cache_mutex_;
   mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;

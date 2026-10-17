@@ -25,6 +25,7 @@ constexpr size_t kOffLen = 12;       // be32 (data bytes after header blocks)
 constexpr size_t kOffLsn = 16;       // be64
 constexpr size_t kOffTailLsn = 24;   // be64
 constexpr size_t kOffCrc = 32;       // le32
+constexpr size_t kOffPrevBlock = 36; // be32
 constexpr size_t kOffNumLogops = 40;
 constexpr size_t kOffCycleData = 44; // be32[64]
 constexpr size_t kOffFmt = 300;      // be32
@@ -41,6 +42,9 @@ struct RecordCandidate {
   uint32_t block = 0;   // log-relative block number
   uint32_t len = 0;
   uint32_t hdrs = 1;    // header blocks (1 + ext headers)
+  uint32_t num_ops = 0;
+  uint32_t prev_block = 0;
+  uint64_t lsn = 0;
 };
 
 struct ScanState {
@@ -92,6 +96,9 @@ bool ScanChunk(const uint8_t* buf, size_t len, uint64_t base_offset,
     c.block = lsn_block;
     c.len = hlen;
     c.hdrs = hdrs;
+    c.num_ops = GetBE32(p + kOffNumLogops);
+    c.prev_block = GetBE32(p + kOffPrevBlock);
+    c.lsn = lsn;
     state->records.push_back(c);
   }
   return true;
@@ -184,6 +191,13 @@ Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
         .Metadata("log")
         .Offset(data_off);
   }
+  // Geometry of the newest record, needed by the read-write writer.
+  result.cycle = newest->cycle;
+  result.block = newest->block;
+  result.blocks = newest->hdrs + newest->len / kSectorSize;
+  result.num_ops = newest->num_ops;
+  result.prev_block = newest->prev_block;
+  result.lsn = newest->lsn;
   // Restore the first word of the first data sector.
   uint32_t original_first_word = GetBE32(hdr.data() + kOffCycleData);
   StoreBE32(data.data(), original_first_word);
@@ -203,6 +217,64 @@ Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
                                   << result.newest_record_lsn << std::dec
                                   << " state=" << ToString(result.state));
   return result;
+}
+
+Result<LogPosition> ReadLogPosition(BlockDevice& dev, const XfsGeometry& geo,
+                                    const XfsSuperblock& sb) {
+  const uint64_t log_blocks =
+      (static_cast<uint64_t>(sb.logblocks) << geo.block_log) / 512;
+  if (log_blocks == 0 || log_blocks > 0x7fffffff) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry, "invalid log size")
+        .Metadata("log")
+        .Actual(log_blocks);
+  }
+  auto check = CheckLogClean(dev, geo, sb);
+  if (!check.ok()) return check.error();
+  const LogCheckResult& r = check.value();
+
+  LogPosition position;
+  position.log_blocks = static_cast<uint32_t>(log_blocks);
+  position.record_size = 32 * 1024;  // XLOG_BIG_RECORD_BSIZE, one header block
+  if (r.state == LogState::kEmpty) {
+    // All-zero log: the kernel starts a fresh log at block 0, cycle 1, and the
+    // previous block link is "none" (the mkfs record does the same).
+    position.cycle = 1;
+    position.next_block = 0;
+    position.prev_block = 0xffffffffu;
+    position.tail_lsn = (uint64_t{1} << 32);
+    position.clean = false;
+    return position;
+  }
+  if (r.state != LogState::kClean) {
+    return XFS_ERR(XfsError::kDirtyLog,
+                   "log is not clean; the journal must be replayed before it "
+                   "can be written")
+        .Metadata("log")
+        .Actual(r.newest_record_lsn);
+  }
+  if (r.blocks == 0) {
+    return XFS_ERR(XfsError::kCorruptSuperblock, "log record has zero size")
+        .Metadata("log")
+        .Actual(r.block);
+  }
+
+  // The next record starts right after the unmount record. If that crosses the
+  // physical end of the log, the write position wraps to block 0 and the cycle
+  // advances (this is what xlog_set_state does through its bump_cycle).
+  uint64_t end = static_cast<uint64_t>(r.block) + r.blocks;
+  uint32_t cycle = r.cycle;
+  if (end >= log_blocks) {
+    end -= log_blocks;
+    ++cycle;
+  }
+  position.cycle = cycle;
+  position.next_block = static_cast<uint32_t>(end);
+  position.prev_block = r.block;
+  position.tail_lsn = (static_cast<uint64_t>(cycle) << 32) | position.next_block;
+  position.clean = true;
+  XFS_DEBUG("log position: cycle=" << cycle << " next=" << position.next_block
+                                   << " prev=" << r.block << " clean=yes");
+  return position;
 }
 
 }  // namespace xfs

@@ -173,7 +173,9 @@ Result<FormatReport> Format(BlockDevice& device, const FormatOptions& options) {
       remaining -= chunk;
     }
     std::vector<uint8_t> record;
-    internal::BuildLogRecord(geo, &record);
+    auto built = internal::BuildLogRecord(geo);
+    if (!built.ok()) return built.error();
+    record = std::move(built.value());
     if (!device.Write(geo.FsbToByte(geo.logstart), record.data(),
                       record.size())) {
       return XFS_ERR(XfsError::kIoError, "failed to write log record")

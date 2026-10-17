@@ -374,7 +374,9 @@ def main(path: str) -> int:
     data = bytearray(img.read(log_offset + 512, 512))
     data[0:4] = hdr[44:48]  # restore the word replaced by the cycle value
     assert data[8] == 0xAA and (data[9] & 0x20), "clean unmount record"
-    assert u16(data, 12) == 0x556E, "unmount magic"
+    # xfs_unmount_log_format.magic is written in host byte order by the kernel
+    # (see MakeUnmountOp); recovery never reads it, only the flag.
+    assert struct.unpack_from("<H", data, 12)[0] == 0x556E, "unmount magic"
     print(f"log OK: clean unmount record at byte {log_offset}")
 
     print("ALL FIXTURE CHECKS PASSED")

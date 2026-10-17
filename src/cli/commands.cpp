@@ -811,6 +811,13 @@ int CommandPwrite(const std::string& target, const std::string& path,
     }
     return 1;
   }
+  // Close the journal with an unmount record, then push everything to stable
+  // storage: the next mount (Linux or this build) must find a clean log.
+  Status closed = fs.value()->WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return 1;
+  }
   Status flush = fs.value()->Flush();
   if (!flush.ok()) {
     PrintError(flush.error());

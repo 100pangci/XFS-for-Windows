@@ -116,6 +116,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "check failed after refused writes" }
           Write-Output "in-place write checks passed"
 
+      - name: Crash matrix (kill every write phase)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "crash"
+          if ($LASTEXITCODE -ne 0) { throw "crash matrix failed" }
+
+      - name: Upload the crash images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-crash
+          path: crash/
+          if-no-files-found: error
+
       - name: Upload xfswin.exe
         uses: actions/upload-artifact@v4
         with:
@@ -455,6 +471,34 @@ jobs:
           test "$(cat rw/rw-pristine.sha256)" = "$(sha256sum rw/rw.img | cut -d' ' -f1)"
           sudo bash tests/scripts/verify_rw_linux.sh \
             modified/rw-modified.img rw/rw.img rw/rw-recipe.json rw/rw-overlay.bin
+
+  # ---------------------------------------------------------------------------
+  # Linux replays every crash window of the read-write writer. Each image was
+  # killed at one XFSWIN_CRASH_AT point; the kernel has to mount it (replaying
+  # our log record when it is committed), show either the old or the logged new
+  # timestamps, and leave a filesystem xfs_repair -n accepts.
+  # ---------------------------------------------------------------------------
+  linux-verify-crash:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-crash
+          path: crash
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Replay and verify every crash window
+        run: |
+          ls -l crash | head -20
+          sudo bash tests/scripts/verify_crash_linux.sh crash crash/pristine.img
 
   # ---------------------------------------------------------------------------
   # Raw device path (Case C): attach a fixed VHD as a real disk and format it

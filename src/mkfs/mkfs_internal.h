@@ -124,8 +124,9 @@ void BuildInodeChunk(const FormatGeometry& geo, uint32_t gen,
                      std::vector<uint8_t>* buf);
 
 // Builds the clean-log record (record header + unmount record, 1024 bytes)
-// that is written at the start of an otherwise zeroed internal log.
-void BuildLogRecord(const FormatGeometry& geo, std::vector<uint8_t>* buf);
+// that is written at the start of an otherwise zeroed internal log. Uses the
+// same record writer as the read-write path.
+Result<std::vector<uint8_t>> BuildLogRecord(const FormatGeometry& geo);
 
 // Root inode number calculation (matches xfs_ialloc_calc_rootino).
 uint64_t CalcRootIno(const FormatGeometry& geo, uint32_t first_chunk_agbno);
