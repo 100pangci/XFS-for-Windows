@@ -179,6 +179,7 @@ class Record:
         self.tail_lsn = 0
         self.crc_ok = False
         self.crc_unset = False
+        self.cleared = False
         self.num_ops = 0
         self.prev_block = 0
         self.ops = []
@@ -201,6 +202,13 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
     rec.cycle = be32(header, 4)
     version = be32(header, 8)
     rec.len = be32(header, 12)
+    if rec.cycle == 0 or rec.len == 0:
+        # xlog_get_cycle() treats a header with cycle 0 as unwritten space, and
+        # xlog_valid_rec_header() rejects h_len == 0 ("LR body must have data").
+        # The kernel stamps such headers over stale log space while clearing it,
+        # so they are not records at all.
+        rec.cleared = True
+        return rec
     rec.lsn = be64(header, 16)
     rec.tail_lsn = be64(header, 24)
     stored_crc = struct.unpack_from("<I", header, 32)[0]
@@ -343,13 +351,16 @@ def decode_inode_item(rec: Record, index: int):
 
 
 def unmount_record(rec: Record) -> bool:
-    """Same decision as xlog_check_unmount_rec: one op, unmount flag."""
+    """Same decision as xlog_check_unmount_rec: one op, unmount flag.
+
+    The kernel never reads the op's payload here (mkfs.xfs writes the 8-byte
+    xfs_unmount_log_format with oh_len = 8, the kernel's own writer uses
+    oh_len = 0 with the payload trailing), so neither do we.
+    """
     if rec.num_ops != 1 or len(rec.ops) != 1:
         return False
     op = rec.ops[0]
-    if op.client_id != CLIENT_LOG or not (op.flags & FLAG_UNMOUNT_TRANS):
-        return False
-    return len(op.payload) == 8 and le16(op.payload, 0) == UNMOUNT_TYPE
+    return op.client_id == CLIENT_LOG and bool(op.flags & FLAG_UNMOUNT_TRANS)
 
 
 def scan(image: bytes, sb: Superblock):
@@ -363,8 +374,10 @@ def scan(image: bytes, sb: Superblock):
         offset = log_byte + block * SECTOR
         if be32(image, offset) != REC_MAGIC:
             continue
-        candidates.append(parse_record(image, log_byte, sb.log_blocks, sb,
-                                       block))
+        record = parse_record(image, log_byte, sb.log_blocks, sb, block)
+        if record.cleared:
+            continue  # stale space the kernel marked as not-a-record
+        candidates.append(record)
     # Newest by (cycle, block): records are written with increasing cycles and
     # increasing block numbers inside a cycle.
     valid = [r for r in candidates if r.crc_ok and not r.problems]

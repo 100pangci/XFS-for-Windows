@@ -185,60 +185,113 @@ Consequences for the writer:
   can walk backwards; the very first record after mkfs points at the mkfs
   record (or 0xffffffff if none - to be confirmed against tested output).
 
-## 6. What RW-1 must implement
+## 6. What RW-1 implements
 
 ```text
-src/write/log_record.cpp    record assembly: header(s), ops, cycle data, CRC
-src/write/log_state.cpp     read the log: newest record, cycle, head/tail,
-                            previous block, "is clean"
-src/write/transaction.cpp   in-memory transaction: log items, reservations,
-                            commit -> write record, then write metadata
-src/write/log_item.cpp      inode item and buffer item formatting
-src/write/superblock_counters.cpp  (already needed by RW-2/3)
+include/xfs/log_format.h    on-disk record/op/transaction/item constants
+include/xfs/log_record.h    LogOp/LogRecordParams + BuildLogRecord (used by
+src/write/log_record.cpp    the writer *and* mkfs's clean record)
+include/xfs/transaction.h   log items + the metadata buffers they protect
+src/write/transaction.cpp   commit: record -> flush -> metadata -> flush
+src/write/inode_write.cpp   SetFileTimes: one inode item, one record
+src/core/log_checker.cpp    ReadLogPosition: the state a clean mount leaves
+                            behind (cycle, next block, prev link, tail LSN)
 ```
 
 Commit ordering (ordered data, then metadata, then the log tail):
 
-1. reserve log space and build the item list;
-2. stamp each dirty metadata buffer with the transaction LSN;
-3. write the record (header + data) to the log ring, then flush;
+1. begin: take the write position (scan the log for a clean one the first time),
+   assign the transaction id and the LSN, and wrap to block 0 with a new cycle
+   early if the reserved space does not fit before the end of the ring (records
+   are never split across the end);
+2. build the item list, stamp every metadata buffer with the LSN;
+3. write the record header block, then the data blocks, then flush - the record
+   must be durable before the metadata it describes;
 4. write the metadata buffers, then flush;
-5. only then consider the transaction durable; update the in-memory tail.
+5. advance the write position, mark the log dirty, invalidate the caches.
 
-Crash points `before_log_write`, `mid_log_record`, `after_log_commit`,
-`before_metadata_write`, `mid_metadata_write`, `after_metadata_write`,
-`before_device_flush`, `after_device_flush` already exist and are wired into
-the data path; RW-1 wires them into this sequence.
+Every step has an injection point (`before_log_write`, `mid_log_record`,
+`after_log_commit`, `before_metadata_write`, `mid_metadata_write`,
+`after_metadata_write`) plus the data-phase and flush points that already
+existed. `WriteCleanUnmountRecord` closes the log at the current head with one
+unmount op; the CLI and the WinFsp unmount path both call it, so the next mount
+(Linux or this build) finds a clean log.
 
-The first mutation is deliberately small: **update `mtime`/`ctime` of one
-inode** (the write path already knows how to do the data part). That exercises
-one inode item, one log record, one metadata buffer, the LSN rules and the
-clean-unmount record - without the allocator.
+The tail LSN of a record is the record's own LSN: every commit writes and
+flushes its metadata before the next transaction starts, so nothing older than
+the newest record can still need replaying.
 
-## 7. Open questions to settle with Linux before landing RW-1
+## 7. Open questions, answered
 
-These need an experiment (write a candidate log, then mount/replay on Linux and
-compare), not more reading:
+1. **`h_tail_lsn`/`h_prev_block` of the first record after a clean unmount.**
+   `xlog_set_state` sets `l_prev_block` to the found record's header block and
+   the tail to `(cycle, after_umount_blk)`. We do the same: the next record's
+   `h_prev_block` is the unmount record's block, its tail is its own LSN, and a
+   wrap to block 0 bumps the cycle (checked by `log_position_of_a_fresh_fixture...`
+   and the crash matrix).
+2. **`h_size` and header blocks.** For a non-striped internal log the kernel
+   uses `XLOG_BIG_RECORD_BSIZE` (32 KiB) as the iclog size, which is exactly
+   one header block (`xlog_logrec_hblks`). We write 32768 and never produce a
+   record that needs extension headers (rejected above 32 KiB of data).
+3. **Minimal inode buffer.** `xfs_inode_buf_verify` validates
+   `XFS_BB_TO_FSB(b_length) * inopblock` inodes; for one 512-byte block that is
+   zero inodes, so a 1-BB buffer is accepted and recovery checks the magic at
+   `ilf_boffset` itself. The item uses `blkno = inode offset / 512`, `len = 1`,
+   `boffset = 0`, and replay applies it to a 512-byte buffer.
+4. **Checkpoint header.** `th_type = XFS_TRANS_CHECKPOINT` (40), `th_magic`
+   'TRAN', `th_tid` = the op tids, `th_num_items` = the number of item regions
+   (recovery ignores it, but it is what the CIL writes); the commit op is a
+   zero-length op flagged `XLOG_COMMIT_TRANS`, and the start op is a
+   zero-length op flagged `XLOG_START_TRANS` (recovery asserts its length is 0).
+5. **CRC coverage and cycle stamps.** `xlog_cksum` covers the header (with the
+   CRC field zeroed) plus the record data *as written*, i.e. with the cycle
+   words already stamped in (`xlog_recover_check_crc` runs in the CRCPASS
+   before `xlog_unpack_data` restores them). Extension headers only apply above
+   32 KiB, which this writer refuses to produce. Our records match the kernel
+   byte for byte; `tests/tools/log_probe.py` recomputes all of it from the
+   image, independently of the C++ implementation.
 
-1. Exact `h_tail_lsn`/`h_prev_block` values for the first record written after
-   a clean unmount (including the cycle bump when the write wraps the ring).
-2. Whether `h_size` in our records must equal the log's maximum record size
-   and how many header blocks a 64 KiB-minimum log expects.
-3. The minimal inode buffer (`ilf_blkno/ilf_len/ilf_boffset`) that the inode
-   buffer verifier accepts (1 BB vs. a full inode cluster).
-4. Whether a checkpoint record needs `th_type = XFS_TRANS_CHECKPOINT` and
-   `th_num_items`, and how the commit op must be terminated (zero-length op).
-5. The exact CRC coverage (`XLOG_REC_SIZE` vs. the extended header blocks) and
-   the cycle-stamp positions for records larger than 32 KiB.
+Two more facts learned while implementing:
+
+- **mkfs's clean record has a zero CRC.** The kernel tolerates that
+  (`xlog_recover_check_crc` only rejects a mismatch when the stored CRC is set)
+  and recovery never reaches it because our records always point the tail at
+  themselves - but the formatter now writes the real CRC through the same
+  record builder as the writer.
+- **The unmount payload's magic is written in host byte order** by the kernel
+  (a plain `XLOG_UNMOUNT_TYPE` assignment to a `__be16`). Nothing reads it
+  (recovery only looks at the flag), but we match the kernel so log dumps are
+  identical.
+- **Recovering a torn record.** The head is walked back when a CRC check fails
+  (`xlog_find_head`/`xlog_verify_tail` with `first_bad`) and the tail is pushed
+  forward when the failure is within `XLOG_MAX_ICLOGS * hsize` of the head.
+  That is what makes a crash between "header written" and "data written" leave
+  the old state.
 
 ## 8. Test strategy
 
-- Unit: record assembly and parsing round-trip (our own reader), cycle data
-  restore, CRC.
-- Linux replay: with `XFSWIN_CRASH_AT` at every point of one transaction,
-  terminate the process, then on Linux require a `mount` (which replays) and
-  `xfs_repair -n` to succeed; the file must show either the old or the new
-  mtime.
-- Differential: dump the log with `xfs_logprint -t` before/after and compare
-  structure with a Linux-created equivalent transaction.
-- Only after that: RW-2 (allocator) and beyond.
+- Unit (`tests/unit/journal_tests.cpp`): record layout and header fields, op
+  chain round-trip, cycle stamping, CRC, parameter rejection, the clean-log
+  write position, the clean unmount record closing the log, `SetFileTimes`
+  changing only the core fields it owns, and write-ahead ordering observed
+  through a recording device (data -> log header -> log data -> flush -> inode
+  -> flush).
+- Independent oracle (`tests/tools/log_probe.py`): parses an image's log from
+  the kernel specification: magic/version/cycle/uuid, `h_lsn` block, `h_len`
+  multiple of 512, cycle stamping, the CRC, the op chain, the item payloads and
+  whether the newest complete record is an unmount record.
+- Crash windows (Windows: `tests/scripts/verify_crash_windows.ps1` +
+  `tests/tools/rw_crash_check.py`): one `pwrite` per injection point, then
+  require the pre-replay image to be consistent - the log intact except at most
+  one torn newest record, the inode never torn, and if the inode changed, a
+  complete record with the same LSN and timestamps must describe it.
+- Linux replay (`tests/scripts/verify_crash_linux.sh` +
+  `tests/tools/rw_replay_check.py`, CI job `linux-verify-crash`): mount each
+  crash image (the kernel replays our record), require the old timestamps for
+  the points before the record is durable and the *logged* new ones after it,
+  require the data to be old or new, require a clean log after the unmount and
+  `xfs_repair -n` to stay silent.
+- Still to do: a differential dump (`xfs_logprint -t`) against a
+  Linux-created transaction, and replaying our log with the real `xfs_logprint`
+  in CI once the record shapes are common (RW-2 items).
+- Next: RW-2 (allocator, growth, unwritten extents) and RW-3 (create/unlink).
