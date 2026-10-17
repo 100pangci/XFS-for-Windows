@@ -467,6 +467,9 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
       return STATUS_SUCCESS;
     }
   }
+  // End-of-directory marker: tells the FSD the enumeration is complete (see
+  // FspFileSystemAddDirInfo with a NULL DirInfo).
+  FspFileSystemAddDirInfo(nullptr, buffer, length, bytes_transferred);
   return STATUS_SUCCESS;
 }
 
