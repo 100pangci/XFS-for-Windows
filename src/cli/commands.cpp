@@ -538,7 +538,7 @@ int CommandStat(const std::string& target, const std::string& path) {
   std::cout << "  uid/gid  : " << i.uid << "/" << i.gid << "\n";
   std::cout << "  links    : " << i.nlink << "\n";
   std::cout << "  size     : " << i.size << " bytes\n";
-  std::cout << "  blocks   : " << i.nblocks << "\n";
+  std::cout << "  blocks   : " << i.nblocks << " (filesystem blocks)\n";
   std::cout << "  extents  : " << i.nextents << " data, " << i.anextents
             << " attr\n";
   std::cout << "  atime    : " << FormatTime(i.atime) << "\n";

@@ -443,8 +443,11 @@ Status BuildFixtureImage(BlockDevice& device, const FixtureOptions& options,
     extent.startblock = data_fsb;
     extent.blockcount = options.file_blocks;
     extent.unwritten = false;
+    // di_nblocks counts *filesystem* blocks (the kernel adds the bmap extent
+    // lengths to i_nblocks directly and xfs_repair recomputes it the same way),
+    // even though the on-disk comment says "512 byte blocks".
     BuildRegularFileInode(geo, chunk.data() + file_off, file_ino, gen,
-                          file_size, file_size >> 9, extent, timestamp);
+                          file_size, options.file_blocks, extent, timestamp);
 
     if (!device.Write(chunk_offset, chunk.data(), chunk.size())) {
       return XFS_ERR(XfsError::kIoError, "cannot write inode chunk").Ag(agno);

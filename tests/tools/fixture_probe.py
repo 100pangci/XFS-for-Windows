@@ -333,7 +333,8 @@ def main(path: str) -> int:
     nblocks = u64(f, 64)
     nextents = u32(f, 76)
     assert size == FILE_BLOCKS * blocksize, size
-    assert nblocks == size // 512, (nblocks, size)
+    # di_nblocks is in filesystem blocks, not 512-byte units.
+    assert nblocks == FILE_BLOCKS, (nblocks, FILE_BLOCKS)
     assert nextents == 1, nextents
     l0, l1 = u64(f, 176), u64(f, 184)
     startoff, startblock, blockcount, unwritten = decode_bmbt_rec(l0, l1)
