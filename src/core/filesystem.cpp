@@ -177,6 +177,12 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
 }
 
 Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = inode_cache_.find(ino);
+    if (it != inode_cache_.end()) return it->second;
+  }
+
   auto inode = ReadInode(*device_, geometry_, ino);
   if (!inode.ok()) return inode.error();
   if (inode.value().OnUnlinkedList()) {
@@ -186,7 +192,34 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
         .Ino(ino)
         .Metadata("inode");
   }
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    constexpr size_t kMaxCachedInodes = 32768;
+    if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
+    inode_cache_.emplace(ino, inode.value());
+  }
   return inode;
+}
+
+void XfsFilesystem::CacheDirectory(uint64_t ino,
+                                   std::vector<XfsDirEntry> entries) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  constexpr size_t kMaxCachedDirs = 128;
+  constexpr size_t kMaxCachedDirEntries = 262144;
+  if (dir_cache_.size() >= kMaxCachedDirs ||
+      dir_cache_entries_ + entries.size() > kMaxCachedDirEntries) {
+    dir_cache_.clear();
+    dir_cache_entries_ = 0;
+  }
+  DirCache cache;
+  cache.index.reserve(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    cache.index.emplace(entries[i].name, i);
+  }
+  cache.entries = std::move(entries);
+  dir_cache_entries_ += cache.entries.size();
+  dir_cache_.emplace(ino, std::move(cache));
 }
 
 Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
@@ -220,6 +253,12 @@ Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
 
 Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
     uint64_t ino) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = dir_cache_.find(ino);
+    if (it != dir_cache_.end()) return it->second.entries;
+  }
+
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   if (!inode.value().IsDir()) {
@@ -234,11 +273,25 @@ Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
         return OkStatus();
       });
   if (!s.ok()) return s.error();
+  CacheDirectory(ino, entries);
   return entries;
 }
 
 Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
                                               std::string_view name) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = dir_cache_.find(dir_ino);
+    if (it != dir_cache_.end()) {
+      auto indexed = it->second.index.find(std::string(name));
+      if (indexed == it->second.index.end()) {
+        return XFS_ERR(XfsError::kNotFound, "name not found in directory")
+            .Ino(dir_ino);
+      }
+      return it->second.entries[indexed->second];
+    }
+  }
+
   auto inode = OpenInode(dir_ino);
   if (!inode.ok()) return inode.error();
   return xfs::LookupName(*device_, geometry_, inode.value(), name);

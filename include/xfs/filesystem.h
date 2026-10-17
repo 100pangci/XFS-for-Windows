@@ -10,8 +10,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "xfs/block_device.h"
@@ -110,11 +112,25 @@ class XfsFilesystem {
  private:
   XfsFilesystem() = default;
 
+  // Read-only caches. Directory contents and inodes cannot change while we
+  // mount (the filesystem is never written by this process), so caching them
+  // is safe and makes large-directory enumeration fast.
+  struct DirCache {
+    std::vector<XfsDirEntry> entries;
+    std::unordered_map<std::string, size_t> index;
+  };
+  void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
+
   std::unique_ptr<BlockDevice> device_;
   XfsSuperblock superblock_;
   XfsGeometry geometry_;
   MountOptions options_;
   std::vector<std::string> warnings_;
+
+  mutable std::mutex cache_mutex_;
+  mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;
+  mutable std::unordered_map<uint64_t, DirCache> dir_cache_;
+  mutable size_t dir_cache_entries_ = 0;
 };
 
 }  // namespace xfs

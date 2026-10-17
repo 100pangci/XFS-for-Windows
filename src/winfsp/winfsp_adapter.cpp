@@ -50,6 +50,11 @@ std::u16string ToU16(const std::wstring& w) {
   return std::u16string(w.begin(), w.end());
 }
 
+struct DirChild {
+  std::u16string name;
+  uint64_t ino;
+};
+
 struct AdapterState {
   std::unique_ptr<XfsFilesystem> fs;
   PSECURITY_DESCRIPTOR security_descriptor = nullptr;
@@ -71,6 +76,14 @@ struct AdapterState {
   std::unordered_map<uint64_t, uint64_t> node_by_inode;
   std::unordered_map<uint64_t, std::unique_ptr<FileNode>> nodes;
   uint64_t next_node_id = 1;
+
+  // Sorted (Windows name, inode) children per directory. Directory contents
+  // are immutable for this read-only mount, so this is built once per
+  // directory and reused by every ReadDirectory page (WinFsp re-enters with a
+  // marker for each page) and by repeated Explorer enumerations.
+  std::unordered_map<uint64_t, std::shared_ptr<const std::vector<DirChild>>>
+      dir_children;
+  size_t dir_children_entries = 0;
 };
 
 uint64_t NodeId(PVOID context) {
@@ -187,27 +200,42 @@ uint64_t ToFileTime(const XfsTimestamp& ts) {
   return static_cast<uint64_t>(sec) * 10000000ULL + ts.nsec / 100;
 }
 
-uint32_t FileAttributesFor(const XfsInode& inode) {
+uint32_t FileAttributesFor(uint16_t mode) {
   uint32_t attributes = FILE_ATTRIBUTE_READONLY;
-  if (inode.IsDir()) attributes |= FILE_ATTRIBUTE_DIRECTORY;
+  if ((mode & 0170000) == 0040000) attributes |= FILE_ATTRIBUTE_DIRECTORY;
   return attributes;
+}
+
+void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
+                      uint64_t size, const XfsTimestamp& atime,
+                      const XfsTimestamp& mtime, const XfsTimestamp& ctime,
+                      const XfsTimestamp& crtime, uint64_t ino,
+                      FSP_FSCTL_FILE_INFO* info) {
+  std::memset(info, 0, sizeof(*info));
+  info->FileAttributes = FileAttributesFor(mode);
+  info->AllocationSize =
+      nblocks * static_cast<uint64_t>(state.fs->geometry().block_size);
+  info->FileSize = (mode & 0170000) == 0040000 ? 0 : size;
+  info->CreationTime = ToFileTime(crtime);
+  info->LastAccessTime = ToFileTime(atime);
+  info->LastWriteTime = ToFileTime(mtime);
+  info->ChangeTime = ToFileTime(ctime);
+  info->IndexNumber = ino;
+  info->HardLinks = 0;
+  info->EaSize = 0;
+  info->ReparseTag = 0;
 }
 
 void FillFileInfo(AdapterState& state, const XfsInode& inode,
                   FSP_FSCTL_FILE_INFO* info) {
-  std::memset(info, 0, sizeof(*info));
-  info->FileAttributes = FileAttributesFor(inode);
-  info->AllocationSize =
-      inode.nblocks * static_cast<uint64_t>(state.fs->geometry().block_size);
-  info->FileSize = inode.IsDir() ? 0 : inode.size;
-  info->CreationTime = ToFileTime(inode.crtime);
-  info->LastAccessTime = ToFileTime(inode.atime);
-  info->LastWriteTime = ToFileTime(inode.mtime);
-  info->ChangeTime = ToFileTime(inode.ctime);
-  info->IndexNumber = inode.ino;
-  info->HardLinks = 0;
-  info->EaSize = 0;
-  info->ReparseTag = 0;
+  FillFileInfoCore(state, inode.mode, inode.nblocks, inode.size, inode.atime,
+                   inode.mtime, inode.ctime, inode.crtime, inode.ino, info);
+}
+
+void FillFileInfo(AdapterState& state, const XfsFileInfo& inode,
+                  FSP_FSCTL_FILE_INFO* info) {
+  FillFileInfoCore(state, inode.mode, inode.nblocks, inode.size, inode.atime,
+                   inode.mtime, inode.ctime, inode.crtime, inode.ino, info);
 }
 
 void FillSecurity(AdapterState& state, PSECURITY_DESCRIPTOR buffer,
@@ -289,7 +317,7 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
                                      << inode.error().Format());
     return NtFromError(inode.error().code);
   }
-  uint32_t attributes = FileAttributesFor(inode.value());
+  uint32_t attributes = FileAttributesFor(inode.value().mode);
   if (NeedsSecurityOverflow(state, security_descriptor_size)) {
     if (file_attributes) *file_attributes = attributes;
     return STATUS_BUFFER_OVERFLOW;
@@ -437,10 +465,10 @@ NTSTATUS SetSecurity(FSP_FILE_SYSTEM*, PVOID, SECURITY_INFORMATION,
   return STATUS_MEDIA_WRITE_PROTECTED;
 }
 
-bool AddOneDirectoryEntry(FSP_FILE_SYSTEM* file_system, const XfsInode& inode,
-                          const std::u16string& name, PVOID buffer,
+bool AddOneDirectoryEntry(FSP_FILE_SYSTEM* file_system,
+                          const std::u16string& name,
+                          const FSP_FSCTL_FILE_INFO& file_info, PVOID buffer,
                           ULONG length, PULONG bytes_transferred) {
-  AdapterState& state = *State(file_system);
   if (name.size() >= 256) return TRUE;  // skip unrepresentable long names
   std::vector<uint8_t> entry(sizeof(FSP_FSCTL_DIR_INFO) +
                              name.size() * sizeof(char16_t));
@@ -448,7 +476,7 @@ bool AddOneDirectoryEntry(FSP_FILE_SYSTEM* file_system, const XfsInode& inode,
   auto* info = reinterpret_cast<FSP_FSCTL_DIR_INFO*>(entry.data());
   info->Size = static_cast<UINT16>(sizeof(FSP_FSCTL_DIR_INFO) +
                                    name.size() * sizeof(char16_t));
-  FillFileInfo(state, inode, &info->FileInfo);
+  info->FileInfo = file_info;
   std::memcpy(info->FileNameBuf, name.data(), name.size() * sizeof(char16_t));
   return FspFileSystemAddDirInfo(info, buffer, length, bytes_transferred) !=
          FALSE;
@@ -466,79 +494,106 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (!context.IsDir()) return STATUS_NOT_A_DIRECTORY;
   *bytes_transferred = 0;
 
+  // Sorted Windows-name children, built once per directory and reused for
+  // every page (the FSD calls again with a marker per page) and for repeated
+  // Explorer enumerations.
+  std::shared_ptr<const std::vector<DirChild>> children;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto it = state.dir_children.find(context.ino);
+    if (it != state.dir_children.end()) children = it->second;
+  }
+  if (!children) {
+    auto entries = state.fs->ListDirectory(context.ino);
+    if (!entries.ok()) return NtFromError(entries.error().code);
+    auto built = std::make_shared<std::vector<DirChild>>();
+    built->reserve(entries.value().size());
+    for (const auto& entry : entries.value()) {
+      if (entry.name == "." || entry.name == "..") continue;
+      WindowsName win = XfsNameToWindows(entry.name);
+      if (win.too_long) {
+        XFS_WARN("directory entry '" << entry.name
+                                     << "' is too long for Windows; skipped");
+        continue;
+      }
+      built->push_back({std::move(win.name), entry.ino});
+    }
+    std::sort(built->begin(), built->end(),
+              [](const DirChild& a, const DirChild& b) {
+                return a.name < b.name;
+              });
+    {
+      std::lock_guard<std::mutex> lock(state.node_mutex);
+      constexpr size_t kMaxCachedDirs = 64;
+      constexpr size_t kMaxCachedEntries = 262144;
+      if (state.dir_children.size() >= kMaxCachedDirs ||
+          state.dir_children_entries + built->size() > kMaxCachedEntries) {
+        state.dir_children.clear();
+        state.dir_children_entries = 0;
+      }
+      state.dir_children_entries += built->size();
+      state.dir_children.emplace(context.ino, built);
+    }
+    children = std::move(built);
+  }
+
   // Fixed ordering: ".", "..", then children sorted by Windows name. The
   // marker is the last name returned by the previous call.
   std::u16string marker_name = marker ? ToU16(std::wstring(marker))
                                       : std::u16string();
   bool marker_seen = marker == nullptr;
 
-  auto entries = state.fs->ListDirectory(context.ino);
-  if (!entries.ok()) return NtFromError(entries.error().code);
-
-  struct Child {
-    std::u16string name;
-    uint64_t ino;
-  };
-  std::vector<Child> children;
-  children.reserve(entries.value().size());
-  for (const auto& entry : entries.value()) {
-    if (entry.name == "." || entry.name == "..") continue;
-    WindowsName win = XfsNameToWindows(entry.name);
-    if (win.too_long) {
-      XFS_WARN("directory entry '" << entry.name
-                                   << "' is too long for Windows; skipped");
-      continue;
-    }
-    children.push_back({win.name, entry.ino});
-  }
-  std::sort(children.begin(), children.end(),
-            [](const Child& a, const Child& b) { return a.name < b.name; });
-
-  auto resolve_info = [&](uint64_t ino, XfsInode* out) -> bool {
-    auto inode = state.fs->OpenInode(ino);
-    if (!inode.ok()) {
+  auto add_entry = [&](uint64_t ino, const std::u16string& name) -> bool {
+    auto file_info = state.fs->GetFileInfo(ino);
+    if (!file_info.ok()) {
       XFS_WARN("cannot open inode " << ino << ": "
-                                    << inode.error().Format());
-      return false;
+                                    << file_info.error().Format());
+      return true;  // skip this entry, keep enumerating
     }
-    *out = std::move(inode.value());
-    return true;
+    FSP_FSCTL_FILE_INFO out;
+    FillFileInfo(state, file_info.value(), &out);
+    return AddOneDirectoryEntry(file_system, name, out, buffer, length,
+                                bytes_transferred);
   };
 
   // Dot entries (only for non-root directories; the FSD handles root ".").
   if (context.ino != state.fs->RootInode()) {
+    uint64_t parent_ino = 0;
+    bool have_parent = false;
     for (bool parent_entry : {false, true}) {
-      std::u16string wname = parent_entry ? u".." : u".";
+      const std::u16string wname = parent_entry ? u".." : u".";
       if (!marker_seen) {
         if (wname == marker_name) marker_seen = true;
         continue;
       }
-      XfsInode target = context;
       if (parent_entry) {
-        auto parent = state.fs->LookupName(context.ino, "..");
-        if (!parent.ok() || !resolve_info(parent.value().ino, &target)) {
-          continue;
+        if (!have_parent) {
+          auto parent = state.fs->LookupName(context.ino, "..");
+          if (!parent.ok()) continue;
+          parent_ino = parent.value().ino;
+          have_parent = true;
         }
-      }
-      if (!AddOneDirectoryEntry(file_system, target, wname, buffer, length,
-                                bytes_transferred)) {
-        return STATUS_SUCCESS;
+        if (!add_entry(parent_ino, wname)) return STATUS_SUCCESS;
+      } else {
+        if (!add_entry(context.ino, wname)) return STATUS_SUCCESS;
       }
     }
   }
 
-  for (const auto& child : children) {
-    if (!marker_seen) {
-      if (child.name == marker_name) marker_seen = true;
-      continue;
-    }
-    XfsInode inode;
-    if (!resolve_info(child.ino, &inode)) continue;
-    if (!AddOneDirectoryEntry(file_system, inode, child.name, buffer, length,
-                              bytes_transferred)) {
-      return STATUS_SUCCESS;
-    }
+  // Children: when the marker was a dot entry start at the beginning,
+  // otherwise resume strictly after the marker name (WinFsp semantics).
+  auto begin = children->begin();
+  if (!marker_seen) {
+    begin = std::upper_bound(
+        children->begin(), children->end(), marker_name,
+        [](const std::u16string& value, const DirChild& child) {
+          return value < child.name;
+        });
   }
+  for (auto it = begin; it != children->end(); ++it) {
+    if (!add_entry(it->ino, it->name)) return STATUS_SUCCESS;
+  }
+
   // End-of-directory marker: tells the FSD the enumeration is complete (see
   // FspFileSystemAddDirInfo with a NULL DirInfo).
   FspFileSystemAddDirInfo(nullptr, buffer, length, bytes_transferred);

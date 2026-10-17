@@ -182,6 +182,26 @@ WinFsp's built-in operation guard (`FspFileSystemSetOperationGuard` with
 callback runs serialized. Setting only the strategy is not enough: without the
 guard callbacks the FSD does not lock at all.
 
+## Read-only caches
+
+The filesystem is never written while mounted, so inode parsing and directory
+contents are cached:
+
+- `XfsFilesystem` caches up to 32k parsed inodes and up to 128 directory
+  listings (256k entries total, cleared wholesale when a cap is exceeded). This
+  removes repeated inode reads and directory parsing from Explorer's attribute
+  queries, path resolution and repeated enumerations.
+- The WinFsp adapter caches the sorted Windows-name child list per directory
+  (64 directories / 256k entries). WinFsp asks for one page at a time with a
+  marker; without the cache every page would re-list, re-map and re-sort the
+  whole directory.
+- `LookupName` uses the cached directory index, so resolving
+  `usr/lib64/libfoo.so` costs a hash lookup instead of re-reading the parent
+  directory for every path component.
+
+Cold listings still read every inode once (metadata must be correct); warm
+listings of a 4000-entry directory take tens of milliseconds.
+
 ## WinFsp adapter contracts
 
 Findings that the adapter must honor (all verified by the CI mount job):
