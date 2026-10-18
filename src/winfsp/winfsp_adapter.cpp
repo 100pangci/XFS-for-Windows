@@ -139,6 +139,7 @@ AdapterState* State(FSP_FILE_SYSTEM* fs) {
 
 NTSTATUS NtFromError(XfsError code) {
   switch (code) {
+    case XfsError::kOk: return STATUS_SUCCESS;
     case XfsError::kNotFound: return STATUS_OBJECT_NAME_NOT_FOUND;
     case XfsError::kNotDirectory: return STATUS_NOT_A_DIRECTORY;
     case XfsError::kNotRegularFile: return STATUS_INVALID_DEVICE_REQUEST;
@@ -724,11 +725,14 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
       name = resolved.value().second;
     }
   }
-  Status status = node->inode->IsDir()
-                      ? state.fs->RemoveEmptyDirectory(parent_ino, name,
-                                                  /*defer_inode_free=*/false)
-                      : state.fs->Unlink(parent_ino, name,
-                                         /*defer_inode_free=*/true);
+  Status status;
+  const bool deferred = !node->inode->IsDir();
+  if (deferred) {
+    status = state.fs->Unlink(parent_ino, name, /*defer_inode_free=*/true);
+  } else {
+    status = state.fs->RemoveEmptyDirectory(parent_ino, name,
+                                            /*defer_inode_free=*/false);
+  }
   if (!status.ok()) {
     // CanDelete / SetDelete validated this beforehand; a failure here cannot
     // be reported through the WinFsp interface.
@@ -738,13 +742,15 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
   }
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
-    node->delete_pending = true;
+    // Only a deferred free leaves work for Close; a removed directory is
+    // already gone.
+    node->delete_pending = deferred;
   }
   DropNamespaceCaches(state, parent_ino);
   XFS_DEBUG("deleted " << name << " in " << parent_ino
                        << (node->inode->IsDir() ? " (directory)" : "")
                        << "; inode " << node->inode->ino
-                       << " freed at last close");
+                       << (deferred ? " freed at last close" : " freed"));
 }
 
 VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
@@ -1166,6 +1172,10 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
   FSP_FILE_SYSTEM fake{};
   fake.UserContext = &state;
+  // Plain opens carry the packed FILE_OPEN disposition (the FSD
+  // packs the disposition into the high 8 bits; 0 would mean
+  // FILE_SUPERSEDE and truncate the file).
+  const UINT32 kFileOpen = 1u << 24;
 
   const wchar_t* dirs[] = {L"\\", L"\\folder", L"\\fragdir"};
   const wchar_t* files[] = {L"\\hello.txt", L"\\large.bin", L"\\sparse.img",
@@ -1247,7 +1257,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
 
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
-      if (!check(Open(&fake, const_cast<PWSTR>(dir), FILE_DIRECTORY_FILE, 0,
+      if (!check(Open(&fake, const_cast<PWSTR>(dir), FILE_DIRECTORY_FILE | kFileOpen, 0,
                       &ctx, &fi) == STATUS_SUCCESS,
                  "Open directory")) {
         continue;
@@ -1263,7 +1273,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
     for (const wchar_t* file : files) {
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
-      NTSTATUS opened = Open(&fake, const_cast<PWSTR>(file), 0, 0, &ctx, &fi);
+      NTSTATUS opened = Open(&fake, const_cast<PWSTR>(file), kFileOpen, 0, &ctx, &fi);
       if (opened == STATUS_OBJECT_NAME_NOT_FOUND) continue;
       if (!check(opened == STATUS_SUCCESS, "Open file")) continue;
       ++opened_files;
@@ -1287,7 +1297,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
       NTSTATUS opened = Open(&fake, const_cast<PWSTR>(L"\\bigdir"),
-                             FILE_DIRECTORY_FILE, 0, &ctx, &fi);
+                             FILE_DIRECTORY_FILE | kFileOpen, 0, &ctx, &fi);
       if (opened == STATUS_OBJECT_NAME_NOT_FOUND) {
         // Not every image has the large directory; skip it.
       } else if (check(opened == STATUS_SUCCESS, "Open bigdir")) {
@@ -1310,7 +1320,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
     for (const wchar_t* candidate : candidates) {
       PVOID ctx = nullptr;
       FSP_FSCTL_FILE_INFO fi{};
-      if (Open(&fake, const_cast<PWSTR>(candidate), 0, 0, &ctx, &fi) !=
+      if (Open(&fake, const_cast<PWSTR>(candidate), kFileOpen, 0, &ctx, &fi) !=
           STATUS_SUCCESS) {
         continue;
       }
@@ -1371,7 +1381,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       // Re-open (fresh node: re-reads inode and extents) and compare.
       Close(&fake, ctx);
       ctx = nullptr;
-      if (!check(Open(&fake, const_cast<PWSTR>(candidate), 0, 0, &ctx, &fi) ==
+      if (!check(Open(&fake, const_cast<PWSTR>(candidate), kFileOpen, 0, &ctx, &fi) ==
                      STATUS_SUCCESS,
                  "rw selftest: re-open")) {
         break;
@@ -1431,7 +1441,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
             "rw3 selftest: write new file");
       Close(&fake, ctx);
       ctx = nullptr;
-      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), 0, 0, &ctx,
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), kFileOpen, 0, &ctx,
                  &fi) == STATUS_SUCCESS,
             "rw3 selftest: re-open created file");
       if (ctx) {
@@ -1485,7 +1495,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       // The directory is no longer empty: the delete disposition is refused
       // without modifying anything.
       ctx = nullptr;
-      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE, 0,
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE | kFileOpen, 0,
                &ctx, &fi) == STATUS_SUCCESS) {
         enumerate(ctx, "rw3 dir with child");
         check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), TRUE) ==
@@ -1498,7 +1508,7 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       // on the AGI unlinked list), the handle keeps working until Close, and
       // Close frees the inode.
       child = nullptr;
-      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), 0, 0, &child,
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), kFileOpen, 0, &child,
                &fi) == STATUS_SUCCESS) {
         check(SetDelete(&fake, child,
                         const_cast<PWSTR>(L"\\rw3-dir\\child.bin"),
@@ -1516,13 +1526,13 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
         Close(&fake, child);  // frees the unlinked inode
       }
       PVOID gone = nullptr;
-      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), 0, 0,
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), kFileOpen, 0,
                  &gone, &fi) == STATUS_OBJECT_NAME_NOT_FOUND,
             "rw3 selftest: deleted child name gone");
 
       // Now the directory is empty and can be removed; its name disappears.
       ctx = nullptr;
-      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE, 0,
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE | kFileOpen, 0,
                &ctx, &fi) == STATUS_SUCCESS) {
         check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), TRUE) ==
                   STATUS_SUCCESS,
@@ -1530,14 +1540,15 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
         Cleanup(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), FspCleanupDelete);
         Close(&fake, ctx);
       }
-      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE,
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"),
+                 FILE_DIRECTORY_FILE | kFileOpen,
                  0, &gone, &fi) == STATUS_OBJECT_NAME_NOT_FOUND,
             "rw3 selftest: removed dir name gone");
 
       // Remove the first file the same way, then create the name again: names
       // and inodes are reusable.
       ctx = nullptr;
-      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), 0, 0, &ctx,
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), kFileOpen, 0, &ctx,
                &fi) == STATUS_SUCCESS) {
         check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-created.bin"),
                         TRUE) == STATUS_SUCCESS,

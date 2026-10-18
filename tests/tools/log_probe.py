@@ -384,6 +384,7 @@ def decode_inode_item(rec: Record, index: int):
         item["atime"] = decode_timestamp(core, DINODE_ATIME)
         item["mtime"] = decode_timestamp(core, DINODE_MTIME)
         item["ctime"] = decode_timestamp(core, DINODE_CTIME)
+        item["core_nlink"] = le32(core, 16)
         item["core_size"] = le64(core, DINODE_SIZE_FIELD)
         item["core_nblocks"] = le64(core, DINODE_NBLOCKS)
         item["core_ino"] = le64(core, DINODE_INO)

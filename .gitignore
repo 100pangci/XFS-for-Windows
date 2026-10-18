@@ -1,6 +1,7 @@
 # Build output
 build*/
 out/
+out-*/
 CMakeUserPresets.json
 
 # Reference material (xfsprogs source etc.) - never part of the product

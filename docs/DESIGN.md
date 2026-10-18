@@ -33,8 +33,10 @@ CLI (xfswin.exe)                       WinFsp host
 - The formatter (`src/mkfs/`) creates whole filesystems and is called only from
   `xfswin format` after the CLI's destructive-operation guards.
 - `src/write/` holds the mutation layer: policy + range mapping + in-place
-  data writes (RW-0), the transaction/journal writer (RW-1), and the block
-  allocator + data fork editor (RW-2, `docs/ALLOCATOR.md`). The rule stays the
+  data writes (RW-0), the transaction/journal writer (RW-1), the block
+  allocator + data fork editor (RW-2, `docs/ALLOCATOR.md`) and the inode
+  allocator + directory writer + namespace layer (RW-3,
+  `docs/INODE_ALLOCATOR.md`). The rule stays the
   same: WinFsp and the CLI call the high-level mutation API, never inode/btree
   structures.
 
@@ -247,18 +249,37 @@ file data) to keep them coherent.
 Cold listings still read every inode once (metadata must be correct); warm
 listings of a 4000-entry directory take tens of milliseconds.
 
-## Read-write support (RW-0: data, RW-1: transactions, RW-2: allocator)
+## Read-write support (RW-0: data, RW-1: transactions, RW-2: allocator, RW-3: namespace)
 
 Status: an existing regular file can be overwritten in place, extended and
-truncated. Every metadata change (inode, allocator, free-space btrees,
-superblock counters) goes through the journal as a real transaction, and every
-block allocation/free is done through the RW-2 allocator. Nothing else:
-create/unlink/rename/mkdir/symlink still require the inode allocator and
-directory updates.
-Roadmap: RW-3 inode allocation + create/unlink, RW-4 rename/hardlink/symlink,
-RW-5 journal replay, RW-6 raw devices (VHD first). `docs/JOURNAL.md` is the
-reference for the log format, `docs/ALLOCATOR.md` for the allocator and the
-data fork editor.
+truncated, and files and empty directories can be created and removed
+(`rw3`: inode allocator + directory writer + namespace layer). Every metadata
+change (inode, allocator, free-space btrees, superblock counters, directory
+blocks, inobt/AGI) goes through the journal as a real transaction; every block
+allocation/free is done through the RW-2 allocator and every directory mutation
+through the RW-3 writer. Rename, hard links, symlink creation, xattrs and ACLs
+are still refused.
+Roadmap: RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw devices
+(VHD first). `docs/JOURNAL.md` is the reference for the log format,
+`docs/ALLOCATOR.md` for the allocator and the data fork editor, and
+`docs/INODE_ALLOCATOR.md` for the inode chunks, the AGI unlinked list and the
+namespace transactions.
+
+**Namespace path (RW-3).** `XfsFilesystem::CreateRegularFile` / `Mkdir` /
+`Unlink` / `RemoveEmptyDirectory` (`src/write/namespace.cpp`) follow the Linux
+transaction shapes: create and mkdir commit inode allocation, inode
+initialisation, the parent's dirent insertion, the parent timestamps/counters
+and the AGI/inobt/superblock updates in one record, so a crash leaves either no
+file or a complete file; unlink and rmdir commit the dirent removal, the link
+count transition and the AGI unlinked-list insertion in one record and then
+free the truncate and the inode in rolling transactions (xfs_inactive +
+xfs_ifree). An open-but-unlinked file is a zero-link inode on the unlinked list
+until `FreeUnlinkedInode`, exactly the state `xlog_recover_process_iunlinks`
+cleans up after a crash. When no AG has a free inode, a chunk is allocated in
+its own transaction first (`EnsureInodeCapacity`), so the create record never
+carries a chunk allocation; a crash in between leaves one extra all-free chunk,
+never an unreachable inode. `src/write/dir_write.cpp` maintains all four
+directory formats and the conversions between them.
 
 **Write path.** `XfsFilesystem::WriteFileData` (`src/write/file_write.cpp`) is
 the single entry point for `pwrite`/WinFsp `Write`/append:
@@ -393,7 +414,7 @@ and a security descriptor that actually allows writing. File attributes follow
 the volume and the POSIX mode bits: on a writable volume a 0644 file is
 writable, a 0444 file is reported read-only.
 
-**Locking model.** RW-0 through RW-2 use one coarse `mutation_mutex_` for all
+**Locking model.** RW-0 through RW-3 use one coarse `mutation_mutex_` for all
 mutations (correctness first; per-object locking comes once the writer is
 stable). It also orders "device write" against "cache publication" for
 concurrent readers, which is what the generation counter relies on; parallel
@@ -425,6 +446,17 @@ replay on Linux (`rw2_crash_replay_check.py` + `xfs_repair -n`). Every crash
 image must replay to a legal old or new state: no exposed uninitialised bytes,
 no negative/garbage free-block counters, and a filesystem the kernel mounts.
 
+RW-3 adds the namespace matrix (`verify_crash_rw3_windows.ps1`,
+`verify_crash_rw3_linux.sh`): create, mkdir, unlink (three transactions: the
+namespace record, the truncate and the ifree) and rmdir (two: the namespace
+record and the ifree) are killed at every point and every hit. Windows checks
+each image before replay (`rw3_crash_check.py`: torn buffers, torn records, the
+write-ahead contract for every logged inode, and - when the log is clean - the
+full inobt/AGI/directory check plus an old-or-new namespace state). After
+replay Linux must see the name absent or a completely created file/directory,
+or the original file/directory intact (`rw3_crash_replay_check.py`), never an
+orphan inode, a dangling dirent or a bad counter.
+
 ## WinFsp adapter contracts
 
 Findings that the adapter must honor (all verified by the CI mount job):
@@ -443,11 +475,20 @@ Findings that the adapter must honor (all verified by the CI mount job):
   not clamp to `inode.size`; `ReadFileData` still clamps for regular reads.
 - `cat` must switch stdout to binary mode (`_setmode(_O_BINARY)`) or Windows
   translates every `\n` in file data to CRLF.
-- Write callbacks that are not implemented yet (`Create`, `Overwrite`,
-  `SetBasicInfo`, `CanDelete`, `Rename`, `SetSecurity`, `SetVolumeLabel`)
-  return `STATUS_MEDIA_WRITE_PROTECTED` on a read-only volume and
-  `STATUS_NOT_SUPPORTED` on a read-write one: calling a read-write volume
-  "write protected" would be false.
+- Write callbacks that are not implemented yet (`SetBasicInfo`, `Rename`,
+  `SetSecurity`, `SetVolumeLabel`) return `STATUS_MEDIA_WRITE_PROTECTED` on a
+  read-only volume and `STATUS_NOT_SUPPORTED` on a read-write one: calling a
+  read-write volume "write protected" would be false.
+- `Create` is only called by the FSD when the target must be created
+  (`FILE_CREATE`, or the `*_IF` dispositions after `Open` reported
+  `OBJECT_NAME_NOT_FOUND`), so existence is a collision there; `Open` truncates
+  for the OVERWRITE dispositions (the FSD reports `FILE_OVERWRITTEN` from that
+  `Open`). `SetDelete`/`CanDelete` only validate (empty directory, no immutable
+  flag, regular files only); the deletion happens in `Cleanup` through
+  `Unlink(..., defer_inode_free=true)`, which leaves the zero-link inode on the
+  AGI unlinked list so the handle keeps working until `Close` calls
+  `FreeUnlinkedInode`. Every namespace mutation drops the adapter's
+  per-directory listings and its path memo.
 - `Write` receives an offset for normal handles and a write-to-end flag for
   append handles; the append offset is resolved inside the core under its
   mutation lock (`WriteFileData(..., append=true)`), so a concurrent append
@@ -459,9 +500,10 @@ Findings that the adapter must honor (all verified by the CI mount job):
   refreshes the node's cached inode and extent list afterwards (`RefreshNode`),
   so the next `GetFileInfo`/read sees the new size and map. A
   `SetAllocationSize` request is accepted as advisory without preallocating.
-- `Cleanup` stays empty: deletes are refused, so there is no delete-on-close
-  work; file size changes need no pending-allocation repair (Windows retries
-  through the same callbacks after a failure).
+- Windows guarantees a delete `Cleanup` is the last outstanding cleanup for a
+  file node (`SupportsPosixUnlinkRename` is not set), so unlinking there is
+  POSIX-like: the name disappears immediately and only the inode survives to
+  `Close`.
 - Drive letters are per logon session: a letter created by an elevated process
   is invisible to the user's Explorer session. Directory mount points are NTFS
   junctions and are visible across sessions, so elevated mounts should use

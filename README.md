@@ -44,10 +44,11 @@ realtime device, no writes to existing filesystems.**
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
-| **Experimental read-write mount** | images only (`--rw-experimental`): existing regular files can be overwritten, extended and truncated through real transactions |
+| **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted; directories can be created and removed |
 | Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
 | Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
-| create / delete / rename / mkdir / symlink | **not implemented** (refused) |
+| create / mkdir / unlink / rmdir | yes (RW-3), one transaction per namespace change; unlink frees the data and the inode |
+| rename / hardlink / symlink creation / xattr / ACL | **not implemented** (refused) |
 | Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
 | Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt and the superblock free block counter |
 | Journal replay (reading a dirty log) | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`; Linux replays ours) |
@@ -84,6 +85,16 @@ btree-format images, verifies their bytes through the kernel, runs
 `xfs_repair -n`, then appends to the extended file so the next Windows job can
 read the result back (reverse interoperability). `linux-verify-rw2-crash`
 replays every crash window of an extend and a truncate.
+
+RW-3 adds the inode allocator and directory mutation:
+[`docs/INODE_ALLOCATOR.md`](docs/INODE_ALLOCATOR.md) describes the inobt/AGI
+rules and the chunk lifetime; `create`, `mkdir`, `unlink` and `rmdir` go
+through the same transactions the WinFsp callbacks use. `linux-verify-rw3`
+mounts Windows-created files and directories (shortform, leaf and node formats,
+churn and a fully grown directory), verifies names, types, sizes and contents
+through the kernel, and modifies a Windows-created directory from Linux so the
+next Windows job can read it back. `linux-verify-rw3-crash` replays every crash
+window of all four operations and requires the old or the complete new state.
 
 ## Read-write support (experimental, RW-2: overwrite, extend, truncate)
 
@@ -142,6 +153,47 @@ Scope of this milestone:
   (`XFSWIN_CRASH_AT=<point>[:<hit>]`) so crash-consistency can be tested
   against Linux `mount` / `xfs_repair -n`.
 
+## Experimental namespace support (RW-3: create, mkdir, unlink, rmdir)
+
+```text
+xfswin create test.img /new.bin --rw-experimental --mode=0644
+xfswin mkdir test.img /newdir --rw-experimental --mode=0755
+xfswin unlink test.img /new.bin --rw-experimental
+xfswin rmdir test.img /newdir --rw-experimental
+```
+
+Scope of this milestone:
+
+- **Regular files and directories only.** `create` makes a regular file with an
+  empty data fork, `mkdir` an empty shortform directory, `unlink` removes a
+  regular file (freeing its blocks and its inode) and `rmdir` removes an empty
+  directory. A non-empty `rmdir` and deleting symlinks or special files are
+  refused before anything is modified. Rename, hard links, symlink creation,
+  xattrs and ACLs are **not** implemented.
+- **One transaction per namespace change.** `CreateFile`/`Mkdir` commit the
+  inode allocation, the new inode, the parent's dirent, timestamps and the
+  AGI/inobt/superblock counters together, so a crash leaves either no file or a
+  complete file. `Unlink`/`RemoveDirectory` commit the dirent removal, the link
+  count and the AGI unlinked-list insertion together, then free the truncate
+  and the inode in rolling transactions. An open-but-unlinked file stays on the
+  AGI unlinked list until its last handle closes
+  (`XfsFilesystem::FreeUnlinkedInode`), exactly like Linux's `xfs_inactive`.
+- **Directory writer.** All four on-disk formats are maintained
+  (shortform, block, leaf and node) with the conversions between them,
+  recomputed bestfree tables, compacted stale leaf entries, the leaf chain and
+  the da btree rebuilt with last-hash keys. See `include/xfs/dir_write.h`.
+- **Inode allocator.** New chunks are `xfs_ialloc_ag_alloc`: aligned contiguous
+  blocks, a full inobt record, an `XFS_LI_ICREATE` item so replay rebuilds the
+  cluster; a chunk that becomes completely free is removed and its blocks are
+  returned. When no AG has a free inode the chunk is allocated in its own
+  transaction first, so the create transaction never carries a chunk
+  allocation. See [`docs/INODE_ALLOCATOR.md`](docs/INODE_ALLOCATOR.md).
+- **The WinFsp mount handles it too.** `Create` (files and directories),
+  `Overwrite` dispositions, `SetDelete`/`CanDelete` validation and
+  delete-on-close in `Cleanup` are implemented; deletes are performed through
+  the unlinked list so an open handle keeps working until `Close`. `Rename`
+  remains refused (`STATUS_NOT_SUPPORTED`).
+
 ## Requirements
 
 - Windows x64
@@ -191,6 +243,10 @@ xfswin stat test.img /hello.txt               # inode details
 xfswin mount test.img X:                      # read-only WinFsp mount
 xfswin mount test.img X: --rw-experimental    # writable mount (images only)
 xfswin pwrite test.img /hello.bin 0 --rw-experimental --text=hi
+xfswin create test.img /new.bin --rw-experimental --mode=0644
+xfswin mkdir test.img /newdir --rw-experimental --mode=0755
+xfswin unlink test.img /new.bin --rw-experimental
+xfswin rmdir test.img /newdir --rw-experimental
 xfswin unmount X:
 xfswin mount \\.\PhysicalDrive2 X:            # real disk (Administrator)
 xfswin mount \\.\HarddiskVolume11 E:\XFS      # a partition, as a directory mount
@@ -229,15 +285,16 @@ destructive flag), `3` refused for safety reasons.
   `FSP_FSCTL_VOLUME_PARAMS::ReadOnlyVolume=1`, opens the block device
   read-only and rejects every write-path callback.
 - Read-write mounts are opt-in (`--rw-experimental`), image only, and restricted
-  to the scope described above: an existing regular file can be overwritten,
-  extended and truncated, including the block allocations, extent map and
-  allocator metadata those operations need. They are an allow-list: a
-  filesystem with features this build cannot keep consistent is refused for
+  to the scope described above: regular files can be created, overwritten,
+  extended, truncated and deleted, and directories can be created and removed,
+  including the block allocations, extent map, inode allocation, directory
+  formats and allocator metadata those operations need. They are an allow-list:
+  a filesystem with features this build cannot keep consistent is refused for
   read-write instead of being modified best-effort.
-- Namespace changes are still refused: the core has no inode allocator, so it
-  cannot create, delete, rename, mkdir or create symlinks. The journal is only
-  ever *read* on mount (cleanliness check); a dirty log refuses mount (Linux
-  replays logs written by this build).
+- Rename, hard links, symlink creation, xattrs and ACL changes are refused; the
+  core has no transaction for them yet. The journal is only ever *read* on
+  mount (cleanliness check); a dirty log refuses mount (Linux replays logs
+  written by this build).
 - `xfswin format` is still the only writer of a whole filesystem, and the only
   path that can destroy existing data.
 
@@ -308,10 +365,13 @@ The WinFsp adapter can also be exercised without the driver:
 
 ```powershell
 build\src\RelWithDebInfo\xfswin.exe selftest tests\images\populated.img
+build\src\RelWithDebInfo\xfswin.exe selftest test.img --rw-experimental
 ```
 
 This drives the real adapter callbacks (open, read directory with markers,
-read files, close) against an image and validates buffer handling.
+read files, close; with `--rw-experimental` also write, grow/shrink,
+create/mkdir, delete-on-close and rmdir) against an image and validates buffer
+handling.
 
 ## Code layout
 

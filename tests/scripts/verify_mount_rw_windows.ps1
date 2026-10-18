@@ -16,8 +16,8 @@
 #
 #   1. writes the overlay into one file through the WinFsp Write callback and
 #      Flush, and verifies the bytes read back through the mount,
-#   2. asserts that growth, holes, truncation, create, delete, rename, mkdir
-#      and writes to a read-only file are all refused (RW-0 scope),
+#   2. asserts that rename and symlink creation and writes to a read-only file
+#      are refused, while create/mkdir/delete/rmdir work (RW-3 scope),
 #   3. writes the second overlay through `xfswin pwrite` after unmounting,
 #   4. runs `xfswin check` on the result and leaves rw-modified.img behind for
 #      Linux verification (tests/scripts/verify_rw_linux.sh).
@@ -195,13 +195,32 @@ try {
         "OK $($overlaySpec.path) matches the expected content"
     }
 
-    "== RW-2 scope: existing files can grow and shrink, namespace stays read-only =="
+    "== RW-3 scope: create, mkdir and delete work; rename stays refused =="
     $helloPath = Join-Path $mountPoint 'hello.bin'
     $subPath = Join-Path $mountPoint 'sub'
+    $newFilePath = Join-Path $mountPoint 'new.txt'
+    $newDirPath = Join-Path $mountPoint 'newdir'
 
-    Assert-Refused { [System.IO.File]::WriteAllText((Join-Path $mountPoint 'new.txt'), 'x') } "create file"
-    Assert-Refused { New-Item -ItemType Directory -Path (Join-Path $mountPoint 'newdir') | Out-Null } "create directory"
-    Assert-Refused { Remove-Item -LiteralPath $helloPath } "delete file"
+    [System.IO.File]::WriteAllText($newFilePath, 'created-through-winfsp')
+    Assert (Test-Path $newFilePath) "create file did not work"
+    Assert ([System.IO.File]::ReadAllText($newFilePath) -eq
+        'created-through-winfsp') "created file content mismatch"
+    New-Item -ItemType Directory -Path $newDirPath | Out-Null
+    Assert (Test-Path $newDirPath) "mkdir did not work"
+    [System.IO.File]::WriteAllText((Join-Path $newDirPath 'child.txt'), 'child')
+    Assert ((Get-Content (Join-Path $newDirPath 'child.txt') -Raw) -eq 'child') `
+        "child content mismatch"
+    $rmdirFailed = $false
+    try { Remove-Item -LiteralPath $newDirPath -ErrorAction Stop } catch {
+        $rmdirFailed = $true
+    }
+    Assert $rmdirFailed "rmdir of a non-empty directory unexpectedly succeeded"
+    Remove-Item -LiteralPath (Join-Path $newDirPath 'child.txt') -ErrorAction Stop
+    Remove-Item -LiteralPath $newDirPath -ErrorAction Stop
+    Assert (-not (Test-Path $newDirPath)) "rmdir did not remove the directory"
+    Remove-Item -LiteralPath $newFilePath -ErrorAction Stop
+    Assert (-not (Test-Path $newFilePath)) "delete did not remove the file"
+
     Assert-Refused { Rename-Item -LiteralPath (Join-Path $mountPoint 'ro.txt') -NewName 'renamed.txt' } "rename file"
     Assert-Refused {
         # A 0444 file stays read-only on disk.

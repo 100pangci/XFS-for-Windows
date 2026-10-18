@@ -150,6 +150,24 @@ jobs:
             -WorkDir "crash-rw2"
           if ($LASTEXITCODE -ne 0) { throw "RW-2 crash matrix failed" }
 
+      - name: RW-3 round-trip images (create / mkdir / unlink / rmdir)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw3_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "rw3"
+          if ($LASTEXITCODE -ne 0) { throw "RW-3 round-trip image generation failed" }
+
+      - name: RW-3 crash matrix (create / mkdir / unlink / rmdir)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_rw3_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "crash-rw3"
+          if ($LASTEXITCODE -ne 0) { throw "RW-3 crash matrix failed" }
+
       - name: Upload the crash images
         uses: actions/upload-artifact@v4
         with:
@@ -169,6 +187,20 @@ jobs:
         with:
           name: rw2-crash
           path: crash-rw2/
+          if-no-files-found: error
+
+      - name: Upload the RW-3 round-trip images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw3-images
+          path: rw3/
+          if-no-files-found: error
+
+      - name: Upload the RW-3 crash images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw3-crash
+          path: crash-rw3/
           if-no-files-found: error
 
       - name: Upload xfswin.exe
@@ -652,6 +684,123 @@ jobs:
             throw "tail is '$tail', expected LINUX-AFTER-WINDOWS"
           }
           Write-Output "reverse interoperability verified: $($bytes.Length) bytes"
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the RW-3 round trip: create, mkdir, unlink, rmdir, a leaf
+  # directory with churn, a node-format directory, and reverse interoperability
+  # (the kernel creates, writes and removes inside a Windows-created
+  # directory).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw3:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw3-images
+          path: rw3
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Mount, replay and verify every RW-3 image
+        run: |
+          ls -l rw3
+          sudo bash tests/scripts/verify_rw3_linux.sh rw3
+
+      - name: Upload the reverse-interoperability image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw3-reverse
+          path: rw3/reverse.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux replays every RW-3 crash image: create, mkdir, unlink and rmdir at
+  # every crash point and transaction hit. The kernel must see the old or the
+  # complete new state (no dangling dirents, no orphan inodes), and xfs_repair
+  # -n plus the structural oracle must stay silent.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw3-crash:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw3-crash
+          path: crash-rw3
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Replay and verify every RW-3 crash window
+        run: |
+          ls -l crash-rw3 | head -20
+          sudo bash tests/scripts/verify_crash_rw3_linux.sh crash-rw3
+
+  # ---------------------------------------------------------------------------
+  # Windows reads back the image the Linux kernel modified: files created,
+  # written and removed inside a Windows-created directory.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw3-reverse:
+    needs: linux-verify-rw3
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw3-reverse
+          path: rw3
+
+      - name: Read the Linux-modified image with xfswin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "bin\xfswin.exe"
+          python tests/tools/rw3_probe.py rw3/reverse.img --quiet
+          if ($LASTEXITCODE -ne 0) { throw "oracle rejected the reverse image" }
+          $listing = & $exe ls rw3\reverse.img /r3dir
+          if ($LASTEXITCODE -ne 0) { throw "ls failed on the reverse image" }
+          $text = $listing -join "`n"
+          foreach ($name in @('child.bin', 'linux-after.txt', 'linuxdir')) {
+            if ($text -notmatch [regex]::Escape($name)) {
+              throw "the reverse image is missing $name"
+            }
+          }
+          if ($text -match 'empty\.bin') {
+            throw "empty.bin should have been removed by Linux"
+          }
+          # Start-Process keeps the child's stdout byte-exact (a pipeline may
+          # decode and re-encode native output).
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList @('cat', 'rw3\reverse.img', '/r3dir/linux-after.txt') `
+            -RedirectStandardOutput 'reverse.txt' -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "cat failed on the reverse image ($($proc.ExitCode))"
+          }
+          $content = [System.Text.Encoding]::ASCII.GetString(
+            [System.IO.File]::ReadAllBytes("reverse.txt"))
+          if ($content -ne 'LINUX-AFTER-WINDOWS') {
+            throw "reverse content '$content' != LINUX-AFTER-WINDOWS"
+          }
+          Write-Output "RW-3 reverse interoperability verified"
 
   # ---------------------------------------------------------------------------
   # Raw device path (Case C): attach a fixed VHD as a real disk and format it

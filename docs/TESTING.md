@@ -49,12 +49,13 @@ python tests\tools\xfs_probe.py build\smoke.img
 It must print `ALL STRUCTURAL CHECKS PASSED`. This catches bugs where the C++
 reader and writer share a wrong assumption.
 
-## Read-write tests (RW-0 data, RW-1 transactions, RW-2 allocator)
+## Read-write tests (RW-0 data, RW-1 transactions, RW-2 allocator, RW-3 namespace)
 
 The write path is the same core code for the CLI and for WinFsp, so it is
 tested in layers. RW-1 added the journal, so the layers now include a log
 format oracle and a crash matrix that Linux replays. RW-2 adds the allocator
-and the extent map; every layer below runs on it as well.
+and the extent map, RW-3 the inode allocator and the namespace; every layer
+below runs on them as well.
 
 ### 1. Unit and integration tests (no driver, no Linux)
 
@@ -90,6 +91,24 @@ fresh remount afterwards:
   counting data *and* bmbt blocks;
 - the allocator counters after mixed allocate/free operations.
 
+RW-3 adds `tests/unit/rw3_tests.cpp`, also against the real fixture image with
+a fresh remount and the built-in consistency check after every scenario:
+
+- the inode allocator itself: first free inode, allocation order, freeing and
+  reuse, a new chunk allocated in transaction, a fully freed chunk removed with
+  its blocks returned, the unlinked buckets, and the chunk layout (aligned run,
+  full inobt record, `agi_newino`);
+- `CreateRegularFile`/`Mkdir` and the counters they move (parent nlink for
+  mkdir), `Unlink` freeing the data blocks *and* the inode,
+  `RemoveEmptyDirectory`, and the open-but-unlinked deferral
+  (`defer_inode_free` then `FreeUnlinkedInode`);
+- a directory growing through all four formats (640 creates with 8-byte names,
+  then half of them removed) and an `rmdir` of a grown directory returning its
+  leaf/free blocks;
+- inode reuse after a delete without stale data (the new file has a higher
+  generation and size 0) and the refusals (non-empty rmdir, invalid names,
+  duplicate names, directories in `unlink`, files in `rmdir`).
+
 Every one of these images is also checked by `xfswin check`, which now also
 recomputes `di_nblocks` from the extent map and the bmbt blocks, and verifies
 `agf_btreeblks` against the number of non-root free-space btree blocks.
@@ -121,26 +140,43 @@ CI against the Linux-populated and golden images.
 xfswin pwrite test.img /hello.bin 4096 --rw-experimental --from=overlay.bin
 xfswin extend test.img /hello.bin 45000 --rw-experimental
 xfswin truncate test.img /hello.bin 20000 --rw-experimental
+xfswin create test.img /new.bin --rw-experimental --mode=0644
+xfswin mkdir test.img /newdir --rw-experimental
+xfswin unlink test.img /new.bin --rw-experimental
+xfswin rmdir test.img /newdir --rw-experimental
 xfswin check test.img
 python tests\tools\rw2_probe.py test.img --inode 67
+python tests\tools\rw3_probe.py test.img
 ```
 
 `pwrite`, `extend` and `truncate` perform the same core mutations the WinFsp
 callbacks do (image only, require `--rw-experimental`), so CI can verify writes
 against Linux oracles without the WinFsp driver. `pwrite` supports growth now;
 `extend` writes the deterministic pattern `((offset * 131) + 7) & 0xFF` (or a
-`--fill=0xNN` constant) past EOF; `truncate` is `SetFileSize`.
+`--fill=0xNN` constant) past EOF; `truncate` is `SetFileSize`. `create`,
+`mkdir`, `unlink` and `rmdir` are the namespace mutations (`CreateRegularFile`,
+`Mkdir`, `Unlink`, `RemoveEmptyDirectory`) with the same opt-in flag.
+
+`tests/tools/rw3_probe.py` is the independent structural oracle for RW-3: it
+parses the inobt and the AGI from the raw image, cross-checks their counters
+against each other and the superblock, walks all four directory formats
+(data/leaf/free blocks, bestfree tables, the da btree keys and the leaf chain)
+and - with `--expect <spec.json>` - verifies an exact name/type/size listing.
+It shares no code with the C++ writer.
 
 ### 3. WinFsp read-write mount
 
 Without a driver, `xfswin selftest <image> --rw-experimental` drives the real
 callbacks (open, write, flush, re-open, read back), then writes past EOF,
 shrinks the file, grows it sparsely and shrinks it again, verifying the size and
-the data through a fresh node. With a driver,
+the data through a fresh node; RW-3 extends it with create + write + re-open,
+mkdir with enumeration, the non-empty rmdir refusal, delete-on-close with reads
+on the unlinked inode after `Cleanup`, rmdir and name reuse. With a driver,
 `tests/scripts/verify_mount_rw_windows.ps1` mounts the image read-write,
 overwrites bytes in a file through WinFsp, verifies the read-back, asserts that
-namespace operations (create/delete/rename/mkdir) and writes to 0444 files are
-refused, exercises growth, append handles and `SetEndOfFile` shrink/grow on an
+rename, symlink creation and writes to 0444 files are refused (create, delete
+and mkdir are exercised by the adapter self-test and the RW-3 CLI images),
+exercises growth, append handles and `SetEndOfFile` shrink/grow on an
 existing file, then writes a second overlay through `xfswin pwrite` and runs
 `xfswin check`.
 
@@ -200,6 +236,34 @@ kernel replays the log) and requires the window contract:
 plus a clean log after the unmount and `xfs_repair -n` staying silent. The
 "new" timestamps are not guessed: `tests/tools/rw_replay_check.py` reads them
 out of the complete log record in the image, which is what the kernel replays.
+
+RW-2 doubles the matrix across an extend and a truncate
+(`verify_crash_rw2_windows.ps1` + `rw2_crash_check.py`, replayed by
+`verify_crash_rw2_linux.sh` + `rw2_crash_replay_check.py`): every point of both
+write transactions, the data write, the flushes and the truncate transactions,
+and the contract is old or new *size* with pixels that are never garbage.
+
+RW-3 adds the namespace matrix:
+
+```powershell
+pwsh -File tests/scripts/verify_crash_rw3_windows.ps1 `
+  -Exe build\src\RelWithDebInfo\xfswin.exe `
+  -Tests build\tests\RelWithDebInfo\xfs_tests.exe -WorkDir out\crash-rw3
+```
+
+It kills `create` and `mkdir` (one transaction each), `unlink` (three: the
+namespace record, the truncate, the ifree) and `rmdir` (two: the namespace
+record and the ifree) at every crash point and hit. Each image is checked
+before replay by `tests/tools/rw3_crash_check.py`: every written metadata buffer
+individually intact, at most one torn newest record, the write-ahead contract
+for every logged inode (a buffer carrying a complete record's LSN must match
+that record's item), and - when the log is clean - the full inobt/AGI/directory
+check plus an old-or-new namespace state. On Linux,
+`tests/scripts/verify_crash_rw3_linux.sh` mounts every image (replay) and
+requires via `rw3_crash_replay_check.py` that the name is absent or completely
+created, or the original file/directory intact (with its original size and
+content for unlink), then a clean log, silent `xfs_repair -n` and a passing
+`rw3_probe.py`.
 
 ## Linux oracles (required for release)
 
@@ -304,16 +368,19 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs twelve jobs:
+Every push runs fifteen jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
-   suite (including the journal and allocator tests), formats a 300 MiB image,
-   runs `xfswin check`, cross-checks the image with the independent Python
-   probe, builds the fixture image (one allocated file) and probes it,
-   exercises the CLI write path (`pwrite`, growth, truncate, refusals, `check`
-   after the writes), generates the RW-2 round-trip images
-   (`verify_rw2_windows.ps1`) and runs both crash matrices
-   (`verify_crash_windows.ps1`, `verify_crash_rw2_windows.ps1`), uploading
+   suite (including the journal, allocator and namespace tests), formats a
+   300 MiB image, runs `xfswin check`, cross-checks the image with the
+   independent Python probe, builds the fixture image (one allocated file) and
+   probes it, exercises the CLI write path (`pwrite`, growth, truncate,
+   refusals, `check` after the writes), generates the RW-2 round-trip images
+   (`verify_rw2_windows.ps1`), the RW-3 round-trip images
+   (`verify_rw3_windows.ps1`: create, mkdir, unlink, rmdir, a leaf directory
+   with churn and a node-format directory, all verified with `rw3_probe.py`)
+   and runs all three crash matrices (`verify_crash_windows.ps1`,
+   `verify_crash_rw2_windows.ps1`, `verify_crash_rw3_windows.ps1`), uploading
    every image for the Linux jobs.
 2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
    `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
@@ -331,14 +398,14 @@ Every push runs twelve jobs:
    targets against the Linux-generated manifest (differential test).
 5. **windows-mount**: installs the WinFsp runtime, builds with the WinFsp SDK,
    runs `xfswin selftest` (adapter callbacks without the driver, read-only and
-   read-write), mounts the Linux image at `X:`, verifies
-   reads/hashes/Unicode names, asserts that create/delete/rename/mkdir are
-   rejected as write-protected, then mounts the read-write image with
-   `--rw-experimental`, overwrites bytes through the WinFsp `Write` callback,
-   exercises growth, append handles and `SetEndOfFile` on an existing file,
-   asserts that namespace operations and writes to 0444 files stay refused,
-   writes a second overlay through `xfswin pwrite` and uploads the modified
-   image.
+   read-write, including RW-3 create/mkdir/delete-on-close/rmdir), mounts the
+   Linux image at `X:`, verifies reads/hashes/Unicode names, asserts that every
+   write-path callback is rejected as write-protected, then mounts the
+   read-write image with `--rw-experimental`, overwrites bytes through the
+   WinFsp `Write` callback, exercises growth, append handles and `SetEndOfFile`
+   on an existing file, exercises create/mkdir/delete/rmdir (with rename and
+   writes to 0444 files still refused), writes a second overlay through
+   `xfswin pwrite` and uploads the modified image.
 6. **linux-verify-rw** (ubuntu-24.04): verifies the read-write round trip:
    `xfs_repair -n` must stay clean, the two modified files must match the
    content regenerated by `tests/tools/rw_content.py` with the overlays
@@ -363,11 +430,25 @@ Every push runs twelve jobs:
     appended to with `xfswin cat` and checks the size and tail bytes - the
     reverse direction of interoperability (Linux continues writing, Windows
     reads it back).
-11. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+11. **linux-verify-rw3** (ubuntu-24.04): mounts the RW-3 images (shortform
+    files and directories, a grown leaf directory with churn, a node-format
+    directory), verifies the exact names/types/sizes/contents through the
+    kernel from the manifest, requires `xfs_repair -n` silence and a clean log,
+    then creates, writes and removes files and directories inside the
+    Windows-created `/r3dir` so the reverse job can read the result back.
+12. **linux-verify-rw3-crash** (ubuntu-24.04): replays every RW-3 crash window
+    (create, mkdir, unlink, rmdir) and requires the old or the complete new
+    state, a clean log after replay, `xfs_repair -n` silence and a passing
+    structural oracle.
+13. **windows-verify-rw3-reverse** (windows-2022): lists the Linux-modified
+    image with `xfswin ls`, checks that the Linux-created names are visible and
+    the deleted one is gone, and reads the Linux-written content back with
+    `xfswin cat`.
+14. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
     VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
     with the raw device backend, reads it back with `info`/`check`/`ls`, and
     detaches it. Uploads the VHD.
-12. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+15. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
     from the artifact and runs the full Linux verification (`xfs_db`,
     `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
     through the raw device path -- the CI stand-in for Case C hardware.

@@ -1,9 +1,16 @@
 # Inode allocator and inode lifecycle (RW-3)
 
-Status: implementation note for RW-3. Everything here was verified against the
+Status: implemented. `src/write/ialloc.cpp` is the allocator (inobt, AGI,
+icreate, free, unlinked buckets), `src/write/namespace.cpp` the namespace layer
+that uses it (`CreateRegularFile`, `Mkdir`, `Unlink`, `RemoveEmptyDirectory`,
+`FreeUnlinkedInode`), and the WinFsp adapter drives the same operations from
+`Create`/`Cleanup`/`SetDelete`. Everything here was verified against the
 kernel sources (`reference/linux/fs/xfs`, the same tree as `docs/JOURNAL.md`)
 and `xfsprogs` (`reference/xfsprogs-7.2.0`); the function names in parentheses
-are the upstream code this follows.
+are the upstream code this follows. CI covers it three ways: unit tests
+(`tests/unit/rw3_tests.cpp`), the independent Python oracle
+(`tests/tools/rw3_probe.py`), and Linux mount/`xfs_repair -n` jobs for the
+round trip and the crash matrix.
 
 Scope: the writable profile (`CheckWritableProfile`):
 
@@ -61,13 +68,13 @@ The AGI, inobt and superblock updates are one transaction.
    layout), `count` 64, `freecount` 64, `free` all ones;
 5. `agi_count += 64`, `agi_freecount += 64`, `agi_newino = startino`,
    `sb_icount += 64`, `sb_ifree += 64`;
-6. hand out the first inode of the chunk.
+6. hand out the first inode of the chunk (or leave all 64 free when the chunk
+   was preallocated).
 
 The kernel logs the new cluster as an *ordered* buffer plus a logical
-`XFS_LI_ICREATE` item, so recovery re-initialises the whole cluster even if the
-inode buffer write was lost. This build emits the same icreate item
-(`xfs_icreate_log`, type `0x123f`, one region) and writes the cluster buffer
-itself after the record is durable:
+`XFS_LI_ICREATE` item and writes the pristine cluster buffer at allocation
+time. This build emits the same icreate item (`xfs_icreate_log`, type `0x123f`,
+one region):
 
 ```text
 xfs_icreate_log (28 bytes)
@@ -80,6 +87,25 @@ from that geometry: the same guarantee the kernel has. An icreate item is
 reordered with the buffer items (before inode items), so a create transaction
 that also initialises a new *file* inode in the same chunk replays the cluster
 first and the inode core second (the kernel's ordering too).
+
+Every inode this build hands out is written as a complete image (magic,
+version, generation, `di_ino`, uuid, fork, CRC) by `LogPreparedInode`, so an
+allocated inode never depends on the icreate replay; the unused inodes of a
+chunk keep the old block contents until they are allocated (or until a crash
+replays the icreate item and makes the whole cluster pristine), which no reader
+inspects because the inobt marks them free.
+
+**Two-phase chunk allocation (namespace path).** A chunk allocation carries the
+block allocator's bnobt/cntbt/AGF/AGFL buffers, the inobt insert and the
+icreate item; together with a growing directory's blocks that can exceed one
+32 KiB log record. Before a create the namespace layer therefore asks
+`EnsureInodeCapacity`: when no AG reports a free inode, `PreallocateChunk`
+(`xfs_ialloc_ag_alloc` without handing out an inode) runs in its own
+transaction, and the create transaction then only takes one inode out of the
+new chunk. A crash between the two transactions leaves a legal filesystem with
+one extra all-free chunk - exactly the state `xfs_ialloc_ag_alloc` leaves
+before an inode is handed out - never an allocated inode that is unreachable.
+`AllocateInode` keeps the in-transaction fallback for direct callers.
 
 ## 4. Freeing an inode
 
@@ -157,4 +183,31 @@ cached data can never be served for a reused inode number.
   refuses (before writing) any structural case it cannot complete;
 - the exact-block "continue after the last chunk" allocation of
   `xfs_ialloc_ag_alloc` is not implemented: a new chunk is allocated with the
-  geometry's alignment, which is a legal placement Linux continues from.
+  geometry's alignment, which is a legal placement Linux continues from;
+- rename, hard links and symlink creation are refused, so an inode never has
+  more than one namespace entry and never moves between directories; the
+  adapter can therefore remember `(parent, name)` per open node.
+
+## 9. Where it is wired in
+
+| piece | file |
+|---|---|
+| inobt/AGI/icreate, chunk lifetime, unlinked buckets | `src/write/ialloc.cpp` |
+| namespace transactions (create, mkdir, unlink, rmdir, ifree) | `src/write/namespace.cpp` |
+| directory formats and conversions | `src/write/dir_write.cpp` |
+| two-phase chunk allocation before a create | `XfsFilesystem::EnsureInodeCapacity` |
+| WinFsp `Create`/`Cleanup`/`SetDelete`/`CanDelete` | `src/winfsp/winfsp_adapter.cpp` |
+| CLI `create`/`mkdir`/`unlink`/`rmdir` | `src/cli/commands.cpp` |
+
+Tests and oracles:
+
+- `tests/unit/rw3_tests.cpp`: allocator, namespace, format conversions, inode
+  reuse and the refused cases, against the real fixture image with the
+  built-in consistency check after every scenario;
+- `tests/tools/rw3_probe.py`: independent parser of the inobt/AGI and of all
+  four directory formats (data/leaf/free blocks, bestfree, da btree keys),
+  run on every Windows-written image before Linux mounts it;
+- `tests/tools/rw3_crash_check.py`, `rw3_crash_replay_check.py`,
+  `tests/scripts/verify_rw3_windows.ps1`, `verify_rw3_linux.sh`,
+  `verify_crash_rw3_windows.ps1`, `verify_crash_rw3_linux.sh`: the round trip
+  and the crash matrix, with Linux replaying every crash window.
