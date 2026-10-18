@@ -160,15 +160,12 @@ Status DirectoryEditor::CheckMutable(const XfsInode& inode) {
         .Metadata("inode")
         .Actual(inode.format);
   }
-  // The directory writer computes offsets in the full literal area; a
-  // directory with an attribute fork would shift its data fork. Attribute
-  // mutation is out of scope for RW-3, so refuse instead of guessing.
-  if (inode.forkoff != 0 || inode.anextents != 0) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "directories with attribute forks are not mutable yet")
-        .Ino(inode.ino)
-        .Metadata("inode");
-  }
+  // Directories with an attribute fork are mutable: every kernel create
+  // reserves one (xfs_icreate_want_attrfork -> forkoff 24, empty extents attr
+  // fork), and real xattrs must survive a dirent edit. Only the data fork is
+  // rewritten, inside the capacity the core parser already derived from
+  // di_forkoff (XfsInode::data_fork); the attr fork bytes are preserved
+  // untouched.
   return OkStatus();
 }
 
@@ -216,6 +213,9 @@ Status DirectoryEditor::Load(const XfsInode& inode) {
   free_blocks_.clear();
   block_dirty_ = false;
   data_size_ = inode.size;
+  // The data fork's share of the literal area: the whole inode after the core,
+  // or only up to di_forkoff when an attribute fork is present.
+  literal_capacity_ = static_cast<uint32_t>(inode.data_fork.size());
 
   if (inode.format == di::kFormatLocal) return LoadShortform(inode);
   std::vector<uint8_t> buf;
@@ -616,8 +616,7 @@ Status DirectoryEditor::InsertPlaced(const DirEntryWrite& entry,
     if (index == placed_.size()) {
       image += SfEntrySizeFor(entry.name.size(), wide);
     }
-    const size_t capacity =
-        static_cast<size_t>(geo_->inode_size) - di::kCoreSizeV3;
+    const size_t capacity = literal_capacity_;
     if (image > capacity) {
       return XFS_ERR(XfsError::kNoSpace, "does not fit shortform")
           .Ino(ino_)
@@ -2081,8 +2080,9 @@ Status DirectoryEditor::FinalizeInode(std::vector<uint8_t>* raw_inode,
     std::vector<uint8_t> image;
     BuildShortformImage(&image);
     data_size_ = image.size();
-    const size_t literal =
-        static_cast<size_t>(geo_->inode_size) - di::kCoreSizeV3;
+    // Only the data fork's share of the literal area belongs to the directory;
+    // an attribute fork after di_forkoff must not be touched or zeroed.
+    const size_t literal = literal_capacity_;
     if (image.size() > literal) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "shortform directory does not fit the inode")
@@ -2175,7 +2175,7 @@ Status DirectoryEditor::Replace(std::string_view name, uint64_t new_ino,
       for (const PlacedEntry& p : placed_) {
         image += SfEntrySizeFor(p.e.name.size(), wide);
       }
-      if (image > static_cast<size_t>(geo_->inode_size) - di::kCoreSizeV3) {
+      if (image > literal_capacity_) {
         auto alloc = AllocDirBlock(0);
         if (!alloc.ok()) return alloc.error();
         (void)alloc;

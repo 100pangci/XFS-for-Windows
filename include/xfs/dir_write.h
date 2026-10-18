@@ -271,6 +271,9 @@ class DirectoryEditor {
   std::map<uint32_t, NodeBlock> node_blocks_;
   std::map<uint32_t, FreeBlock> free_blocks_;
   uint64_t data_size_ = 0;
+  // Bytes of the literal area the data fork owns: the whole area after the
+  // core, or only up to di_forkoff when an attribute fork is present.
+  uint32_t literal_capacity_ = 0;
 };
 
 }  // namespace xfs
