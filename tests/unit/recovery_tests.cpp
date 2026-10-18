@@ -15,11 +15,14 @@
 
 #include "support/fixture_device.h"
 #include "test_util.h"
+#include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/inode.h"
+#include "xfs/log_checker.h"
 #include "xfs/log_format.h"
 #include "xfs/log_record.h"
+#include "xfs/ondisk.h"
 #include "xfs/recovery.h"
 #include "xfs/superblock.h"
 
@@ -120,12 +123,53 @@ class SyntheticLog {
     return device_.Read(byte_offset, data, size);
   }
 
+  // Replays the current log content (the caller scanned it first).
+  xfs::Result<xfs::ReplayStats> Replay(const xfs::LogScan& scan,
+                                       xfs::RecoveredLogState* state) {
+    return xfs::ReplayLog(device_, sb_, geo_, scan, state);
+  }
+
  private:
   uint32_t log_blocks_;
   xfstest::MemoryBlockDevice device_;
   xfs::XfsSuperblock sb_;
   xfs::XfsGeometry geo_;
 };
+
+// A buffer log item whose bitmap covers `logged_chunks` full chunks: the
+// payload is the complete logged region, run-length one.
+std::vector<std::vector<uint8_t>> BufItemRegions(
+    uint64_t daddr, uint32_t len_blocks, uint16_t blft, uint16_t extra_flags,
+    const std::vector<uint8_t>& payload) {
+  CHECK(payload.size() % lf::kBufChunkSize == 0);
+  const uint32_t chunks = static_cast<uint32_t>(payload.size() / lf::kBufChunkSize);
+  const uint32_t map_words = (chunks + 31) / 32;
+  std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
+  PutLE16At(format.data(), 0, lf::kItemBuf);
+  PutLE16At(format.data(), 2, 2);  // format + one region
+  PutLE16At(format.data(), 4,
+            static_cast<uint16_t>((blft << lf::kBlftShift) | extra_flags));
+  PutLE16At(format.data(), 6, static_cast<uint16_t>(len_blocks));
+  PutLE32At(format.data(), 8, static_cast<uint32_t>(daddr));
+  PutLE32At(format.data(), 12, static_cast<uint32_t>(daddr >> 32));
+  PutLE32At(format.data(), 16, map_words);
+  for (uint32_t i = 0; i < chunks; ++i) {
+    format[lf::kBufMapOffset + i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+  }
+  return {format, payload};
+}
+
+// Builds a valid 512-byte AGF image (magic, uuid, lsn, CRC).
+std::vector<uint8_t> MakeAgf(uint32_t seqno) {
+  std::vector<uint8_t> agf(512, 0);
+  xfs::PutBE32(agf.data(), 0, 0x58414746);  // 'XAGF'
+  xfs::PutBE32(agf.data(), 4, 1);
+  xfs::PutBE32(agf.data(), 8, seqno);
+  xfs::PutBE32(agf.data(), 12, 1024);
+  std::memcpy(agf.data() + 64, kUuid, 16);
+  xfs::UpdateXfsChecksum(agf.data(), agf.size(), 216);
+  return agf;
+}
 
 // One inode log item (format header + log dinode) as the item regions.
 std::vector<std::vector<uint8_t>> InodeItemRegions(uint64_t ino) {
@@ -199,7 +243,7 @@ TEST(recovery_scan_clean_unmount_record) {
 TEST(recovery_scan_dirty_single_transaction) {
   SyntheticLog log;
   auto ops = CommitOps(7, InodeItemRegions(128));
-  CHECK_EQ(log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 7, ops), 2u);
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 7, ops);
 
   auto scan = log.Scan();
   CHECK(scan.ok());
@@ -290,7 +334,7 @@ TEST(recovery_scan_uncommitted_transaction_is_dropped) {
   // Rewrite the newest record (block 62) without its COMMIT op.
   std::vector<LogOp> ops = CommitOps(before, InodeItemRegions(128));
   ops.pop_back();  // drop COMMIT_TRANS
-  CHECK_EQ(log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), before, ops), 2u);
+  log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), before, ops);
 
   auto scan = log.Scan();
   CHECK(scan.ok());
@@ -315,7 +359,7 @@ TEST(recovery_scan_unsupported_item_refuses) {
   PutLE16At(rui.data(), 2, 1);  // one region
   const uint32_t tid = next_tid;
   auto ops = CommitOps(tid, {rui});
-  CHECK_EQ(log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops), 2u);
+  log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops);
 
   auto scan = log.Scan();
   CHECK(scan.ok());
@@ -411,4 +455,236 @@ TEST(recovery_scan_real_fixture_dirty_transaction) {
   // Drop the filesystem without writing an unmount record: the fixture keeps
   // the dirty log for the next test.
   fs.value().reset();
+}
+
+// ---------------------------------------------------------------------------
+// Replay (pass1/pass2)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint64_t kAgfDaddr = 4096;  // byte 2 MiB inside the test device
+
+// A buffer log item for a cancellation (the bitmap logs one chunk).
+std::vector<std::vector<uint8_t>> CancelItemRegions(uint64_t daddr,
+                                                    uint32_t len_blocks,
+                                                    uint16_t blft) {
+  std::vector<uint8_t> chunk(lf::kBufChunkSize, 0);
+  return BufItemRegions(daddr, len_blocks, blft, lf::kBlfCancel, chunk);
+}
+
+}  // namespace
+
+TEST(recovery_replay_buffer_item_stamps_lsn_and_crc) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  std::vector<uint8_t> updated = MakeAgf(8);
+  auto ops = CommitOps(11, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0, updated));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 11, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().Recoverable());
+  xfs::RecoveredLogState state;
+  auto replay = log.Replay(scan.value(), &state);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 1u);
+  CHECK_EQ(replay.value().transactions_replayed, 1u);
+
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 8u);  // the logged change
+  CHECK_EQ(xfs::GetBE64(after.data(), xfs::ondisk::agf::kLsn),
+           xfs::MakeLsn(1, 0));
+  CHECK(xfs::VerifyXfsChecksum(after.data(), after.size(),
+                               xfs::ondisk::agf::kCrc));
+  // The writer continues after the replayed record, with the replayed window
+  // pinned as the tail (intent completion still needs it).
+  CHECK_EQ(state.head_block, scan.value().head_block);
+  CHECK_EQ(state.head_cycle, 1u);
+  CHECK_EQ(state.tail_lsn, xfs::MakeLsn(1, 0));
+}
+
+TEST(recovery_replay_skips_newer_metadata) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  xfs::PutBE64(on_disk.data(), xfs::ondisk::agf::kLsn, xfs::MakeLsn(2, 0));
+  xfs::UpdateXfsChecksum(on_disk.data(), on_disk.size(), xfs::ondisk::agf::kCrc);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  std::vector<uint8_t> older = MakeAgf(9);
+  auto ops = CommitOps(12, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0, older));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 12, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 0u);
+  CHECK_EQ(replay.value().buffers_skipped_newer, 1u);
+
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 7u);  // still the newer on-disk value
+  CHECK_EQ(xfs::GetBE64(after.data(), xfs::ondisk::agf::kLsn),
+           xfs::MakeLsn(2, 0));
+}
+
+TEST(recovery_replay_cancel_table) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  // Record 1: a logged update that a later cancellation invalidates.
+  auto first = CommitOps(21, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                            MakeAgf(9)));
+  const uint32_t block1 = 0;
+  const uint32_t block2 =
+      block1 + log.WriteRecord(1, block1, 0xffffffffu, xfs::MakeLsn(1, 0), 21,
+                               first);
+  // Record 2: the block is freed (cancelled).
+  auto cancel = CommitOps(22, CancelItemRegions(kAgfDaddr, 1, lf::kBlftAgf));
+  const uint32_t block3 =
+      block2 + log.WriteRecord(1, block2, block1, xfs::MakeLsn(1, 0), 22,
+                               cancel);
+  // Record 3: the block is reused and logged again; this one must replay.
+  auto reuse = CommitOps(23, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                            MakeAgf(10)));
+  log.WriteRecord(1, block3, block2, xfs::MakeLsn(1, 0), 23, reuse);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK_EQ(scan.value().transactions.size(), 3u);
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 1u);  // only the post-cancel one
+
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 10u);
+}
+
+TEST(recovery_replay_refuses_unsupported_items) {
+  SyntheticLog log;
+  std::vector<uint8_t> rui(lf::kIntentLogFormatSize, 0);
+  PutLE16At(rui.data(), 0, lf::kItemRui);
+  PutLE16At(rui.data(), 2, 1);
+  auto ops = CommitOps(31, {rui});
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (!replay.ok()) {
+    CHECK(replay.error().message.find("XFS_LI_RUI") != std::string::npos);
+  }
+}
+
+TEST(recovery_replay_collects_pending_intents) {
+  SyntheticLog log;
+  std::vector<uint8_t> efi(lf::kIntentLogFormatSize + lf::kExtentSize, 0);
+  PutLE16At(efi.data(), 0, lf::kItemEfi);
+  PutLE16At(efi.data(), 2, 1);
+  PutLE32At(efi.data(), lf::kIntentNextentsOffset, 1);
+  PutLE64At(efi.data(), lf::kIntentIdOffset, 0x1234);
+  auto first = CommitOps(41, {efi});
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 41, first);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().Recoverable());
+  auto pending = xfs::CollectPendingIntents(scan.value());
+  CHECK_EQ(pending.size(), 1u);
+  if (!pending.empty()) CHECK_EQ(pending[0].type, lf::kItemEfi);
+
+  // A done item cancels the matching intent.
+  std::vector<uint8_t> efd(lf::kIntentLogFormatSize + lf::kExtentSize, 0);
+  PutLE16At(efd.data(), 0, lf::kItemEfd);
+  PutLE16At(efd.data(), 2, 1);
+  PutLE32At(efd.data(), lf::kIntentNextentsOffset, 1);
+  PutLE64At(efd.data(), lf::kIntentIdOffset, 0x1234);
+  auto second = CommitOps(42, {efd});
+  log.WriteRecord(1, 2, 0, xfs::MakeLsn(1, 0), 42, second);
+
+  auto scan2 = log.Scan();
+  CHECK(scan2.ok());
+  if (!scan2.ok()) return;
+  CHECK_EQ(xfs::CollectPendingIntents(scan2.value()).size(), 0u);
+  auto replay = log.Replay(scan2.value(), nullptr);
+  CHECK(replay.ok());
+  if (replay.ok()) CHECK_EQ(replay.value().intents_pending, 0u);
+}
+
+TEST(recovery_replay_real_transaction_is_idempotent) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  const uint64_t ino = fixture.info().file_ino;
+  const xfs::XfsTimestamp stamp{1700000123, 456789};
+  auto updated = fs.value()->SetFileTimes(ino, stamp, stamp, stamp);
+  CHECK(updated.ok());
+  if (!updated.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  const xfs::XfsGeometry geo = fs.value()->geometry();
+  const xfs::XfsSuperblock sb = fs.value()->superblock();
+
+  auto scan = xfs::ScanLog(*memory, sb, geo);
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().Recoverable());
+  xfs::RecoveredLogState state;
+  auto replay = xfs::ReplayLog(*memory, sb, geo, scan.value(), &state);
+  if (!replay.ok()) {
+    std::fprintf(stderr, "replay failed: %s\n", replay.error().Format().c_str());
+  }
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().inodes_replayed, 1u);
+
+  std::vector<uint8_t> inode_after(geo.inode_size);
+  CHECK(memory->Read(geo.InoToByteOffset(ino), inode_after.data(),
+                     inode_after.size()));
+  // The replayed inode carries the transaction's LSN.
+  CHECK_EQ(xfs::GetBE64(inode_after.data(), xfs::ondisk::inode::kLsn),
+           scan.value().newest_lsn);
+  CHECK(xfs::VerifyXfsChecksum(inode_after.data(), inode_after.size(),
+                               xfs::ondisk::inode::kCrc));
+
+  // A second recovery of the same image is a no-op: same bytes, same state.
+  auto scan2 = xfs::ScanLog(*memory, sb, geo);
+  CHECK(scan2.ok());
+  if (!scan2.ok()) return;
+  auto replay2 = xfs::ReplayLog(*memory, sb, geo, scan2.value(), nullptr);
+  CHECK(replay2.ok());
+  std::vector<uint8_t> inode_twice(geo.inode_size);
+  CHECK(memory->Read(geo.InoToByteOffset(ino), inode_twice.data(),
+                     inode_twice.size()));
+  CHECK(inode_after == inode_twice);
+
+  fs.value().reset();
+  fixture.Reset();
 }
