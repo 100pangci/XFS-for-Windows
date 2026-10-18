@@ -181,9 +181,26 @@ def verify(mountpoint, manifest_path):
     return 0 if not problems else 1
 
 
+def pin(mountpoint):
+    """Forces one more fsync'd transaction right before the device freeze.
+
+    fsync makes the log record durable; the metadata behind it stays dirty in
+    memory, so the recovery window (tail..head) cannot be empty at capture
+    time. The scratch path is outside base/ and therefore outside the
+    manifest.
+    """
+    scratch = os.path.join(mountpoint, "scratch")
+    os.makedirs(scratch, exist_ok=True)
+    write_file(os.path.join(scratch, "pin"), b"pin\n")
+    fsync_dir(scratch)
+
+
 def main(argv):
     if len(argv) == 3 and argv[1] == "setup":
         setup(argv[2])
+        return 0
+    if len(argv) == 3 and argv[1] == "pin":
+        pin(argv[2])
         return 0
     if len(argv) == 4 and argv[1] == "verify":
         return verify(argv[2], argv[3])
