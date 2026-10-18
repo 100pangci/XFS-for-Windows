@@ -49,13 +49,13 @@ python tests\tools\xfs_probe.py build\smoke.img
 It must print `ALL STRUCTURAL CHECKS PASSED`. This catches bugs where the C++
 reader and writer share a wrong assumption.
 
-## Read-write tests (RW-0 data, RW-1 transactions, RW-2 allocator, RW-3 namespace)
+## Read-write tests (RW-0 data, RW-1 transactions, RW-2 allocator, RW-3 namespace, RW-4 complex namespace)
 
 The write path is the same core code for the CLI and for WinFsp, so it is
 tested in layers. RW-1 added the journal, so the layers now include a log
 format oracle and a crash matrix that Linux replays. RW-2 adds the allocator
-and the extent map, RW-3 the inode allocator and the namespace; every layer
-below runs on them as well.
+and the extent map, RW-3 the inode allocator and the namespace, RW-4 atomic
+rename, hard links and symlinks; every layer below runs on them as well.
 
 ### 1. Unit and integration tests (no driver, no Linux)
 
@@ -109,6 +109,34 @@ a fresh remount and the built-in consistency check after every scenario:
   generation and size 0) and the refusals (non-empty rmdir, invalid names,
   duplicate names, directories in `unlink`, files in `rmdir`).
 
+RW-4 adds `tests/unit/rw4_tests.cpp`, again against the real fixture image and
+with the built-in consistency check after every scenario:
+
+- same-directory and cross-directory file rename: the inode, size, blocks and
+  link count are unchanged, the old name is gone, the new one resolves;
+- same-parent and cross-parent directory moves: the moved directory's `..`,
+  the parent link counts (`A -= 1`, `B += 1` for a free target name) and the
+  descendant entries;
+- rename replace: the target inode reaches nlink 0 and appears in the AGI
+  unlinked bucket; the deferred variant keeps it readable and frees it with
+  `FreeUnlinkedInode`; a target with another hard link only drops one link; a
+  replaced empty directory loses both links;
+- the refusals: a directory into its own subtree (`kWouldCycle`), a non-empty
+  target directory, file ↔ directory mismatches, occupied targets without
+  replace, invalid names, and both no-op cases (same path, two names of one
+  inode);
+- hard links: nlink 1 → 2 → 3, unlinking one name at a time, the last unlink
+  freeing the inode, cross-directory links, linking a directory refused and a
+  duplicate name refused;
+- symlinks: an inline target (LOCAL, `di_nblocks = 0`), a remote target
+  (EXTENTS, one block, exact `readlink`), the target limits (empty, 1023,
+  1024, embedded NUL), unlink freeing the remote block, and rename over a
+  symlink never following its target;
+- replace in a grown directory: 200 entries (leaf) and 640 entries (node),
+  with a rename-replace inside them and the exact listing afterwards;
+- `rmdir` of a nested directory repointing the *child's* `..` at the root
+  (`xfs_dir_remove_child`) while the parent's `..` stays untouched.
+
 Every one of these images is also checked by `xfswin check`, which now also
 recomputes `di_nblocks` from the extent map and the bmbt blocks, and verifies
 `agf_btreeblks` against the number of non-root free-space btree blocks.
@@ -142,11 +170,15 @@ xfswin extend test.img /hello.bin 45000 --rw-experimental
 xfswin truncate test.img /hello.bin 20000 --rw-experimental
 xfswin create test.img /new.bin --rw-experimental --mode=0644
 xfswin mkdir test.img /newdir --rw-experimental
+xfswin rename test.img /new.bin /renamed.bin --rw-experimental
+xfswin link test.img /renamed.bin /second --rw-experimental
+xfswin symlink test.img ../target /link --rw-experimental
 xfswin unlink test.img /new.bin --rw-experimental
 xfswin rmdir test.img /newdir --rw-experimental
 xfswin check test.img
 python tests\tools\rw2_probe.py test.img --inode 67
 python tests\tools\rw3_probe.py test.img
+python tests\tools\rw4_probe.py test.img --model model.json
 ```
 
 `pwrite`, `extend` and `truncate` perform the same core mutations the WinFsp
@@ -154,8 +186,11 @@ callbacks do (image only, require `--rw-experimental`), so CI can verify writes
 against Linux oracles without the WinFsp driver. `pwrite` supports growth now;
 `extend` writes the deterministic pattern `((offset * 131) + 7) & 0xFF` (or a
 `--fill=0xNN` constant) past EOF; `truncate` is `SetFileSize`. `create`,
-`mkdir`, `unlink` and `rmdir` are the namespace mutations (`CreateRegularFile`,
-`Mkdir`, `Unlink`, `RemoveEmptyDirectory`) with the same opt-in flag.
+`mkdir`, `unlink` and `rmdir` are the RW-3 namespace mutations
+(`CreateRegularFile`, `Mkdir`, `Unlink`, `RemoveEmptyDirectory`); `rename`,
+`link` and `symlink` are the RW-4 primitives (`Rename`, `Link`,
+`CreateSymlink`) with the same opt-in flag. `rename` replaces an existing
+target only with `--replace`.
 
 `tests/tools/rw3_probe.py` is the independent structural oracle for RW-3: it
 parses the inobt and the AGI from the raw image, cross-checks their counters
@@ -164,6 +199,15 @@ against each other and the superblock, walks all four directory formats
 and - with `--expect <spec.json>` - verifies an exact name/type/size listing.
 It shares no code with the C++ writer.
 
+`tests/tools/rw4_probe.py` builds on it with the RW-4 invariants: every
+allocated inode's symlink representation (LOCAL target bytes, remote
+`xfs_dsymlink_hdr` fields, per-extent chunking and CRC), a namespace walk from
+the root that re-derives each directory's `..`, `di_nlink = 2 + subdirectories`
+and each file/symlink's `di_nlink = number of names`, the AGI unlinked lists
+(unreachable inodes must be on them), and - with `--model model.json` - exact
+paths, inode numbers, link counts, sizes, symlink targets, directory listings
+and directory formats (shortform/block/leaf/node).
+
 ### 3. WinFsp read-write mount
 
 Without a driver, `xfswin selftest <image> --rw-experimental` drives the real
@@ -171,12 +215,18 @@ callbacks (open, write, flush, re-open, read back), then writes past EOF,
 shrinks the file, grows it sparsely and shrinks it again, verifying the size and
 the data through a fresh node; RW-3 extends it with create + write + re-open,
 mkdir with enumeration, the non-empty rmdir refusal, delete-on-close with reads
-on the unlinked inode after `Cleanup`, rmdir and name reuse. With a driver,
+on the unlinked inode after `Cleanup`, rmdir and name reuse. RW-4 adds the
+`Rename` callback (same directory, then replace over a target with an open
+handle: the old handle still reads the old inode, the new path serves the moved
+inode, the last `Close` frees the old one), a hard link through the core API
+with a write through one name read through the other, and a symlink created by
+the core, read through the adapter, then deleted through
+`SetDelete`/`Cleanup`/`Close`. With a driver,
 `tests/scripts/verify_mount_rw_windows.ps1` mounts the image read-write,
 overwrites bytes in a file through WinFsp, verifies the read-back, asserts that
-rename, symlink creation and writes to 0444 files are refused (create, delete
-and mkdir are exercised by the adapter self-test and the RW-3 CLI images),
-exercises growth, append handles and `SetEndOfFile` shrink/grow on an
+symlink creation and writes to 0444 files are refused (create, delete, mkdir
+and rename are exercised by the adapter self-test and the RW-3/RW-4 CLI
+images), exercises growth, append handles and `SetEndOfFile` shrink/grow on an
 existing file, then writes a second overlay through `xfswin pwrite` and runs
 `xfswin check`.
 
@@ -264,6 +314,38 @@ requires via `rw3_crash_replay_check.py` that the name is absent or completely
 created, or the original file/directory intact (with its original size and
 content for unlink), then a clean log, silent `xfs_repair -n` and a passing
 `rw3_probe.py`.
+
+RW-4 adds the complex-namespace matrix:
+
+```powershell
+pwsh -File tests/scripts/verify_crash_rw4_windows.ps1 `
+  -Exe build\src\RelWithDebInfo\xfswin.exe `
+  -Tests build\tests\RelWithDebInfo\xfs_tests.exe -WorkDir out\crash-rw4
+```
+
+Eight scenarios, each killed at every crash point and every transaction hit:
+
+| scenario | transactions | legal old | legal new |
+|---|---|---|---|
+| same-directory file rename | 1 | `/a` present, `/b` absent | `/a` absent, `/b` present (same inode/size) |
+| cross-directory file rename | 1 | `A/f` | `B/f` |
+| replace regular file | 3 (rename, truncate, ifree) | `src` + `dst` intact | `src` gone, `dst` serves the moved inode, old target freed |
+| cross-parent directory move | 1 | `A/child`, A nlink 3 | `B/child`, B nlink 3, A nlink 2, ".." = B |
+| replace empty directory | 2 (rename, ifree) | `s` + `t`, root nlink 4 | `t` only, root nlink 3 |
+| hard link | 1 | one name, nlink 1 | both names, same inode, nlink 2 |
+| inline symlink | 1 | `/sl` absent | `/sl` symlink, target byte-exact |
+| remote symlink | 1 | `/slr` absent | `/slr` symlink, target byte-exact, blocks allocated |
+
+`rw4_crash_check.py` checks each image before replay (intact buffers, at most
+one torn record, write-ahead logging, and - when the log is clean - the full
+`rw4_probe` namespace walk plus the scenario state). On Linux,
+`verify_crash_rw4_linux.sh` mounts every image so the kernel replays the
+journal, requires `rw4_crash_replay_check.py` to see exactly one of the two
+legal namespaces (including parent link counts, hard-link identity and
+`readlink` bytes), then unmounts and requires a clean log, a passing
+`rw4_probe.py` (which also proves the replayed AGI unlinked lists are empty:
+`xlog_recover_process_iunlinks` freed every orphan) and a silent
+`xfs_repair -n`.
 
 ## Linux oracles (required for release)
 
@@ -368,10 +450,10 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs fifteen jobs:
+Every push runs eighteen jobs:
 
 1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
-   suite (including the journal, allocator and namespace tests), formats a
+   suite (including the journal, allocator, namespace and RW-4 tests), formats a
    300 MiB image, runs `xfswin check`, cross-checks the image with the
    independent Python probe, builds the fixture image (one allocated file) and
    probes it, exercises the CLI write path (`pwrite`, growth, truncate,
@@ -379,10 +461,13 @@ Every push runs fifteen jobs:
    (`verify_rw2_windows.ps1`), the RW-3 round-trip images
    (`verify_rw3_windows.ps1`: create, mkdir, unlink, rmdir, and directories in
    all four formats - shortform, block, leaf with churn and node - all
-   verified with `rw3_probe.py`)
-   and runs all three crash matrices (`verify_crash_windows.ps1`,
-   `verify_crash_rw2_windows.ps1`, `verify_crash_rw3_windows.ps1`), uploading
-   every image for the Linux jobs.
+   verified with `rw3_probe.py`), the RW-4 round-trip images
+   (`verify_rw4_windows.ps1`: rename, replace, directory moves, hard links,
+   inline/remote symlinks, a node-format directory with a replace inside it,
+   all verified with `rw4_probe.py` and its namespace model)
+   and runs all four crash matrices (`verify_crash_windows.ps1`,
+   `verify_crash_rw2_windows.ps1`, `verify_crash_rw3_windows.ps1`,
+   `verify_crash_rw4_windows.ps1`), uploading every image for the Linux jobs.
 2. **linux-reference-probe** (ubuntu-24.04): dumps what the distro's real
    `mkfs.xfs` produces (geometries, root/rt inodes, AGI/AGF counters, repair
    output) for comparison against the formatter.
@@ -399,14 +484,15 @@ Every push runs fifteen jobs:
    targets against the Linux-generated manifest (differential test).
 5. **windows-mount**: installs the WinFsp runtime, builds with the WinFsp SDK,
    runs `xfswin selftest` (adapter callbacks without the driver, read-only and
-   read-write, including RW-3 create/mkdir/delete-on-close/rmdir), mounts the
+   read-write, including RW-3 create/mkdir/delete-on-close/rmdir and RW-4
+   rename/replace-with-open-handle/hard-link/symlink), mounts the
    Linux image at `X:`, verifies reads/hashes/Unicode names, asserts that every
    write-path callback is rejected as write-protected, then mounts the
    read-write image with `--rw-experimental`, overwrites bytes through the
    WinFsp `Write` callback, exercises growth, append handles and `SetEndOfFile`
-   on an existing file, exercises create/mkdir/delete/rmdir (with rename and
-   writes to 0444 files still refused), writes a second overlay through
-   `xfswin pwrite` and uploads the modified image.
+   on an existing file, exercises create/mkdir/delete/rmdir/rename (with
+   symlink creation and writes to 0444 files still refused), writes a second
+   overlay through `xfswin pwrite` and uploads the modified image.
 6. **linux-verify-rw** (ubuntu-24.04): verifies the read-write round trip:
    `xfs_repair -n` must stay clean, the two modified files must match the
    content regenerated by `tests/tools/rw_content.py` with the overlays
@@ -446,11 +532,27 @@ Every push runs fifteen jobs:
     image with `xfswin ls`, checks that the Linux-created names are visible and
     the deleted one is gone, and reads the Linux-written content back with
     `xfswin cat`.
-14. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
+14. **linux-verify-rw4** (ubuntu-24.04): mounts the RW-4 images (same-directory
+    and cross-directory renames, file and empty-directory replacement, a
+    node-format directory with a replace inside it, inline/remote/dangling/
+    Unicode symlinks), verifies every name, size, content, symlink target and
+    hard-link inode/nlink through the kernel from the manifest, requires
+    `xfs_repair -n` silence and a clean log, then renames files and
+    directories, hard-links and symlinks inside the Windows-created tree for
+    the reverse job.
+15. **linux-verify-rw4-crash** (ubuntu-24.04): replays every RW-4 crash window
+    (rename, replace, directory move, link, symlink) and requires one of the
+    two legal namespaces, a clean log after replay, `xfs_repair -n` silence and
+    a passing structural oracle.
+16. **windows-verify-rw4-reverse** (windows-2022): reads the Linux-modified
+    image (including `readlink`-exact symlink targets and the shared hard-link
+    inode) with `xfswin stat`/`ls`, then renames, links and unlinks on the
+    Linux-created tree and re-probes the result.
+17. **windows-rawdevice-vhd** (windows-2022, Administrator): creates a fixed
     VHD, attaches it as a real disk, formats it through `\\.\PhysicalDriveN`
     with the raw device backend, reads it back with `info`/`check`/`ls`, and
     detaches it. Uploads the VHD.
-15. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
+18. **linux-verify-rawdevice** (ubuntu-24.04): strips the 512-byte VHD footer
     from the artifact and runs the full Linux verification (`xfs_db`,
     `xfs_repair -n`, read-only mount, writable copy) on the filesystem written
     through the raw device path -- the CI stand-in for Case C hardware.

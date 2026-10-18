@@ -44,11 +44,14 @@ realtime device, no writes to existing filesystems.**
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
-| **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted; directories can be created and removed |
+| **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
 | Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
 | Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
 | create / mkdir / unlink / rmdir | yes (RW-3), one transaction per namespace change; unlink frees the data and the inode |
-| rename / hardlink / symlink creation / xattr / ACL | **not implemented** (refused) |
+| rename (atomic, cross-directory, replace) | yes (RW-4): one transaction for both parents, both link counts and the target lifecycle |
+| hard links / link counts / AGI unlinked | yes (RW-4): `xfswin link`, nlink up to XFS_MAXLINK, last-link free |
+| symlink creation (inline + remote) | yes (RW-4): real `S_IFLNK` inodes, v5 `xfs_dsymlink_hdr` remote blocks |
+| xattr / ACL mutation | **not implemented** (refused) |
 | Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
 | Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt and the superblock free block counter |
 | Journal replay (reading a dirty log) | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`; Linux replays ours) |
@@ -95,6 +98,18 @@ formats, churn and a fully grown directory), verifies names, types, sizes and
 contents through the kernel, and modifies a Windows-created directory from
 Linux so the next Windows job can read it back. `linux-verify-rw3-crash` replays every crash
 window of all four operations and requires the old or the complete new state.
+
+RW-4 adds the complex namespace operations:
+[`docs/NAMESPACE.md`](docs/NAMESPACE.md) describes the rename transaction
+shape, the replace-target lifecycle, the cross-directory ".." migration, hard
+link counts and the local/remote symlink format. `rename`, `link` and
+`symlink` are atomic core primitives that the WinFsp `Rename` callback and the
+CLI share. `linux-verify-rw4` mounts same-directory and cross-directory
+renames, file and empty-directory replacement, a grown (node format) directory
+with a replace inside it, and inline/remote/dangling/Unicode symlinks, then
+checks `readlink`/`stat`/content byte-exactly and lists the hard-link inode;
+`linux-verify-rw4-crash` replays every crash window of rename, replace,
+directory move, link and symlink and requires a legal old or new namespace.
 
 ## Read-write support (experimental, RW-2: overwrite, extend, truncate)
 
@@ -191,8 +206,70 @@ Scope of this milestone:
 - **The WinFsp mount handles it too.** `Create` (files and directories),
   `Overwrite` dispositions, `SetDelete`/`CanDelete` validation and
   delete-on-close in `Cleanup` are implemented; deletes are performed through
-  the unlinked list so an open handle keeps working until `Close`. `Rename`
-  remains refused (`STATUS_NOT_SUPPORTED`).
+  the unlinked list so an open handle keeps working until `Close`.
+  `Rename` is implemented in RW-4 (below).
+
+## Experimental namespace support (RW-4: rename, hard links, symlinks)
+
+```text
+xfswin rename test.img /a.bin /b.bin --rw-experimental          # same directory
+xfswin rename test.img /A/f /B/f --rw-experimental              # cross directory
+xfswin rename test.img /src /dst --rw-experimental --replace    # replace a file or empty dir
+xfswin link test.img /existing /second-name --rw-experimental
+xfswin symlink test.img ../hello.bin /short --rw-experimental
+xfswin symlink test.img /nonexistent/target /dangling --rw-experimental
+```
+
+Scope of this milestone:
+
+- **One transaction per rename.** The source dirent removal, the target dirent
+  insert/replace, both parents' timestamps and link counts, the moved inode's
+  ctime and ".." (for a directory moving across parents), and the replaced
+  target's link count plus AGI unlinked insertion all commit together. A crash
+  therefore leaves either the old or the new namespace — never one name
+  without the other, a dangling dirent, or a wrong link count. Semantics match
+  Linux `xfs_rename`: renaming between two names of the same inode is a no-op,
+  a file only replaces a file, a directory only an empty directory, and moving
+  a directory into its own subtree fails with `kWouldCycle` (EINVAL) before
+  anything is written.
+- **Replace keeps the target lifecycle.** A replaced inode loses one link (two
+  when it is a directory) and, when that reaches zero, goes on the AGI
+  unlinked list exactly like an unlink. With open handles the caller defers
+  `FreeUnlinkedInode` until the last close; otherwise it is truncated and
+  freed immediately. A target that still has other hard links only loses one
+  link and is *not* put on the unlinked list.
+- **Hard links** (`xfswin link`, `XfsFilesystem::Link`) insert one dirent,
+  update the parent's timestamps and bump `di_nlink`/ctime in the same
+  transaction. Directories are refused, and `di_nlink` at `XFS_MAXLINK`
+  (2^31-1) fails with `kTooManyLinks` instead of wrapping.
+- **Symlinks are real XFS symlink inodes.** Short targets live inline
+  (`XFS_DINODE_FMT_LOCAL`, `di_size` = target length); longer targets (up to
+  1023 bytes) get remote blocks with the v5 `xfs_dsymlink_hdr` (magic, chunk
+  offset/length, owner, block number, UUID, LSN, CRC) and one header per
+  contiguous extent, exactly what the kernel and `xfs_repair` expect. The
+  target is an opaque byte string: it is never resolved, escaped or required
+  to exist, and only the *name* goes through the Windows name mapping.
+- **Open handles keep following the inode.** `handle → inode` is unaffected by
+  a rename; a replaced target's handle keeps reading the old inode until it
+  closes, while the new path serves the moved inode. The WinFsp adapter marks
+  the old target delete-pending instead of freeing it under an open handle.
+- **Cache invalidation** drops both parent listings, the path memo (which may
+  contain every descendant of a moved directory), and the moved/replaced
+  inodes' cached metadata; a directory move must invalidate the whole subtree
+  because `/A/x/y` is stale too. The adapter never assumes `inode → one path`:
+  hard links mean several names legitimately map to the same inode.
+- **Windows symlink representation** remains the documented reader policy:
+  the target is exposed as the file content (and `stat` prints it), not as a
+  Windows reparse point. Adding `GetReparsePoint`/`SetReparsePoint` with
+  reparse tags is explicitly out of scope for this milestone.
+
+### If it does not fit
+
+A rename that would exceed the 32 KiB log-record budget (two large
+directories, structural conversions, allocator metadata) is refused **before
+any write**: the transaction is built in memory and `BuildLogRecord` rejects
+it, so the filesystem is unchanged. This is preferable to splitting an atomic
+rename into two transactions.
 
 ## Requirements
 
@@ -247,6 +324,9 @@ xfswin create test.img /new.bin --rw-experimental --mode=0644
 xfswin mkdir test.img /newdir --rw-experimental --mode=0755
 xfswin unlink test.img /new.bin --rw-experimental
 xfswin rmdir test.img /newdir --rw-experimental
+xfswin rename test.img /old.bin /new.bin --rw-experimental [--replace]
+xfswin link test.img /existing /second-name --rw-experimental
+xfswin symlink test.img ../target /linkpath --rw-experimental
 xfswin unmount X:
 xfswin mount \\.\PhysicalDrive2 X:            # real disk (Administrator)
 xfswin mount \\.\HarddiskVolume11 E:\XFS      # a partition, as a directory mount
@@ -286,15 +366,16 @@ destructive flag), `3` refused for safety reasons.
   read-only and rejects every write-path callback.
 - Read-write mounts are opt-in (`--rw-experimental`), image only, and restricted
   to the scope described above: regular files can be created, overwritten,
-  extended, truncated and deleted, and directories can be created and removed,
-  including the block allocations, extent map, inode allocation, directory
-  formats and allocator metadata those operations need. They are an allow-list:
-  a filesystem with features this build cannot keep consistent is refused for
-  read-write instead of being modified best-effort.
-- Rename, hard links, symlink creation, xattrs and ACL changes are refused; the
-  core has no transaction for them yet. The journal is only ever *read* on
-  mount (cleanliness check); a dirty log refuses mount (Linux replays logs
-  written by this build).
+  extended, truncated, deleted, renamed and hard-linked, directories can be
+  created, removed and renamed (with the ".." rewrite and parent link counts),
+  and symlinks can be created and removed, including the block allocations,
+  extent map, inode allocation, directory formats and allocator metadata those
+  operations need. They are an allow-list: a filesystem with features this
+  build cannot keep consistent is refused for read-write instead of being
+  modified best-effort.
+- xattr and ACL mutation are refused; the core has no transaction for them yet.
+  The journal is only ever *read* on mount (cleanliness check); a dirty log
+  refuses mount (Linux replays logs written by this build).
 - `xfswin format` is still the only writer of a whole filesystem, and the only
   path that can destroy existing data.
 
