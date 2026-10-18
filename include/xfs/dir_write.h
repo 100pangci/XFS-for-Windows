@@ -83,6 +83,14 @@ class DirectoryEditor {
   // Removes one entry and returns it.
   Result<XfsDirEntry> Remove(std::string_view name);
 
+  // Atomically repoints an existing entry at a different inode number (and
+  // ftype) without changing its name, position or any leaf/bests/btree
+  // structure - xfs_dir_replace and the xfs_dir2_*_replace helpers. The name
+  // must exist. This is what a rename with replacement needs: remove+insert
+  // would churn offsets and leaf entries for no reason, and the target entry
+  // must never be visible as "gone" even inside the transaction.
+  Status Replace(std::string_view name, uint64_t new_ino, uint8_t new_ftype);
+
   // Updates the directory's parent reference (".."): the shortform header
   // field or the ".." dirent in the data blocks. Used by rmdir, which
   // repoints an unlinked child directory at the root like xfs_remove.
@@ -202,6 +210,7 @@ class DirectoryEditor {
   // ---- leaf format ----
   Status InsertLeaf(const DirEntryWrite& entry);  // kNoSpace = convert
   Status RemoveLeaf(std::string_view name, XfsDirEntry* removed);
+  Status ReplaceLeaf(std::string_view name, uint64_t new_ino, uint8_t new_ftype);
   Status LeafToNode();
   Status AddLeafEntry(LeafBlock* leaf, size_t index, uint32_t hash,
                       uint32_t addr);
@@ -211,6 +220,7 @@ class DirectoryEditor {
   // ---- node format ----
   Status InsertNode(const DirEntryWrite& entry);
   Status RemoveNode(std::string_view name, XfsDirEntry* removed);
+  Status ReplaceNode(std::string_view name, uint64_t new_ino, uint8_t new_ftype);
   LeafBlock* LeafForHash(uint32_t hash);
   Status SplitLeaf(LeafBlock* leaf, std::vector<LeafEnt> middle);
   Status RebuildNodeTree();

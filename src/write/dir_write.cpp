@@ -1374,6 +1374,37 @@ Status DirectoryEditor::RemoveLeaf(std::string_view name,
   return XFS_ERR(XfsError::kNotFound, "directory entry not found").Ino(ino_);
 }
 
+// xfs_dir2_leaf_replace: the entry keeps its name, hash and leaf slot; only
+// the inode number and ftype inside the data block change.
+Status DirectoryEditor::ReplaceLeaf(std::string_view name, uint64_t new_ino,
+                                    uint8_t new_ftype) {
+  const uint32_t hash = DirHash(name);
+  LeafBlock* leaf = &leaf_blocks_[root_dablk_];
+  size_t index = 0;
+  while (index < leaf->ents.size() && leaf->ents[index].hash < hash) ++index;
+  for (; index < leaf->ents.size() && leaf->ents[index].hash == hash;
+       ++index) {
+    const uint32_t addr = leaf->ents[index].addr;
+    if (addr == 0) continue;
+    const uint32_t db = addr >> (block_log_ - 3);
+    const uint32_t off = (addr & ((1u << (block_log_ - 3)) - 1)) << 3;
+    auto block_it = data_blocks_.find(db);
+    if (block_it == data_blocks_.end()) continue;
+    uint8_t* b = block_it->second.data();
+    const uint8_t namelen = GetU8(b, off + 8);
+    if (namelen != name.size() ||
+        std::memcmp(b + off + 9, name.data(), name.size()) != 0) {
+      continue;
+    }
+    PutBE64(b, off, new_ino);
+    if (geo_->features.ftype) b[off + 9 + namelen] = new_ftype;
+    data_dirty_.insert(db);
+    dirty_ = true;
+    return OkStatus();
+  }
+  return XFS_ERR(XfsError::kNotFound, "directory entry not found").Ino(ino_);
+}
+
 // ---------------------------------------------------------------------------
 // Node format
 // ---------------------------------------------------------------------------
@@ -1627,6 +1658,54 @@ Status DirectoryEditor::RemoveNode(std::string_view name,
   if (!s.ok()) return s;
   dirty_ = true;
   return OkStatus();
+}
+
+// xfs_dir2_node_replace: find the leaf entry by hash and name (the entry may
+// live past the first leaf of its hash), then rewrite the data entry's inode
+// number and ftype. No leaf, node, free block or bests change.
+Status DirectoryEditor::ReplaceNode(std::string_view name, uint64_t new_ino,
+                                    uint8_t new_ftype) {
+  const uint32_t hash = DirHash(name);
+  LeafBlock* leaf = LeafForHash(hash);
+  if (leaf == nullptr) {
+    return XFS_ERR(XfsError::kNotFound, "directory entry not found").Ino(ino_);
+  }
+  for (;;) {
+    size_t index = 0;
+    while (index < leaf->ents.size() && leaf->ents[index].hash < hash) ++index;
+    for (; index < leaf->ents.size() && leaf->ents[index].hash == hash;
+         ++index) {
+      const uint32_t addr = leaf->ents[index].addr;
+      if (addr == 0) continue;
+      const uint32_t db = addr >> (block_log_ - 3);
+      const uint32_t off = (addr & ((1u << (block_log_ - 3)) - 1)) << 3;
+      auto block_it = data_blocks_.find(db);
+      if (block_it == data_blocks_.end()) continue;
+      uint8_t* b = block_it->second.data();
+      const uint8_t namelen = GetU8(b, off + 8);
+      if (namelen != name.size() ||
+          std::memcmp(b + off + 9, name.data(), name.size()) != 0) {
+        continue;
+      }
+      PutBE64(b, off, new_ino);
+      if (geo_->features.ftype) b[off + 9 + namelen] = new_ftype;
+      data_dirty_.insert(db);
+      dirty_ = true;
+      return OkStatus();
+    }
+    if (leaf->ents.empty() || leaf->ents.back().hash != hash ||
+        leaf->forw == 0) {
+      break;
+    }
+    auto next = leaf_blocks_.find(leaf->forw);
+    if (next == leaf_blocks_.end()) {
+      return XFS_ERR(XfsError::kCorruptDirectory, "leaf chain broken")
+          .Ino(ino_)
+          .Actual(leaf->forw);
+    }
+    leaf = &next->second;
+  }
+  return XFS_ERR(XfsError::kNotFound, "directory entry not found").Ino(ino_);
 }
 
 Status DirectoryEditor::RebuildNodeTree() {
@@ -2058,9 +2137,74 @@ Status DirectoryEditor::Insert(const DirEntryWrite& entry) {
   return InsertNode(entry);
 }
 
+Status DirectoryEditor::Replace(std::string_view name, uint64_t new_ino,
+                                uint8_t new_ftype) {
+  Status s = ValidateDirName(name, ino_);
+  if (!s.ok()) return s;
+  if (fmt_ == XfsDirFormat::kShortform || fmt_ == XfsDirFormat::kBlock) {
+    size_t index = placed_.size();
+    for (size_t i = 0; i < placed_.size(); ++i) {
+      if (placed_[i].e.name.size() == name.size() &&
+          std::memcmp(placed_[i].e.name.data(), name.data(), name.size()) ==
+              0) {
+        index = i;
+        break;
+      }
+    }
+    if (index == placed_.size()) {
+      return XFS_ERR(XfsError::kNotFound, "directory entry not found")
+          .Ino(ino_);
+    }
+    if (fmt_ == XfsDirFormat::kShortform) {
+      // xfs_dir2_sf_replace: a wide inode number may force the directory to
+      // grow by 4 bytes per entry; when the result no longer fits the literal
+      // area, Linux converts the shortform directory to the block format and
+      // replaces there.
+      bool wide = sf_parent_ > 0xffffffffull || new_ino > 0xffffffffull;
+      if (!wide) {
+        for (size_t i = 0; i < placed_.size(); ++i) {
+          if (i != index && placed_[i].e.ino > 0xffffffffull) {
+            wide = true;
+            break;
+          }
+        }
+      }
+      size_t image = SfHeaderSizeFor(wide);
+      for (const PlacedEntry& p : placed_) {
+        image += SfEntrySizeFor(p.e.name.size(), wide);
+      }
+      if (image > static_cast<size_t>(geo_->inode_size) - di::kCoreSizeV3) {
+        auto alloc = AllocDirBlock(0);
+        if (!alloc.ok()) return alloc.error();
+        (void)alloc;
+        fmt_ = XfsDirFormat::kBlock;
+        data_size_ = dir_block_size_;
+        block_dirty_ = true;
+        dirty_ = true;
+        return Replace(name, new_ino, new_ftype);
+      }
+      placed_[index].e.ino = new_ino;
+      placed_[index].e.ftype = new_ftype;
+      data_size_ = image;
+      dirty_ = true;
+      return OkStatus();
+    }
+    placed_[index].e.ino = new_ino;
+    placed_[index].e.ftype = new_ftype;
+    block_dirty_ = true;
+    dirty_ = true;
+    return OkStatus();
+  }
+  if (fmt_ == XfsDirFormat::kLeaf) {
+    return ReplaceLeaf(name, new_ino, new_ftype);
+  }
+  return ReplaceNode(name, new_ino, new_ftype);
+}
+
 Result<XfsDirEntry> DirectoryEditor::Remove(std::string_view name) {
   XfsDirEntry removed;
-  Status s = OkStatus();
+  Status s = ValidateDirName(name, ino_);
+  if (!s.ok()) return s.error();
   switch (fmt_) {
     case XfsDirFormat::kShortform:
     case XfsDirFormat::kBlock:
