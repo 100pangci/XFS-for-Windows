@@ -194,7 +194,7 @@ class XfsFilesystem {
   // in `parent_ino`. The whole create is one transaction: inode allocation,
   // inode initialisation, parent dirent insertion, parent timestamps and the
   // AGI/inobt/superblock counters commit together. Returns the new inode.
-  Result<uint64_t> CreateFile(uint64_t parent_ino, std::string_view name,
+  Result<uint64_t> CreateRegularFile(uint64_t parent_ino, std::string_view name,
                               uint16_t mode, uint32_t uid, uint32_t gid);
 
   // Creates an empty directory (shortform, nlink 2) and bumps the parent's
@@ -213,7 +213,7 @@ class XfsFilesystem {
   // Removes an empty directory (only "." and ".." may remain), same
   // transaction/deferral contract as Unlink. A non-empty directory fails with
   // kDirectoryNotEmpty before anything is modified.
-  Status RemoveDirectory(uint64_t parent_ino, std::string_view name,
+  Status RemoveEmptyDirectory(uint64_t parent_ino, std::string_view name,
                          bool defer_inode_free = false);
 
   // Finishes the deletion of a zero-link inode that is on the AGI unlinked

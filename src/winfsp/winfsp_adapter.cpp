@@ -26,7 +26,10 @@ typedef NTSTATUS* PNTSTATUS;
 #include <cwctype>
 #include <filesystem>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "xfs/log.h"
@@ -81,6 +84,14 @@ struct AdapterState {
     // never re-walk the BMBT.
     std::shared_ptr<const std::vector<XfsExtent>> extents;
     uint32_t refcount = 0;
+    // Where the name lives (no rename yet, so it stays valid for the node's
+    // lifetime). Cleanup needs it for delete-on-close.
+    uint64_t parent_ino = 0;
+    std::string xfs_name;
+    // Delete-on-close: Cleanup removed the namespace entry and put the inode
+    // on the AGI unlinked list; the last Close frees the inode
+    // (FreeUnlinkedInode).
+    bool delete_pending = false;
   };
   std::mutex node_mutex;
   std::unordered_map<uint64_t, uint64_t> node_by_inode;
@@ -92,15 +103,13 @@ struct AdapterState {
   // repeated path walk into one hash lookup.
   std::unordered_map<std::wstring, uint64_t> path_inode_cache;
 
-  // Sorted (Windows name, inode) children per directory. Directory contents
-  // are immutable for this read-only mount, so this is built once per
-  // directory and reused by every ReadDirectory page (WinFsp re-enters with a
-  // marker for each page) and by repeated Explorer enumerations.
-  //
-  // On a read-write mount directory mutations are not implemented yet, so the
-  // same "built once" rule holds; the first mutation added later must
-  // invalidate this cache (and the core caches) through
-  // XfsFilesystem::InvalidateCaches plus a drop of this per-directory list.
+  // Sorted (Windows name, inode) children per directory. On a read-only mount
+  // directory contents never change, so this is built once per directory and
+  // reused by every ReadDirectory page (WinFsp re-enters with a marker for
+  // each page) and by repeated Explorer enumerations. Every namespace
+  // mutation (create, mkdir, unlink, rmdir) drops the affected directories
+  // through DropNamespaceCaches, and the core caches through
+  // XfsFilesystem::InvalidateCaches.
   std::unordered_map<uint64_t, std::shared_ptr<const std::vector<DirChild>>>
       dir_children;
   size_t dir_children_entries = 0;
@@ -135,6 +144,8 @@ NTSTATUS NtFromError(XfsError code) {
     case XfsError::kNotRegularFile: return STATUS_INVALID_DEVICE_REQUEST;
     case XfsError::kNotSymlink: return STATUS_INVALID_DEVICE_REQUEST;
     case XfsError::kNameTooLong: return STATUS_OBJECT_NAME_INVALID;
+    case XfsError::kAlreadyExists: return STATUS_OBJECT_NAME_COLLISION;
+    case XfsError::kDirectoryNotEmpty: return STATUS_DIRECTORY_NOT_EMPTY;
     case XfsError::kInvalidArgument: return STATUS_INVALID_PARAMETER;
     case XfsError::kPermissionDenied: return STATUS_ACCESS_DENIED;
     case XfsError::kReadOnlyVolume: return STATUS_MEDIA_WRITE_PROTECTED;
@@ -244,6 +255,118 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   return inode;
 }
 
+// Splits a WinFsp path into the parent directory's inode and the on-disk
+// (raw XFS) name of the last component. This is what create/mkdir/unlink/
+// rmdir need: the namespace API works on (parent, name) pairs.
+Result<std::pair<uint64_t, std::string>> ResolveParentAndName(
+    AdapterState& state, PWSTR file_name) {
+  auto parts = SplitPath(file_name);
+  if (parts.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot create the root")
+        .Metadata("namespace");
+  }
+  auto name = WindowsNameToXfs(ToU16(parts.back()));
+  if (!name) {
+    return XFS_ERR(XfsError::kNotFound, "name is not representable")
+        .Metadata("namespace");
+  }
+  parts.pop_back();
+  uint64_t parent = state.fs->RootInode();
+  auto current = state.fs->OpenInode(parent);
+  if (!current.ok()) return current.error();
+  for (const auto& part : parts) {
+    if (part == L".") continue;
+    if (!current.value().IsDir()) {
+      return XFS_ERR(XfsError::kNotDirectory,
+                     "path component is not a directory")
+          .Ino(current.value().ino);
+    }
+    auto xfs_name = WindowsNameToXfs(ToU16(part));
+    if (!xfs_name) {
+      return XFS_ERR(XfsError::kNotFound, "name is not representable")
+          .Ino(current.value().ino);
+    }
+    auto entry = state.fs->LookupName(current.value().ino, *xfs_name);
+    if (!entry.ok()) return entry.error();
+    auto next = state.fs->OpenInode(entry.value().ino);
+    if (!next.ok()) return next.error();
+    current = std::move(next);
+  }
+  return std::make_pair(current.value().ino, *name);
+}
+
+// A namespace mutation changed the directory listing: drop the adapter's
+// per-directory listings (and the path memo, which may point at deleted
+// names). The core invalidated its own caches when the transaction committed.
+// `parent_ino` == 0 only drops the path memo.
+void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino) {
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  if (parent_ino != 0) {
+    auto it = state.dir_children.find(parent_ino);
+    if (it != state.dir_children.end()) {
+      state.dir_children_entries -= it->second->size();
+      state.dir_children.erase(it);
+    }
+  }
+  state.path_inode_cache.clear();
+}
+
+// Read-only delete validation shared by SetDelete and CanDelete: can this
+// inode be removed right now? Mirrors the checks XfsFilesystem's namespace
+// layer makes before it would modify anything.
+Status CheckDeletable(AdapterState& state, const XfsInode& inode) {
+  if (inode.ino == state.fs->RootInode()) {
+    return XFS_ERR(XfsError::kPermissionDenied, "cannot delete the root")
+        .Ino(inode.ino)
+        .Metadata("delete");
+  }
+  if ((inode.flags & ondisk::inode::kDiFlagImmutable) != 0) {
+    return XFS_ERR(XfsError::kPermissionDenied, "inode is immutable")
+        .Ino(inode.ino)
+        .Metadata("delete");
+  }
+  if (inode.IsDir()) {
+    // xfs_dir_remove_child: nlink must be 2 and only "." and ".." may remain.
+    if (inode.nlink != 2) {
+      return XFS_ERR(XfsError::kDirectoryNotEmpty, "directory is not empty")
+          .Ino(inode.ino)
+          .Actual(inode.nlink)
+          .Metadata("delete");
+    }
+    auto listing = state.fs->ListDirectory(inode.ino);
+    if (!listing.ok()) return listing.error();
+    for (const XfsDirEntry& entry : listing.value()) {
+      if (entry.name != "." && entry.name != "..") {
+        return XFS_ERR(XfsError::kDirectoryNotEmpty, "directory is not empty")
+            .Ino(inode.ino)
+            .Metadata("delete");
+      }
+    }
+    return OkStatus();
+  }
+  if (!inode.IsRegular()) {
+    // Symlinks and the special files are not deleted by this build.
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "only regular files and directories can be deleted")
+        .Ino(inode.ino)
+        .Metadata("delete");
+  }
+  return OkStatus();
+}
+
+bool IsOverwriteDisposition(UINT32 create_options) {
+  // Disposition lives in the high 8 bits of the create options (WinFsp SDK
+  // fsctl.h); FILE_SUPERSEDE = 0, FILE_OVERWRITE = 4, FILE_OVERWRITE_IF = 5.
+  switch ((create_options >> 24) & 0xFF) {
+    case 0:   // FILE_SUPERSEDE
+    case 4:   // FILE_OVERWRITE
+    case 5:   // FILE_OVERWRITE_IF
+      return true;
+    default:
+      return false;
+  }
+}
+
 uint64_t ToFileTime(const XfsTimestamp& ts) {
   constexpr int64_t kEpochOffset = 11644473600LL;  // 1601 -> 1970 seconds
   int64_t sec = ts.sec + kEpochOffset;
@@ -331,6 +454,45 @@ void RefreshNode(AdapterState& state, uint64_t node_id) {
   } else {
     it->second->extents.reset();
   }
+}
+
+// Registers an open file node for `inode` (the WinFsp file-context model:
+// one node per inode, reference counted) and returns its context value.
+Result<PVOID> TakeNode(AdapterState& state, XfsInode inode, uint64_t parent_ino,
+                       std::string xfs_name) {
+  auto node = std::make_shared<const XfsInode>(std::move(inode));
+  // Parse the data fork once per open: reads then never re-walk the extent
+  // list or the BMBT.
+  std::shared_ptr<const std::vector<XfsExtent>> extents;
+  if (node->IsRegular() && node->format != ondisk::inode::kFormatLocal) {
+    auto loaded = std::make_shared<std::vector<XfsExtent>>();
+    if (LoadDataForkExtents(state.fs->device(), state.fs->geometry(), *node,
+                            loaded.get())
+            .ok()) {
+      extents = std::move(loaded);
+    }
+  }
+  uint64_t id;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto index = state.node_by_inode.find(node->ino);
+    if (index != state.node_by_inode.end()) {
+      // Same file already open: reuse its node and take another reference.
+      id = index->second;
+      ++state.nodes[id]->refcount;
+    } else {
+      id = state.next_node_id++;
+      auto entry = std::make_shared<AdapterState::FileNode>();
+      entry->inode = node;
+      entry->extents = std::move(extents);
+      entry->refcount = 1;
+      entry->parent_ino = parent_ino;
+      entry->xfs_name = std::move(xfs_name);
+      state.nodes.emplace(id, std::move(entry));
+      state.node_by_inode.emplace(node->ino, id);
+    }
+  }
+  return reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
 }
 
 void FillSecurity(AdapterState& state, PSECURITY_DESCRIPTOR buffer,
@@ -423,91 +585,193 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR, UINT32, UINT32, UINT32,
-                PSECURITY_DESCRIPTOR, UINT64, PVOID*, FSP_FSCTL_FILE_INFO*) {
-  // Creating files needs the inode allocator and a directory transaction
-  // (RW-3); until then even a read-write mount refuses it.
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
+                UINT32 create_options, UINT32 /*granted_access*/,
+                UINT32 /*file_attributes*/, PSECURITY_DESCRIPTOR /*security*/,
+                UINT64 /*allocation_size*/, PVOID* file_context,
+                FSP_FSCTL_FILE_INFO* file_info) {
+  AdapterState& state = *State(file_system);
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  // The FSD only calls Create when the target must be created: FILE_CREATE
+  // always, FILE_OPEN_IF / FILE_OVERWRITE_IF after Open reported
+  // OBJECT_NAME_NOT_FOUND. Existence is therefore an error here.
+  auto target = ResolveParentAndName(state, file_name);
+  if (!target.ok()) return NtFromError(target.error().code);
+  const uint64_t parent_ino = target.value().first;
+  const std::string& name = target.value().second;
+  const bool directory = (create_options & FILE_DIRECTORY_FILE) != 0;
+
+  uint64_t ino = 0;
+  if (directory) {
+    Status status = state.fs->Mkdir(parent_ino, name, 0755, 0, 0);
+    if (!status.ok()) return NtFromStatus(status);
+    auto entry = state.fs->LookupName(parent_ino, name);
+    if (!entry.ok()) return NtFromError(entry.error().code);
+    ino = entry.value().ino;
+  } else {
+    auto created = state.fs->CreateRegularFile(parent_ino, name, 0644, 0, 0);
+    if (!created.ok()) return NtFromError(created.error().code);
+    ino = created.value();
+  }
+  auto inode = state.fs->OpenInode(ino);
+  if (!inode.ok()) return NtFromError(inode.error().code);
+  auto context = TakeNode(state, std::move(inode.value()), parent_ino, name);
+  if (!context.ok()) return NtFromError(context.error().code);
+  *file_context = context.value();
+  auto info = state.fs->GetFileInfo(ino);
+  if (!info.ok()) return NtFromError(info.error().code);
+  FillFileInfo(state, info.value(), file_info);
+  DropNamespaceCaches(state, parent_ino);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
               UINT32 create_options, UINT32 /*granted_access*/,
               PVOID* file_context, FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
-  auto inode = ResolvePathCached(state, file_name);
-  if (!inode.ok()) {
-    XFS_DEBUG("Open('" << WideToUtf8(file_name)
-                       << "') failed: " << inode.error().Format());
-    return NtFromError(inode.error().code);
+  if (SplitPath(file_name).empty()) {
+    // The root directory itself: no parent, never deletable.
+    if ((create_options & FILE_NON_DIRECTORY_FILE) != 0) {
+      return STATUS_FILE_IS_A_DIRECTORY;
+    }
+    auto inode = state.fs->OpenInode(state.fs->RootInode());
+    if (!inode.ok()) return NtFromError(inode.error().code);
+    auto context = TakeNode(state, std::move(inode.value()),
+                            state.fs->RootInode(), std::string());
+    if (!context.ok()) return NtFromError(context.error().code);
+    *file_context = context.value();
+    auto info = state.fs->GetFileInfo(state.fs->RootInode());
+    if (!info.ok()) return NtFromError(info.error().code);
+    FillFileInfo(state, info.value(), file_info);
+    return STATUS_SUCCESS;
   }
+  auto target = ResolveParentAndName(state, file_name);
+  if (!target.ok()) {
+    XFS_DEBUG("Open('" << WideToUtf8(file_name)
+                       << "') failed: " << target.error().Format());
+    return NtFromError(target.error().code);
+  }
+  const uint64_t parent_ino = target.value().first;
+  const std::string& name = target.value().second;
+  auto entry = state.fs->LookupName(parent_ino, name);
+  if (!entry.ok()) return NtFromError(entry.error().code);
+  auto inode = state.fs->OpenInode(entry.value().ino);
+  if (!inode.ok()) return NtFromError(inode.error().code);
   if ((create_options & FILE_DIRECTORY_FILE) && !inode.value().IsDir()) {
     return STATUS_NOT_A_DIRECTORY;
   }
   if ((create_options & FILE_NON_DIRECTORY_FILE) && inode.value().IsDir()) {
     return STATUS_FILE_IS_A_DIRECTORY;
   }
-  auto node = std::make_shared<const XfsInode>(std::move(inode.value()));
-  FillFileInfo(state, *node, file_info);
-  // Parse the data fork once per open: reads then never re-walk the extent
-  // list or the BMBT.
-  std::shared_ptr<const std::vector<XfsExtent>> extents;
-  if (node->IsRegular() && node->format != ondisk::inode::kFormatLocal) {
-    auto loaded = std::make_shared<std::vector<XfsExtent>>();
-    if (LoadDataForkExtents(state.fs->device(), state.fs->geometry(), *node,
-                            loaded.get())
-            .ok()) {
-      extents = std::move(loaded);
+  // FILE_OVERWRITE / FILE_OVERWRITE_IF / FILE_SUPERSEDE on an existing file:
+  // the FSD reports FILE_OVERWRITTEN based on this Open, so the truncation
+  // (SetFileSize(0), one metadata transaction) happens here - exactly what
+  // Windows then observes as the new end-of-file.
+  if (IsOverwriteDisposition(create_options) && !inode.value().IsDir()) {
+    if (!inode.value().IsRegular()) return STATUS_NOT_SUPPORTED;
+    auto info = state.fs->SetFileSize(inode.value().ino, 0);
+    if (!info.ok()) {
+      XFS_DEBUG("Open(overwrite, ino=" << inode.value().ino
+                                       << ") refused: "
+                                       << info.error().Format());
+      return NtFromError(info.error().code);
     }
+    auto fresh = state.fs->OpenInode(inode.value().ino);
+    if (!fresh.ok()) return NtFromError(fresh.error().code);
+    inode = std::move(fresh);
   }
-  uint64_t id;
-  {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
-    auto index = state.node_by_inode.find(node->ino);
-    if (index != state.node_by_inode.end()) {
-      // Same file already open: reuse its node and take another reference.
-      id = index->second;
-      ++state.nodes[id]->refcount;
-    } else {
-      id = state.next_node_id++;
-      auto entry = std::make_shared<AdapterState::FileNode>();
-      entry->inode = node;
-      entry->extents = std::move(extents);
-      entry->refcount = 1;
-      state.nodes.emplace(id, std::move(entry));
-      state.node_by_inode.emplace(node->ino, id);
-    }
-  }
-  *file_context = reinterpret_cast<PVOID>(static_cast<uintptr_t>(id));
+  auto context =
+      TakeNode(state, std::move(inode.value()), parent_ino, name);
+  if (!context.ok()) return NtFromError(context.error().code);
+  *file_context = context.value();
+  auto info = state.fs->GetFileInfo(entry.value().ino);
+  if (!info.ok()) return NtFromError(info.error().code);
+  FillFileInfo(state, info.value(), file_info);
   return STATUS_SUCCESS;
 }
 
-NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, BOOLEAN, UINT64,
-                   FSP_FSCTL_FILE_INFO*) {
-  // FILE_OVERWRITE / FILE_SUPERSEDE on an existing file: Windows expects the
-  // file to be truncated. That is a SetFileSize(0) transaction, not available
-  // yet.
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32,
+                   BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO* file_info) {
+  AdapterState& state = *State(file_system);
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  auto node = LookupNode(state, file_context);
+  if (!node) return STATUS_INVALID_HANDLE;
+  if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
+  if (!node->inode->IsRegular()) return STATUS_NOT_SUPPORTED;
+  auto info = state.fs->SetFileSize(node->inode->ino, 0);
+  if (!info.ok()) return NtFromError(info.error().code);
+  RefreshNode(state, NodeId(file_context));
+  auto refreshed = LookupNode(state, file_context);
+  if (refreshed) FillFileInfo(state, *refreshed->inode, file_info);
+  return STATUS_SUCCESS;
 }
 
-VOID Cleanup(FSP_FILE_SYSTEM*, PVOID, PWSTR, ULONG) {
-  // Nothing to do: deletes are refused (CanDelete), so a delete-on-close
-  // handle can never exist, and SetFileSize only changes the on-disk state of
-  // an existing file, so no pending allocation cleanup exists either. When
-  // delete lands (RW-3) this is where delete-on-close and the purge of cached
-  // pages must be handled.
+VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
+             ULONG flags) {
+  AdapterState& state = *State(file_system);
+  if (0 == (flags & FspCleanupDelete) || !state.read_write) return;
+  auto node = LookupNode(state, file_context);
+  if (!node || node->delete_pending) return;
+  // The FSD sends FileName with a delete request. The namespace removal is
+  // one transaction; the inode stays on the AGI unlinked list until the last
+  // Close, so open handles keep working (xfs_remove + xfs_inactive).
+  uint64_t parent_ino = node->parent_ino;
+  std::string name = node->xfs_name;
+  if (file_name != nullptr && *file_name != L'\0') {
+    auto resolved = ResolveParentAndName(state, file_name);
+    if (resolved.ok()) {
+      parent_ino = resolved.value().first;
+      name = resolved.value().second;
+    }
+  }
+  Status status = node->inode->IsDir()
+                      ? state.fs->RemoveEmptyDirectory(parent_ino, name,
+                                                  /*defer_inode_free=*/false)
+                      : state.fs->Unlink(parent_ino, name,
+                                         /*defer_inode_free=*/true);
+  if (!status.ok()) {
+    // CanDelete / SetDelete validated this beforehand; a failure here cannot
+    // be reported through the WinFsp interface.
+    XFS_ERROR("Cleanup(delete, ino=" << node->inode->ino
+                                     << ") failed: " << status.error().Format());
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    node->delete_pending = true;
+  }
+  DropNamespaceCaches(state, parent_ino);
+  XFS_DEBUG("deleted " << name << " in " << parent_ino
+                       << (node->inode->IsDir() ? " (directory)" : "")
+                       << "; inode " << node->inode->ino
+                       << " freed at last close");
 }
 
 VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   AdapterState& state = *State(file_system);
   if (!file_context) return;
   // One reference per Open. The node is destroyed when the last one goes away
-  // (idempotent for repeated Close of the same node).
-  std::lock_guard<std::mutex> lock(state.node_mutex);
-  auto it = state.nodes.find(NodeId(file_context));
-  if (it == state.nodes.end()) return;
-  if (0 == --it->second->refcount) {
-    state.node_by_inode.erase(it->second->inode->ino);
-    state.nodes.erase(it);
+  // (idempotent for repeated Close of the same node). A delete-on-close node
+  // frees its inode here: xfs_ifree for the zero-link inode that Cleanup left
+  // on the AGI unlinked list.
+  uint64_t free_ino = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto it = state.nodes.find(NodeId(file_context));
+    if (it == state.nodes.end()) return;
+    if (0 == --it->second->refcount) {
+      if (it->second->delete_pending) free_ino = it->second->inode->ino;
+      state.node_by_inode.erase(it->second->inode->ino);
+      state.nodes.erase(it);
+    }
+  }
+  if (free_ino != 0) {
+    Status status = state.fs->FreeUnlinkedInode(free_ino);
+    if (!status.ok()) {
+      XFS_ERROR("Close: cannot free unlinked inode " << free_ino << ": "
+                                                     << status.error().Format());
+    }
+    DropNamespaceCaches(state, 0);
   }
 }
 
@@ -631,8 +895,25 @@ NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR) {
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS SetDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR,
+                   BOOLEAN delete_file) {
+  AdapterState& state = *State(file_system);
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  auto node = LookupNode(state, file_context);
+  if (!node) return STATUS_INVALID_HANDLE;
+  if (!delete_file) return STATUS_SUCCESS;  // clearing the disposition
+  // The actual deletion happens in Cleanup; this is the read-only test that
+  // Windows performs first (like xfs_remove's checks, before any mutation).
+  return NtFromStatus(CheckDeletable(state, *node->inode));
+}
+
+NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR) {
+  // Used only when SetDelete is not implemented; kept consistent with it.
+  AdapterState& state = *State(file_system);
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  auto node = LookupNode(state, file_context);
+  if (!node) return STATUS_INVALID_HANDLE;
+  return NtFromStatus(CheckDeletable(state, *node->inode));
 }
 
 NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR, PWSTR, BOOLEAN) {
@@ -1124,6 +1405,162 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
     }
   }
 
+  // RW-3 self-test: create, mkdir, delete-on-close and rmdir through the same
+  // callbacks WinFsp drives. This is the driver-free coverage of the inode
+  // allocator, the directory writer and the open-but-unlinked state.
+  if (read_write && !failures) {
+    auto options_for = [](UINT32 disposition, UINT32 options) {
+      // Disposition in the high 8 bits, options in the low 24 (fsctl.h).
+      return (disposition << 24) | options;
+    };
+    constexpr UINT32 kFileCreate = 2;  // FILE_CREATE
+    PVOID ctx = nullptr;
+    FSP_FSCTL_FILE_INFO fi{};
+    NTSTATUS st = Create(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"),
+                         options_for(kFileCreate, 0), 0, 0, nullptr, 0, &ctx,
+                         &fi);
+    check(st == STATUS_SUCCESS, "rw3 selftest: Create file");
+    if (st == STATUS_SUCCESS) {
+      check(fi.FileSize == 0, "rw3 selftest: new file size");
+      std::vector<uint8_t> payload(4096, 0xA5);
+      ULONG written = 0;
+      check(Write(&fake, ctx, payload.data(), 0,
+                  static_cast<ULONG>(payload.size()), FALSE, FALSE, &written,
+                  &fi) == STATUS_SUCCESS &&
+                written == payload.size(),
+            "rw3 selftest: write new file");
+      Close(&fake, ctx);
+      ctx = nullptr;
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), 0, 0, &ctx,
+                 &fi) == STATUS_SUCCESS,
+            "rw3 selftest: re-open created file");
+      if (ctx) {
+        std::vector<uint8_t> readback(payload.size(), 0);
+        ULONG got = 0;
+        check(Read(&fake, ctx, readback.data(), 0,
+                   static_cast<ULONG>(readback.size()), &got) == STATUS_SUCCESS &&
+                  got == readback.size() && readback == payload,
+              "rw3 selftest: created-file contents");
+        Close(&fake, ctx);
+      }
+      // A duplicate create collides (the FSD tries Open first in practice).
+      PVOID dup = nullptr;
+      check(Create(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"),
+                   options_for(kFileCreate, 0), 0, 0, nullptr, 0, &dup,
+                   &fi) == STATUS_OBJECT_NAME_COLLISION,
+            "rw3 selftest: duplicate create collides");
+
+      // mkdir, enumerate it while empty, then create a child and enumerate
+      // again: the parent listing cache must have been dropped.
+      ctx = nullptr;
+      st = Create(&fake, const_cast<PWSTR>(L"\\rw3-dir"),
+                  options_for(kFileCreate, FILE_DIRECTORY_FILE), 0, 0, nullptr,
+                  0, &ctx, &fi);
+      check(st == STATUS_SUCCESS, "rw3 selftest: mkdir");
+      if (ctx) {
+        check((fi.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              "rw3 selftest: mkdir attribute");
+        enumerate(ctx, "rw3 empty dir");
+        check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), TRUE) ==
+                  STATUS_SUCCESS,
+              "rw3 selftest: empty dir deletable");
+        Close(&fake, ctx);
+      }
+      PVOID child = nullptr;
+      st = Create(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"),
+                  options_for(kFileCreate, 0), 0, 0, nullptr, 0, &child, &fi);
+      check(st == STATUS_SUCCESS, "rw3 selftest: create child");
+      if (child) {
+        std::vector<uint8_t> child_data(1024, 0x5C);
+        ULONG written = 0;
+        check(Write(&fake, child, child_data.data(), 0,
+                    static_cast<ULONG>(child_data.size()), FALSE, FALSE,
+                    &written, &fi) == STATUS_SUCCESS,
+              "rw3 selftest: write child");
+        check(GetFileInfo(&fake, child, &fi) == STATUS_SUCCESS &&
+                  fi.FileSize == child_data.size(),
+              "rw3 selftest: child size");
+        Close(&fake, child);
+      }
+      // The directory is no longer empty: the delete disposition is refused
+      // without modifying anything.
+      ctx = nullptr;
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE, 0,
+               &ctx, &fi) == STATUS_SUCCESS) {
+        enumerate(ctx, "rw3 dir with child");
+        check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), TRUE) ==
+                  STATUS_DIRECTORY_NOT_EMPTY,
+              "rw3 selftest: non-empty rmdir refused");
+        Close(&fake, ctx);
+      }
+
+      // Delete-on-close: Cleanup removes the namespace entry (the inode goes
+      // on the AGI unlinked list), the handle keeps working until Close, and
+      // Close frees the inode.
+      child = nullptr;
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), 0, 0, &child,
+               &fi) == STATUS_SUCCESS) {
+        check(SetDelete(&fake, child,
+                        const_cast<PWSTR>(L"\\rw3-dir\\child.bin"),
+                        TRUE) == STATUS_SUCCESS,
+              "rw3 selftest: SetDelete child");
+        Cleanup(&fake, child, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"),
+                FspCleanupDelete);
+        std::vector<uint8_t> readback(1024, 0);
+        ULONG got = 0;
+        check(Read(&fake, child, readback.data(), 0,
+                   static_cast<ULONG>(readback.size()), &got) == STATUS_SUCCESS,
+              "rw3 selftest: read open-but-unlinked");
+        check(GetFileInfo(&fake, child, &fi) == STATUS_SUCCESS,
+              "rw3 selftest: info open-but-unlinked");
+        Close(&fake, child);  // frees the unlinked inode
+      }
+      PVOID gone = nullptr;
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir\\child.bin"), 0, 0,
+                 &gone, &fi) == STATUS_OBJECT_NAME_NOT_FOUND,
+            "rw3 selftest: deleted child name gone");
+
+      // Now the directory is empty and can be removed; its name disappears.
+      ctx = nullptr;
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE, 0,
+               &ctx, &fi) == STATUS_SUCCESS) {
+        check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), TRUE) ==
+                  STATUS_SUCCESS,
+              "rw3 selftest: emptied dir deletable");
+        Cleanup(&fake, ctx, const_cast<PWSTR>(L"\\rw3-dir"), FspCleanupDelete);
+        Close(&fake, ctx);
+      }
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw3-dir"), FILE_DIRECTORY_FILE,
+                 0, &gone, &fi) == STATUS_OBJECT_NAME_NOT_FOUND,
+            "rw3 selftest: removed dir name gone");
+
+      // Remove the first file the same way, then create the name again: names
+      // and inodes are reusable.
+      ctx = nullptr;
+      if (Open(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"), 0, 0, &ctx,
+               &fi) == STATUS_SUCCESS) {
+        check(SetDelete(&fake, ctx, const_cast<PWSTR>(L"\\rw3-created.bin"),
+                        TRUE) == STATUS_SUCCESS,
+              "rw3 selftest: SetDelete file");
+        Cleanup(&fake, ctx, const_cast<PWSTR>(L"\\rw3-created.bin"),
+                FspCleanupDelete);
+        Close(&fake, ctx);
+      }
+      ctx = nullptr;
+      check(Create(&fake, const_cast<PWSTR>(L"\\rw3-created.bin"),
+                   options_for(kFileCreate, 0), 0, 0, nullptr, 0, &ctx,
+                   &fi) == STATUS_SUCCESS,
+            "rw3 selftest: recreate the same name");
+      if (ctx) Close(&fake, ctx);
+      std::fprintf(stderr,
+                   "selftest: RW-3 namespace mutation verified through the "
+                   "Create/SetDelete/Cleanup callbacks\n");
+    } else {
+      // A failed create leaves nothing behind; report and continue.
+      if (ctx) Close(&fake, ctx);
+    }
+  }
+
   LocalFree(state.security_descriptor);
   std::fprintf(stderr, "selftest: %s (%d failures)\n",
                failures ? "FAILED" : "PASSED", failures);
@@ -1250,6 +1687,7 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   interface.SetBasicInfo = SetBasicInfo;
   interface.SetFileSize = SetFileSize;
   interface.CanDelete = CanDelete;
+  interface.SetDelete = SetDelete;
   interface.Rename = Rename;
   interface.GetSecurity = GetSecurity;
   interface.SetSecurity = SetSecurity;

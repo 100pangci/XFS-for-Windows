@@ -172,7 +172,7 @@ Status XfsFilesystem::EnsureInodeCapacity(uint32_t preferred_agno) {
 // Create a regular file
 // ---------------------------------------------------------------------------
 
-Result<uint64_t> XfsFilesystem::CreateFile(uint64_t parent_ino,
+Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
                                            std::string_view name,
                                            uint16_t mode, uint32_t uid,
                                            uint32_t gid) {
@@ -526,7 +526,7 @@ Status XfsFilesystem::Unlink(uint64_t parent_ino, std::string_view name,
                              defer_inode_free, nullptr);
 }
 
-Status XfsFilesystem::RemoveDirectory(uint64_t parent_ino,
+Status XfsFilesystem::RemoveEmptyDirectory(uint64_t parent_ino,
                                       std::string_view name,
                                       bool defer_inode_free) {
   return RemoveNamespaceEntry(parent_ino, name, /*directory_expected=*/true,

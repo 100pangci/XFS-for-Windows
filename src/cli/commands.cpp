@@ -63,10 +63,19 @@ void PrintUsage() {
       "      --rw-experimental [--fill=0xNN]\n"
       "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
       "      --rw-experimental\n"
+      "  create <image> <path>         create a regular file\n"
+      "      --rw-experimental [--mode=0644]\n"
+      "  mkdir <image> <path>          create a directory\n"
+      "      --rw-experimental [--mode=0755]\n"
+      "  unlink <image> <path>         remove a regular file\n"
+      "      --rw-experimental\n"
+      "  rmdir <image> <path>          remove an empty directory\n"
+      "      --rw-experimental\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
-      "      --rw-experimental         writable mount (images only; existing files\n"
-      "                                can be overwritten, extended, truncated)\n"
+      "      --rw-experimental         writable mount (images only; files can be\n"
+      "                                created, overwritten, extended, truncated\n"
+      "                                and removed; rename is not supported)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -970,6 +979,207 @@ int CommandTruncate(const std::string& target, const std::string& path,
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// RW-3 namespace commands: create, mkdir, unlink, rmdir. They drive the same
+// transactions the WinFsp callbacks use, so CI can verify them against Linux
+// without a driver.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool ParseOctal(const std::string& text, uint32_t* out) {
+  if (text.empty() || text.size() > 6) return false;
+  uint32_t value = 0;
+  for (char c : text) {
+    if (c < '0' || c > '7') return false;
+    value = value * 8 + static_cast<uint32_t>(c - '0');
+  }
+  *out = value;
+  return true;
+}
+
+// Splits an XFS path into (parent inode, final component) for the namespace
+// API. The root itself cannot be created or removed.
+Result<std::pair<uint64_t, std::string>> ParentAndName(XfsFilesystem& fs,
+                                                       std::string_view path) {
+  if (path.empty() || path == "/" || path.back() == '/') {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "path must name a file or directory (no trailing '/')")
+        .Metadata("path");
+  }
+  const size_t slash = path.rfind('/');
+  const std::string_view parent =
+      slash == std::string_view::npos ? std::string_view("/")
+                                      : path.substr(0, slash);
+  const std::string_view name =
+      slash == std::string_view::npos ? path : path.substr(slash + 1);
+  if (name.empty() || name == "." || name == "..") {
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid final path component")
+        .Metadata("path");
+  }
+  auto ino = fs.LookupPath(parent.empty() ? std::string_view("/") : parent);
+  if (!ino.ok()) return ino.error();
+  if (!ino.value().IsDir()) {
+    return XFS_ERR(XfsError::kNotDirectory, "parent is not a directory")
+        .Ino(ino.value().ino);
+  }
+  return std::make_pair(ino.value().ino, std::string(name));
+}
+
+// Shared front matter for the namespace commands: opt-in flag, image only,
+// exclusive read-write mount.
+int OpenWritable(const std::string& target, const Options& options,
+                 std::unique_ptr<XfsFilesystem>* fs_out) {
+  if (!options.rw_experimental) {
+    std::cerr << "error: this command modifies the image; pass "
+                 "--rw-experimental to confirm (images only)\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: read-write commands are restricted to image files "
+                 "in this version\n";
+    return 3;
+  }
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  *fs_out = std::move(fs.value());
+  return 0;
+}
+
+// Closes the journal with an unmount record and flushes to stable storage.
+bool CloseWritable(XfsFilesystem& fs) {
+  Status closed = fs.WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return false;
+  }
+  if (!fs.Flush().ok()) {
+    std::cerr << "error: flush failed\n";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int CommandCreate(const std::string& target, const std::string& path,
+                  uint32_t mode, const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto split = ParentAndName(*fs, path);
+  if (!split.ok()) {
+    PrintError(split.error());
+    return 1;
+  }
+  auto created = fs->CreateRegularFile(split.value().first, split.value().second,
+                                static_cast<uint16_t>(mode), 0, 0);
+  if (!created.ok()) {
+    PrintError(created.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "created " << path << " (inode " << created.value() << ")\n";
+  return 0;
+}
+
+int CommandMkdir(const std::string& target, const std::string& path,
+                 uint32_t mode, const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto split = ParentAndName(*fs, path);
+  if (!split.ok()) {
+    PrintError(split.error());
+    return 1;
+  }
+  Status status = fs->Mkdir(split.value().first, split.value().second,
+                            static_cast<uint16_t>(mode), 0, 0);
+  if (!status.ok()) {
+    PrintError(status.error());
+    return 1;
+  }
+  auto entry = fs->LookupName(split.value().first, split.value().second);
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "created directory " << path << " (inode "
+            << (entry.ok() ? std::to_string(entry.value().ino)
+                           : std::string("?"))
+            << ")\n";
+  return 0;
+}
+
+int CommandUnlink(const std::string& target, const std::string& path,
+                  const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto split = ParentAndName(*fs, path);
+  if (!split.ok()) {
+    PrintError(split.error());
+    return 1;
+  }
+  auto entry = fs->LookupName(split.value().first, split.value().second);
+  if (!entry.ok()) {
+    PrintError(entry.error());
+    return 1;
+  }
+  auto inode = fs->OpenInode(entry.value().ino);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  if (inode.value().IsDir()) {
+    std::cerr << "error: " << path << " is a directory; use rmdir\n";
+    return 1;
+  }
+  Status status = fs->Unlink(split.value().first, split.value().second,
+                             /*defer_inode_free=*/false);
+  if (!status.ok()) {
+    PrintError(status.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "unlinked " << path << " (inode " << entry.value().ino << ")\n";
+  return 0;
+}
+
+int CommandRmdir(const std::string& target, const std::string& path,
+                 const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto split = ParentAndName(*fs, path);
+  if (!split.ok()) {
+    PrintError(split.error());
+    return 1;
+  }
+  auto entry = fs->LookupName(split.value().first, split.value().second);
+  if (!entry.ok()) {
+    PrintError(entry.error());
+    return 1;
+  }
+  Status status = fs->RemoveEmptyDirectory(split.value().first, split.value().second,
+                                      /*defer_inode_free=*/false);
+  if (!status.ok()) {
+    PrintError(status.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "removed directory " << path << " (inode " << entry.value().ino
+            << ")\n";
+  return 0;
+}
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
@@ -979,6 +1189,8 @@ int Run(const std::vector<std::string>& args) {
   std::string pwrite_from;
   uint8_t extend_fill = 0;
   bool have_fill = false;
+  uint32_t namespace_mode = 0;
+  bool have_mode = false;
   bool explicit_rw = false;
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
@@ -1006,6 +1218,13 @@ int Run(const std::vector<std::string>& args) {
       }
       extend_fill = static_cast<uint8_t>(value);
       have_fill = true;
+    } else if (StartsWith(arg, "--mode=")) {
+      if (!ParseOctal(arg.substr(7), &namespace_mode) ||
+          namespace_mode > 07777) {
+        std::cerr << "error: --mode must be an octal mode (e.g. --mode=0644)\n";
+        return 1;
+      }
+      have_mode = true;
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
       PrintUsage();
       return 0;
@@ -1109,6 +1328,38 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandTruncate(positional[1], positional[2], positional[3],
                            options);
+  }
+  if (command == "create") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin create <image> <path> --rw-experimental "
+                   "[--mode=0644]\n";
+      return 1;
+    }
+    return CommandCreate(positional[1], positional[2],
+                         have_mode ? namespace_mode : 0644u, options);
+  }
+  if (command == "mkdir") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin mkdir <image> <path> --rw-experimental "
+                   "[--mode=0755]\n";
+      return 1;
+    }
+    return CommandMkdir(positional[1], positional[2],
+                        have_mode ? namespace_mode : 0755u, options);
+  }
+  if (command == "unlink") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin unlink <image> <path> --rw-experimental\n";
+      return 1;
+    }
+    return CommandUnlink(positional[1], positional[2], options);
+  }
+  if (command == "rmdir") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin rmdir <image> <path> --rw-experimental\n";
+      return 1;
+    }
+    return CommandRmdir(positional[1], positional[2], options);
   }
   if (command == "format") {
     if (positional.size() != 2) {

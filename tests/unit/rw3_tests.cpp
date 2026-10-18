@@ -518,7 +518,7 @@ TEST(rw3_create_regular_file) {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
     if (!fs.ok()) return;
-    auto created = fs.value()->CreateFile(root, "hello.txt", 0100644, 0, 0);
+    auto created = fs.value()->CreateRegularFile(root, "hello.txt", 0100644, 0, 0);
     if (!created.ok()) {
       std::printf("create error: %s\n", created.error().Format().c_str());
     }
@@ -591,7 +591,7 @@ TEST(rw3_mkdir_and_rmdir) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto rm = fs.value()->RemoveDirectory(root, "sub");
+    auto rm = fs.value()->RemoveEmptyDirectory(root, "sub");
     if (!rm.ok()) std::printf("rmdir error: %s\n", rm.error().Format().c_str());
     CHECK(rm.ok());
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
@@ -623,7 +623,7 @@ TEST(rw3_unlink_frees_data_and_inode) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto created = fs.value()->CreateFile(root, "doomed.bin", 0644, 0, 0);
+    auto created = fs.value()->CreateRegularFile(root, "doomed.bin", 0644, 0, 0);
     CHECK(created.ok());
     if (!created.ok()) return;
     ino = created.value();
@@ -665,7 +665,7 @@ TEST(rw3_open_but_unlinked_defers_the_inode_free) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto created = fs.value()->CreateFile(root, "open.bin", 0644, 0, 0);
+    auto created = fs.value()->CreateRegularFile(root, "open.bin", 0644, 0, 0);
     CHECK(created.ok());
     if (!created.ok()) return;
     ino = created.value();
@@ -720,7 +720,7 @@ TEST(rw3_directory_grows_through_all_formats) {
     if (!fs.ok()) return;
     for (int i = 0; i < kEntries; ++i) {
       const std::string name = FixedName(i);
-      auto created = fs.value()->CreateFile(root, name, 0644, 0, 0);
+      auto created = fs.value()->CreateRegularFile(root, name, 0644, 0, 0);
       if (!created.ok()) {
         std::printf("create %s error: %s\n", name.c_str(),
                     created.error().Format().c_str());
@@ -794,7 +794,7 @@ TEST(rw3_rmdir_of_a_grown_directory_frees_its_blocks) {
     CHECK(found.ok());
     dir = found.value().ino;
     for (int i = 0; i < 200; ++i) {
-      auto created = fs.value()->CreateFile(dir, FixedName(i), 0644, 0, 0);
+      auto created = fs.value()->CreateRegularFile(dir, FixedName(i), 0644, 0, 0);
       CHECK(created.ok());
     }
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
@@ -815,7 +815,7 @@ TEST(rw3_rmdir_of_a_grown_directory_frees_its_blocks) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto rm = fs.value()->RemoveDirectory(root, "big", false);
+    auto rm = fs.value()->RemoveEmptyDirectory(root, "big", false);
     if (!rm.ok()) std::printf("rmdir error: %s\n", rm.error().Format().c_str());
     CHECK(rm.ok());
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
@@ -840,7 +840,7 @@ TEST(rw3_create_after_delete_reuses_the_inode_without_stale_data) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto created = fs.value()->CreateFile(root, "a.bin", 0644, 0, 0);
+    auto created = fs.value()->CreateRegularFile(root, "a.bin", 0644, 0, 0);
     CHECK(created.ok());
     if (!created.ok()) return;
     first = created.value();
@@ -849,7 +849,7 @@ TEST(rw3_create_after_delete_reuses_the_inode_without_stale_data) {
     first_gen = inode.value().gen;
     CHECK(fs.value()->WriteFileData(first, 0, secret.data(), secret.size()).ok());
     CHECK(fs.value()->Unlink(root, "a.bin", false).ok());
-    auto second = fs.value()->CreateFile(root, "b.bin", 0644, 0, 0);
+    auto second = fs.value()->CreateRegularFile(root, "b.bin", 0644, 0, 0);
     CHECK(second.ok());
     if (!second.ok()) return;
     // The allocator hands out the first free inode: the one just freed.
@@ -882,8 +882,8 @@ TEST(rw3_rmdir_rejects_a_non_empty_directory) {
     auto found = fs.value()->LookupName(root, "full");
     CHECK(found.ok());
     const uint64_t dir = found.value().ino;
-    CHECK(fs.value()->CreateFile(dir, "child", 0644, 0, 0).ok());
-    auto rm = fs.value()->RemoveDirectory(root, "full", false);
+    CHECK(fs.value()->CreateRegularFile(dir, "child", 0644, 0, 0).ok());
+    auto rm = fs.value()->RemoveEmptyDirectory(root, "full", false);
     CHECK(!rm.ok());
     CHECK_EQ(rm.error().code, XfsError::kDirectoryNotEmpty);
     // Nothing was modified.
@@ -904,20 +904,20 @@ TEST(rw3_create_rejects_invalid_names) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    auto dot = fs.value()->CreateFile(root, ".", 0644, 0, 0);
+    auto dot = fs.value()->CreateRegularFile(root, ".", 0644, 0, 0);
     CHECK(!dot.ok());
-    auto dotdot = fs.value()->CreateFile(root, "..", 0644, 0, 0);
+    auto dotdot = fs.value()->CreateRegularFile(root, "..", 0644, 0, 0);
     CHECK(!dotdot.ok());
-    auto slash = fs.value()->CreateFile(root, "a/b", 0644, 0, 0);
+    auto slash = fs.value()->CreateRegularFile(root, "a/b", 0644, 0, 0);
     CHECK(!slash.ok());
-    auto empty = fs.value()->CreateFile(root, "", 0644, 0, 0);
+    auto empty = fs.value()->CreateRegularFile(root, "", 0644, 0, 0);
     CHECK(!empty.ok());
     const std::string too_long(256, 'x');
-    auto long_name = fs.value()->CreateFile(root, too_long, 0644, 0, 0);
+    auto long_name = fs.value()->CreateRegularFile(root, too_long, 0644, 0, 0);
     CHECK(!long_name.ok());
     CHECK_EQ(long_name.error().code, XfsError::kNameTooLong);
     const std::string max_name(255, 'y');
-    auto max_ok = fs.value()->CreateFile(root, max_name, 0644, 0, 0);
+    auto max_ok = fs.value()->CreateRegularFile(root, max_name, 0644, 0, 0);
     if (!max_ok.ok()) {
       std::printf("255-byte create error: %s\n",
                   max_ok.error().Format().c_str());
@@ -938,8 +938,8 @@ TEST(rw3_create_duplicate_name_is_refused) {
   {
     auto fs = fixture.Mount(/*read_write=*/true);
     CHECK(fs.ok());
-    CHECK(fs.value()->CreateFile(root, "dup", 0644, 0, 0).ok());
-    auto again = fs.value()->CreateFile(root, "dup", 0644, 0, 0);
+    CHECK(fs.value()->CreateRegularFile(root, "dup", 0644, 0, 0).ok());
+    auto again = fs.value()->CreateRegularFile(root, "dup", 0644, 0, 0);
     CHECK(!again.ok());
     CHECK_EQ(again.error().code, XfsError::kAlreadyExists);
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
