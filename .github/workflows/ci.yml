@@ -1172,7 +1172,7 @@ jobs:
           if-no-files-found: error
 
   windows-recover-linux-logs:
-    needs: linux-generate-dirty-logs
+    needs: [linux-generate-dirty-logs, windows-build-test]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
