@@ -338,7 +338,7 @@ Invoke-Ok 'link /big/g0000.bin -> /big/glink.bin' @('link', $img,
 Invoke-Ok 'rename /big/g0005.bin -> /BIG-MOVED.bin' @('rename', $img,
     '/big/g0005.bin', '/BIG-MOVED.bin', '--rw-experimental')
 Test-Consistent $img
-$big_expected = @('BIG-MOVED.bin')
+$big_expected = @()
 foreach ($name in $big_names) {
     if ($name -in @('g0001.bin', 'g0005.bin')) { continue }
     $big_expected += $name
@@ -356,7 +356,10 @@ $models['nodedir'] = [ordered]@{
         [ordered]@{ path = '/' }
     )
     absent = @('/big/g0001.bin', '/big/g0005.bin')
-    listings = [ordered]@{ '/' = @('hello.bin', 'big', 'BIG-MOVED.bin') }
+    listings = [ordered]@{
+        '/' = @('hello.bin', 'big', 'BIG-MOVED.bin')
+        '/big' = $big_expected
+    }
 }
 $images['nodedir.img'] = [ordered]@{
     dirs = @('big')

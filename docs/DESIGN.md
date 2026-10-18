@@ -140,7 +140,13 @@ treated as empty/clean. Unknown content is refused (or accepted only with
 ## Directory formats
 
 - shortform: inode literal area, `count/i8count/parent`, variable entries
-  with optional ftype and 4- or 8-byte inode numbers.
+  with optional ftype and 4- or 8-byte inode numbers. Every entry stores its
+  *data-space* offset: the first at `data_first_offset` (after the data-block
+  header and the implicit `.`/`..`), each later one at least
+  `xfs_dir2_data_entsize` after its predecessor - the block format's entry
+  size including the 2-byte tag, not the smaller on-disk shortform size.
+  `xfs_dir2_sf_verify` rejects an overlapping sequence, so a hole left by a
+  rename only fits a name whose data entry is small enough.
 - block: single block with `XDB3`, embedded leaf entries before the block
   tail; enumeration walks the data-entry chain.
 - leaf: data blocks plus one `XDL3` leaf1 block at the leaf-space offset;
