@@ -1241,3 +1241,104 @@ TEST(rw4_shortform_offsets_use_the_data_entry_size) {
   CheckConsistent(fixture);
   fixture.Reset();
 }
+
+// ---------------------------------------------------------------------------
+// The kernel reserves an empty attribute fork on every inode it creates
+// (xfs_icreate_want_attrfork: di_forkoff 24, an EXTENTS attr fork), and real
+// xattrs must survive a Windows-side directory edit. The directory writer only
+// rewrites the data fork - up to di_forkoff - so both cases must keep the
+// attribute fork bytes byte-for-byte intact.
+// ---------------------------------------------------------------------------
+
+TEST(rw4_directory_with_an_attribute_fork_is_mutable) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  uint64_t dir = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    CHECK(fs.value()->Mkdir(kRoot, "d", 0755, 0, 0).ok());
+    auto found = fs.value()->LookupName(kRoot, "d");
+    CHECK(found.ok());
+    if (!found.ok()) return;
+    dir = found.value().ino;
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Give the directory a shortform attribute fork with one xattr (the state a
+  // Linux mkdir or setfattr leaves behind).
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    const XfsGeometry& geo = fs.value()->geometry();
+    CHECK_EQ(geo.inode_size, 512u);
+    std::vector<uint8_t> raw(geo.inode_size, 0);
+    CHECK(fixture.storage().Read(geo.InoToByteOffset(dir), raw.data(),
+                                 raw.size()));
+    raw[ondisk::inode::kForkoff] = 24;  // 192 bytes of data fork
+    raw[ondisk::inode::kAformat] = ondisk::inode::kFormatLocal;
+    // xfs_attr_shortform: totsize (be16), count, i8count, then
+    // {namelen, valuelen, flags, name, value} entries.
+    uint8_t* attr = raw.data() + 176 + 24 * 8;
+    PutBE16(attr, 0, 16);  // 4-byte header + 12-byte entry
+    attr[2] = 1;           // count
+    attr[3] = 0;           // i8count
+    attr[4] = 6;           // namelen
+    attr[5] = 3;           // valuelen
+    attr[6] = 0;           // flags
+    std::memcpy(attr + 7, "user.x", 6);
+    std::memcpy(attr + 13, "abc", 3);
+    UpdateXfsChecksum(raw.data(), raw.size(), ondisk::inode::kCrc);
+    CHECK(fixture.storage().Write(geo.InoToByteOffset(dir), raw.data(),
+                                  raw.size()));
+    CHECK(fixture.storage().Flush());
+  }
+  CheckConsistent(fixture);
+  uint64_t sub_ino = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    // Entries inside the directory, then a cross-parent move of the directory
+    // itself: both rewrite its data fork (".." for the move).
+    CHECK(fs.value()->CreateRegularFile(dir, "f", 0644, 0, 0).ok());
+    CHECK(fs.value()->Mkdir(kRoot, "sub", 0755, 0, 0).ok());
+    auto sub = fs.value()->LookupName(kRoot, "sub");
+    CHECK(sub.ok());
+    if (!sub.ok()) return;
+    sub_ino = sub.value().ino;
+    CHECK(fs.value()->Rename(kRoot, "d", sub_ino, "d2", false).ok());
+    CHECK(fs.value()->Unlink(dir, "f", false).ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    auto inode = fs.value()->OpenInode(dir);
+    CHECK(inode.ok());
+    if (!inode.ok()) return;
+    CHECK_EQ(inode.value().forkoff, 24);
+    CHECK_EQ(inode.value().aformat, ondisk::inode::kFormatLocal);
+    CHECK_EQ(inode.value().attr_fork.size(),
+             static_cast<size_t>(512 - 176 - 24 * 8));
+    const std::vector<uint8_t>& attr = inode.value().attr_fork;
+    CHECK_EQ(GetBE16(attr.data(), 0), 16u);
+    CHECK_EQ(attr[2], 1u);
+    CHECK_EQ(attr[3], 0u);
+    CHECK_EQ(attr[4], 6u);
+    CHECK_EQ(attr[5], 3u);
+    CHECK_EQ(attr[6], 0u);
+    CHECK(std::memcmp(attr.data() + 7, "user.x", 6) == 0);
+    CHECK(std::memcmp(attr.data() + 13, "abc", 3) == 0);
+    CHECK(fs.value()->LookupName(sub_ino, "d2").ok());
+    CHECK(!fs.value()->LookupName(kRoot, "d").ok());
+    auto moved = fs.value()->OpenInode(dir);
+    CHECK(moved.ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}

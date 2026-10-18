@@ -116,6 +116,26 @@ Moving a directory into its own subtree (including onto itself) is rejected
 with `kWouldCycle` (Linux `EINVAL`) by walking `..` from the destination
 parent before any editor is touched.
 
+### Directories with attribute forks
+
+Every inode the Linux kernel creates on this filesystem carries a reserved
+attribute fork (`xfs_icreate_want_attrfork`: `di_forkoff =
+xfs_default_attroffset >> 3` = 24 for 512-byte inodes, `di_aformat = EXTENTS`,
+no attributes yet), and real xattrs can follow later. The directory writer
+therefore confines every rewrite to the data fork:
+
+- the data fork owns the literal area up to `di_forkoff * 8`
+  (`XfsInode::data_fork`, already sliced by the core parser); the shortform
+  size checks and the image rebuild inside `FinalizeInode` use that capacity,
+  so a directory whose shortform data no longer fits converts to the block
+  format exactly like the kernel does;
+- the attribute fork bytes are part of the inode image the writer starts from
+  and are never touched: the inode core keeps `di_forkoff`/`di_aformat`, and
+  the logged region is only the data fork's share of the literal area;
+- attributes are still neither interpreted nor mutated (xattr/ACL support is
+  out of scope), but a rename, link, unlink or dirent edit inside such a
+  directory preserves them byte for byte.
+
 ### Replace semantics
 
 | source | target | result |
