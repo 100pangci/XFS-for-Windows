@@ -650,9 +650,16 @@ struct InodeCounts {
 };
 
 // Recomputes di_nblocks from the extent map (data extents plus bmbt blocks),
-// the same value xfs_repair checks.
+// the same value xfs_repair checks. Formats without a data fork - shortform
+// (local) directories and symlinks, device nodes, UUID inodes - have no
+// blocks.
 Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
                            const XfsInode& inode, uint64_t* out) {
+  if (inode.format == di::kFormatLocal || inode.format == di::kFormatDev ||
+      inode.format == di::kFormatUuid) {
+    *out = 0;
+    return OkStatus();
+  }
   std::vector<XfsExtent> extents;
   Status s = LoadDataForkExtents(dev, geo, inode, &extents);
   if (!s.ok()) return s;
@@ -862,6 +869,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
           return OkStatus();
         };
         Status s = WalkBtree(bnobt, agf.bno_root, cb);
+        const bool bno_ok = s.ok();
         if (!s.ok()) {
           report.Add("AG" + std::to_string(agno) + " bnobt",
                      CheckStatus::kCorrupt, s.error().Format());
@@ -928,6 +936,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
           return OkStatus();
         };
         s = WalkBtree(cnt, agf.cnt_root, ccb);
+        const bool cnt_ok = s.ok();
         if (!s.ok()) {
           report.Add("AG" + std::to_string(agno) + " cntbt",
                      CheckStatus::kCorrupt, s.error().Format());
@@ -938,12 +947,58 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                      "cntbt total " + std::to_string(cnt_counts.blocks) +
                          " != bnobt total " + std::to_string(bno.blocks));
         }
-        // agf_btreeblks is the number of non-root free space btree blocks of
-        // both trees (xfs_repair counts exactly these).
-        if (s.ok()) {
+
+        // agf_btreeblks is the number of *non-root* blocks of the free space
+        // btrees plus, when the rmapbt is enabled, the non-root rmap blocks
+        // (xchk_agf_xref_btreeblks and xfs_repair count exactly these; the
+        // refcount tree is not part of it, see the comment in xfs_ag.c). The
+        // root blocks are represented by the trees themselves, and the AGFL
+        // blocks are tracked by agf_flcount instead.
+        uint32_t rmap_blocks = 0;
+        bool rmap_ok = true;
+        if (superblock_.features.rmapbt) {
+          BtreeSpec rmap;
+          rmap.name = "rmapbt";
+          // Short block header (56 bytes, CRC at 52) but two 20-byte keys per
+          // node entry and 4-byte pointers (XFS_RMAP_KEY_ADDR etc).
+          rmap.format = BtreeFormat::kShort;
+          rmap.block_size = geo.block_size;
+          rmap.key_size = bt::kRmapKeySize;
+          rmap.ptr_size = bt::kRmapPtrSize;
+          rmap.rec_size = bt::kRmapRecSize;
+          rmap.magic = ondisk::kRmapCrcMagic;
+          rmap.max_depth = bt::kMaxTraversalLevels;
+          rmap.null_ptr = kNullAgBlock;
+          rmap.expected_owner = agno;
+          rmap.owner_size = 4;
+          rmap.uuid = geo.meta_uuid;
+          rmap.sb_lsn = superblock_.lsn;
+          rmap.ptr_to_daddr = bnobt.ptr_to_daddr;
+          BtreeWalkCallbacks rcb;
+          rcb.read_block = read_ag_block;
+          rcb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
+          rcb.visit = [&](uint64_t, const BtreeBlockMeta&,
+                          const uint8_t*) -> Status {
+            ++rmap_blocks;
+            return OkStatus();
+          };
+          const Status rs = WalkBtree(rmap, agf.rmap_root, rcb);
+          if (!rs.ok()) {
+            report.Add("AG" + std::to_string(agno) + " rmapbt",
+                       CheckStatus::kCorrupt, rs.error().Format());
+            rmap_ok = false;
+          } else if (rmap_blocks != agf.rmap_blocks) {
+            report.Add("AG" + std::to_string(agno) + " rmapbt blocks",
+                       CheckStatus::kCorrupt,
+                       "AGF rmap_blocks " + std::to_string(agf.rmap_blocks) +
+                           " != counted " + std::to_string(rmap_blocks));
+            rmap_ok = false;
+          }
+        }
+        if (bno_ok && cnt_ok && rmap_ok) {
           const uint32_t counted_btreeblks =
-              (bno_blocks > 0 ? bno_blocks - 1 : 0) +
-              (cnt_blocks > 0 ? cnt_blocks - 1 : 0);
+              (bno_blocks - 1) + (cnt_blocks - 1) +
+              (rmap_blocks > 0 ? rmap_blocks - 1 : 0);
           if (agf.btreeblks != counted_btreeblks) {
             report.Add("AG" + std::to_string(agno) + " btree blocks",
                        CheckStatus::kCorrupt,

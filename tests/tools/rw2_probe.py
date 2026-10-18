@@ -29,6 +29,7 @@ SB_MAGIC = 0x58465342
 BNO_MAGIC = 0x41423342
 CNT_MAGIC = 0x41423343
 BMAP_MAGIC = 0x424D4133
+RMAP_MAGIC = 0x524D4233
 DINODE_MAGIC = 0x494E
 NULL_AGBLOCK = 0xFFFFFFFF
 NULL_FSB = 0xFFFFFFFFFFFFFFFF
@@ -112,6 +113,8 @@ class Geometry:
         self.ifree = u64(sb, 136)
         self.fdblocks = u64(sb, 144)
         self.features_incompat = u32(sb, 216)
+        self.features_ro_compat = u32(sb, 212)
+        self.rmapbt = (self.features_ro_compat & 2) != 0
         self.lsn = u64(sb, 240)
         self.uuid = bytes(sb[32:48])
         # Without the meta-uuid feature the metadata (and every inode) uses the
@@ -211,6 +214,49 @@ def read_short_btree(img, geo, agno, root, magic, key_is_len,
     return records, blocks, levels
 
 
+def read_rmapbt(img, geo, agno, root):
+    """Counts the blocks of the reverse-mapping btree and checks every block
+    header (magic, whole-block CRC, owner = AG number). The rmap btree keeps
+    the v5 short block header (56 bytes) but stores two 20-byte keys per node
+    entry followed by 4-byte child pointers (XFS_RMAP_KEY_ADDR/PTR_ADDR).
+    Returns the total block count including the root."""
+    blocksize = geo.blocksize
+    hdr = 56  # XFS_RMAP_BLOCK_LEN == XFS_BTREE_SBLOCK_CRC_LEN
+    node_maxrecs = (blocksize - hdr) // 44  # 2 keys (2 x 20) + 4-byte pointer
+    seen = set()
+    stack = [(root, None)]
+    blocks = 0
+    while stack:
+        agbno, expected_level = stack.pop()
+        if not (0 <= agbno < geo.ag_blocks(agno)):
+            raise SystemExit(f"AG{agno}: rmapbt pointer {agbno} out of range")
+        if agbno in seen:
+            raise SystemExit(f"AG{agno}: rmapbt cycle at {agbno}")
+        seen.add(agbno)
+        blocks += 1
+        buf = img.read(geo.ag_offset(agno) + (agbno << geo.blocklog), blocksize)
+        if u32(buf, 0) != RMAP_MAGIC:
+            raise SystemExit(f"AG{agno}: bad rmapbt magic at {agbno}")
+        if xfs_crc(buf, 52) != le32(buf, 52):
+            raise SystemExit(f"AG{agno}: bad rmapbt CRC at {agbno}")
+        if u32(buf, 48) != agno:
+            raise SystemExit(f"AG{agno}: rmapbt owner mismatch at {agbno}")
+        level = u16(buf, 4)
+        numrecs = u16(buf, 6)
+        if expected_level is not None and level != expected_level:
+            raise SystemExit(f"AG{agno}: rmapbt level mismatch at {agbno}")
+        maxrecs = (blocksize - hdr) // (24 if level == 0 else 44)
+        if numrecs > maxrecs:
+            raise SystemExit(f"AG{agno}: rmapbt numrecs out of range")
+        if level > 0:
+            if numrecs == 0:
+                raise SystemExit(f"AG{agno}: empty rmapbt node")
+            for i in range(numrecs):
+                stack.append((u32(buf, hdr + node_maxrecs * 40 + i * 4),
+                              level - 1))
+    return blocks
+
+
 def read_agfl(img, geo, agno, agf):
     flfirst = u32(agf, 40)
     fllast = u32(agf, 44)
@@ -294,6 +340,15 @@ def check_image(img, verbose=True, blocks_only=False):
         if max((r[1] for r in bno_recs), default=0) != longest:
             raise SystemExit(f"AG{agno}: longest mismatch")
         expected_btreeblks = (bno_blocks - 1) + (cnt_blocks - 1)
+        if geo.rmapbt:
+            # agf_btreeblks also counts the non-root rmapbt blocks
+            # (xchk_agf_xref_btreeblks; the refcount tree is not part of it).
+            rmap_blocks = read_rmapbt(img, geo, agno, u32(agf, 24))
+            if u32(agf, 80) != rmap_blocks:
+                raise SystemExit(
+                    f"AG{agno}: AGF rmap_blocks {u32(agf, 80)} != "
+                    f"{rmap_blocks}")
+            expected_btreeblks += rmap_blocks - 1
         if btreeblks != expected_btreeblks:
             raise SystemExit(
                 f"AG{agno}: btreeblks {btreeblks} != {expected_btreeblks}")
