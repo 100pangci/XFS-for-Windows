@@ -61,6 +61,7 @@ enum class XfsError : uint32_t {
   kNotRegularFile,
   kNotSymlink,
   kNameTooLong,
+  kDirectoryNotEmpty,
   kReadOnlyVolume,
   kNotMounted,
 

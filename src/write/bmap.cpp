@@ -295,6 +295,13 @@ Status DataForkEditor::Load(const XfsInode& inode) {
   fork_bytes_ = static_cast<uint32_t>(inode.data_fork.size());
   format_ = inode.format;
   extents_.clear();
+  if (format_ == di::kFormatLocal) {
+    // A shortform directory has no extent list yet; the first InsertExtent
+    // converts the fork to extents format (xfs_bmap_local_to_extents).
+    nextents_ = 0;
+    loaded_ = true;
+    return OkStatus();
+  }
   Status s = LoadDataForkExtents(*device_, *geo_, inode, &extents_,
                                  /*cap=*/1u << 20);
   if (!s.ok()) return s;
@@ -488,6 +495,8 @@ Status DataForkEditor::InsertExtent(const XfsExtent& extent) {
         .Fsb(extent.startblock)
         .Metadata("extent");
   }
+  // A local fork gains its first extent: xfs_bmap_local_to_extents.
+  if (format_ == di::kFormatLocal) format_ = di::kFormatExtents;
   const size_t pos = FindExtentAt(extent.startoff);
   if (pos < extents_.size() &&
       extents_[pos].startoff < extent.startoff + extent.blockcount) {

@@ -548,6 +548,11 @@ Result<XfsDirFormat> DetectDirFormat(BlockDevice& dev, const XfsGeometry& geo,
   auto rootn = io.ReadDirBlock(io.LeafOffsetBytes(), ondisk::kDaNode3Magic,
                                "dir root node");
   if (rootn.ok()) return XfsDirFormat::kNode;
+  // A root leafn block is the node format before the first leaf split
+  // (xfs_dir2_leaf_to_node): a single leaf, no da btree yet.
+  auto rootl = io.ReadDirBlock(io.LeafOffsetBytes(), ondisk::kDir3LeafnMagic,
+                               "dir root leafn");
+  if (rootl.ok()) return XfsDirFormat::kNode;
   return root.error();
 }
 
@@ -584,6 +589,14 @@ Status EnumerateViaLeaf(DirIo& io, bool has_ftype,
             .Ino(inode.ino);
       }
     }
+  } else {
+    // A root leafn is the node format before the first leaf split
+    // (xfs_dir2_leaf_to_node): a single leaf with no da btree yet.
+    auto rootl =
+        io.ReadDirBlock(file_off, ondisk::kDir3LeafnMagic, "dir leafn");
+    if (rootl.ok()) node_buf = std::move(rootl.value());
+  }
+  if (!node_buf.empty()) {
     // node_buf now holds the leftmost leaf block (leafn magic); parse it.
     auto leaf = ParseLeafBlock(std::move(node_buf));
     if (!leaf.ok()) return leaf.error();
@@ -961,9 +974,19 @@ Result<XfsDirEntry> LookupName(BlockDevice& dev, const XfsGeometry& geo,
   // scan its hash run, shifting forward across leaves while the run continues.
   auto node_buf_res =
       io.ReadDirBlock(io.LeafOffsetBytes(), ondisk::kDaNode3Magic, "dir node");
-  if (!node_buf_res.ok()) return node_buf_res.error();
-  std::vector<uint8_t> node_buf = std::move(node_buf_res.value());
+  std::vector<uint8_t> node_buf;
   bool at_leaf = false;
+  if (node_buf_res.ok()) {
+    node_buf = std::move(node_buf_res.value());
+  } else {
+    // Root leafn: a single leaf block, no node tree yet.
+    auto rootl =
+        io.ReadDirBlock(io.LeafOffsetBytes(), ondisk::kDir3LeafnMagic,
+                        "dir leafn");
+    if (!rootl.ok()) return node_buf_res.error();
+    node_buf = std::move(rootl.value());
+    at_leaf = true;
+  }
   for (int depth = 0; depth < ondisk::kDaNodeMaxDepth + 2 && !at_leaf; ++depth) {
     auto node = ParseNodeBlock(node_buf);
     if (!node.ok()) return node.error();

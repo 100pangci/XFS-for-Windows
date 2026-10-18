@@ -215,7 +215,7 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
 
 Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
   auto finish = [&](XfsInode inode) -> Result<XfsInode> {
-    if (inode.OnUnlinkedList()) {
+    if (inode.OnUnlinkedList() && !writable_) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "inode is on the unlinked list; reading it read-only is "
                      "not safe without journal replay")

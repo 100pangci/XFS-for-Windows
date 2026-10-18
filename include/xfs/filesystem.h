@@ -189,6 +189,39 @@ class XfsFilesystem {
   //     block and zeroes the part of it beyond the new size.
   Result<XfsFileInfo> SetFileSize(uint64_t ino, uint64_t new_size);
 
+  // ---- namespace mutation (RW-3, read-write mounts only) ----
+  // Creates a regular file (mode must be a regular-file mode; 0 means 0644)
+  // in `parent_ino`. The whole create is one transaction: inode allocation,
+  // inode initialisation, parent dirent insertion, parent timestamps and the
+  // AGI/inobt/superblock counters commit together. Returns the new inode.
+  Result<uint64_t> CreateFile(uint64_t parent_ino, std::string_view name,
+                              uint16_t mode, uint32_t uid, uint32_t gid);
+
+  // Creates an empty directory (shortform, nlink 2) and bumps the parent's
+  // link count, in one transaction.
+  Status Mkdir(uint64_t parent_ino, std::string_view name, uint16_t mode,
+               uint32_t uid, uint32_t gid);
+
+  // Removes a regular file. The namespace entry, the link count transition
+  // and the AGI unlinked-list insertion are one transaction. When
+  // `defer_inode_free` is false the inode is then truncated and freed
+  // (rolling transactions, like xfs_inactive/xfs_ifree); when it is true the
+  // zero-link inode stays on the unlinked list until FreeUnlinkedInode.
+  Status Unlink(uint64_t parent_ino, std::string_view name,
+                bool defer_inode_free = false);
+
+  // Removes an empty directory (only "." and ".." may remain), same
+  // transaction/deferral contract as Unlink. A non-empty directory fails with
+  // kDirectoryNotEmpty before anything is modified.
+  Status RemoveDirectory(uint64_t parent_ino, std::string_view name,
+                         bool defer_inode_free = false);
+
+  // Finishes the deletion of a zero-link inode that is on the AGI unlinked
+  // list: truncates its data fork and frees the inode (xfs_inactive +
+  // xfs_ifree). This is the "last handle closed" step of an open-but-unlinked
+  // file.
+  Status FreeUnlinkedInode(uint64_t ino);
+
   // ---- transactions and metadata mutations (read-write mounts only) ----
   // Begins a transaction at the current log position. The returned LSN is the
   // LSN of the record that will carry it; log items and the metadata buffers
@@ -265,6 +298,18 @@ class XfsFilesystem {
   Status LogPreparedInode(XfsTransaction& txn, uint64_t ino,
                           std::vector<uint8_t> inode, uint32_t ilog_fields,
                           const std::vector<uint8_t>& fork_region);
+
+  // ---- namespace helpers (RW-3) ----
+  // Allocates a new free inode chunk in a separate transaction when no AG has
+  // free inodes, so the create/mkdir transaction stays within one log record.
+  Status EnsureInodeCapacity(uint32_t preferred_agno);
+  // Shared unlink/rmdir implementation; the caller holds the transaction.
+  Status RemoveNamespaceEntry(uint64_t parent_ino, std::string_view name,
+                              bool directory_expected, bool defer_inode_free,
+                              uint64_t* removed_ino);
+  // Releases every data block of an inode with nlink 0 in rolling
+  // transactions (xfs_itruncate_extents before xfs_ifree).
+  Status TruncateForFree(uint64_t ino);
 
   // ---- file data chunk cache ----
   // Reads are served in 256 KiB chunks so that one device read covers many
