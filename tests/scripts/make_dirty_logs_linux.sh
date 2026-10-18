@@ -103,6 +103,24 @@ for scenario in $SCENARIOS; do
         echo "ERROR: $scenario is not a dirty log ($STATE)" >&2
         exit 1
     fi
+    # Record the real item inventory of this operation (docs/RECOVERY.md's
+    # operation -> item table is built from this evidence, not from guesses).
+    python3 "$REPO/tests/tools/recovery_probe.py" --json \
+        "$OUT/$scenario.img" > "$OUT/$scenario.journal.json"
+    python3 - "$scenario" "$OUT/$scenario.journal.json" >> "$OUT/inventory.txt" <<'PY'
+import json
+import sys
+
+scenario, path = sys.argv[1], sys.argv[2]
+data = json.load(open(path))
+counts = {}
+for trans in data["transactions"]:
+    for item in trans["items"]:
+        counts[item["type"]] = counts.get(item["type"], 0) + 1
+print("%-16s records=%d transactions=%d items: %s" % (
+    scenario, len(data["records"]), len(data["transactions"]),
+    ", ".join("%s=%d" % (k, counts[k]) for k in sorted(counts)) or "none"))
+PY
     echo "  $STATE ($(stat -c %s "$OUT/$scenario.img") bytes)"
     stop_device
 done

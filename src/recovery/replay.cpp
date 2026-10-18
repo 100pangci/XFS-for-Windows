@@ -927,6 +927,13 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
 
   LogDinodeToDisk(ldip, log_dinode_size, dip, geo_.inode_size, current_lsn);
 
+  // Device nodes keep the 32-bit dev_t at the start of the data fork
+  // (xfs_dinode_put_rdev); the value comes from the item header's union.
+  if (fields & lf::kILogDev) {
+    const uint32_t rdev = LoadLE32(item.regions[0].data() + lf::kIlfU);
+    PutBE32(dip, di::kCoreSizeV3, rdev);
+  }
+
   // Fork regions. XFS_ILOG_DFORK/AFORK mask and the region order are fixed by
   // xfs_inode_item_format: format, dinode, [data fork], [attr fork].
   const uint32_t dpart = fields & (lf::kILogDData | lf::kILogDExt |
