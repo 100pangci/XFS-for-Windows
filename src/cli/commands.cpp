@@ -53,6 +53,8 @@ void PrintUsage() {
       "  list                          list physical disks (with safety info)\n"
       "  info <device|image>           show superblock and geometry\n"
       "  check <device|image>          read-only consistency validation\n"
+      "  recover <image>               replay the journal (RW-5)\n"
+      "      --yes-i-really-mean-it    required: recovery writes metadata\n"
       "  mkimage <file> <size>         create a sparse test image (e.g. 300M)\n"
       "  ls <device|image> <path>      list a directory\n"
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
@@ -369,11 +371,33 @@ int CommandCheck(const std::string& target, const Options& options) {
     return 1;
   }
   MountOptions mount_options;
-  mount_options.force_unsafe_ro = options.force_unsafe_ro;
+  // `check` never writes: mount the pre-recovery view if the log is dirty (or
+  // not parseable) and report the journal state explicitly below.
+  mount_options.force_unsafe_ro = true;
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     std::cout << "UNSUPPORTED/CORRUPT: " << fs.error().Format() << "\n";
     return 2;
+  }
+  auto journal = fs.value()->AnalyzeJournal();
+  if (!journal.ok()) {
+    std::cout << "journal: cannot be analysed - " << journal.error().Format()
+              << "\n";
+  } else if (journal.value().needed) {
+    const auto& summary = journal.value();
+    std::cout << "journal: " << ToString(summary.state)
+              << " - recovery required (recoverable transactions="
+              << summary.recoverable_transactions
+              << ", items=" << summary.items;
+    if (!summary.unsupported_items.empty()) {
+      std::cout << ", unsupported items="
+                << summary.unsupported_items.size() << ": "
+                << summary.unsupported_items.front();
+    }
+    std::cout << ")\n";
+  } else {
+    std::cout << "journal: " << ToString(journal.value().state) << " - "
+              << journal.value().detail << "\n";
   }
   CheckReport report = fs.value()->CheckConsistency(CheckOptions{});
   for (const auto& item : report.items) {
@@ -1083,6 +1107,70 @@ bool CloseWritable(XfsFilesystem& fs) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// recover: journal replay as a standalone command (RW-5). Writes metadata, so
+// it demands --yes-i-really-mean-it; the same image-only policy as the other
+// read-write commands applies.
+// ---------------------------------------------------------------------------
+int CommandRecover(const std::string& target, const Options& options) {
+  if (!options.yes_i_really_mean_it) {
+    std::cerr << "error: `recover` replays the journal and writes metadata; "
+                 "pass --yes-i-really-mean-it to confirm\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: journal recovery is restricted to image files in "
+                 "this version\n";
+    return 3;
+  }
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  mount_options.read_write = true;  // scans, replays and finishes the log
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  const auto& report = fs.value()->recovery_report();
+  if (!report.has_value()) {
+    std::cout << "log is clean; nothing to recover\n";
+    return 0;
+  }
+  // The standalone shape ends with a clean unmount record so every later
+  // mount (Linux or this build) starts from a recovered, clean log.
+  if (!CloseWritable(*fs.value())) return 1;
+  const ReplayStats& replay = report->replay;
+  std::cout << "recovery complete\n";
+  std::cout << "  records scanned          : " << replay.records_scanned << "\n";
+  std::cout << "  committed transactions   : " << replay.transactions_replayed
+            << "\n";
+  std::cout << "  items replayed           : " << replay.items_replayed << "\n";
+  std::cout << "  buffers replayed         : " << replay.buffers_replayed << "\n";
+  std::cout << "  buffers skipped by LSN   : " << replay.buffers_skipped_newer
+            << "\n";
+  std::cout << "  intents completed        : " << report->intents_completed
+            << "\n";
+  std::cout << "  unlinked inodes processed: "
+            << report->unlinked_inodes_processed << "\n";
+  std::cout << "  final log state          : clean\n";
+  if (options.verbose) {
+    std::cout << "  inodes replayed          : " << replay.inodes_replayed
+              << "\n";
+    std::cout << "  icreate chunks replayed  : "
+              << replay.icreate_chunks_replayed << "\n";
+    std::cout << "  bytes written            : "
+              << HumanBytes(replay.bytes_written) << "\n";
+    std::cout << "  AGI buckets cleared      : "
+              << report->agi_buckets_cleared << "\n";
+  }
+  return 0;
+}
+
 }  // namespace
 
 int CommandCreate(const std::string& target, const std::string& path,
@@ -1385,6 +1473,14 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandCheck(positional[1], options);
+  }
+  if (command == "recover") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin recover <image> --yes-i-really-mean-it "
+                   "[--verbose]\n";
+      return 1;
+    }
+    return CommandRecover(positional[1], options);
   }
   if (command == "mkimage") {
     if (positional.size() != 3) {
