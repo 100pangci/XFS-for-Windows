@@ -72,37 +72,49 @@ stop_device() {
 : > "$OUT/summary.txt"
 for scenario in $SCENARIOS; do
     echo "== $scenario =="
-    stop_device
-    LIVE="$WORK/live.img"
-    rm -f "$LIVE"
-    truncate -s "${SIZE_MB}M" "$LIVE"
-    LOOP=$(losetup --find --show "$LIVE")
-    DM="xfswin-rw5-$$"
-    dmsetup create "$DM" --table "0 $(blockdev --getsz "$LOOP") linear $LOOP 0"
-    DEV="/dev/mapper/$DM"
-    # The writable profile of this project, nothing else. (mkfs.xfs: crc /
-    # finobt / rmapbt / reflink / inobtcount / bigtime are -m options; sparse
-    # is an -i option.)
-    mkfs.xfs -f -q \
-        -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 \
-        -i sparse=0 "$DEV"
-    mount "$DEV" "$MOUNT"
-    python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
-    python3 "$REPO/tests/tools/dirty_ops.py" "$scenario" "$MOUNT" \
-        "$OUT/$scenario.manifest.json"
-    # Freeze the block device and take the bytes.
-    dmsetup suspend "$DM"
-    dd if="$LIVE" of="$OUT/$scenario.img" bs=1M status=none conv=sparse
-    dmsetup resume "$DM"
-    umount "$MOUNT"
-    # Record what the kernel's own log dump says, then let the independent
-    # probe classify the snapshot (it must be dirty, otherwise the capture
-    # method is wrong).
-    xfs_logprint -t "$OUT/$scenario.img" > "$OUT/$scenario.logprint.txt" 2>&1 || true
-    STATE=$(python3 "$REPO/tests/tools/recovery_probe.py" \
-                "$OUT/$scenario.img" | head -1 || true)
+    captured=0
+    for attempt in 1 2 3; do
+        stop_device
+        LIVE="$WORK/live.img"
+        rm -f "$LIVE"
+        truncate -s "${SIZE_MB}M" "$LIVE"
+        LOOP=$(losetup --find --show "$LIVE")
+        DM="xfswin-rw5-$$"
+        dmsetup create "$DM" --table "0 $(blockdev --getsz "$LOOP") linear $LOOP 0"
+        DEV="/dev/mapper/$DM"
+        # The writable profile of this project, nothing else. (mkfs.xfs: crc /
+        # finobt / rmapbt / reflink / inobtcount / bigtime are -m options;
+        # sparse is an -i option.)
+        mkfs.xfs -f -q \
+            -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 \
+            -i sparse=0 "$DEV"
+        mount "$DEV" "$MOUNT"
+        python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
+        python3 "$REPO/tests/tools/dirty_ops.py" "$scenario" "$MOUNT" \
+            "$OUT/$scenario.manifest.json"
+        # Freeze a replayable window: one more fsync'd transaction keeps the
+        # metadata behind the log records dirty, so the tail cannot have moved
+        # past them yet. (The AIL could in principle still win the race, hence
+        # the retry loop.)
+        python3 "$REPO/tests/tools/dirty_ops.py" pin "$MOUNT"
+        dmsetup suspend "$DM"
+        dd if="$LIVE" of="$OUT/$scenario.img" bs=1M status=none conv=sparse
+        dmsetup resume "$DM"
+        umount "$MOUNT"
+        # Record what the kernel's own log dump says, then let the independent
+        # probe classify the snapshot (it must be dirty, otherwise the capture
+        # method is wrong).
+        xfs_logprint -t "$OUT/$scenario.img" > "$OUT/$scenario.logprint.txt" 2>&1 || true
+        STATE=$(python3 "$REPO/tests/tools/recovery_probe.py" \
+                    "$OUT/$scenario.img" | head -1 || true)
+        if [ "$STATE" = "state: dirty" ]; then
+            captured=1
+            break
+        fi
+        echo "  attempt $attempt: not dirty ($STATE), retrying"
+    done
     echo "$scenario $STATE" >> "$OUT/summary.txt"
-    if [ "$STATE" != "state: dirty" ]; then
+    if [ "$captured" -ne 1 ]; then
         echo "ERROR: $scenario is not a dirty log ($STATE)" >&2
         exit 1
     fi
