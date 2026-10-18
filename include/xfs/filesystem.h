@@ -13,6 +13,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -26,6 +27,7 @@
 #include "xfs/extent.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
+#include "xfs/recovery.h"
 #include "xfs/superblock.h"
 #include "xfs/transaction.h"
 
@@ -38,11 +40,16 @@ struct MountOptions {
   // understood. Never allowed by default; read-only access only, and the
   // caller is responsible for the safety implications.
   bool force_unsafe_ro = false;
-  // Requests a writable mount. The device must be writable, the log clean and
-  // the feature profile must pass CheckWritableProfile(); otherwise mounting
-  // fails instead of silently falling back to read-only. Callers that want
-  // read-only access after a refused read-write mount ask for read-only.
+  // Requests a writable mount. The device must be writable, the log clean or
+  // recoverable (see below) and the feature profile must pass
+  // CheckWritableProfile(); otherwise mounting fails instead of silently
+  // falling back to read-only. Callers that want read-only access after a
+  // refused read-write mount ask for read-only.
   bool read_write = false;
+  // (RW-5) When set, a dirty log is replayed as part of the mount (read-write
+  // mounts only; the default). `false` is the "norecovery" behaviour: a dirty
+  // log refuses the mount unless force_unsafe_ro is set.
+  bool recover_dirty_log = true;
 };
 
 struct XfsFileInfo {
@@ -296,6 +303,47 @@ class XfsFilesystem {
   // read-only mount or when the log is already clean.
   Status WriteCleanUnmountRecord();
 
+  // ---- journal recovery (RW-5, writable devices) ----
+  // Read-only analysis of the internal log for `xfswin check` and for mount
+  // diagnostics: head/tail, record validation, committed transactions and the
+  // item inventory (unsupported item types make the log unrecoverable by this
+  // build). Never writes.
+  struct RecoverySummary {
+    bool needed = false;
+    LogState state = LogState::kUnknown;
+    uint64_t recoverable_transactions = 0;
+    uint64_t items = 0;
+    std::vector<std::string> unsupported_items;
+    std::string detail;
+    bool recoverable() const { return unsupported_items.empty(); }
+  };
+  Result<RecoverySummary> AnalyzeJournal() const;
+
+  // The outcome of a recovery run.
+  struct RecoveryReport {
+    ReplayStats replay;
+    uint64_t intents_completed = 0;
+    uint64_t unlinked_inodes_processed = 0;
+    uint64_t agi_buckets_cleared = 0;
+    bool recovered = false;  // false when the log was already clean/empty
+  };
+  // Runs the whole recovery: scan and validate, replay the committed
+  // transactions (pass1/pass2), re-read the superblock, finish unresolved
+  // intents through normal transactions, process the AGI unlinked lists and
+  // flush. Requires a writable device. Refuses - before the first write -
+  // when the log contains anything this build cannot replay.
+  //
+  // `clean_log` writes the clean-unmount record at the end (the standalone
+  // `xfswin recover` shape); a mounted filesystem leaves the log writable and
+  // writes the unmount record when it goes away.
+  enum class RecoveryFinish { kMount, kCleanLog };
+  Result<RecoveryReport> RecoverJournal(RecoveryFinish finish);
+
+  // The report of the recovery Mount ran, when the log was dirty.
+  const std::optional<RecoveryReport>& recovery_report() const {
+    return recovery_report_;
+  }
+
   // Flushes pending writes to stable storage. Returns failure if the device
   // flush fails: callers (WinFsp Flush, clean unmount) must not report
   // success after a failed flush.
@@ -422,6 +470,27 @@ class XfsFilesystem {
   // record (i.e. the log needs a clean-unmount record before we let go).
   bool log_dirty_ = false;
   uint32_t next_tid_ = 1;
+  // (RW-5) While unresolved intents from a recovered log are being completed,
+  // every commit must keep h_tail_lsn pinned to the start of the replayed
+  // window: a crash mid-completion then re-replays the whole window (including
+  // the intent items and their done items), which is what makes the completion
+  // crash-safe. Cleared once all intents are finished.
+  std::optional<uint64_t> recovery_tail_pin_;
+  // Set by Mount when it replayed a dirty log.
+  std::optional<RecoveryReport> recovery_report_;
+
+  // Runs the recovery phases on the already-scanned log (RecoverJournal).
+  Result<RecoveryReport> RecoverScannedLog(const LogScan& scan,
+                                           RecoveryFinish finish);
+  // Completes one recovered intent item (deferred operation) in a normal
+  // transaction, logging the matching done item.
+  Status CompleteIntent(const PendingIntent& intent);
+  // Processes every AG's AGI unlinked buckets (xlog_recover_process_iunlinks):
+  // truncates and frees zero-link inodes, clearing buckets that cannot be
+  // walked.
+  Result<uint64_t> ProcessAgiUnlinkedLists(uint64_t* buckets_cleared);
+  Status ClearAgiBucket(uint32_t agno, uint32_t bucket,
+                        const char* reason);
 
   mutable std::mutex cache_mutex_;
   mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;

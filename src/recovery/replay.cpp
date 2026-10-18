@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "xfs/crc32c.h"
+#include "xfs/crash.h"
 #include "xfs/endian.h"
 #include "xfs/ialloc.h"
 #include "xfs/inode.h"
@@ -313,6 +314,8 @@ class ReplayBuffers {
         UpdateXfsChecksum(data.data(), data.size(), type.crc_offset);
       }
       const uint64_t offset = entry.first.daddr * 512;
+      MaybeCrash(CrashPoint::kRecoveryMidBuffer,
+                 std::string(type.name) + " daddr=" + std::to_string(entry.first.daddr));
       if (!dev_.Write(offset, data.data(), data.size())) {
         return XFS_ERR(XfsError::kIoError,
                        "failed to write a replayed metadata buffer")
@@ -1104,10 +1107,13 @@ void Replayer::RecordIntent(const RecoveredItem& item, uint64_t lsn) {
 }
 
 void Replayer::ReleaseIntent(const RecoveredItem& item) {
-  if (item.regions.empty() || item.regions[0].size() < lf::kIntentLogFormatSize) {
+  if (item.regions.empty() ||
+      item.regions[0].size() < lf::kIntentLogFormatSize) {
     return;
   }
-  const uint64_t id = GetBE64(item.regions[0].data(), lf::kIntentIdOffset);
+  // Host byte order, like every log item format.
+  const uint64_t id =
+      LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
   const uint16_t want =
       item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
   for (auto it = intents_.begin(); it != intents_.end(); ++it) {
@@ -1116,7 +1122,7 @@ void Replayer::ReleaseIntent(const RecoveredItem& item) {
         it->regions[0].size() < lf::kIntentLogFormatSize) {
       continue;
     }
-    if (GetBE64(it->regions[0].data(), lf::kIntentIdOffset) == id) {
+    if (LoadLE64(it->regions[0].data() + lf::kIntentIdOffset) == id) {
       intents_.erase(it);
       break;
     }
@@ -1162,6 +1168,13 @@ Status Replayer::Pass2() {
       stats_.items_replayed++;
     }
     stats_.transactions_replayed++;
+    MaybeCrash(CrashPoint::kRecoveryAfterTransaction,
+               "tid=" + std::to_string(trans.tid) + " lsn=0x" + [&] {
+                 char buf[32];
+                 std::snprintf(buf, sizeof(buf), "%llx",
+                               static_cast<unsigned long long>(trans.lsn));
+                 return std::string(buf);
+               }());
   }
   return OkStatus();
 }
@@ -1250,6 +1263,9 @@ Result<ReplayStats> Replayer::Run(const LogScan& scan, RecoveredLogState* state)
   }
   Status status = Pass1();
   if (!status.ok()) return status.error();
+  MaybeCrash(CrashPoint::kRecoveryBeforePass2,
+             "head=" + std::to_string(scan.head_block) + " tail=" +
+                 std::to_string(scan.tail_block));
   status = Pass2();
   if (!status.ok()) return status.error();
   status = buffers_.Flush();

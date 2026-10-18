@@ -148,40 +148,86 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         .Ino(fs->geometry_.rootino);
   }
 
-  // Log cleanliness.
+  // Log state: scanned and validated with the recovery engine (RW-5). A
+  // read-write mount replays a dirty log; a read-only mount refuses unless the
+  // caller explicitly asked for the unsafe pre-recovery view.
   LogState log_state = LogState::kUnknown;
   bool log_checked = false;
+  bool recovered = false;
   if (options.check_log) {
-    auto log = CheckLogClean(*fs->device_, fs->geometry_, fs->superblock_);
-    if (!log.ok()) {
-      if (!options.force_unsafe_ro) return log.error();
-      fs->warnings_.push_back("log check failed: " + log.error().message);
+    auto scan = ScanLog(*fs->device_, fs->superblock_, fs->geometry_);
+    if (!scan.ok()) {
+      if (!options.force_unsafe_ro) return scan.error();
+      fs->warnings_.push_back("log check failed: " + scan.error().message);
     } else {
-      const LogCheckResult& r = log.value();
+      const LogScan& log = scan.value();
       log_checked = true;
-      log_state = r.state;
-      if (r.state == LogState::kClean || r.state == LogState::kEmpty) {
-        XFS_SB_INFO("log is " << ToString(r.state) << " (" << r.detail << ")");
+      log_state = log.state;
+      if (log.state == LogState::kClean || log.state == LogState::kEmpty) {
+        XFS_SB_INFO("log is " << ToString(log.state) << " (" << log.detail
+                              << ")");
       } else {
-        if (!options.force_unsafe_ro) {
-          return XFS_ERR(XfsError::kDirtyLog,
-                         "log is not clean (" + r.detail +
-                             "); refusing to mount. The filesystem was not "
-                             "cleanly unmounted or needs journal replay, "
-                             "which this build does not implement. Use "
-                             "--force-unsafe-ro to mount read-only anyway.")
+        const bool can_recover = options.read_write &&
+                                 options.recover_dirty_log;
+        if (can_recover && !fs->device_->Info().writable) {
+          return XFS_ERR(XfsError::kReadOnlyVolume,
+                         "the log needs replay but the device was opened "
+                         "read-only")
               .Metadata("log");
         }
-        fs->warnings_.push_back(
-            "log is " + std::string(ToString(r.state)) + " (" + r.detail +
-            "); mounting read-only with --force-unsafe-ro");
+        if (can_recover) {
+          // Never recover a filesystem this build would then refuse to
+          // modify: check the profile first.
+          Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+          if (!profile.ok()) {
+            auto error = profile.error();
+            error.message +=
+                " (read-only access is unaffected; mount without the "
+                "read-write option)";
+            return error;
+          }
+          auto report =
+              fs->RecoverScannedLog(log, RecoveryFinish::kMount);
+          if (!report.ok()) return report.error();
+          recovered = true;
+          fs->recovery_report_ = report.value();
+          XFS_SB_INFO("log recovered: transactions="
+                      << report.value().replay.transactions_replayed
+                      << " items=" << report.value().replay.items_replayed
+                      << " buffers=" << report.value().replay.buffers_replayed
+                      << " inodes=" << report.value().replay.inodes_replayed
+                      << " intents=" << report.value().intents_completed
+                      << " unlinked="
+                      << report.value().unlinked_inodes_processed);
+        } else if (!options.force_unsafe_ro) {
+          std::string detail =
+              "recoverable transactions=" + std::to_string(log.transactions.size());
+          if (!log.unsupported_items.empty()) {
+            detail += ", unsupported items=" +
+                      std::to_string(log.unsupported_items.size()) + " (" +
+                      log.unsupported_items.front() + ")";
+          }
+          return XFS_ERR(XfsError::kDirtyLog,
+                         "log is not clean (" + log.detail + "; " + detail +
+                             "); refusing to mount. Use --force-unsafe-ro to "
+                             "mount read-only with the pre-recovery metadata, "
+                             "or mount read-write (or run `xfswin recover`) to "
+                             "replay the journal.")
+              .Metadata("log");
+        } else {
+          fs->warnings_.push_back(
+              "log is " + std::string(ToString(log.state)) + " (" +
+              log.detail +
+              "); mounting read-only with --force-unsafe-ro: metadata may "
+              "reflect a pre-recovery state");
+        }
       }
     }
   }
 
-  // Read-write mounts are an allow-list: writable device, clean log, and
-  // exactly the feature profile this build can modify. A refusal is an error
-  // (never a silent read-only mount), so the caller decides what to do.
+  // Read-write mounts are an allow-list: writable device, clean or recovered
+  // log, and exactly the feature profile this build can modify. A refusal is
+  // an error (never a silent read-only mount), so the caller decides.
   if (options.read_write) {
     if (!fs->device_->Info().writable) {
       return XFS_ERR(XfsError::kReadOnlyVolume,
@@ -189,12 +235,16 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "read-only")
           .Metadata("mount");
     }
-    if (!log_checked || (log_state != LogState::kClean &&
-                         log_state != LogState::kEmpty)) {
+    if (!log_checked) {
       return XFS_ERR(XfsError::kDirtyLog,
-                     "read-write mounts require a clean log; this build does "
-                     "not replay the journal yet. Mount read-only, or let "
-                     "Linux replay the log first.")
+                     "read-write mounts require the log to be checked")
+          .Metadata("log");
+    }
+    if (!recovered && log_state != LogState::kClean &&
+        log_state != LogState::kEmpty) {
+      return XFS_ERR(XfsError::kDirtyLog,
+                     "read-write mounts require a clean or recoverable log "
+                     "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
     Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
@@ -207,6 +257,19 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
     }
     fs->writable_ = true;
     XFS_SB_INFO("mounted read-write: " << WritableProfileSummary(fs->superblock_));
+    if (!recovered) {
+      // A clean log can still carry zero-link inodes on the AGI unlinked
+      // lists (a crash after the unlink transaction was flushed). Linux
+      // processes them on every mount; so do we, before the volume is
+      // visible (xlog_recover_process_iunlinks).
+      uint64_t cleared = 0;
+      auto processed = fs->ProcessAgiUnlinkedLists(&cleared);
+      if (!processed.ok()) return processed.error();
+      if (processed.value() != 0 || cleared != 0) {
+        XFS_SB_INFO("unlinked inode recovery: freed="
+                    << processed.value() << " cleared_buckets=" << cleared);
+      }
+    }
   }
 
   for (const auto& w : fs->warnings_) XFS_WARN(w);

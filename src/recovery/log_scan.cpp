@@ -83,6 +83,12 @@ uint64_t MakeLsn(uint32_t cycle, uint32_t block) {
   return (static_cast<uint64_t>(cycle) << 32) | block;
 }
 
+// The log item format headers (EFI/EFD/BUI/BUD, ...) are host byte order.
+uint64_t LoadLE64(const uint8_t* p) {
+  return static_cast<uint64_t>(LoadLE32(p)) |
+         (static_cast<uint64_t>(LoadLE32(p + 4)) << 32);
+}
+
 // ---------------------------------------------------------------------------
 // Block-addressed access to the logical ring
 // ---------------------------------------------------------------------------
@@ -151,6 +157,24 @@ class LogImage {
   BlockDevice& dev_;
   RecoveryGeometry geometry_;
 };
+
+// Errors that mean "this log cannot be parsed as a log": the mount policy
+// reports them as an unknown (refused) log state rather than a hard error, so
+// `xfswin check` and forced read-only mounts behave like they always have.
+bool IsLogConsistencyError(XfsError code) {
+  switch (code) {
+    case XfsError::kCorruptBtree:
+    case XfsError::kBadCrc:
+    case XfsError::kBadMagic:
+    case XfsError::kBadUuid:
+    case XfsError::kBadVersion:
+    case XfsError::kBadLength:
+    case XfsError::kBadValue:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Record header parsing
@@ -840,10 +864,37 @@ Result<DiscoveredLog> FindTail(LogImage& img, bool logv2, uint32_t logbsize,
     auto cycle0 = img.ReadCycle(0);
     if (!cycle0.ok()) return cycle0.error();
     if (cycle0.value() == 0) {
-      // Nothing was ever written: the log is empty.
-      out.state = LogState::kEmpty;
+      // Either nothing was ever written (empty log) or the space in front of
+      // the head is garbage that happens to end in a zero cycle. The kernel
+      // would treat both as "no recovery needed"; this build keeps the old
+      // refusal for the second case, so look at the whole ring.
+      std::vector<uint8_t> block(512);
+      bool all_zero = true;
+      for (uint32_t i = 0; i < img.blocks() && all_zero; ++i) {
+        if (!img.ReadBlock(i, block.data())) {
+          return XFS_ERR(XfsError::kIoError, "failed to read the log")
+              .Metadata("log");
+        }
+        for (uint8_t byte : block) {
+          if (byte != 0) {
+            all_zero = false;
+            break;
+          }
+        }
+      }
+      if (all_zero) {
+        out.state = LogState::kEmpty;
+        out.head_block = 0;
+        out.tail_block = 0;
+        return out;
+      }
+      out.state = LogState::kUnknown;
       out.head_block = 0;
       out.tail_block = 0;
+      if (warnings) {
+        warnings->push_back(
+            "log contains data but no valid record headers");
+      }
       return out;
     }
   }
@@ -851,8 +902,15 @@ Result<DiscoveredLog> FindTail(LogImage& img, bool logv2, uint32_t logbsize,
   auto sync = RseekLogrecHdr(img, head_blk, head_blk, 1);
   if (!sync.ok()) return sync.error();
   if (sync.value().found == 0) {
-    return XFS_ERR(XfsError::kCorruptBtree, "couldn't find the log sync record")
-        .Metadata("log");
+    // Data in the ring but no record header anywhere: not a log this build
+    // can trust. The mount policy treats this like an unknown (dirty) log.
+    out.state = LogState::kUnknown;
+    out.head_block = 0;
+    out.tail_block = 0;
+    if (warnings) {
+      warnings->push_back("log contains data but no valid record headers");
+    }
+    return out;
   }
   const uint32_t rhead_blk = sync.value().block;
   RecordHeader rhead = sync.value().header;
@@ -1551,7 +1609,15 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
       sb.logsunit > kHeaderCycleBytes ? sb.logsunit : kHeaderCycleBytes;
 
   auto discovered = FindTail(img, logv2, logbsize, sb, &scan.warnings);
-  if (!discovered.ok()) return discovered.error();
+  if (!discovered.ok()) {
+    if (IsLogConsistencyError(discovered.error().code)) {
+      scan.state = LogState::kUnknown;
+      scan.detail = "log is inconsistent: " + discovered.error().message;
+      scan.warnings.push_back(scan.detail);
+      return scan;
+    }
+    return discovered.error();
+  }
   const DiscoveredLog& d = discovered.value();
   scan.state = d.state;
   scan.head_block = d.head_block;
@@ -1569,6 +1635,9 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
       return scan;
     case LogState::kClean:
       scan.detail = "newest log record is an unmount record";
+      return scan;
+    case LogState::kUnknown:
+      scan.detail = "log contains data but no valid record headers";
       return scan;
     default:
       break;
@@ -1594,10 +1663,33 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   auto iter = IterateRecords(img, d.head_block, d.tail_block,
                              RecordPass::kReconstruct, logv2, logbsize, sb,
                              handler, &first_bad, &first_bad_set, &scan.warnings);
-  if (!iter.ok()) return iter.error();
+  if (!iter.ok()) {
+    if (IsLogConsistencyError(iter.error().code)) {
+      scan.state = LogState::kUnknown;
+      scan.detail = "log is inconsistent: " + iter.error().message;
+      scan.warnings.push_back(scan.detail);
+      return scan;
+    }
+    return iter.error();
+  }
 
   scan.transactions = reconstruction.transactions();
   scan.unsupported_items = reconstruction.unsupported();
+
+  // An unresolved intent this build cannot finish is a refusal too: replaying
+  // its metadata would be safe, but the deferred operation could not be
+  // completed (xlog_recover_process_intents). EFI (extent free) is the only
+  // intent type with a completion pass today.
+  for (const PendingIntent& intent : CollectPendingIntents(scan)) {
+    if (intent.type == lf::kItemEfi) continue;
+    scan.unsupported_items.push_back(
+        "unresolved intent " +
+        std::string(LogItemTypeName(intent.type) ? LogItemTypeName(intent.type)
+                                                 : "unknown") +
+        " transaction tid=" + std::to_string(intent.tid) + " lsn=" +
+        LsnText(intent.lsn) +
+        " requires deferred completion this build does not implement");
+  }
 
   XFS_INFO("recovery scan: head=" << d.head_block << " cycle=" << d.head_cycle
                                   << " tail=" << d.tail_block
@@ -1622,17 +1714,21 @@ std::vector<PendingIntent> CollectPendingIntents(const LogScan& scan) {
         pending.push_back(std::move(intent));
       } else if (cls == RecoveryItemClass::kIntentDone) {
         // xlog_recover_release_intent(): a done item cancels the matching
-        // intent (by id) if it was collected from an earlier record.
-        if (item.regions.empty() || item.regions[0].size() < 20) continue;
-        const uint64_t id = GetBE64(item.regions[0].data(), 8);
+        // intent (by id) if it was collected from an earlier record. The item
+        // formats are host byte order.
+        if (item.regions.empty() || item.regions[0].size() < lf::kIntentLogFormatSize) {
+          continue;
+        }
+        const uint64_t id =
+            LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
         const uint16_t want_type =
             item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           if (it->type != want_type || it->regions.empty() ||
-              it->regions[0].size() < 20) {
+              it->regions[0].size() < lf::kIntentLogFormatSize) {
             continue;
           }
-          if (GetBE64(it->regions[0].data(), 8) == id) {
+          if (LoadLE64(it->regions[0].data() + lf::kIntentIdOffset) == id) {
             pending.erase(it);
             break;
           }

@@ -40,6 +40,19 @@ enum class CrashPoint {
   kAfterMetadataWrite,
   kBeforeDeviceFlush,
   kAfterDeviceFlush,
+  // Journal recovery (RW-5): the scan, the replay passes, the deferred
+  // completion phases and the final log-state transition.
+  kRecoveryScan,
+  kRecoveryBeforePass2,
+  kRecoveryAfterTransaction,
+  kRecoveryMidBuffer,
+  kRecoveryAfterMetadataFlush,
+  kRecoveryBeforeIntents,
+  kRecoveryMidIntents,
+  kRecoveryBeforeIunlinks,
+  kRecoveryMidIunlinks,
+  kRecoveryBeforeLogClean,
+  kRecoveryAfterLogClean,
   kCount,
 };
 
