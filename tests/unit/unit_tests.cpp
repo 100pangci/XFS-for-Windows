@@ -679,7 +679,9 @@ TEST(remote_symlink_target) {
   uint8_t* block = dev->bytes().data() + kBlockSize * 10;
   std::memset(block, 0, kBlockSize);
   PutBE32(block, ondisk::symlink::kMagic, ondisk::kSymlinkMagic);
-  PutBE32(block, ondisk::symlink::kOffset, ondisk::symlink::kHeaderSize);
+  // sl_offset is the offset of this chunk inside the target string, exactly
+  // what xfs_symlink_hdr_set writes (0 for the first extent).
+  PutBE32(block, ondisk::symlink::kOffset, 0);
   PutBE32(block, ondisk::symlink::kBytes, static_cast<uint32_t>(target.size()));
   PutBE64(block, ondisk::symlink::kOwner, 64);
   PutBE64(block, ondisk::symlink::kBlkno, (10 * kBlockSize) / 512);
