@@ -378,12 +378,17 @@ TEST(rw3_unlinked_bucket_roundtrip) {
   });
   CHECK_EQ(ReadAg0Agi(fixture).unlinked[7], 68u);
 
+  // The next read-write mount processes the AGI unlinked lists
+  // (xlog_recover_process_iunlinks). Inode 68 is not an allocated zero-link
+  // inode, so the bucket cannot be walked and is cleared exactly like the
+  // kernel's xlog_recover_clear_agi_bucket.
   RunAllocTransaction(fixture, [&](XfsTransaction&, BlockAllocator&,
                                    InodeAllocator& inodes) -> Status {
     auto head = inodes.UnlinkedBucketHead(0, 7);
     if (!head.ok()) return head.error();
-    if (head.value() != 68) {
-      return XFS_ERR(XfsError::kInternal, "unexpected unlinked bucket head");
+    if (head.value() != kNullAgino) {
+      return XFS_ERR(XfsError::kInternal,
+                     "unwalkable unlinked bucket was not cleared at mount");
     }
     return inodes.SetUnlinkedBucketHead(0, 7, kNullAgino);
   });

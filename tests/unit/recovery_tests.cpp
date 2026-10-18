@@ -15,8 +15,11 @@
 
 #include "support/fixture_device.h"
 #include "test_util.h"
+#include "xfs/ag.h"
+#include "xfs/alloc.h"
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
+#include "xfs/error.h"
 #include "xfs/filesystem.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
@@ -685,6 +688,311 @@ TEST(recovery_replay_real_transaction_is_idempotent) {
                      inode_twice.size()));
   CHECK(inode_after == inode_twice);
 
+  fs.value().reset();
+  fixture.Reset();
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem-level recovery (mount, intents, unlinked inodes, clean log)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Leaves the fixture image with a dirty log: one committed transaction that
+// updated the fixture file's timestamps, then the filesystem is dropped
+// without writing the unmount record.
+void MakeWriterDirtyLog(xfstest::FixtureImage& fixture,
+                        const xfs::XfsTimestamp& stamp) {
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  auto updated = fs.value()->SetFileTimes(fixture.info().file_ino, stamp, stamp,
+                                          stamp);
+  CHECK(updated.ok());
+}
+
+}  // namespace
+
+TEST(recovery_mount_replays_writer_dirty_log) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const xfs::XfsTimestamp stamp{1700000555, 123};
+  MakeWriterDirtyLog(fixture, stamp);
+
+  // A plain read-only mount must refuse (no writes on a read-only mount).
+  auto ro = fixture.Mount(/*read_write=*/false);
+  CHECK(!ro.ok());
+  if (!ro.ok()) CHECK_EQ(ro.error().code, xfs::XfsError::kDirtyLog);
+
+  // A read-write mount replays the journal as part of mounting.
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    const auto& report = *fs.value()->recovery_report();
+    CHECK(report.recovered);
+    CHECK_EQ(report.replay.transactions_replayed, 1u);
+    CHECK_EQ(report.replay.inodes_replayed, 1u);
+    CHECK_EQ(report.replay.buffers_skipped_newer, 0u);
+  }
+  auto info = fs.value()->GetFileInfo(fixture.info().file_ino);
+  CHECK(info.ok());
+  if (info.ok()) CHECK_EQ(info.value().mtime.sec, stamp.sec);
+
+  // Unmount cleanly: the log ends with an unmount record for everyone.
+  CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+  fs.value().reset();
+
+  auto clean = fixture.Mount(/*read_write=*/false);
+  CHECK(clean.ok());
+  if (clean.ok()) {
+    auto check = xfs::CheckLogClean(clean.value()->device(),
+                                    clean.value()->geometry(),
+                                    clean.value()->superblock());
+    CHECK(check.ok());
+    if (check.ok()) CHECK(check.value().state == xfs::LogState::kClean);
+  }
+  fixture.Reset();
+}
+
+TEST(recovery_recover_command_cleans_the_log) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const xfs::XfsTimestamp stamp{1700000777, 0};
+  MakeWriterDirtyLog(fixture, stamp);
+
+  // The standalone command shape: open the image without touching the log,
+  // then run recovery explicitly and finish with a clean unmount record.
+  xfs::MountOptions options;
+  options.check_log = false;
+  auto borrowed =
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage());
+  auto fs = xfs::XfsFilesystem::Mount(std::move(borrowed), options);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto report =
+      fs.value()->RecoverJournal(xfs::XfsFilesystem::RecoveryFinish::kCleanLog);
+  CHECK(report.ok());
+  if (!report.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(report.value().recovered);
+  CHECK_EQ(report.value().replay.transactions_replayed, 1u);
+  fs.value().reset();
+
+  // The log is clean now: even a strict read-only mount is happy.
+  auto clean = fixture.Mount(/*read_write=*/false);
+  CHECK(clean.ok());
+  if (clean.ok()) {
+    auto check = xfs::CheckLogClean(clean.value()->device(),
+                                    clean.value()->geometry(),
+                                    clean.value()->superblock());
+    CHECK(check.ok());
+    if (check.ok()) CHECK(check.value().state == xfs::LogState::kClean);
+    auto info = clean.value()->GetFileInfo(fixture.info().file_ino);
+    CHECK(info.ok());
+    if (info.ok()) CHECK_EQ(info.value().mtime.sec, stamp.sec);
+  }
+  fixture.Reset();
+}
+
+TEST(recovery_mount_finishes_extent_free_intents) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) return;
+
+  // Allocate a run of blocks so an EFI can describe a genuinely allocated
+  // extent, then unmount cleanly.
+  xfs::Allocation alloc;
+  uint64_t freeblks_before = 0;
+  uint64_t btreeblks_before = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    auto agf = xfs::ReadAgf(*memory, fs.value()->geometry(), 0);
+    CHECK(agf.ok());
+    if (agf.ok()) {
+      freeblks_before = agf.value().freeblks;
+      btreeblks_before = agf.value().btreeblks;
+    }
+    xfs::Status status = fs.value()->RunTransaction(
+        [&](xfs::XfsTransaction& txn) -> xfs::Status {
+          xfs::BlockAllocator blocks(&txn, &fs.value()->device(),
+                                     &fs.value()->geometry());
+          xfs::Status s = blocks.Allocate(0, 4, &alloc);
+          if (!s.ok()) return s;
+          return blocks.Commit();
+        });
+    CHECK(status.ok());
+    if (!status.ok()) {
+      fixture.Reset();
+      return;
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+
+  // Append a hand-built EFI record (extent free intent) at the next log write
+  // position: this is what a Linux truncate/unlink leaves behind after a
+  // crash.
+  {
+    const xfs::XfsGeometry& geo = xfs::MakeGeometry(
+        xfs::ReadSuperblock(*memory, 0, true).value());
+    auto sb = xfs::ReadSuperblock(*memory, 0, true);
+    CHECK(sb.ok());
+    if (!sb.ok()) return;
+    auto position = xfs::ReadLogPosition(*memory, geo, sb.value());
+    CHECK(position.ok());
+    if (!position.ok()) return;
+    std::vector<uint8_t> efi(lf::kIntentLogFormatSize + lf::kExtentSize, 0);
+    PutLE16At(efi.data(), 0, lf::kItemEfi);
+    PutLE16At(efi.data(), 2, 1);
+    PutLE32At(efi.data(), lf::kIntentNextentsOffset, 1);
+    PutLE64At(efi.data(), lf::kIntentIdOffset, 0xeF1u);
+    PutLE64At(efi.data() + lf::kIntentLogFormatSize,
+              lf::kExtentStartOffset, alloc.fsb);
+    PutLE32At(efi.data() + lf::kIntentLogFormatSize, lf::kExtentLenOffset,
+              alloc.len);
+    xfs::LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x77;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = xfs::MakeLsn(position.value().cycle,
+                                   position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = xfs::BuildLogRecord(
+        params, CommitOps(0x77, {efi}));
+    CHECK(record.ok());
+    if (!record.ok()) return;
+    CHECK(memory->Write(geo.FsbToByte(sb.value().logstart) +
+                            static_cast<uint64_t>(params.block) * 512,
+                        record.value().data(), record.value().size()));
+    CHECK(memory->Flush());
+  }
+
+  // Mount read-write: the log is replayed, the EFI is found, the extents are
+  // freed in a transaction that also logs the EFD.
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    const auto& report = *fs.value()->recovery_report();
+    CHECK_EQ(report.replay.intents_pending, 1u);
+    CHECK_EQ(report.intents_completed, 1u);
+  }
+  auto agf = xfs::ReadAgf(*memory, fs.value()->geometry(), 0);
+  CHECK(agf.ok());
+  if (agf.ok()) {
+    CHECK_EQ(agf.value().freeblks, freeblks_before);
+    CHECK_EQ(agf.value().btreeblks, btreeblks_before);
+  }
+  // The completion transaction logged the matching EFD: a second scan finds
+  // no pending intent.
+  auto scan = xfs::ScanLog(*memory, fs.value()->superblock(),
+                           fs.value()->geometry());
+  CHECK(scan.ok());
+  if (scan.ok()) {
+    CHECK(scan.value().Recoverable());
+    CHECK_EQ(xfs::CollectPendingIntents(scan.value()).size(), 0u);
+  }
+  fs.value().reset();
+
+  // Crash right after the completion (no unmount record): the next recovery
+  // re-replays the window, the EFD releases the intent, and the extents are
+  // not freed twice.
+  auto again = fixture.Mount(/*read_write=*/true);
+  CHECK(again.ok());
+  if (again.ok()) {
+    if (again.value()->recovery_report().has_value()) {
+      CHECK_EQ(again.value()->recovery_report()->intents_completed, 0u);
+    }
+    auto agf2 = xfs::ReadAgf(*memory, again.value()->geometry(), 0);
+    CHECK(agf2.ok());
+    if (agf2.ok()) {
+      CHECK_EQ(agf2.value().freeblks, freeblks_before);
+      CHECK_EQ(agf2.value().btreeblks, btreeblks_before);
+    }
+  }
+  fixture.Reset();
+}
+
+TEST(recovery_mount_frees_unlinked_inodes) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  uint64_t ino = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    auto created = fs.value()->CreateRegularFile(
+        fs.value()->RootInode(), "unlinked-recovery-test", 0644, 0, 0);
+    CHECK(created.ok());
+    if (!created.ok()) {
+      fixture.Reset();
+      return;
+    }
+    ino = created.value();
+    // Defer the free: the inode becomes zero-link and goes on the AGI
+    // unlinked list, exactly the open-but-unlinked crash state.
+    CHECK(fs.value()->Unlink(fs.value()->RootInode(), "unlinked-recovery-test",
+                             /*defer_inode_free=*/true)
+              .ok());
+  }
+  const xfs::XfsGeometry geo = xfs::MakeGeometry(
+      xfs::ReadSuperblock(fixture.storage(), 0, true).value());
+  const uint32_t agno = geo.InoAgno(ino);
+  const uint32_t bucket = geo.InoAgino(ino) % 64;
+  {
+    auto agi = xfs::ReadAgi(fixture.storage(), geo, agno);
+    CHECK(agi.ok());
+    if (agi.ok()) CHECK(agi.value().unlinked[bucket] != 0xffffffffu);
+  }
+
+  // Remount read-write: recovery replays the unlink transaction (a no-op for
+  // the metadata, which is already on disk) and then processes the AGI
+  // unlinked lists before the volume is usable.
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    CHECK(fs.value()->recovery_report()->unlinked_inodes_processed >= 1u);
+  }
+  auto agi = xfs::ReadAgi(fs.value()->device(), fs.value()->geometry(), agno);
+  CHECK(agi.ok());
+  if (agi.ok()) CHECK_EQ(agi.value().unlinked[bucket], 0xffffffffu);
+  auto lookup = fs.value()->LookupName(fs.value()->RootInode(),
+                                       "unlinked-recovery-test");
+  CHECK(!lookup.ok());
+  auto freed = fs.value()->OpenInode(ino);
+  if (freed.ok()) CHECK_EQ(freed.value().nlink, 0u);
   fs.value().reset();
   fixture.Reset();
 }

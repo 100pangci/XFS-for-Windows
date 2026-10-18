@@ -436,15 +436,20 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
   }
 
   // The transaction is durable; advance the write position. The next record's
-  // tail is its own LSN because every buffer this one logged is now on disk.
+  // tail is its own LSN because every buffer this one logged is now on disk -
+  // unless a recovered intent is still unresolved: then the tail stays pinned
+  // to the replayed window so a crash here re-replays it (and the done item
+  // this transaction logged releases the intent).
   log_position_.next_block += record_blocks;
   if (log_position_.next_block >= log_position_.log_blocks) {
     log_position_.next_block = 0;
     ++log_position_.cycle;
   }
   log_position_.prev_block = txn.block_;
-  log_position_.tail_lsn =
-      MakeLsn(log_position_.cycle, log_position_.next_block);
+  log_position_.tail_lsn = recovery_tail_pin_.has_value()
+                               ? *recovery_tail_pin_
+                               : MakeLsn(log_position_.cycle,
+                                         log_position_.next_block);
   log_dirty_ = true;
   txn.started_ = false;
 

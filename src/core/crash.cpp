@@ -37,6 +37,17 @@ constexpr PointName kPointNames[] = {
     {CrashPoint::kAfterMetadataWrite, "after_metadata_write"},
     {CrashPoint::kBeforeDeviceFlush, "before_device_flush"},
     {CrashPoint::kAfterDeviceFlush, "after_device_flush"},
+    {CrashPoint::kRecoveryScan, "recovery_scan"},
+    {CrashPoint::kRecoveryBeforePass2, "recovery_before_pass2"},
+    {CrashPoint::kRecoveryAfterTransaction, "recovery_after_transaction"},
+    {CrashPoint::kRecoveryMidBuffer, "recovery_mid_buffer"},
+    {CrashPoint::kRecoveryAfterMetadataFlush, "recovery_after_metadata_flush"},
+    {CrashPoint::kRecoveryBeforeIntents, "recovery_before_intents"},
+    {CrashPoint::kRecoveryMidIntents, "recovery_mid_intents"},
+    {CrashPoint::kRecoveryBeforeIunlinks, "recovery_before_iunlinks"},
+    {CrashPoint::kRecoveryMidIunlinks, "recovery_mid_iunlinks"},
+    {CrashPoint::kRecoveryBeforeLogClean, "recovery_before_log_clean"},
+    {CrashPoint::kRecoveryAfterLogClean, "recovery_after_log_clean"},
 };
 
 std::mutex g_config_mutex;

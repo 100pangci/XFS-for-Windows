@@ -105,17 +105,17 @@ constexpr uint16_t kItemAttri = 0x1246;     // XFS_LI_ATTRI
 constexpr uint16_t kItemAttrd = 0x1247;     // XFS_LI_ATTRD
 
 // ---------------------------------------------------------------------------
-// Intent item formats (host byte order header, big-endian payload extents)
+// Intent item formats (host byte order, like every log item format)
 // ---------------------------------------------------------------------------
 // xfs_efi_log_format: type u16, size u16 (= regions), nextents u32, id u64,
-// then xfs_extent[]. EFD carries the id of the EFI it completes, BUI/BUD the
-// same for bmap updates.
+// then xfs_extent[] (all host order). EFD carries the id of the EFI it
+// completes, BUI/BUD the same for bmap updates.
 constexpr size_t kIntentLogFormatSize = 16;  // header before the extent array
-constexpr size_t kIntentIdOffset = 8;        // be64 efi_id / bui_id / ...
-constexpr size_t kIntentNextentsOffset = 4;  // be32
-constexpr size_t kExtentSize = 16;           // xfs_extent: start be64, len be32
-constexpr size_t kExtentStartOffset = 0;     // be64
-constexpr size_t kExtentLenOffset = 8;       // be32
+constexpr size_t kIntentIdOffset = 8;        // u64 efi_id / bui_id / ...
+constexpr size_t kIntentNextentsOffset = 4;  // u32
+constexpr size_t kExtentSize = 16;           // xfs_extent: start u64, len u32
+constexpr size_t kExtentStartOffset = 0;     // u64
+constexpr size_t kExtentLenOffset = 8;       // u32
 
 // xfs_icreate_log, 28 bytes, host endian type/size then big-endian fields.
 // Replay calls xfs_ialloc_inode_init, which rebuilds the whole inode cluster
