@@ -582,9 +582,11 @@ uint32_t DirectoryEditor::PlaceEntry(size_t entsize, uint32_t first_offset,
 Status DirectoryEditor::InsertPlaced(const DirEntryWrite& entry,
                                      uint32_t first_offset, bool shortform) {
   const bool wide = SfWide(entry.ino);
-  const size_t entsize =
-      shortform ? SfEntrySizeFor(entry.name.size(), wide)
-                : DataEntrySize(entry.name.size());
+  // The hole test always uses the data-space entry size, in every directory
+  // format: xfs_dir2_sf_addname_pick calls xfs_dir2_data_entsize even while
+  // the directory is stored shortform. The on-disk shortform entry size
+  // (SfEntrySizeFor) only sizes the inode fork image below.
+  const size_t entsize = DataEntrySize(entry.name.size());
   const uint32_t offset = PlaceEntry(entsize, first_offset, shortform, wide);
   if (offset > 0xffff) {
     return XFS_ERR(XfsError::kNoSpace, "directory offset out of range")
