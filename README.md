@@ -90,10 +90,10 @@ RW-3 adds the inode allocator and directory mutation:
 [`docs/INODE_ALLOCATOR.md`](docs/INODE_ALLOCATOR.md) describes the inobt/AGI
 rules and the chunk lifetime; `create`, `mkdir`, `unlink` and `rmdir` go
 through the same transactions the WinFsp callbacks use. `linux-verify-rw3`
-mounts Windows-created files and directories (shortform, leaf and node formats,
-churn and a fully grown directory), verifies names, types, sizes and contents
-through the kernel, and modifies a Windows-created directory from Linux so the
-next Windows job can read it back. `linux-verify-rw3-crash` replays every crash
+mounts Windows-created files and directories (shortform, block, leaf and node
+formats, churn and a fully grown directory), verifies names, types, sizes and
+contents through the kernel, and modifies a Windows-created directory from
+Linux so the next Windows job can read it back. `linux-verify-rw3-crash` replays every crash
 window of all four operations and requires the old or the complete new state.
 
 ## Read-write support (experimental, RW-2: overwrite, extend, truncate)

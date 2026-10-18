@@ -229,9 +229,50 @@ $images['nodedir.img'] = [ordered]@{
 }
 
 # ---------------------------------------------------------------------------
+# 5. blockdir.img: the single-block format (data + embedded leaf + tail) with
+#    entries removed and added again, so all four directory formats cross the
+#    Linux boundary.
+# ---------------------------------------------------------------------------
+$img = Join-Path $WorkDir 'blockdir.img'
+Copy-Item $fixture $img -Force
+Invoke-Ok 'mkdir /blocky' @('mkdir', $img, '/blocky', '--rw-experimental')
+$block_kept = @()
+$block_dropped = @()
+for ($i = 0; $i -lt 120; $i++) {
+    $name = 'b{0:d3}.bin' -f $i
+    Invoke-Ok "create /blocky/$name" @('create', $img, "/blocky/$name",
+        '--rw-experimental')
+    if (($i % 4) -eq 0) { $block_dropped += $name } else { $block_kept += $name }
+}
+Invoke-Ok 'write /blocky/b001.bin' @('pwrite', $img, '/blocky/b001.bin',
+    '0', '--rw-experimental', "--from=$payload4k")
+foreach ($name in $block_dropped) {
+    Invoke-Ok "unlink /blocky/$name" @('unlink', $img, "/blocky/$name",
+        '--rw-experimental')
+}
+Test-Consistent $img
+$block_entries = @()
+foreach ($name in $block_kept) {
+    $size = if ($name -eq 'b001.bin') { 4096 } else { 0 }
+    $block_entries += [ordered]@{ name = $name; ftype = 'file'; size = $size }
+}
+$specs['blockdir.img.dir'] = [ordered]@{
+    dir_ino = (Get-Inode $img '/blocky')
+    entries = $block_entries
+    absent = $block_dropped
+}
+$images['blockdir.img'] = [ordered]@{
+    files = @([ordered]@{ path = 'blocky/b001.bin'; size = 4096; seed = 34 })
+    dirs = @('blocky')
+    listings = [ordered]@{ 'blocky' = $block_kept }
+    absent = @($block_dropped | ForEach-Object { "blocky/$_" })
+}
+
+# ---------------------------------------------------------------------------
 # Structural oracle on every image.
 # ---------------------------------------------------------------------------
-foreach ($name in @('create.img', 'rm.img', 'leafchurn.img', 'nodedir.img')) {
+foreach ($name in @('create.img', 'rm.img', 'leafchurn.img', 'nodedir.img',
+        'blockdir.img')) {
     $img = Join-Path $WorkDir $name
     foreach ($key in $specs.Keys) {
         if (-not $key.StartsWith($name)) { continue }

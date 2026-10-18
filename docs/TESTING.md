@@ -377,8 +377,9 @@ Every push runs fifteen jobs:
    probes it, exercises the CLI write path (`pwrite`, growth, truncate,
    refusals, `check` after the writes), generates the RW-2 round-trip images
    (`verify_rw2_windows.ps1`), the RW-3 round-trip images
-   (`verify_rw3_windows.ps1`: create, mkdir, unlink, rmdir, a leaf directory
-   with churn and a node-format directory, all verified with `rw3_probe.py`)
+   (`verify_rw3_windows.ps1`: create, mkdir, unlink, rmdir, and directories in
+   all four formats - shortform, block, leaf with churn and node - all
+   verified with `rw3_probe.py`)
    and runs all three crash matrices (`verify_crash_windows.ps1`,
    `verify_crash_rw2_windows.ps1`, `verify_crash_rw3_windows.ps1`), uploading
    every image for the Linux jobs.
@@ -431,8 +432,9 @@ Every push runs fifteen jobs:
     reverse direction of interoperability (Linux continues writing, Windows
     reads it back).
 11. **linux-verify-rw3** (ubuntu-24.04): mounts the RW-3 images (shortform
-    files and directories, a grown leaf directory with churn, a node-format
-    directory), verifies the exact names/types/sizes/contents through the
+    files and directories, all four directory formats including a grown leaf
+    directory with churn and a node-format directory), verifies the exact
+    names/types/sizes/contents through the
     kernel from the manifest, requires `xfs_repair -n` silence and a clean log,
     then creates, writes and removes files and directories inside the
     Windows-created `/r3dir` so the reverse job can read the result back.
