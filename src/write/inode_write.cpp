@@ -205,7 +205,15 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   std::vector<uint8_t> log_dinode;
   CopyCoreToLogDinode(inode.data(), inode.size(), &log_dinode);
 
-  const bool with_region = !fork_region.empty();
+  // The kernel's recovery checks the logged region against
+  // roundup(ilf_dsize, 4) (xlog_calc_iovec_len), so pad a fork region that is
+  // not a multiple of 4 with zeros and log the padded length. The bytes past
+  // the real fork data are ignored by the inode verifiers.
+  std::vector<uint8_t> logged_region = fork_region;
+  if (!logged_region.empty() && (logged_region.size() % 4) != 0) {
+    logged_region.resize((logged_region.size() + 3) & ~size_t{3}, 0);
+  }
+  const bool with_region = !logged_region.empty();
   uint32_t fields = lf::kILogCore | ilog_fields;
   if (!with_region) {
     // No data fork region to log (for example an empty extent list): drop the
@@ -219,7 +227,7 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   PutLE32(&item_header, lf::kIlfFields, fields);
   PutLE16(&item_header, lf::kIlfAsize, 0);
   PutLE16(&item_header, lf::kIlfDsize,
-          static_cast<uint16_t>(with_region ? fork_region.size() : 0));
+          static_cast<uint16_t>(logged_region.size()));
   PutLE64(&item_header, lf::kIlfIno, ino);
   PutLE64(&item_header, lf::kIlfBlkno, cluster_start / 512);
   PutLE32(&item_header, lf::kIlfLen,
@@ -227,7 +235,7 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   PutLE32(&item_header, lf::kIlfBoffset, static_cast<uint32_t>(boffset));
   txn.AddLogOp(std::move(item_header));
   txn.AddLogOp(std::move(log_dinode));
-  if (with_region) txn.AddLogOp(fork_region);
+  if (with_region) txn.AddLogOp(std::move(logged_region));
 
   // On-disk inode: the prepared image, with the transaction LSN and a fresh
   // CRC (the fork bytes were written by the caller).

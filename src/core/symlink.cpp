@@ -94,7 +94,11 @@ Result<std::string> ReadSymlinkTarget(BlockDevice& dev, const XfsGeometry& geo,
     uint32_t sl_bytes = GetBE32(extent_buf.data(), sym::kBytes);
     uint64_t sl_owner = GetBE64(extent_buf.data(), sym::kOwner);
     uint64_t sl_blkno = GetBE64(extent_buf.data(), sym::kBlkno);
-    if (sl_offset != hdr_size || sl_bytes != chunk || sl_owner != inode.ino) {
+    // sl_offset is the offset of this chunk inside the target string (0 for
+    // the first extent); sl_bytes is the chunk length, exactly what the
+    // kernel's xfs_symlink_hdr_ok/xfs_symlink_remote_read checks.
+    if (sl_offset != target_offset || sl_bytes != chunk ||
+        sl_owner != inode.ino) {
       return XFS_ERR(XfsError::kCorruptInode,
                      "symlink header does not match (offset/length/owner)")
           .Ino(inode.ino)

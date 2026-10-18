@@ -46,6 +46,7 @@ namespace {
 
 namespace di = ondisk::inode;
 namespace d = ondisk::dir;
+namespace sym = ondisk::symlink;
 namespace lf = logfmt;
 
 constexpr uint32_t kNullAgino = 0xffffffffu;
@@ -54,6 +55,23 @@ constexpr size_t kMaxUnlinkedWalk = 1u << 20;
 uint32_t NextGeneration() {
   static std::mt19937 rng(std::random_device{}());
   return rng();
+}
+
+// XFS_MAXLINK: the di_nlink ceiling the VFS enforces (EMLINK).
+constexpr uint32_t kMaxLink = (1u << 31) - 1;
+
+// XFS_DIR3_FT_* for an inode mode (xfs_mode_to_ftype).
+uint8_t FtypeForMode(uint16_t mode) {
+  switch (mode & kSIfmt) {
+    case kSIfreg: return d::kFtRegFile;
+    case kSIfdir: return d::kFtDir;
+    case kSIflnk: return d::kFtSymlink;
+    case kSIfchr: return d::kFtChrdev;
+    case kSIfblk: return d::kFtBlkdev;
+    case kSIfifo: return d::kFtFifo;
+    case kSIfsock: return d::kFtSock;
+    default: return d::kFtUnknown;
+  }
 }
 
 void StoreTimestamp(uint8_t* field, const XfsTimestamp& ts) {
@@ -374,6 +392,10 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
                                            bool directory_expected,
                                            bool defer_inode_free,
                                            uint64_t* removed_ino) {
+  if (name.empty() || name == "." || name == "..") {
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid unlink name")
+        .Ino(parent_ino);
+  }
   uint64_t ino = 0;
   bool needs_free = false;
   Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
@@ -478,6 +500,29 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
     }
     const uint32_t new_nlink = is_dir ? 0 : nlink - 1;
     PutBE32(child_image.data(), di::kNlink, new_nlink);
+
+    // xfs_dir_remove_child: point an unlinked child directory's ".." entry at
+    // the root so it never references an inode that may be freed before the
+    // child is closed. That edit lives in the *child's* data fork, so it needs
+    // the child's own fork/editor - never the parent's.
+    uint32_t child_ilog = 0;
+    std::vector<uint8_t> child_fork_region;
+    if (is_dir && parent_ino != geometry_.rootino) {
+      DataForkEditor child_fork(&txn, &blocks, device_.get(), &geometry_);
+      s = child_fork.Load(child.value());
+      if (!s.ok()) return s;
+      DirectoryEditor child_dir(&txn, &blocks, device_.get(), &geometry_,
+                                &child_fork);
+      s = child_dir.Load(child.value());
+      if (!s.ok()) return s;
+      s = child_dir.RepointDotDot(geometry_.rootino);
+      if (!s.ok()) return s;
+      s = child_dir.LogBlocks();
+      if (!s.ok()) return s;
+      s = child_dir.FinalizeInode(&child_image, &child_ilog, &child_fork_region);
+      if (!s.ok()) return s;
+    }
+
     if (new_nlink == 0) {
       auto head = inodes.UnlinkedBucketHead(agno, bucket);
       if (!head.ok()) return head.error();
@@ -489,18 +534,13 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
       PutBE32(child_image.data(), di::kNextUnlinked, head.value());
       s = inodes.SetUnlinkedBucketHead(agno, bucket, agino);
       if (!s.ok()) return s;
-      // xfs_dir_remove_child points an unlinked child directory's ".." at the
-      // root so it never references an inode that may be freed first.
-      if (is_dir && parent_ino != geometry_.rootino) {
-        s = dir.RepointDotDot(geometry_.rootino);
-        if (!s.ok()) return s;
-      }
     } else {
       PutBE32(child_image.data(), di::kNextUnlinked,
               RawNextUnlinked(child_image));
     }
     StoreTimestamp(child_image.data() + di::kCtime, now);
-    s = LogPreparedInode(txn, entry.ino, std::move(child_image), 0, {});
+    s = LogPreparedInode(txn, entry.ino, std::move(child_image), child_ilog,
+                         child_fork_region);
     if (!s.ok()) return s;
 
     s = blocks.Commit();
@@ -515,6 +555,9 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
   InvalidateCaches(CacheInvalidation::Directory(parent_ino));
   InvalidateCaches(CacheInvalidation::Inode(parent_ino));
   InvalidateCaches(CacheInvalidation::Extents(ino));
+  // An unlinked directory's ".." was repointed; its own cached listing (read
+  // during the emptiness check) is stale.
+  InvalidateCaches(CacheInvalidation::Directory(ino));
   if (removed_ino != nullptr) *removed_ino = ino;
   if (needs_free && !defer_inode_free) return FreeUnlinkedInode(ino);
   return OkStatus();
@@ -663,8 +706,15 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           .Ino(ino)
           .Metadata("ifree");
     }
-    if (inode.value().format == di::kFormatLocal ||
-        inode.value().nextents == 0) {
+    // A symlink whose target lives in remote blocks is freed like Linux
+    // xfs_inactive_symlink_rmt: the inode is turned into a regular file (a
+    // zero-length symlink must never be visible on disk) in the same
+    // transaction that releases the blocks, so it needs at least one pass even
+    // when the extent list is already empty.
+    const bool remote_symlink = inode.value().IsSymlink() &&
+                                inode.value().format != di::kFormatLocal;
+    if (!remote_symlink && (inode.value().format == di::kFormatLocal ||
+                            inode.value().nextents == 0)) {
       return OkStatus();
     }
     bool more = false;
@@ -700,6 +750,11 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
       std::vector<uint8_t> fork_region;
       s = editor.Finalize(&image, &ilog_fields, &fork_region);
       if (!s.ok()) return s;
+      if (fresh.value().IsSymlink()) {
+        const uint16_t mode = GetBE16(image.data(), di::kMode);
+        PutBE16(image.data(), di::kMode,
+                static_cast<uint16_t>((mode & ~kSIfmt) | kSIfreg));
+      }
       PutBE64(image.data(), di::kSize, 0);
       s = LogPreparedInode(txn, ino, std::move(image), ilog_fields,
                            fork_region);
@@ -713,6 +768,694 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
   }
   InvalidateCaches(CacheInvalidation::Extents(ino));
   return OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Rename (xfs_rename / xfs_dir_rename_children)
+// ---------------------------------------------------------------------------
+//
+// One transaction carries every change Linux makes in xfs_rename:
+//
+//   target side   insert (or xfs_dir_replace) the target name -> moved inode
+//                 + target parent timestamps (and +1 parent link for a
+//                 cross-parent directory move into an empty name)
+//   target inode  link count -1 (-2 when a directory is replaced) and the AGI
+//                 unlinked insert when it reaches zero (xfs_droplink)
+//   moved inode   ctime; for a cross-parent directory move the ".." rewrite
+//                 (xfs_dir_replace on the moved inode) and +1/-1 on the two
+//                 parents
+//   source side   remove the source name + source parent timestamps
+//
+// Because the whole namespace flip lives in one committed log record, a crash
+// can only leave the old namespace or the new one - never both names, neither
+// name, a dangling dirent or a wrong link count. A record that does not fit
+// the transaction budget fails here, before any write.
+
+Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
+    uint64_t src_parent, std::string_view src_name, uint64_t dst_parent,
+    std::string_view dst_name, bool replace_existing,
+    bool defer_replaced_free) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
+        .Metadata("rename");
+  }
+  if (src_name.empty() || src_name == "." || src_name == ".." ||
+      dst_name.empty() || dst_name == "." || dst_name == "..") {
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid rename name")
+        .Metadata("rename");
+  }
+
+  RenameOutcome outcome;
+  bool replaced_zero_link = false;
+  Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
+    // --- resolve and validate everything before modifying anything ---
+    auto src_dp = OpenInode(src_parent);
+    if (!src_dp.ok()) return src_dp.error();
+    if (!src_dp.value().IsDir()) {
+      return XFS_ERR(XfsError::kNotDirectory, "source parent is not a directory")
+          .Ino(src_parent)
+          .Metadata("rename");
+    }
+    if ((src_dp.value().flags & di::kDiFlagImmutable) != 0) {
+      return XFS_ERR(XfsError::kPermissionDenied, "source parent is immutable")
+          .Ino(src_parent)
+          .Metadata("rename");
+    }
+    const bool same_parent = src_parent == dst_parent;
+    XfsInode dst_dp;
+    if (same_parent) {
+      dst_dp = src_dp.value();
+    } else {
+      auto d = OpenInode(dst_parent);
+      if (!d.ok()) return d.error();
+      if (!d.value().IsDir()) {
+        return XFS_ERR(XfsError::kNotDirectory,
+                       "target parent is not a directory")
+            .Ino(dst_parent)
+            .Metadata("rename");
+      }
+      if ((d.value().flags & di::kDiFlagImmutable) != 0) {
+        return XFS_ERR(XfsError::kPermissionDenied,
+                       "target parent is immutable")
+            .Ino(dst_parent)
+            .Metadata("rename");
+      }
+      dst_dp = std::move(d.value());
+    }
+
+    auto src_entry = LookupName(src_parent, src_name);
+    if (!src_entry.ok()) return src_entry.error();
+    auto moved = OpenInode(src_entry.value().ino);
+    if (!moved.ok()) return moved.error();
+    if ((moved.value().flags & di::kDiFlagImmutable) != 0) {
+      return XFS_ERR(XfsError::kPermissionDenied, "source is immutable")
+          .Ino(moved.value().ino)
+          .Metadata("rename");
+    }
+    const bool src_is_dir = moved.value().IsDir();
+    const uint8_t src_ftype = FtypeForMode(moved.value().mode);
+
+    // The VFS returns success without touching anything when both names
+    // resolve to the same inode (including the same path).
+    if (same_parent && src_name == dst_name) {
+      outcome.moved_ino = moved.value().ino;
+      return OkStatus();
+    }
+
+    bool target_exists = false;
+    XfsInode target;
+    auto target_entry = LookupName(dst_parent, dst_name);
+    if (target_entry.ok()) {
+      if (!replace_existing) {
+        return XFS_ERR(XfsError::kAlreadyExists, "target name already exists")
+            .Ino(dst_parent)
+            .Metadata("rename");
+      }
+      auto t = OpenInode(target_entry.value().ino);
+      if (!t.ok()) return t.error();
+      target = std::move(t.value());
+      if (target.ino == moved.value().ino) {
+        // Renaming between two names of the same inode: POSIX no-op.
+        outcome.moved_ino = moved.value().ino;
+        return OkStatus();
+      }
+      const bool target_is_dir = target.IsDir();
+      if (target_is_dir && !src_is_dir) {
+        return XFS_ERR(XfsError::kNotRegularFile,
+                       "cannot replace a directory with a file")
+            .Ino(target.ino)
+            .Metadata("rename");
+      }
+      if (!target_is_dir && src_is_dir) {
+        return XFS_ERR(XfsError::kNotDirectory,
+                       "cannot replace a file with a directory")
+            .Ino(target.ino)
+            .Metadata("rename");
+      }
+      if ((target.flags & di::kDiFlagImmutable) != 0) {
+        return XFS_ERR(XfsError::kPermissionDenied, "target is immutable")
+            .Ino(target.ino)
+            .Metadata("rename");
+      }
+      if (target_is_dir) {
+        // xfs_dir_rename_children: an existing target directory must be
+        // empty (nlink 2 and only "." / ".." entries).
+        if (target.nlink != 2) {
+          return XFS_ERR(XfsError::kDirectoryNotEmpty,
+                         "target directory is not empty")
+              .Ino(target.ino)
+              .Actual(target.nlink)
+              .Metadata("rename");
+        }
+        auto listing = ListDirectory(target.ino);
+        if (!listing.ok()) return listing.error();
+        for (const XfsDirEntry& e : listing.value()) {
+          if (e.name != "." && e.name != "..") {
+            return XFS_ERR(XfsError::kDirectoryNotEmpty,
+                           "target directory is not empty")
+                .Ino(target.ino)
+                .Metadata("rename");
+          }
+        }
+      }
+      target_exists = true;
+    } else if (target_entry.error().code != XfsError::kNotFound) {
+      return target_entry.error();
+    }
+
+    if (src_is_dir) {
+      // VFS start_renaming: moving a directory into its own subtree (or onto
+      // itself) is EINVAL. Walk ".." from the target parent up to the root.
+      uint64_t cursor = dst_parent;
+      for (size_t depth = 0; depth <= kMaxUnlinkedWalk; ++depth) {
+        if (cursor == moved.value().ino) {
+          return XFS_ERR(XfsError::kWouldCycle,
+                         "cannot move a directory into its own subtree")
+              .Ino(moved.value().ino)
+              .Metadata("rename");
+        }
+        if (cursor == geometry_.rootino) break;
+        auto up = LookupName(cursor, "..");
+        if (!up.ok()) return up.error();
+        if (up.value().ino == cursor) break;  // defensive: self-parent
+        cursor = up.value().ino;
+      }
+      if (!same_parent && !target_exists && dst_dp.nlink >= kMaxLink) {
+        // vfs_rename: the new parent gains a ".." link (EMLINK).
+        return XFS_ERR(XfsError::kTooManyLinks,
+                       "target parent link count is at the limit")
+            .Ino(dst_parent)
+            .Actual(dst_dp.nlink)
+            .Metadata("rename");
+      }
+    }
+
+    // --- target side ---
+    const XfsTimestamp now = CurrentTimestamp();
+    BlockAllocator blocks(&txn, device_.get(), &geometry_);
+    InodeAllocator inodes(&txn, &blocks, device_.get(), &superblock_,
+                          &geometry_);
+
+    DataForkEditor src_fork(&txn, &blocks, device_.get(), &geometry_);
+    Status s = src_fork.Load(src_dp.value());
+    if (!s.ok()) return s;
+    DirectoryEditor src_dir(&txn, &blocks, device_.get(), &geometry_, &src_fork);
+    s = src_dir.Load(src_dp.value());
+    if (!s.ok()) return s;
+
+    std::unique_ptr<DataForkEditor> dst_fork;
+    std::unique_ptr<DirectoryEditor> dst_dir;
+    DirectoryEditor* target_dir = &src_dir;
+    if (!same_parent) {
+      dst_fork = std::make_unique<DataForkEditor>(&txn, &blocks, device_.get(),
+                                                  &geometry_);
+      s = dst_fork->Load(dst_dp);
+      if (!s.ok()) return s;
+      dst_dir = std::make_unique<DirectoryEditor>(
+          &txn, &blocks, device_.get(), &geometry_, dst_fork.get());
+      s = dst_dir->Load(dst_dp);
+      if (!s.ok()) return s;
+      target_dir = dst_dir.get();
+    }
+
+    if (target_exists) {
+      // xfs_dir_replace: the destination name now points at the moved inode.
+      s = target_dir->Replace(dst_name, moved.value().ino, src_ftype);
+      if (!s.ok()) return s;
+    } else {
+      s = target_dir->Insert(
+          DirEntryWrite{std::string(dst_name), moved.value().ino, src_ftype});
+      if (!s.ok()) return s;
+    }
+    // Log the target directory's blocks (shortform writes ride in the inode
+    // item; block/leaf/node edits are buffer items here).
+    s = target_dir->LogBlocks();
+    if (!s.ok()) return s;
+
+    // --- source side (after the target, like xfs_dir_rename_children) ---
+    auto removed = src_dir.Remove(src_name);
+    if (!removed.ok()) return removed.error();
+    s = src_dir.LogBlocks();
+    if (!s.ok()) return s;
+
+    // The moved directory's ".." entry follows it to the new parent
+    // (xfs_dir_replace(tp, src_ip, "..", target_dp)); its editor is separate
+    // from both parents'.
+    std::unique_ptr<DataForkEditor> moved_fork;
+    std::unique_ptr<DirectoryEditor> moved_dir;
+    if (src_is_dir && !same_parent) {
+      moved_fork = std::make_unique<DataForkEditor>(&txn, &blocks,
+                                                    device_.get(), &geometry_);
+      s = moved_fork->Load(moved.value());
+      if (!s.ok()) return s;
+      moved_dir = std::make_unique<DirectoryEditor>(
+          &txn, &blocks, device_.get(), &geometry_, moved_fork.get());
+      s = moved_dir->Load(moved.value());
+      if (!s.ok()) return s;
+      s = moved_dir->RepointDotDot(dst_parent);
+      if (!s.ok()) return s;
+      s = moved_dir->LogBlocks();
+      if (!s.ok()) return s;
+    }
+
+    // --- the moved inode (ctime + optional "..") ---
+    {
+      auto raw = ReadRawInode(moved.value().ino);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      if (moved_dir) {
+        s = moved_dir->FinalizeInode(&image, &ilog_fields, &fork_region);
+        if (!s.ok()) return s;
+      }
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, moved.value().ino, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+    }
+
+    // --- the replaced inode (xfs_droplink twice for a directory) ---
+    if (target_exists) {
+      auto raw = ReadRawInode(target.ino);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      const uint32_t drops = src_is_dir ? 2u : 1u;
+      const uint32_t nlink = GetBE32(image.data(), di::kNlink);
+      if (nlink < drops) {
+        return XFS_ERR(XfsError::kCorruptInode,
+                       "replaced inode has too few links")
+            .Ino(target.ino)
+            .Actual(nlink)
+            .Metadata("rename");
+      }
+      const uint32_t new_nlink = nlink - drops;
+      PutBE32(image.data(), di::kNlink, new_nlink);
+      if (new_nlink == 0) {
+        const uint32_t agno = geometry_.InoAgno(target.ino);
+        const uint32_t agino = geometry_.InoAgino(target.ino);
+        const uint32_t bucket = agino % ondisk::kAgiUnlinkedBuckets;
+        auto head = inodes.UnlinkedBucketHead(agno, bucket);
+        if (!head.ok()) return head.error();
+        if (head.value() == agino) {
+          return XFS_ERR(XfsError::kCorruptInode,
+                         "inode is already the head of its unlinked bucket")
+              .Ino(target.ino)
+              .Metadata("rename");
+        }
+        PutBE32(image.data(), di::kNextUnlinked, head.value());
+        s = inodes.SetUnlinkedBucketHead(agno, bucket, agino);
+        if (!s.ok()) return s;
+      } else {
+        PutBE32(image.data(), di::kNextUnlinked,
+                RawNextUnlinked(image));
+      }
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, target.ino, std::move(image), 0, {});
+      if (!s.ok()) return s;
+      outcome.replaced_ino = target.ino;
+      outcome.replaced_new_nlink = new_nlink;
+      replaced_zero_link = new_nlink == 0;
+    }
+
+    // --- the parents: fork edits, timestamps, link counts ---
+    {
+      auto raw = ReadRawInode(src_parent);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = src_dir.FinalizeInode(&image, &ilog_fields, &fork_region);
+      if (!s.ok()) return s;
+      if (src_is_dir && (!same_parent || target_exists)) {
+        const uint32_t nlink = GetBE32(image.data(), di::kNlink);
+        if (nlink == 0) {
+          return XFS_ERR(XfsError::kCorruptInode,
+                         "source parent link count is already zero")
+              .Ino(src_parent)
+              .Metadata("rename");
+        }
+        PutBE32(image.data(), di::kNlink, nlink - 1);
+      }
+      StoreTimestamp(image.data() + di::kMtime, now);
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, src_parent, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+    }
+    if (!same_parent) {
+      auto raw = ReadRawInode(dst_parent);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = dst_dir->FinalizeInode(&image, &ilog_fields, &fork_region);
+      if (!s.ok()) return s;
+      if (!target_exists && src_is_dir) {
+        // The moved directory's ".." adds one link to the new parent.
+        const uint32_t nlink = GetBE32(image.data(), di::kNlink);
+        PutBE32(image.data(), di::kNlink, nlink + 1);
+      }
+      StoreTimestamp(image.data() + di::kMtime, now);
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, dst_parent, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+    }
+
+    s = blocks.Commit();
+    if (!s.ok()) return s;
+    s = inodes.Commit();
+    if (!s.ok()) return s;
+    outcome.moved_ino = moved.value().ino;
+    outcome.replaced_zero_link = replaced_zero_link;
+    return OkStatus();
+  });
+  if (!status.ok()) return status.error();
+
+  InvalidateCaches(CacheInvalidation::Directory(src_parent));
+  InvalidateCaches(CacheInvalidation::Inode(src_parent));
+  if (dst_parent != src_parent) {
+    InvalidateCaches(CacheInvalidation::Directory(dst_parent));
+    InvalidateCaches(CacheInvalidation::Inode(dst_parent));
+  }
+  if (outcome.moved_ino != 0) {
+    // A moved directory's ".." entry changed; its listing cache is stale.
+    InvalidateCaches(CacheInvalidation::Inode(outcome.moved_ino));
+  }
+  if (outcome.replaced_ino != 0) {
+    InvalidateCaches(CacheInvalidation::Inode(outcome.replaced_ino));
+  }
+  XFS_DEBUG("rename " << src_parent << ":'" << src_name << "' -> " << dst_parent
+                      << ":'" << dst_name << "' moved=" << outcome.moved_ino
+                      << " replaced=" << outcome.replaced_ino);
+  if (outcome.replaced_zero_link && !defer_replaced_free) {
+    Status freed = FreeUnlinkedInode(outcome.replaced_ino);
+    if (!freed.ok()) return freed.error();
+  }
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// Hard link (xfs_link / xfs_dir_add_child)
+// ---------------------------------------------------------------------------
+
+Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
+                           std::string_view dst_name) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
+        .Metadata("link");
+  }
+  if (dst_name.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid link name")
+        .Metadata("link");
+  }
+  Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
+    auto parent = OpenInode(dst_parent);
+    if (!parent.ok()) return parent.error();
+    if (!parent.value().IsDir()) {
+      return XFS_ERR(XfsError::kNotDirectory, "link parent is not a directory")
+          .Ino(dst_parent)
+          .Metadata("link");
+    }
+    if ((parent.value().flags & di::kDiFlagImmutable) != 0) {
+      return XFS_ERR(XfsError::kPermissionDenied, "parent is immutable")
+          .Ino(dst_parent)
+          .Metadata("link");
+    }
+    auto source = OpenInode(ino);
+    if (!source.ok()) return source.error();
+    if (source.value().IsDir()) {
+      // VFS/xfs_link: hard links to directories are forbidden.
+      return XFS_ERR(XfsError::kPermissionDenied,
+                     "cannot hard link a directory")
+          .Ino(ino)
+          .Metadata("link");
+    }
+    if (source.value().nlink >= kMaxLink) {
+      return XFS_ERR(XfsError::kTooManyLinks,
+                     "link count is at the XFS maximum")
+          .Ino(ino)
+          .Actual(source.value().nlink)
+          .Metadata("link");
+    }
+    auto existing = LookupName(dst_parent, dst_name);
+    if (existing.ok()) {
+      return XFS_ERR(XfsError::kAlreadyExists, "name already exists")
+          .Ino(dst_parent)
+          .Metadata("link");
+    }
+    if (existing.error().code != XfsError::kNotFound) {
+      return existing.error();
+    }
+
+    const XfsTimestamp now = CurrentTimestamp();
+    BlockAllocator blocks(&txn, device_.get(), &geometry_);
+    DataForkEditor fork(&txn, &blocks, device_.get(), &geometry_);
+    Status s = fork.Load(parent.value());
+    if (!s.ok()) return s;
+    DirectoryEditor dir(&txn, &blocks, device_.get(), &geometry_, &fork);
+    s = dir.Load(parent.value());
+    if (!s.ok()) return s;
+    s = dir.Insert(DirEntryWrite{std::string(dst_name), ino,
+                                 FtypeForMode(source.value().mode)});
+    if (!s.ok()) return s;
+    s = dir.LogBlocks();
+    if (!s.ok()) return s;
+
+    // Parent: mtime/ctime, and the dirent insertion (xfs_dir_add_child).
+    {
+      auto raw = ReadRawInode(dst_parent);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = dir.FinalizeInode(&image, &ilog_fields, &fork_region);
+      if (!s.ok()) return s;
+      StoreTimestamp(image.data() + di::kMtime, now);
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, dst_parent, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+    }
+
+    // Source inode: xfs_bumplink (nlink + ctime).
+    {
+      auto raw = ReadRawInode(ino);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      const uint32_t nlink = GetBE32(image.data(), di::kNlink);
+      if (nlink >= kMaxLink) {
+        return XFS_ERR(XfsError::kTooManyLinks,
+                       "link count is at the XFS maximum")
+            .Ino(ino)
+            .Metadata("link");
+      }
+      PutBE32(image.data(), di::kNlink, nlink + 1);
+      StoreTimestamp(image.data() + di::kCtime, now);
+      s = LogPreparedInode(txn, ino, std::move(image), 0, {});
+      if (!s.ok()) return s;
+    }
+
+    s = blocks.Commit();
+    if (!s.ok()) return s;
+    return OkStatus();
+  });
+  if (!status.ok()) return status;
+
+  InvalidateCaches(CacheInvalidation::Directory(dst_parent));
+  InvalidateCaches(CacheInvalidation::Inode(dst_parent));
+  InvalidateCaches(CacheInvalidation::Inode(ino));
+  XFS_DEBUG("link " << ino << " -> " << dst_parent << ":'" << dst_name << "'");
+  return OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Symlink creation (xfs_symlink / xfs_symlink_write_target)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Remote symlink capacity per block: the v5 xfs_dsymlink_hdr eats 56 bytes
+// (XFS_SYMLINK_BUF_SPACE).
+uint32_t SymlinkBlocks(uint32_t block_size, uint32_t pathlen) {
+  const uint32_t per_block =
+      block_size > sym::kHeaderSize ? block_size - sym::kHeaderSize : 0;
+  if (per_block == 0) return 0;
+  return (pathlen + per_block - 1) / per_block;
+}
+
+}  // namespace
+
+Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
+                                              std::string_view name,
+                                              std::string_view target,
+                                              uint16_t mode, uint32_t uid,
+                                              uint32_t gid) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
+        .Metadata("symlink");
+  }
+  // xfs_symlink: pathlen >= XFS_SYMLINK_MAXLEN is ENAMETOOLONG; a NUL is
+  // impossible through the syscall interface and rejected by xfs_repair, so
+  // never store one.
+  if (target.empty() || target.size() >= ondisk::kSymlinkMaxLen ||
+      target.find('\0') != std::string_view::npos) {
+    return XFS_ERR(XfsError::kNameTooLong, "invalid symlink target length")
+        .Actual(target.size())
+        .Metadata("symlink");
+  }
+  mode = static_cast<uint16_t>((mode & 07777) | kSIflnk);
+  Status capacity = EnsureInodeCapacity(geometry_.InoAgno(parent_ino));
+  if (!capacity.ok()) return capacity.error();
+
+  uint64_t child_ino = 0;
+  Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
+    auto parent = OpenInode(parent_ino);
+    if (!parent.ok()) return parent.error();
+    if (!parent.value().IsDir()) {
+      return XFS_ERR(XfsError::kNotDirectory,
+                     "symlink parent is not a directory")
+          .Ino(parent_ino)
+          .Metadata("symlink");
+    }
+    if ((parent.value().flags & di::kDiFlagImmutable) != 0) {
+      return XFS_ERR(XfsError::kPermissionDenied, "parent is immutable")
+          .Ino(parent_ino)
+          .Metadata("symlink");
+    }
+    if ((parent.value().flags & di::kDiFlagNosymlinks) != 0) {
+      // xfs_symlink: XFS_DIFLAG_NOSYMLINKS forbids new symlinks (EPERM).
+      return XFS_ERR(XfsError::kPermissionDenied,
+                     "directory does not allow symlinks")
+          .Ino(parent_ino)
+          .Metadata("symlink");
+    }
+    auto existing = LookupName(parent_ino, name);
+    if (existing.ok()) {
+      return XFS_ERR(XfsError::kAlreadyExists, "name already exists")
+          .Ino(parent_ino)
+          .Metadata("symlink");
+    }
+    if (existing.error().code != XfsError::kNotFound) {
+      return existing.error();
+    }
+
+    BlockAllocator blocks(&txn, device_.get(), &geometry_);
+    InodeAllocator inodes(&txn, &blocks, device_.get(), &superblock_,
+                          &geometry_);
+    Status s = inodes.AllocateInode(geometry_.InoAgno(parent_ino),
+                                    geometry_.InoAgino(parent_ino), &child_ino);
+    if (!s.ok()) return s;
+    const XfsTimestamp now = CurrentTimestamp();
+    const uint32_t gen = NextGeneration();
+    std::vector<uint8_t> child = BuildNewInode(geometry_, child_ino, mode, uid,
+                                               gid, gen, now, nullptr);
+    if (child.empty()) {
+      return XFS_ERR(XfsError::kInternal, "cannot build the new inode")
+          .Ino(child_ino);
+    }
+
+    const size_t local_capacity =
+        static_cast<size_t>(geometry_.inode_size) - di::kCoreSizeV3;
+    if (target.size() <= local_capacity) {
+      // xfs_symlink_write_target: inline in the literal area (LOCAL fork).
+      child[di::kFormat] = di::kFormatLocal;
+      PutBE64(child.data(), di::kSize, target.size());
+      std::memcpy(child.data() + di::kCoreSizeV3, target.data(), target.size());
+      std::vector<uint8_t> fork_region(target.begin(), target.end());
+      s = LogPreparedInode(txn, child_ino, std::move(child), lf::kILogDData,
+                           fork_region);
+      if (!s.ok()) return s;
+    } else {
+      // Remote: one contiguous run of xfs_symlink_blocks() blocks (the
+      // allocation is refused before any write when the AG cannot satisfy
+      // it), one v5 xfs_dsymlink_hdr, the target bytes.
+      const uint32_t block_size = geometry_.block_size;
+      const uint32_t need =
+          SymlinkBlocks(block_size, static_cast<uint32_t>(target.size()));
+      if (need == 0) {
+        return XFS_ERR(XfsError::kUnsupportedGeometry,
+                       "block size cannot hold a symlink header")
+            .Ino(child_ino);
+      }
+      Allocation alloc;
+      s = blocks.Allocate(geometry_.InoAgno(parent_ino), need, &alloc);
+      if (!s.ok()) return s;
+      ondisk::BmbtRec rec;
+      rec.startoff = 0;
+      rec.startblock = alloc.fsb;
+      rec.blockcount = alloc.len;
+      rec.unwritten = false;
+      uint64_t l0 = 0, l1 = 0;
+      ondisk::EncodeBmbtRec(rec, &l0, &l1);
+      std::vector<uint8_t> fork_region(16, 0);
+      PutBE64(fork_region.data(), 0, l0);
+      PutBE64(fork_region.data(), 8, l1);
+      child[di::kFormat] = di::kFormatExtents;
+      PutBE32(child.data(), di::kNextents, 1);
+      PutBE64(child.data(), di::kNblocks, alloc.len);
+      PutBE64(child.data(), di::kSize, target.size());
+      std::memcpy(child.data() + di::kCoreSizeV3, fork_region.data(), 16);
+      s = LogPreparedInode(txn, child_ino, std::move(child), lf::kILogDExt,
+                           fork_region);
+      if (!s.ok()) return s;
+
+      // The symlink payload buffer: header + target bytes, one header per
+      // contiguous extent (xfs_symlink_hdr_set).
+      std::vector<uint8_t> image(static_cast<size_t>(alloc.len) * block_size,
+                                 0);
+      PutBE32(image.data(), sym::kMagic, ondisk::kSymlinkMagic);
+      PutBE32(image.data(), sym::kOffset, 0);
+      PutBE32(image.data(), sym::kBytes,
+              static_cast<uint32_t>(target.size()));
+      std::memcpy(image.data() + sym::kUuid, geometry_.meta_uuid.data(), 16);
+      PutBE64(image.data(), sym::kOwner, child_ino);
+      PutBE64(image.data(), sym::kBlkno, geometry_.FsbToByte(alloc.fsb) / 512);
+      std::memcpy(image.data() + sym::kHeaderSize, target.data(),
+                  target.size());
+      s = txn.AddMetadataBuffer(geometry_.FsbToByte(alloc.fsb),
+                                std::move(image), lf::kBlftSymlink, sym::kLsn,
+                                sym::kCrc, "symlink");
+      if (!s.ok()) return s;
+    }
+
+    // Parent: dirent + timestamps (no link count change for a symlink).
+    DataForkEditor fork(&txn, &blocks, device_.get(), &geometry_);
+    s = fork.Load(parent.value());
+    if (!s.ok()) return s;
+    DirectoryEditor dir(&txn, &blocks, device_.get(), &geometry_, &fork);
+    s = dir.Load(parent.value());
+    if (!s.ok()) return s;
+    s = dir.Insert(DirEntryWrite{std::string(name), child_ino, d::kFtSymlink});
+    if (!s.ok()) return s;
+    s = dir.LogBlocks();
+    if (!s.ok()) return s;
+    auto raw = ReadRawInode(parent_ino);
+    if (!raw.ok()) return raw.error();
+    std::vector<uint8_t> image = std::move(raw.value());
+    uint32_t ilog_fields = 0;
+    std::vector<uint8_t> fork_region;
+    s = dir.FinalizeInode(&image, &ilog_fields, &fork_region);
+    if (!s.ok()) return s;
+    StoreTimestamp(image.data() + di::kMtime, now);
+    StoreTimestamp(image.data() + di::kCtime, now);
+    s = LogPreparedInode(txn, parent_ino, std::move(image), ilog_fields,
+                         fork_region);
+    if (!s.ok()) return s;
+
+    s = blocks.Commit();
+    if (!s.ok()) return s;
+    return inodes.Commit();
+  });
+  if (!status.ok()) return status.error();
+
+  InvalidateCaches(CacheInvalidation::Directory(parent_ino));
+  InvalidateCaches(CacheInvalidation::Inode(parent_ino));
+  InvalidateCaches(CacheInvalidation::Inode(child_ino));
+  XFS_DEBUG("symlink '" << name << "' in " << parent_ino << " -> " << child_ino
+                        << " target=" << target.size() << " bytes");
+  return child_ino;
 }
 
 }  // namespace xfs

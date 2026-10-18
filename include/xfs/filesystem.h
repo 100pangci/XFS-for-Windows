@@ -222,6 +222,55 @@ class XfsFilesystem {
   // file.
   Status FreeUnlinkedInode(uint64_t ino);
 
+  // ---- rename / hardlink / symlink (RW-4, read-write mounts only) ----
+  struct RenameOutcome {
+    uint64_t moved_ino = 0;      // the inode that changed name and/or parent
+    uint64_t replaced_ino = 0;   // target inode, 0 when the target was free
+    uint32_t replaced_new_nlink = 0;
+    // True when the replaced inode reached nlink 0 and went on the AGI
+    // unlinked list; it must be freed with FreeUnlinkedInode once its last
+    // handle closes (unless defer_replaced_free was false and this call
+    // already did it).
+    bool replaced_zero_link = false;
+  };
+
+  // Atomic rename (xfs_rename + xfs_dir_rename_children): one transaction
+  // carries the source and target directory edits, both parents' timestamps
+  // and link counts, the moved inode's ctime, the ".." rewrite of a
+  // cross-parent directory move, and the replaced target's link count plus
+  // AGI unlinked insertion. A crash therefore leaves either the old or the new
+  // namespace, never a half-applied one.
+  //
+  // Semantics match Linux/POSIX: renaming between two names of the same inode
+  // is a no-op; a directory can only replace an empty directory, a file only a
+  // file; a directory cannot move into its own subtree (kWouldCycle); a
+  // non-empty target directory fails with kDirectoryNotEmpty before anything
+  // is modified; `replace_existing == false` refuses an existing target with
+  // kAlreadyExists (RENAME_NOREPLACE).
+  //
+  // `defer_replaced_free` mirrors Unlink: with true the zero-link target inode
+  // stays on the unlinked list for a later FreeUnlinkedInode (open handles);
+  // with false it is freed before returning.
+  Result<RenameOutcome> Rename(uint64_t src_parent, std::string_view src_name,
+                               uint64_t dst_parent, std::string_view dst_name,
+                               bool replace_existing,
+                               bool defer_replaced_free = false);
+
+  // Creates a hard link (xfs_link): one transaction inserts the dirent,
+  // updates the parent's timestamps and bumps the inode's link count + ctime.
+  // Directories are refused (kPermissionDenied); a link count at XFS_MAXLINK
+  // fails with kTooManyLinks.
+  Status Link(uint64_t ino, uint64_t dst_parent, std::string_view dst_name);
+
+  // Creates a real XFS symlink inode (xfs_symlink). Targets that fit the
+  // inode literal area are stored inline (LOCAL); longer targets (up to
+  // XFS_SYMLINK_MAXLEN - 1 bytes) get remote data blocks with the v5
+  // xfs_dsymlink_hdr format. The target is an opaque byte string: it is never
+  // resolved, escaped or required to exist.
+  Result<uint64_t> CreateSymlink(uint64_t parent_ino, std::string_view name,
+                                 std::string_view target, uint16_t mode,
+                                 uint32_t uid, uint32_t gid);
+
   // ---- transactions and metadata mutations (read-write mounts only) ----
   // Begins a transaction at the current log position. The returned LSN is the
   // LSN of the record that will carry it; log items and the metadata buffers
