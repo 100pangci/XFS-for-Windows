@@ -1285,3 +1285,46 @@ TEST(recovery_mount_frees_unlinked_inodes) {
   fs.value().reset();
   fixture.Reset();
 }
+
+TEST(recovery_replays_a_freed_inode) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+
+  // A writer-side unlink leaves the transaction that frees the inode in the
+  // log: the core is zeroed (mode 0, xfs_difree), which is exactly what the
+  // kernel's xfs_dinode_verify accepts for an inode that is not in use.
+  // Recovery used to refuse it with "recovered inode did not verify".
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    auto removed = fs.value()->Unlink(fs.value()->RootInode(), "hello.bin");
+    CHECK(removed.ok());
+    // The filesystem object is dropped without writing an unmount record, so
+    // the freeing transaction stays in the log.
+  }
+
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    CHECK(fs.value()->recovery_report()->recovered);
+    CHECK(fs.value()->recovery_report()->replay.inodes_replayed >= 1u);
+  }
+  // The namespace entry is gone and the freed inode stays unreadable: the
+  // tolerance above is for replay, readers keep refusing a mode-0 inode.
+  auto lookup = fs.value()->LookupName(fs.value()->RootInode(), "hello.bin");
+  CHECK(!lookup.ok());
+  auto gone = fs.value()->OpenInode(fixture.info().file_ino);
+  CHECK(!gone.ok());
+  CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+  fs.value().reset();
+  fixture.Reset();
+}

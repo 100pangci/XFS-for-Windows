@@ -166,6 +166,21 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
       if (log.state == LogState::kClean || log.state == LogState::kEmpty) {
         XFS_SB_INFO("log is " << ToString(log.state) << " (" << log.detail
                               << ")");
+        // An explicit recovery still has to finish the log: it adopts the
+        // scanned position, runs the completion phases (the kernel processes
+        // the AGI unlinked lists on every mount, clean log or not) and closes
+        // the log with an unmount record when it does not have one. Without
+        // this the close path would classify the log a second time, and a torn
+        // record behind the newest good one reads as clean to the scanner but
+        // not to the record-latest classifier.
+        if (options.read_write && options.clean_log_after_recovery) {
+          auto report = fs->RecoverScannedLog(log, RecoveryFinish::kCleanLog);
+          if (!report.ok()) return report.error();
+          recovered = true;
+          fs->recovery_report_ = report.value();
+          XFS_SB_INFO("clean log finished: unlinked="
+                      << report.value().unlinked_inodes_processed);
+        }
       } else {
         const bool can_recover = options.read_write &&
                                  options.recover_dirty_log;

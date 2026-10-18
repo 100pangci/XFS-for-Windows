@@ -77,8 +77,12 @@ struct XfsInode {
 };
 
 // Parses + verifies one on-disk inode (v3 core, 176 bytes, plus forks).
+// `allow_free_inode` accepts di_mode == 0 (a freed inode, xfs_difree zeroed the
+// core): the kernel's xfs_dinode_verify only applies the mode/type, extent and
+// fork checks when the mode is non-zero, and recovery replays freed inodes.
+// Readers keep the default (a mode-0 inode is not a file).
 Status ParseInode(const uint8_t* buf, size_t len, const XfsGeometry& geo,
-                  uint64_t ino, XfsInode* out);
+                  uint64_t ino, XfsInode* out, bool allow_free_inode = false);
 
 Result<XfsInode> ReadInode(BlockDevice& dev, const XfsGeometry& geo,
                            uint64_t ino);
