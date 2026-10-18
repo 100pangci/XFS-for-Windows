@@ -41,7 +41,7 @@
 namespace xfs::cli {
 namespace {
 
-constexpr const char* kVersion = "xfswin 0.1.0 (XFS v5 read-only + formatter)";
+constexpr const char* kVersion = "xfswin 0.1.0 (XFS v5 reader, writer, journal recovery)";
 
 void PrintUsage() {
   std::cout <<

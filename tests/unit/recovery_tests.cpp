@@ -949,6 +949,30 @@ TEST(recovery_recover_command_cleans_the_log) {
   fixture.Reset();
 }
 
+TEST(recovery_of_a_clean_log_is_a_noop) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  xfs::MountOptions options;
+  options.check_log = false;
+  auto borrowed =
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage());
+  auto fs = xfs::XfsFilesystem::Mount(std::move(borrowed), options);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto report =
+      fs.value()->RecoverJournal(xfs::XfsFilesystem::RecoveryFinish::kMount);
+  CHECK(report.ok());
+  if (report.ok()) {
+    CHECK(!report.value().recovered);
+    CHECK_EQ(report.value().replay.transactions_replayed, 0u);
+  }
+  fs.value().reset();
+  fixture.Reset();
+}
+
 TEST(recovery_mount_finishes_extent_free_intents) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
