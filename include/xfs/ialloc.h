@@ -72,6 +72,13 @@ class InodeAllocator {
   // unlinked list.
   Status FreeInode(uint64_t ino);
 
+  // Allocates a new, completely free inode chunk in `agno` (xfs_ialloc_ag_alloc
+  // without handing out an inode). No-op when the AG already has free inodes.
+  // Used before a create so that the create transaction never has to carry a
+  // chunk allocation; a crash in between leaves a legal filesystem with more
+  // free inodes, never an unreachable inode. Must run in its own transaction.
+  Status PreallocateChunk(uint32_t agno);
+
   // AGI unlinked list support (xfs_iunlink / xfs_iunlink_remove). These only
   // touch the AGI bucket; the caller updates di_next_unlinked in the inode
   // items.

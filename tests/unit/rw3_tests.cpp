@@ -2,12 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - tests for RW-3: inode allocation, the inode free list and
-// the inode counters (AGI / inobt / superblock).
-//
-// The tests drive the same internal path the high-level namespace operations
-// use (BlockAllocator + InodeAllocator inside a transaction), verify the
-// on-disk result after a fresh remount, and cross-check the AGI counters, the
-// inobt records and the superblock counters independently of the writer.
+// the inode counters (AGI / inobt / superblock), then namespace mutation
+// (create, unlink, mkdir, rmdir) through the public API.
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -18,6 +15,7 @@
 #include "xfs/alloc.h"
 #include "xfs/btree.h"
 #include "xfs/endian.h"
+#include "xfs/extent.h"
 #include "xfs/filesystem.h"
 #include "xfs/ialloc.h"
 #include "xfs/ondisk.h"
@@ -428,6 +426,531 @@ TEST(rw3_new_chunk_is_a_full_64_inode_aligned_chunk) {
   CHECK_EQ(startino % igeo.ialloc_inos, 0u);
   const uint32_t agbno = startino >> geo.inopblog;
   CHECK_EQ(agbno % igeo.ialloc_blks, 0u);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+
+// ===========================================================================
+// Namespace mutation: create, unlink, mkdir, rmdir
+// ===========================================================================
+
+namespace {
+
+std::string FixedName(int index, size_t width = 8) {
+  std::string out = "f";
+  out += std::to_string(index);
+  while (out.size() < width) out.insert(1, 1, '0');
+  return out;
+}
+
+std::vector<std::string> ListNames(XfsFilesystem& fs, uint64_t ino) {
+  std::vector<std::string> names;
+  auto listing = fs.ListDirectory(ino);
+  if (!listing.ok()) {
+    std::printf("listing error: %s\n", listing.error().Format().c_str());
+  }
+  CHECK(listing.ok());
+  if (!listing.ok()) return names;
+  for (const XfsDirEntry& e : listing.value()) {
+    if (e.name == "." || e.name == "..") continue;
+    names.push_back(e.name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+// The directory format as written on disk (independent of the reader's
+// detection helpers): shortform, block, leaf or node.
+const char* DirFormatName(xfstest::FixtureImage& fixture, uint64_t ino) {
+  auto fs = fixture.Mount(/*read_write=*/false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return "?";
+  auto inode = fs.value()->OpenInode(ino);
+  CHECK(inode.ok());
+  if (!inode.ok()) return "?";
+  if (inode.value().format == ondisk::inode::kFormatLocal) return "shortform";
+  const XfsGeometry& geo = fs.value()->geometry();
+  const uint64_t leaf_blk = ondisk::dir::kLeafOffset >> geo.block_log;
+  std::vector<XfsExtent> extents;
+  Status loaded = LoadDataForkExtents(fs.value()->device(), geo,
+                                      inode.value(), &extents);
+  CHECK(loaded.ok());
+  if (!loaded.ok()) return "?";
+  uint64_t fsb0 = 0;
+  bool mapped0 = false;
+  for (const XfsExtent& e : extents) {
+    if (e.startoff <= 0 && 0 < e.EndBlock()) {
+      fsb0 = e.startblock;
+      mapped0 = true;
+    }
+  }
+  if (!mapped0) return "?";
+  std::vector<uint8_t> block(geo.block_size, 0);
+  CHECK(fixture.storage().Read(geo.FsbToByte(fsb0), block.data(), block.size()));
+  const uint32_t magic = GetBE32(block.data(), 0);
+  if (magic == ondisk::kDir3BlockMagic) return "block";
+  if (magic != ondisk::kDir3DataMagic) return "?";
+  // The leaf-space root block decides leaf vs node.
+  for (const XfsExtent& e : extents) {
+    if (e.startoff <= leaf_blk && leaf_blk < e.EndBlock()) {
+      const uint64_t fsb = e.startblock + (leaf_blk - e.startoff);
+      std::vector<uint8_t> root(geo.block_size, 0);
+      CHECK(fixture.storage().Read(geo.FsbToByte(fsb), root.data(),
+                                   root.size()));
+      const uint16_t m = GetBE16(root.data(), 8);
+      if (m == ondisk::kDir3Leaf1Magic) return "leaf";
+      return "node";
+    }
+  }
+  return "?";
+}
+
+}  // namespace
+
+TEST(rw3_create_regular_file) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  const SuperblockCounters before = ReadSuperblockCounters(fixture);
+  uint64_t ino = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    auto created = fs.value()->CreateFile(root, "hello.txt", 0100644, 0, 0);
+    if (!created.ok()) {
+      std::printf("create error: %s\n", created.error().Format().c_str());
+    }
+    CHECK(created.ok());
+    if (!created.ok()) return;
+    ino = created.value();
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  auto fs = fixture.Mount(/*read_write=*/false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  auto inode = fs.value()->OpenInode(ino);
+  CHECK(inode.ok());
+  CHECK_EQ(inode.value().nlink, 1u);
+  CHECK_EQ(inode.value().size, 0ull);
+  CHECK_EQ(inode.value().nblocks, 0ull);
+  CHECK_EQ(inode.value().format, ondisk::inode::kFormatExtents);
+  CHECK_EQ(inode.value().mode & 07777, 0644);
+  CHECK_EQ(inode.value().mode & kSIfmt, kSIfreg);
+  auto found = fs.value()->LookupName(root, "hello.txt");
+  CHECK(found.ok());
+  CHECK_EQ(found.value().ino, ino);
+  CHECK_EQ(found.value().ftype, ondisk::dir::kFtRegFile);
+  const SuperblockCounters after = ReadSuperblockCounters(fixture);
+  CHECK_EQ(after.icount, before.icount);
+  CHECK_EQ(after.ifree, before.ifree - 1);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_mkdir_and_rmdir) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  const SuperblockCounters before = ReadSuperblockCounters(fixture);
+  const uint32_t root_nlink_before = [&] {
+    auto fs = fixture.Mount(false);
+    auto inode = fs.value()->OpenInode(root);
+    CHECK(inode.ok());
+    return inode.value().nlink;
+  }();
+  uint64_t dir = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto mk = fs.value()->Mkdir(root, "sub", 0755, 0, 0);
+    if (!mk.ok()) std::printf("mkdir error: %s\n", mk.error().Format().c_str());
+    CHECK(mk.ok());
+    auto found = fs.value()->LookupName(root, "sub");
+    CHECK(found.ok());
+    dir = found.value().ino;
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    auto inode = fs.value()->OpenInode(dir);
+    CHECK(inode.ok());
+    CHECK(inode.value().IsDir());
+    CHECK_EQ(inode.value().nlink, 2u);
+    CHECK_EQ(inode.value().format, ondisk::inode::kFormatLocal);
+    CHECK_EQ(inode.value().size, 6ull);  // parent inode fits in 32 bits
+    CHECK_EQ(inode.value().mode & 07777, 0755);
+    auto parent = fs.value()->OpenInode(root);
+    CHECK(parent.ok());
+    CHECK_EQ(parent.value().nlink, root_nlink_before + 1);
+  }
+  CheckConsistent(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto rm = fs.value()->RemoveDirectory(root, "sub");
+    if (!rm.ok()) std::printf("rmdir error: %s\n", rm.error().Format().c_str());
+    CHECK(rm.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    auto found = fs.value()->LookupName(root, "sub");
+    CHECK(!found.ok());
+    CHECK_EQ(found.error().code, XfsError::kNotFound);
+    auto parent = fs.value()->OpenInode(root);
+    CHECK(parent.ok());
+    CHECK_EQ(parent.value().nlink, root_nlink_before);
+  }
+  const SuperblockCounters after = ReadSuperblockCounters(fixture);
+  CHECK_EQ(after.icount, before.icount);
+  CHECK_EQ(after.ifree, before.ifree);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_unlink_frees_data_and_inode) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  const SuperblockCounters before = ReadSuperblockCounters(fixture);
+  uint64_t ino = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto created = fs.value()->CreateFile(root, "doomed.bin", 0644, 0, 0);
+    CHECK(created.ok());
+    if (!created.ok()) return;
+    ino = created.value();
+    std::vector<uint8_t> data(8192, 0x5A);
+    auto written = fs.value()->WriteFileData(ino, 0, data.data(), data.size());
+    CHECK(written.ok());
+    CHECK_EQ(written.value(), data.size());
+    auto unlinked = fs.value()->Unlink(root, "doomed.bin", false);
+    if (!unlinked.ok()) {
+      std::printf("unlink error: %s\n", unlinked.error().Format().c_str());
+    }
+    CHECK(unlinked.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    auto found = fs.value()->LookupName(root, "doomed.bin");
+    CHECK(!found.ok());
+    CHECK_EQ(found.error().code, XfsError::kNotFound);
+    // The inode was freed: reading it now fails (mode 0).
+    auto inode = fs.value()->OpenInode(ino);
+    CHECK(!inode.ok());
+  }
+  const SuperblockCounters after = ReadSuperblockCounters(fixture);
+  CHECK_EQ(after.icount, before.icount);
+  CHECK_EQ(after.ifree, before.ifree);
+  CHECK_EQ(after.fdblocks, before.fdblocks);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_open_but_unlinked_defers_the_inode_free) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  uint64_t ino = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto created = fs.value()->CreateFile(root, "open.bin", 0644, 0, 0);
+    CHECK(created.ok());
+    if (!created.ok()) return;
+    ino = created.value();
+    std::vector<uint8_t> data(4096, 0x33);
+    CHECK(fs.value()->WriteFileData(ino, 0, data.data(), data.size()).ok());
+    auto unlinked = fs.value()->Unlink(root, "open.bin", true);
+    if (!unlinked.ok()) {
+      std::printf("unlink error: %s\n", unlinked.error().Format().c_str());
+    }
+    CHECK(unlinked.ok());
+    // The inode is unlinked from the namespace but still readable: this is
+    // the open-but-unlinked state.
+    auto open = fs.value()->OpenInode(ino);
+    CHECK(open.ok());
+    if (!open.ok()) return;
+    CHECK_EQ(open.value().nlink, 0u);
+    CHECK(open.value().mode != 0);
+    // The inode is on the AGI unlinked list (a single-element list has a
+    // NULLAGINO next pointer, so di_next_unlinked alone does not prove it).
+    {
+      const XfsGeometry& geo = fs.value()->geometry();
+      auto agi = ReadAgi(fixture.storage(), geo, geo.InoAgno(ino));
+      CHECK(agi.ok());
+      const uint32_t bucket = geo.InoAgino(ino) % ondisk::kAgiUnlinkedBuckets;
+      CHECK_EQ(agi.value().unlinked[bucket], geo.InoAgino(ino));
+    }
+    std::vector<uint8_t> got(4096, 0);
+    auto read = fs.value()->ReadFile(ino, 0, got.data(), got.size());
+    CHECK(read.ok());
+    CHECK(got == data);
+    // Last handle closed: final inode cleanup.
+    auto freed = fs.value()->FreeUnlinkedInode(ino);
+    if (!freed.ok()) {
+      std::printf("free error: %s\n", freed.error().Format().c_str());
+    }
+    CHECK(freed.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_directory_grows_through_all_formats) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  constexpr int kEntries = 640;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    for (int i = 0; i < kEntries; ++i) {
+      const std::string name = FixedName(i);
+      auto created = fs.value()->CreateFile(root, name, 0644, 0, 0);
+      if (!created.ok()) {
+        std::printf("create %s error: %s\n", name.c_str(),
+                    created.error().Format().c_str());
+        CHECK(created.ok());
+        return;
+      }
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Every name resolves, the listing is exact (plus the fixture's hello.bin).
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    const std::vector<std::string> names = ListNames(*fs.value(), root);
+    CHECK_EQ(names.size(), static_cast<size_t>(kEntries) + 1);
+    for (int i = 0; i < kEntries; ++i) {
+      const std::string name = FixedName(i);
+      auto found = fs.value()->LookupName(root, name);
+      CHECK(found.ok());
+      if (!found.ok()) return;
+      CHECK_EQ(found.value().ftype, ondisk::dir::kFtRegFile);
+    }
+  }
+  // A 640-entry directory with 8-byte names has long left the shortform and
+  // single-block formats; the on-disk format must be leaf or node.
+  const std::string fmt = DirFormatName(fixture, root);
+  CHECK(fmt == "leaf" || fmt == "node");
+  CheckConsistent(fixture);
+  // Delete half of the entries and verify the directory still enumerates.
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    for (int i = 0; i < kEntries; i += 2) {
+      auto unlinked = fs.value()->Unlink(root, FixedName(i), false);
+      if (!unlinked.ok()) {
+        std::printf("unlink %s error: %s\n", FixedName(i).c_str(),
+                    unlinked.error().Format().c_str());
+        CHECK(unlinked.ok());
+        return;
+      }
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    const std::vector<std::string> names = ListNames(*fs.value(), root);
+    CHECK_EQ(names.size(), static_cast<size_t>(kEntries / 2) + 1);
+    for (int i = 0; i < kEntries; ++i) {
+      auto found = fs.value()->LookupName(root, FixedName(i));
+      CHECK_EQ(found.ok(), (i % 2) == 0 ? false : true);
+    }
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_rmdir_of_a_grown_directory_frees_its_blocks) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  uint64_t dir = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    CHECK(fs.value()->Mkdir(root, "big", 0755, 0, 0).ok());
+    auto found = fs.value()->LookupName(root, "big");
+    CHECK(found.ok());
+    dir = found.value().ino;
+    for (int i = 0; i < 200; ++i) {
+      auto created = fs.value()->CreateFile(dir, FixedName(i), 0644, 0, 0);
+      CHECK(created.ok());
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CHECK(DirFormatName(fixture, dir) != std::string("shortform"));
+  const SuperblockCounters before = ReadSuperblockCounters(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    // Remove every child; the directory stays (empty) in a grown format.
+    for (int i = 0; i < 200; ++i) {
+      CHECK(fs.value()->Unlink(dir, FixedName(i), false).ok());
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto rm = fs.value()->RemoveDirectory(root, "big", false);
+    if (!rm.ok()) std::printf("rmdir error: %s\n", rm.error().Format().c_str());
+    CHECK(rm.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  const SuperblockCounters after = ReadSuperblockCounters(fixture);
+  // The directory's data/leaf blocks came back. Inode counters may move by a
+  // whole chunk when the last inode of a chunk is freed (xfs_difree), so the
+  // invariant to check is consistency, not equality.
+  CHECK(after.fdblocks > before.fdblocks);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_create_after_delete_reuses_the_inode_without_stale_data) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  uint64_t first = 0;
+  uint32_t first_gen = 0;
+  std::vector<uint8_t> secret(8192, 0xC7);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto created = fs.value()->CreateFile(root, "a.bin", 0644, 0, 0);
+    CHECK(created.ok());
+    if (!created.ok()) return;
+    first = created.value();
+    auto inode = fs.value()->OpenInode(first);
+    CHECK(inode.ok());
+    first_gen = inode.value().gen;
+    CHECK(fs.value()->WriteFileData(first, 0, secret.data(), secret.size()).ok());
+    CHECK(fs.value()->Unlink(root, "a.bin", false).ok());
+    auto second = fs.value()->CreateFile(root, "b.bin", 0644, 0, 0);
+    CHECK(second.ok());
+    if (!second.ok()) return;
+    // The allocator hands out the first free inode: the one just freed.
+    CHECK_EQ(second.value(), first);
+    auto inode2 = fs.value()->OpenInode(second.value());
+    CHECK(inode2.ok());
+    CHECK(inode2.value().gen != first_gen);
+    CHECK_EQ(inode2.value().size, 0ull);
+    CHECK_EQ(inode2.value().nextents, 0u);
+    CHECK_EQ(inode2.value().nblocks, 0ull);
+    std::vector<uint8_t> got(4096, 0xAA);
+    auto read = fs.value()->ReadFile(second.value(), 0, got.data(), got.size());
+    CHECK(read.ok());
+    CHECK_EQ(read.value(), 0ull);  // size 0: nothing visible
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_rmdir_rejects_a_non_empty_directory) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    CHECK(fs.value()->Mkdir(root, "full", 0755, 0, 0).ok());
+    auto found = fs.value()->LookupName(root, "full");
+    CHECK(found.ok());
+    const uint64_t dir = found.value().ino;
+    CHECK(fs.value()->CreateFile(dir, "child", 0644, 0, 0).ok());
+    auto rm = fs.value()->RemoveDirectory(root, "full", false);
+    CHECK(!rm.ok());
+    CHECK_EQ(rm.error().code, XfsError::kDirectoryNotEmpty);
+    // Nothing was modified.
+    auto again = fs.value()->LookupName(root, "full");
+    CHECK(again.ok());
+    CHECK(fs.value()->LookupName(dir, "child").ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_create_rejects_invalid_names) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    auto dot = fs.value()->CreateFile(root, ".", 0644, 0, 0);
+    CHECK(!dot.ok());
+    auto dotdot = fs.value()->CreateFile(root, "..", 0644, 0, 0);
+    CHECK(!dotdot.ok());
+    auto slash = fs.value()->CreateFile(root, "a/b", 0644, 0, 0);
+    CHECK(!slash.ok());
+    auto empty = fs.value()->CreateFile(root, "", 0644, 0, 0);
+    CHECK(!empty.ok());
+    const std::string too_long(256, 'x');
+    auto long_name = fs.value()->CreateFile(root, too_long, 0644, 0, 0);
+    CHECK(!long_name.ok());
+    CHECK_EQ(long_name.error().code, XfsError::kNameTooLong);
+    const std::string max_name(255, 'y');
+    auto max_ok = fs.value()->CreateFile(root, max_name, 0644, 0, 0);
+    if (!max_ok.ok()) {
+      std::printf("255-byte create error: %s\n",
+                  max_ok.error().Format().c_str());
+    }
+    CHECK(max_ok.ok());
+    CHECK(fs.value()->LookupName(root, max_name).ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_create_duplicate_name_is_refused) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    CHECK(fs.value()->CreateFile(root, "dup", 0644, 0, 0).ok());
+    auto again = fs.value()->CreateFile(root, "dup", 0644, 0, 0);
+    CHECK(!again.ok());
+    CHECK_EQ(again.error().code, XfsError::kAlreadyExists);
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  const std::vector<std::string> expected{"dup", "hello.bin"};
+  auto fs = fixture.Mount(false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  const std::vector<std::string> names = ListNames(*fs.value(), root);
+  CHECK(names == expected);
   CheckConsistent(fixture);
   fixture.Reset();
 }

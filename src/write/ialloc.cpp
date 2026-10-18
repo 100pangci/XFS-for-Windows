@@ -919,6 +919,7 @@ class AllocImpl {
 
   Status AllocateInode(uint32_t preferred_agno, uint32_t preferred_agino,
                        uint64_t* ino_out);
+  Status PreallocateChunk(uint32_t agno);
   Status FreeInode(uint64_t ino);
   Result<uint32_t> UnlinkedBucketHead(uint32_t agno, uint32_t bucket);
   Status SetUnlinkedBucketHead(uint32_t agno, uint32_t bucket, uint32_t agino);
@@ -933,6 +934,7 @@ class AllocImpl {
                               InobtRecord* rec, uint32_t* offset);
   Status AllocateFromRecord(AgiState* ag, const InobtRecord& rec,
                             uint32_t offset);
+  Status CreateChunk(AgiState* ag, InobtRecord* rec_out);
   Status AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
                           uint32_t* offset_out);
   Status ApplySuperblockDeltas();
@@ -1079,8 +1081,7 @@ Status AllocImpl::AllocateFromRecord(AgiState* ag, const InobtRecord& rec,
   return OkStatus();
 }
 
-Status AllocImpl::AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
-                              uint32_t* offset_out) {
+Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
   // Allocate the chunk blocks: ialloc_blks contiguous blocks, aligned like
   // xfs_ialloc_ag_alloc (cluster_align, which is sb_inoalignmt when the
   // filesystem has the align feature and the value is usable).
@@ -1113,15 +1114,11 @@ Status AllocImpl::AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
   PutBE32(icreate.data(), lf::kIclGen, gen);
   txn_->AddLogOp(std::move(icreate));
 
-  // Insert the full (holemask 0) chunk record, then take the first inode.
-  uint32_t offset = 0;
+  // Insert the full (holemask 0) chunk record with all inodes free.
   InobtRecord rec;
   rec.startino = startino;
   rec.free = ~0ULL;
   rec.freecount = 64;
-  // First free inode of a fresh chunk is offset 0.
-  rec.free &= ~(1ULL << offset);
-  rec.freecount--;
   s = ag->inobt->Insert(rec);
   if (!s.ok()) return s;
 
@@ -1130,10 +1127,45 @@ Status AllocImpl::AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
   ag->newino = startino;
   icount_delta_ += 64;
   ifree_delta_ += 64;
-  --ifree_delta_;  // the inode we are handing out
-  ag->freecount--;
   ag->dirty = true;
   *rec_out = rec;
+  return OkStatus();
+}
+
+Status AllocImpl::PreallocateChunk(uint32_t agno) {
+  if (agno >= geo_->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  AgiState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  if (ag->freecount > 0) {
+    // The AG already has free inodes: nothing to do (and a second chunk would
+    // only waste space).
+    return OkStatus();
+  }
+  InobtRecord rec;
+  return CreateChunk(ag, &rec);
+}
+
+Status AllocImpl::AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
+                              uint32_t* offset_out) {
+  InobtRecord rec;
+  Status s = CreateChunk(ag, &rec);
+  if (!s.ok()) return s;
+  // Hand out the first inode of the new chunk (lowest free bit).
+  const uint32_t offset = 0;
+  InobtRecord updated = rec;
+  updated.free &= ~(1ULL << offset);
+  updated.freecount--;
+  s = ag->inobt->Update(updated);
+  if (!s.ok()) return s;
+  ag->freecount--;
+  --ifree_delta_;
+  ag->dirty = true;
+  *rec_out = updated;
   *offset_out = offset;
   return OkStatus();
 }
@@ -1348,7 +1380,8 @@ Status AllocImpl::Commit() {
   if (!txn_->record_fits()) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "inode allocation metadata does not fit in one log record")
-        .Metadata("transaction");
+        .Metadata("transaction")
+        .Expected(txn_->record_bytes());
   }
   return OkStatus();
 }
@@ -1404,6 +1437,10 @@ Status InodeAllocator::AllocateInode(uint32_t preferred_agno,
                                      uint32_t preferred_agino,
                                      uint64_t* ino_out) {
   return impl_->impl->AllocateInode(preferred_agno, preferred_agino, ino_out);
+}
+
+Status InodeAllocator::PreallocateChunk(uint32_t agno) {
+  return impl_->impl->PreallocateChunk(agno);
 }
 
 Status InodeAllocator::FreeInode(uint64_t ino) {
