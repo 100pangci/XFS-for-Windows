@@ -51,7 +51,12 @@ def manifest(mountpoint):
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, mountpoint)
             st = os.lstat(path)
-            entry = {"mode": stat.S_IMODE(st.st_mode), "nlink": st.st_nlink}
+            entry = {"mode": stat.S_IMODE(st.st_mode), "nlink": st.st_nlink,
+                     # mtime changes on every scenario (utime, rename,
+                     # create/unlink through the parent, extend, truncate) and
+                     # is never changed by reading, so comparing it proves the
+                     # timestamp bytes were replayed, not just the namespace.
+                     "mtime_ns": st.st_mtime_ns}
             if stat.S_ISDIR(st.st_mode):
                 entry["type"] = "dir"
             elif stat.S_ISLNK(st.st_mode):

@@ -121,8 +121,8 @@ for scenario in $SCENARIOS; do
     fi
     # Record the real item inventory of this operation (docs/RECOVERY.md's
     # operation -> item table is built from this evidence, not from guesses).
-    python3 "$REPO/tests/tools/recovery_probe.py" --json \
-        "$OUT/$scenario.img" > "$OUT/$scenario.journal.json"
+    python3 "$REPO/tests/tools/recovery_probe.py" \
+        "$OUT/$scenario.img" --json > "$OUT/$scenario.journal.json"
     python3 - "$scenario" "$OUT/$scenario.journal.json" >> "$OUT/inventory.txt" <<'PY'
 import json
 import sys

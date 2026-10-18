@@ -827,7 +827,17 @@ def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
-    path = argv[1]
+    # The image path is the first non-option argument (accepting options first
+    # keeps shell callers from having to remember the order).
+    args = argv[1:]
+    skip = set()
+    if "--compare" in args:
+        skip.add(args.index("--compare") + 1)
+    path = next((a for i, a in enumerate(args)
+                 if not a.startswith("--") and i not in skip), None)
+    if path is None:
+        print(__doc__)
+        return 2
     mode_json = "--json" in argv
     comparison = None
     if "--compare" in argv:
