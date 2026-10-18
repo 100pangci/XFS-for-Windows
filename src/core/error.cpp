@@ -39,6 +39,8 @@ const char* ToString(XfsError code) {
     case XfsError::kNotSymlink: return "not a symlink";
     case XfsError::kNameTooLong: return "name too long";
     case XfsError::kDirectoryNotEmpty: return "directory not empty";
+    case XfsError::kTooManyLinks: return "too many links";
+    case XfsError::kWouldCycle: return "directory move would create a cycle";
     case XfsError::kReadOnlyVolume: return "volume is read-only";
     case XfsError::kNotMounted: return "not mounted";
     case XfsError::kWriteExtendsFile:

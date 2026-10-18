@@ -62,6 +62,8 @@ enum class XfsError : uint32_t {
   kNotSymlink,
   kNameTooLong,
   kDirectoryNotEmpty,
+  kTooManyLinks,       // di_nlink would exceed XFS_MAXLINK (xfs_link/VFS EMLINK)
+  kWouldCycle,         // a directory move into its own descendant (rename EINVAL)
   kReadOnlyVolume,
   kNotMounted,
 
