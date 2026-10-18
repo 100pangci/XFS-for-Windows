@@ -66,6 +66,14 @@ class BlockAllocator {
   // build does not implement (the AGFL cannot provide a block).
   Status Allocate(uint32_t preferred_agno, uint32_t len, Allocation* out);
 
+  // Allocates `len` contiguous blocks from *one* AG (never another), with the
+  // run's start block aligned to `align` blocks (a power of two, 1 = no
+  // alignment). This is the inode chunk allocation (`xfs_ialloc_ag_alloc`
+  // with a cluster/inode-chunk alignment). Fails with kNoSpace when that AG
+  // has no free extent that fits an aligned run.
+  Status AllocateFromAg(uint32_t agno, uint32_t len, uint32_t align,
+                        Allocation* out);
+
   // Frees [fsb, fsb+len), which must lie inside one AG and be currently
   // allocated. Contiguous free neighbours are merged.
   Status Free(uint64_t fsb, uint32_t len);

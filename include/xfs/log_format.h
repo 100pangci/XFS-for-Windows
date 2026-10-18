@@ -85,8 +85,22 @@ constexpr size_t kThNumItems = 12;  // u32
 // ---------------------------------------------------------------------------
 // Item types and item format headers, host byte order
 // ---------------------------------------------------------------------------
-constexpr uint16_t kItemInode = 0x123b;  // XFS_LI_INODE
-constexpr uint16_t kItemBuf = 0x123c;    // XFS_LI_BUF
+constexpr uint16_t kItemInode = 0x123b;   // XFS_LI_INODE
+constexpr uint16_t kItemBuf = 0x123c;     // XFS_LI_BUF
+constexpr uint16_t kItemIcreate = 0x123f; // XFS_LI_ICREATE
+
+// xfs_icreate_log, 28 bytes, host endian type/size then big-endian fields.
+// Replay calls xfs_ialloc_inode_init, which rebuilds the whole inode cluster
+// from scratch: exactly what a newly allocated chunk needs.
+constexpr size_t kIcreateLogSize = 28;
+constexpr size_t kIclType = 0;     // u16
+constexpr size_t kIclSize = 2;     // u16: 1 (single vector)
+constexpr size_t kIclAg = 4;       // be32
+constexpr size_t kIclAgbno = 8;    // be32
+constexpr size_t kIclCount = 12;   // be32
+constexpr size_t kIclIsize = 16;   // be32
+constexpr size_t kIclLength = 20;  // be32
+constexpr size_t kIclGen = 24;     // be32
 
 // xfs_inode_log_format, 56 bytes
 constexpr size_t kInodeLogFormatSize = 56;

@@ -36,6 +36,7 @@ add_library(xfs_core STATIC
   write/inode_write.cpp
   write/alloc.cpp
   write/bmap.cpp
+  write/ialloc.cpp
   write/file_write.cpp
   write/flush.cpp
   win_name_map.cpp

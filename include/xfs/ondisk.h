@@ -343,6 +343,10 @@ constexpr size_t kAllocRecSize = 8;   // leaf record == key size
 constexpr size_t kInobtKeySize = 4;   // startino be32
 constexpr size_t kInobtPtrSize = 4;   // be32
 constexpr size_t kInobtRecSize = 16;  // xfs_inobt_rec
+// xfs_inobt_rec fields without sparse inodes:
+constexpr size_t kInobtRecStartino = 0;   // be32
+constexpr size_t kInobtRecFreecount = 4;  // be32 (sparse layout: holemask+count)
+constexpr size_t kInobtRecFree = 8;       // be64
 constexpr size_t kBmbtKeySize = 8;    // startoff be64
 constexpr size_t kBmbtPtrSize = 8;    // be64
 constexpr size_t kBmbtRecSize = 16;   // xfs_bmbt_rec

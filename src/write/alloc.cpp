@@ -232,6 +232,7 @@ struct AgState {
   Status PutTreeBlock(uint32_t agbno);
   Status RefillAgfl(uint32_t want);
   Status AllocateBestFit(uint32_t want, Allocation* out);
+  Status AllocateAligned(uint32_t want, uint32_t align, Allocation* out);
   void RecomputeLongest();
   uint32_t Contribution() const;
 };
@@ -1243,6 +1244,54 @@ Status AgState::AllocateBestFit(uint32_t want, Allocation* out) {
   return OkStatus();
 }
 
+Status AgState::AllocateAligned(uint32_t want, uint32_t align, Allocation* out) {
+  if (align <= 1) return AllocateBestFit(want, out);
+  // Best fit among the free extents that contain an aligned run of `want`
+  // blocks: the candidate with the smallest extent wins, then the one whose
+  // aligned start is closest to the extent start, then the lowest start.
+  const FreeRec* best = nullptr;
+  uint32_t best_off = 0;
+  uint32_t best_slack = 0;
+  for (const FreeRec& r : recs) {
+    if (r.len < want) continue;
+    uint32_t off = (r.start + align - 1) & ~(align - 1);
+    if (off < r.start) continue;  // overflow cannot happen inside an AG
+    const uint32_t slack = off - r.start;
+    if (slack > r.len - want) continue;
+    if (best == nullptr || r.len < best->len ||
+        (r.len == best->len &&
+         (slack < best_slack || (slack == best_slack && r.start < best->start)))) {
+      best = &r;
+      best_off = off;
+      best_slack = slack;
+    }
+  }
+  if (best == nullptr) {
+    return XFS_ERR(XfsError::kNoSpace,
+                   "AG has no free extent with an aligned run that large")
+        .Ag(agno)
+        .Metadata("free space")
+        .Actual(want);
+  }
+  const FreeRec old = *best;
+  Status s = RemoveRec(old);
+  if (!s.ok()) return s;
+  if (best_off > old.start) {
+    s = InsertRec(FreeRec{old.start, best_off - old.start});
+    if (!s.ok()) return s;
+  }
+  if (old.start + old.len > best_off + want) {
+    s = InsertRec(FreeRec{best_off + want, old.start + old.len - (best_off + want)});
+    if (!s.ok()) return s;
+  }
+  freeblks -= want;
+  RecomputeLongest();
+  agf_dirty = true;
+  out->fsb = owner->geo()->AgFsb(agno, best_off);
+  out->len = want;
+  return OkStatus();
+}
+
 // ---------------------------------------------------------------------------
 // Allocator
 // ---------------------------------------------------------------------------
@@ -1335,11 +1384,17 @@ Status Allocator::Commit() {
   }
 
   if (fdblocks_delta_ != 0) {
-    std::vector<uint8_t> sb_buf(geo_->sector_size, 0);
-    if (!device_->Read(0, sb_buf.data(), sb_buf.size())) {
-      return XFS_ERR(XfsError::kIoError, "failed to read the superblock")
-          .Offset(0)
-          .Metadata("superblock");
+    std::vector<uint8_t> sb_buf;
+    const std::vector<uint8_t>* queued = txn_->QueuedBuffer(0);
+    if (queued != nullptr) {
+      sb_buf = *queued;
+    } else {
+      sb_buf.assign(geo_->sector_size, 0);
+      if (!device_->Read(0, sb_buf.data(), sb_buf.size())) {
+        return XFS_ERR(XfsError::kIoError, "failed to read the superblock")
+            .Offset(0)
+            .Metadata("superblock");
+      }
     }
     const uint64_t current = GetBE64(sb_buf.data(), sb::kFdblocks);
     const int64_t updated = static_cast<int64_t>(current) + fdblocks_delta_;
@@ -1410,6 +1465,31 @@ Status BlockAllocator::Allocate(uint32_t preferred_agno, uint32_t len,
   return XFS_ERR(XfsError::kNoSpace, "no AG has a free extent that large")
       .Metadata("allocator")
       .Actual(len);
+}
+
+Status BlockAllocator::AllocateFromAg(uint32_t agno, uint32_t len,
+                                      uint32_t align, Allocation* out) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (agno >= geo->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
+        .Metadata("allocator");
+  }
+  if (align <= 1) align = 1;
+  if ((align & (align - 1)) != 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "alignment must be a power of two")
+        .Metadata("allocator")
+        .Actual(align);
+  }
+  AgState* ag = nullptr;
+  Status s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  return ag->AllocateAligned(len, align, out);
 }
 
 Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {

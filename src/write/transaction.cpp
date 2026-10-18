@@ -49,6 +49,14 @@ std::string TxnText(const XfsTransaction& txn, const char* what) {
 
 }  // namespace
 
+const std::vector<uint8_t>* XfsTransaction::QueuedBuffer(uint64_t offset) const {
+  auto it = logged_buffers_.find(offset);
+  if (it == logged_buffers_.end()) return nullptr;
+  const size_t index = it->second.op_index;
+  if (index + 1 >= ops_.size()) return nullptr;
+  return &ops_[index + 1].payload;
+}
+
 size_t XfsTransaction::log_bytes() const {
   size_t bytes = 0;
   for (const LogOp& op : ops_) {

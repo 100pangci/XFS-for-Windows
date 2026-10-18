@@ -79,6 +79,11 @@ class XfsTransaction {
 
   const std::vector<LogOp>& ops() const { return ops_; }
   const std::vector<TransactionWrite>& writes() const { return writes_; }
+  // Contents of a metadata buffer already queued in this transaction, or
+  // nullptr when the buffer is not part of it. Lets several callers (the block
+  // allocator's sb_fdblocks, the inode allocator's sb_icount/sb_ifree) apply
+  // deltas to the same superblock buffer without losing each other's changes.
+  const std::vector<uint8_t>* QueuedBuffer(uint64_t offset) const;
   size_t log_bytes() const;
   // Total size of the framed log record (header block + rounded data).
   size_t record_bytes() const;
