@@ -124,9 +124,13 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
     }
     // Clean/empty: only the unlinked lists can still need attention (a crash
     // after the unlink transaction was flushed leaves a legal, clean log with
-    // zero-link inodes on the AGI lists).
+    // zero-link inodes on the AGI lists). The completion uses transactions, so
+    // the filesystem must act writable for the duration.
+    const bool was_writable = writable_;
+    writable_ = true;
     uint64_t cleared = 0;
     auto processed = ProcessAgiUnlinkedLists(&cleared);
+    writable_ = was_writable;
     if (!processed.ok()) return processed.error();
     report.unlinked_inodes_processed = processed.value();
     report.agi_buckets_cleared = cleared;
