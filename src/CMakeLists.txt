@@ -41,6 +41,7 @@ add_library(xfs_core STATIC
   write/namespace.cpp
   write/file_write.cpp
   write/flush.cpp
+  recovery/log_scan.cpp
   win_name_map.cpp
 )
 
