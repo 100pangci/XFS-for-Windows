@@ -128,6 +128,27 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
     // the filesystem must act writable for the duration.
     const bool was_writable = writable_;
     writable_ = true;
+    // Adopt the scanned log position even though nothing is replayed:
+    //   * the close path must not classify the log a second time - a torn
+    //     record behind the newest good one is trimmed here, but the
+    //     record-latest classifier would call the log dirty and refuse to
+    //     write,
+    //   * a log whose tail already reached the head has no unmount record, so
+    //     an explicit recovery still closes it at the scanned head.
+    // A zeroed log keeps going through the classifier, which knows the fresh
+    // "cycle 1, block 0, no previous record" layout.
+    if (scan.state == LogState::kClean) {
+      log_position_ = LogPosition{};
+      log_position_.cycle = scan.head_cycle;
+      log_position_.next_block = scan.head_block;
+      log_position_.prev_block = scan.prev_block;
+      log_position_.tail_lsn = MakeLsn(scan.head_cycle, scan.head_block);
+      log_position_.log_blocks = scan.geometry.log_blocks;
+      log_position_.record_size = 32 * 1024;  // XLOG_BIG_RECORD_BSIZE
+      log_position_.clean = scan.ends_with_unmount_record;
+      log_position_valid_ = true;
+      log_dirty_ = !scan.ends_with_unmount_record;
+    }
     uint64_t cleared = 0;
     auto processed = ProcessAgiUnlinkedLists(&cleared);
     writable_ = was_writable;

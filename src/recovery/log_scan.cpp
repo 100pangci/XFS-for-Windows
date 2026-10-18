@@ -1631,6 +1631,7 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
       return scan;
     case LogState::kClean:
       scan.detail = "newest log record is an unmount record";
+      scan.ends_with_unmount_record = true;
       return scan;
     case LogState::kUnknown:
       scan.detail = "log contains data but no valid record headers";

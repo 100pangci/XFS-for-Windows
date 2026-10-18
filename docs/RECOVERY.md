@@ -262,13 +262,14 @@ Two oracles are kept; neither side proves itself:
   truncate, create, unlink, mkdir, rmdir, rename (same/cross/replace),
   hardlink, symlink (inline/remote). Each fixture is a device-mapper snapshot
   taken while I/O is frozen and with the operation, its manifest and the freeze
-  in one process, so the operation's transaction is still in the recovery
-  window (the generator retries a phase that captured only superblock counter
-  buffers). The expected post-operation namespace/content is recorded as a
-  manifest before the capture, and the generator replays a copy of every
-  snapshot with the Linux kernel and requires that replay to reach the
-  manifest: the fixture exists only if Linux itself recovers to the recorded
-  state. Windows must reproduce it and Linux must accept it.
+  in one process, while a stream of fsync'd noise writes keeps the log busy so
+  the kernel cannot cover the log and the operation's transaction is still in
+  the window (a phase whose window carries no operation item is retried). The
+  expected post-operation namespace/content is recorded as a manifest before
+  the capture, and the generator replays a copy of every snapshot with the
+  Linux kernel and requires that replay to reach the manifest: the fixture
+  exists only if Linux itself recovers to the recorded state. Windows must
+  reproduce it and Linux must accept it.
 * **C - recovery itself crashes**: `windows-recovery-crash-matrix` kills
   `xfswin` inside recovery at every `recovery_*` point and requires the restart
   to converge (`linux-verify-recovery-crash` re-checks the result).
@@ -288,7 +289,12 @@ Two oracles are kept; neither side proves itself:
 * `xfswin recover <image> --yes-i-really-mean-it`: explicit recovery; ends with
   a clean-unmount record and prints records/transactions/items/buffers
   (skipped by LSN), intents completed, unlinked inodes processed and the final
-  log state. `--verbose` adds icreate/inode/byte counters.
+  log state. `--verbose` adds icreate/inode/byte counters. A log that needs no
+  replay still goes through the completion phases and is closed: the scanned
+  position is adopted instead of classifying the log a second time (a torn
+  record behind the newest good one reads as clean to the scanner but not to
+  the record-latest classifier), and a log whose newest good record already is
+  the unmount record is left untouched.
 * `xfswin check`: read-only. A dirty log is reported as
   `journal: dirty - recovery required (recoverable transactions=N, items=M,
   unsupported items=...)`; it never writes.

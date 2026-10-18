@@ -63,7 +63,7 @@ XfsTimestamp CurrentTimestamp() {
 }
 
 Status ParseInode(const uint8_t* buf, size_t len, const XfsGeometry& geo,
-                  uint64_t ino, XfsInode* out) {
+                  uint64_t ino, XfsInode* out, bool allow_free_inode) {
   if (len < geo.inode_size) {
     return XFS_ERR(XfsError::kCorruptInode, "inode buffer too small")
         .Ino(ino)
@@ -177,6 +177,16 @@ Status ParseInode(const uint8_t* buf, size_t len, const XfsGeometry& geo,
         .Ino(ino)
         .Metadata("inode");
   }
+
+  // A free inode is a legal on-disk state: xfs_difree zeroes the core (mode 0,
+  // nlink 0) and the kernel's xfs_dinode_verify only applies the mode/type,
+  // extent-count, fork-offset and realtime checks when di_mode is non-zero
+  // (libxfs/xfs_inode_buf.c). Recovery replays freed inodes (unlink, rmdir,
+  // rename-replace) and asks for them here; the identity fields validated above
+  // (magic, version, checksum, di_ino, uuid) are the ones that hold for every
+  // inode, and there are no forks to decode. Readers keep refusing mode 0: a
+  // freed inode is not a file.
+  if (allow_free_inode && inode.mode == 0) return OkStatus();
 
   // Mode sanity.
   uint16_t type = inode.mode & kSIfmt;

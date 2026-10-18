@@ -131,6 +131,10 @@ struct LogScan {
   uint64_t newest_lsn = 0;   // h_lsn of the newest good record
   uint64_t tail_lsn = 0;     // h_tail_lsn of the newest good record
   bool wrapped = false;      // the newest record wrapped the physical end
+  // kClean because the newest good record is the unmount record (as opposed to
+  // kClean because the tail already reached the head): the log is closed and
+  // an explicit recovery has nothing to append.
+  bool ends_with_unmount_record = false;
 
   std::vector<LogRecordInfo> records;               // replay order
   std::vector<RecoveredTransaction> transactions;   // committed, replay order

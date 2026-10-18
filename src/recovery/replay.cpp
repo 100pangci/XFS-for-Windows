@@ -1018,7 +1018,8 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
   // Re-generate the checksum and validate the recovered inode.
   UpdateXfsChecksum(dip, geo_.inode_size, di::kCrc);
   XfsInode verified;
-  Status check = ParseInode(dip, geo_.inode_size, geo_, in_f.ino, &verified);
+  Status check = ParseInode(dip, geo_.inode_size, geo_, in_f.ino, &verified,
+                            /*allow_free_inode=*/true);
   if (!check.ok()) {
     return XFS_ERR(XfsError::kCorruptInode,
                    "recovered inode did not verify: " + check.error().message)

@@ -15,8 +15,10 @@ Three jobs:
       the journal - that is exactly the crash state recovery has to handle),
       writes the expected post-operation state (type, size, sha256, link
       target, nlink, mtime) as JSON, and then suspends the device-mapper device
-      right away, so the operation's transaction is still inside the recovery
-      window when the device bytes are copied.
+      right away. An fsync'd noise stream in noise/ keeps the log busy until
+      the freeze, so the kernel cannot cover the log (which would move the tail
+      past the operation) and the operation's transaction is still inside the
+      recovery window when the device bytes are copied.
 
   dirty_ops.py verify <mountpoint> <manifest.json>
       compares a mounted filesystem against a manifest (used by the Linux
@@ -195,24 +197,32 @@ def verify(mountpoint, manifest_path):
     return 0 if not problems else 1
 
 
-def _noise(mountpoint, count):
-    """Dumps a burst of fsync'd transactions into the log.
-
-    The kernel covers an idle log (empty CIL and AIL): it syncs the
-    superblock, pushes the AIL and moves the log tail past everything that was
-    just logged, which would leave the recovery window with nothing but the
-    covering transaction. A burst of real transactions keeps the AIL
-    non-empty, so the covering cannot run and the next transaction - the
-    operation under test - stays inside the window. The noise lives in
-    noise/ (outside base/, so outside the manifest).
-    """
+def _noise_files(mountpoint):
+    """Prepares the noise files (outside base/, so outside the manifest)."""
     directory = os.path.join(mountpoint, "noise")
-    for i in range(count):
+    os.makedirs(directory, exist_ok=True)
+    for i in range(64):
+        write_file(os.path.join(directory, "n%d" % i), b"n" * 512)
+    return directory
+
+
+def _noise(directory, stop):
+    """Keeps the log busy until `stop` is set.
+
+    The kernel covers an idle log every syncd period: it syncs the superblock,
+    pushes the whole AIL and moves the tail past everything that was just
+    logged, which leaves the recovery window with nothing but the covering
+    transaction (superblock buffers). Covering cannot start while the CIL or
+    the AIL is non-empty, so a stream of fsync'd in-place writes keeps the
+    operation under test inside the window until the device is frozen.
+    """
+    i = 0
+    while not stop.is_set():
         try:
-            write_file(os.path.join(directory, "n%d" % (i % 64)),
-                       b"n" * 512)
+            write_file(os.path.join(directory, "n%d" % (i % 64)), b"n" * 512)
         except OSError:
             break
+        i += 1
 
 
 def capture(scenario, mountpoint, manifest_path, dm, noise=True):
@@ -221,21 +231,33 @@ def capture(scenario, mountpoint, manifest_path, dm, noise=True):
 
     fsync makes the log record durable but does not stop the kernel from
     syncing the metadata back (which moves the tail past the record). The
-    noise burst keeps the AIL non-empty so the log covering stays away, and
-    the device freeze follows the fsync immediately.
+    noise stream keeps the AIL non-empty so the log covering stays away, and
+    the device freeze follows the fsync immediately. The noise thread is still
+    running when the device is suspended (its next write blocks there), so the
+    window is frozen mid-noise, exactly like a crash on a busy filesystem.
     """
-    os.makedirs(os.path.join(mountpoint, "noise"), exist_ok=True)
+    stop = threading.Event()
+    worker = None
     if noise:
-        worker = threading.Thread(target=_noise, args=(mountpoint, 400),
+        directory = _noise_files(mountpoint)
+        worker = threading.Thread(target=_noise, args=(directory, stop),
                                   daemon=True)
         worker.start()
-        worker.join()
-    run(scenario, mountpoint)
-    data = manifest(mountpoint)
-    with open(manifest_path, "w") as handle:
-        json.dump({"scenario": scenario, "entries": data}, handle,
-                  indent=2, sort_keys=True)
-    subprocess.run(["dmsetup", "suspend", dm], check=True)
+        time.sleep(0.2)  # let the log fill before the operation
+    try:
+        run(scenario, mountpoint)
+        data = manifest(mountpoint)
+        with open(manifest_path, "w") as handle:
+            json.dump({"scenario": scenario, "entries": data}, handle,
+                      indent=2, sort_keys=True)
+        subprocess.run(["dmsetup", "suspend", dm], check=True)
+    finally:
+        stop.set()
+        if worker is not None:
+            # The noise thread is usually blocked in an fsync on the suspended
+            # device; the process exits right after this and kills it, so a
+            # short join is enough to let an idle iteration finish.
+            worker.join(timeout=0.2)
     print("%s: %d entries, device frozen" % (scenario, len(data)))
 
 
