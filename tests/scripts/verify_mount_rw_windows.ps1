@@ -16,8 +16,8 @@
 #
 #   1. writes the overlay into one file through the WinFsp Write callback and
 #      Flush, and verifies the bytes read back through the mount,
-#   2. asserts that rename and symlink creation and writes to a read-only file
-#      are refused, while create/mkdir/delete/rmdir work (RW-3 scope),
+#   2. asserts that symlink creation and writes to a read-only file are
+#      refused, while create/mkdir/delete/rmdir (RW-3) and rename (RW-4) work,
 #   3. writes the second overlay through `xfswin pwrite` after unmounting,
 #   4. runs `xfswin check` on the result and leaves rw-modified.img behind for
 #      Linux verification (tests/scripts/verify_rw_linux.sh).
@@ -195,7 +195,7 @@ try {
         "OK $($overlaySpec.path) matches the expected content"
     }
 
-    "== RW-3 scope: create, mkdir and delete work; rename stays refused =="
+    "== RW-3/RW-4 scope: create, mkdir, delete and rename work =="
     $helloPath = Join-Path $mountPoint 'hello.bin'
     $subPath = Join-Path $mountPoint 'sub'
     $newFilePath = Join-Path $mountPoint 'new.txt'
@@ -221,7 +221,23 @@ try {
     Remove-Item -LiteralPath $newFilePath -ErrorAction Stop
     Assert (-not (Test-Path $newFilePath)) "delete did not remove the file"
 
-    Assert-Refused { Rename-Item -LiteralPath (Join-Path $mountPoint 'ro.txt') -NewName 'renamed.txt' } "rename file"
+    # RW-4: rename through the WinFsp callback, then back so the image still
+    # matches the RW-1/RW-2 content recipe.
+    $renamedPath = Join-Path $mountPoint 'hello-renamed.bin'
+    $helloBeforeRename = [System.IO.File]::ReadAllBytes($helloPath)
+    Rename-Item -LiteralPath $helloPath -NewName 'hello-renamed.bin' -ErrorAction Stop
+    Assert (Test-Path $renamedPath) "rename did not create the new name"
+    Assert (-not (Test-Path $helloPath)) "rename left the old name behind"
+    $afterRename = [System.IO.File]::ReadAllBytes($renamedPath)
+    Assert ($afterRename.Length -eq $helloBeforeRename.Length) `
+        "renamed file changed size"
+    for ($i = 0; $i -lt $afterRename.Length; $i += 997) {
+        Assert ($afterRename[$i] -eq $helloBeforeRename[$i]) `
+            "renamed file changed content at byte $i"
+    }
+    Rename-Item -LiteralPath $renamedPath -NewName 'hello.bin' -ErrorAction Stop
+    Assert (Test-Path $helloPath) "rename back did not restore the name"
+
     Assert-Refused {
         # A 0444 file stays read-only on disk.
         [System.IO.File]::WriteAllText((Join-Path $mountPoint 'ro.txt'), 'nope')
