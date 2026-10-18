@@ -32,6 +32,7 @@
 
 #include "xfs/ag.h"
 #include "xfs/btree.h"
+#include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
@@ -1114,6 +1115,56 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
   PutBE32(icreate.data(), lf::kIclGen, gen);
   txn_->AddLogOp(std::move(icreate));
 
+  // xfs_ialloc_inode_init also initialises the inode clusters themselves:
+  // every inode starts as a pristine free inode (magic, version 3,
+  // generation, di_ino, uuid, NULLAGINO) with its own CRC. Without this the
+  // free inodes in a new chunk keep whatever the free blocks contained, the
+  // inode buffer verifier rejects the cluster and xfs_repair cannot run.
+  //
+  // The clusters are written as ordered buffers (no physical log item): the
+  // ICREATE item above is the logical intent and replay rebuilds exactly
+  // these bytes, while physically logging 16 KiB per cluster would consume
+  // the whole 32 KiB record budget for one allocation.
+  const uint32_t blocks_per_cluster = igeo_.blocks_per_cluster;
+  const uint32_t inodes_per_cluster = igeo_.inodes_per_cluster;
+  if (blocks_per_cluster == 0 ||
+      igeo_.ialloc_blks % blocks_per_cluster != 0 ||
+      inodes_per_cluster != (blocks_per_cluster << geo_->inopblog) ||
+      static_cast<uint64_t>(inodes_per_cluster) * geo_->inode_size !=
+          static_cast<uint64_t>(blocks_per_cluster) * geo_->block_size) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "inode chunk is not a whole number of inode clusters")
+        .Ag(ag->agno)
+        .Agbno(agbno)
+        .Metadata("inobt");
+  }
+  const uint32_t clusters = igeo_.ialloc_blks / blocks_per_cluster;
+  for (uint32_t j = 0; j < clusters; ++j) {
+    const uint32_t cluster_agbno = agbno + j * blocks_per_cluster;
+    std::vector<uint8_t> image(
+        static_cast<size_t>(blocks_per_cluster) * geo_->block_size, 0);
+    for (uint32_t i = 0; i < inodes_per_cluster; ++i) {
+      uint8_t* inode = image.data() + static_cast<size_t>(i) * geo_->inode_size;
+      PutBE16(inode, di::kMagic, ondisk::kDinodeMagic);
+      inode[di::kVersion] = 3;
+      PutBE32(inode, di::kGen, gen);
+      PutBE32(inode, di::kNextUnlinked, 0xffffffffu);
+      PutBE64(inode, di::kIno,
+              geo_->AginoToIno(ag->agno,
+                               (cluster_agbno << geo_->inopblog) + i));
+      std::memcpy(inode + di::kUuid, geo_->meta_uuid.data(), 16);
+      // di_lsn stays zero (xfs_ialloc_inode_init leaves it zero); the write
+      // verifier only recomputes the per-inode CRC.
+      UpdateXfsChecksum(inode, geo_->inode_size, di::kCrc);
+    }
+    const uint64_t cluster_ino =
+        geo_->AginoToIno(ag->agno, cluster_agbno << geo_->inopblog);
+    s = txn_->AddOrderedBuffer(
+        geo_->FsbToByte(geo_->AgFsb(ag->agno, cluster_agbno)),
+        std::move(image), cluster_ino, "inode chunk");
+    if (!s.ok()) return s;
+  }
+
   // Insert the full (holemask 0) chunk record with all inodes free.
   InobtRecord rec;
   rec.startino = startino;
@@ -1412,7 +1463,8 @@ XfsInodeGeometry MakeInodeGeometry(const XfsSuperblock& sb,
 
   // Cluster alignment: sb_inoalignmt when the align feature is set and the
   // value is usable, otherwise the kernel uses alignment 1.
-  constexpr uint16_t kSbVersionAlignBit = 0x0010;
+  // XFS_SB_VERSION_ALIGNBIT (v5 numbering: 0x0080, not the v4 0x0010).
+  constexpr uint16_t kSbVersionAlignBit = 0x0080;
   const bool has_align = (sb.versionnum & kSbVersionAlignBit) != 0;
   g.cluster_align =
       (has_align && sb.inoalignmt >= g.blocks_per_cluster) ? sb.inoalignmt : 1;

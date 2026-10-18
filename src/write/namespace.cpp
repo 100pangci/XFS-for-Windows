@@ -101,7 +101,9 @@ std::vector<uint8_t> BuildNewInode(const XfsGeometry& geo, uint64_t ino,
   PutBE32(b, di::kNextUnlinked, kNullAgino);
   PutBE64(b, di::kChangecount, 1);  // inode_set_iversion(inode, 1)
   b[di::kForkoff] = 0;
-  b[di::kAformat] = 0;
+  // xfs_dinode_verify/xfs_repair require a valid attr-fork format whenever
+  // di_forkoff is zero: EXTENTS, not the zero-filled FMT_DEV value.
+  b[di::kAformat] = di::kFormatExtents;
   StoreTimestamp(b + di::kAtime, now);
   StoreTimestamp(b + di::kMtime, now);
   StoreTimestamp(b + di::kCtime, now);
@@ -674,7 +676,7 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
     PutBE16(image.data(), di::kFlags, 0);
     PutBE64(image.data(), di::kFlags2, 0);
     image[di::kForkoff] = 0;
-    image[di::kAformat] = 0;
+    image[di::kAformat] = di::kFormatExtents;
     image[di::kFormat] = di::kFormatExtents;
     PutBE64(image.data(), di::kSize, 0);
     PutBE64(image.data(), di::kNblocks, 0);

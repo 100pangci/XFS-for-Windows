@@ -156,6 +156,57 @@ def allocated_inodes(img, geo):
     return out
 
 
+def check_inode_chunks(img, geo):
+    """Every inode in an allocated chunk must be a valid inode image.
+
+    xfs_repair reads whole inode clusters through the inode buffer verifier,
+    which checks every inode in the cluster - including the free ones. A new
+    chunk therefore has to be initialised like xfs_ialloc_inode_init does
+    (magic, version 3, generation, NULLAGINO, di_ino, uuid, per-inode CRC);
+    otherwise the cluster is rejected even though the allocated inodes look
+    fine. The record alignment is repair's check from repair/scan.c: with the
+    align feature, every chunk must start at a sb_inoalignmt multiple."""
+    versionnum = rw2_probe.u16(geo.sb, 100)  # sb_versionnum
+    inoalignmt = u32(geo.sb, 180)            # sb_inoalignmt
+    has_align = (versionnum & 0x0080) != 0   # XFS_SB_VERSION_ALIGNBIT (v5)
+    ino_per_block = 1 << geo.inopblog
+    checked = 0
+    for agno in range(geo.agcount):
+        records, _, _ = rw3_probe.read_inobt(img, geo, agno)
+        for startino, _, free in records:
+            if startino % ino_per_block != 0:
+                fail(f"AG{agno}: inobt rec startino {startino} is not "
+                     f"block-aligned")
+            if has_align and inoalignmt and \
+                    (startino >> geo.inopblog) % inoalignmt != 0:
+                fail(f"AG{agno}: inobt rec startino {startino} (block "
+                     f"{startino >> geo.inopblog}) is not aligned to "
+                     f"sb_inoalignmt {inoalignmt}")
+            for i in range(INODES_PER_CHUNK):
+                ino = ((agno << (geo.agblklog + geo.inopblog)) |
+                       (startino + i))
+                buf = img.read(geo.inode_offset(ino), geo.inodesize)
+                if rw2_probe.u16(buf, 0) != 0x494E:
+                    fail(f"inode {ino}: bad magic")
+                if buf[4] != 3:
+                    fail(f"inode {ino}: version {buf[4]} != 3")
+                if rw2_probe.xfs_crc(buf, 100) != le32(buf, 100):
+                    fail(f"inode {ino}: bad CRC")
+                if u64(buf, 152) != ino:
+                    fail(f"inode {ino}: di_ino mismatch")
+                if bytes(buf[160:176]) != geo.meta_uuid:
+                    fail(f"inode {ino}: uuid mismatch")
+                if (free >> i) & 1:
+                    if rw2_probe.u16(buf, 2) != 0:
+                        fail(f"free inode {ino} has mode "
+                             f"{rw2_probe.u16(buf, 2):o}")
+                    if rw2_probe.u32(buf, 16) != 0:
+                        fail(f"free inode {ino} has nlink "
+                             f"{rw2_probe.u32(buf, 16)}")
+                checked += 1
+    print(f"  inode chunks: {checked} inode images valid")
+
+
 def unlinked_chain(img, geo, agno):
     """Returns the inodes on every AGI unlinked bucket of `agno`."""
     agi_off = geo.ag_offset(agno) + 2 * geo.sectsize
@@ -246,8 +297,57 @@ def namespace_walk(img, geo):
     return refs, parents, listings
 
 
+def data_entsize(namelen, ftype=True):
+    """xfs_dir2_data_entsize: the data-space size of a directory entry."""
+    n = 8 + 1 + namelen + 2 + (1 if ftype else 0)
+    return (n + 7) & ~7
+
+
+def check_shortform_offsets(img, geo, listings):
+    """xfs_dir2_sf_verify's offset rule for every shortform directory.
+
+    The stored offset is the entry's *data-space* position: the first entry
+    starts at data_first_offset (after the data block header and the implicit
+    "." and ".." entries), and every later entry follows the previous one by
+    at least xfs_dir2_data_entsize. A smaller offset means the entry overlaps
+    its predecessor, which the kernel and xfs_repair reject even though the
+    names themselves look fine."""
+    first = 64 + data_entsize(1) + data_entsize(2)
+    checked = 0
+    for ino in listings:
+        inode = rw2_probe.read_inode(img, geo, ino)
+        if inode["format"] != rw3_probe.FMT_LOCAL:
+            continue
+        literal = inode["raw"][176:176 + inode["size"]]
+        count = literal[0]
+        i8 = literal[1] != 0
+        off = 10 if i8 else 6
+        ino_len = 8 if i8 else 4
+        need = first
+        for _ in range(count):
+            if off + 3 > len(literal):
+                fail(f"directory {ino}: shortform entry truncated")
+            namelen = literal[off]
+            if namelen == 0:
+                fail(f"directory {ino}: empty shortform name")
+            eoffset = rw2_probe.u16(literal, off + 1)
+            if eoffset < need:
+                name = literal[off + 3:off + 3 + namelen]
+                fail(f"directory {ino}: shortform entry "
+                     f"{name.decode('utf-8', 'replace')!r} at offset {eoffset}"
+                     f" overlaps the previous entry (needs >= {need})")
+            need = eoffset + data_entsize(namelen)
+            off += 3 + namelen + 1 + ino_len
+        if off != len(literal):
+            fail(f"directory {ino}: shortform entries cover {off} bytes, the "
+                 f"fork has {len(literal)}")
+        checked += 1
+    print(f"  shortform dirs: {checked} offset chains valid")
+
+
 def check_namespace(img, geo, allow_unlinked):
     refs, parents, listings = namespace_walk(img, geo)
+    check_shortform_offsets(img, geo, listings)
     allocated = allocated_inodes(img, geo)
     # The realtime bitmap/summary inodes are allocated but have no name.
     rt_inodes = {u64(geo.sb, 64), u64(geo.sb, 72)}
@@ -412,6 +512,7 @@ def main(argv):
     img = rw2_probe.Image(args.image)
     geo = rw2_probe.check_image(img, verbose=not args.quiet)
     rw3_probe.check_inobt(img, geo)
+    check_inode_chunks(img, geo)
     refs, parents, listings = check_namespace(img, geo, args.allow_unlinked)
     if args.model:
         with open(args.model, "r", encoding="utf-8-sig") as f:

@@ -12,6 +12,8 @@
 #include "support/fixture_device.h"
 #include "test_util.h"
 #include "xfs/ag.h"
+#include "xfs/btree.h"
+#include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/extent.h"
 #include "xfs/filesystem.h"
@@ -40,6 +42,63 @@ SuperblockCounters ReadSuperblockCounters(xfstest::FixtureImage& fixture) {
   return out;
 }
 
+struct InobtChunkView {
+  uint32_t startino = 0;
+  uint64_t free = 0;
+};
+
+// Reads every AG0 inobt record straight from disk, like rw3_tests does. The
+// chunk layout matters on this path: a new chunk starts wherever the block
+// allocator found room (not at a 16 KiB-aligned inode number), and the inode
+// clusters are then addressed relative to that chunk start.
+std::vector<InobtChunkView> ReadAg0InobtChunks(xfstest::FixtureImage& fixture) {
+  std::vector<InobtChunkView> out;
+  auto fs = fixture.Mount(/*read_write=*/false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return out;
+  const XfsGeometry& geo = fs.value()->geometry();
+  auto agi = ReadAgi(fixture.storage(), geo, 0);
+  CHECK(agi.ok());
+  if (!agi.ok()) return out;
+  BtreeSpec spec;
+  spec.name = "inobt";
+  spec.format = BtreeFormat::kShort;
+  spec.block_size = geo.block_size;
+  spec.key_size = ondisk::btree::kInobtKeySize;
+  spec.ptr_size = ondisk::btree::kInobtPtrSize;
+  spec.rec_size = ondisk::btree::kInobtRecSize;
+  spec.magic = ondisk::kIbtCrcMagic;
+  spec.null_ptr = ondisk::btree::kNullAgBlock;
+  spec.expected_owner = 0;
+  spec.owner_size = 4;
+  spec.uuid = geo.meta_uuid;
+  spec.ptr_to_daddr = [&](uint64_t agbno, uint64_t* daddr) {
+    if (agbno >= geo.AgBlocksFor(0)) return false;
+    *daddr = geo.FsbToByte(geo.AgFsb(0, static_cast<uint32_t>(agbno))) / 512;
+    return true;
+  };
+  BtreeWalkCallbacks cb;
+  cb.read_block = [&](uint64_t fsb, std::vector<uint8_t>* buf) {
+    buf->resize(geo.block_size);
+    return fixture.storage().Read(geo.FsbToByte(fsb), buf->data(), buf->size());
+  };
+  cb.ptr_in_range = [&](uint64_t ptr) { return ptr < geo.AgBlocksFor(0); };
+  cb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
+                 const uint8_t* buf) -> Status {
+    if (meta.level != 0) return OkStatus();
+    for (uint16_t i = 0; i < meta.numrecs; ++i) {
+      const uint8_t* rec = BtreeLeafRec(buf, meta, spec, i);
+      InobtChunkView v;
+      v.startino = GetBE32(rec + ondisk::btree::kInobtRecStartino);
+      v.free = GetBE64(rec + ondisk::btree::kInobtRecFree);
+      out.push_back(v);
+    }
+    return OkStatus();
+  };
+  CHECK(WalkBtree(spec, agi.value().root, cb).ok());
+  return out;
+}
+
 void CheckConsistent(xfstest::FixtureImage& fixture) {
   auto fs = fixture.Mount(/*read_write=*/false);
   if (!fs.ok()) {
@@ -55,6 +114,50 @@ void CheckConsistent(xfstest::FixtureImage& fixture) {
     }
   }
   CHECK(report.Overall() == CheckStatus::kOk);
+}
+
+// xfs_dir2_data_entsize: the entry's size in the data space (inumber 8 +
+// namelen 1 + name + 2-byte tag + ftype 1, rounded up to 8).
+size_t DataEntsize(size_t namelen) {
+  return (8 + 1 + namelen + 2 + 1 + 7) & ~static_cast<size_t>(7);
+}
+
+// xfs_dir2_sf_verify's offset rule for a shortform directory: the first entry
+// starts at data_first_offset (after the data-block header and the implicit
+// "." and ".." entries) and every later entry follows its predecessor by at
+// least xfs_dir2_data_entsize. A stored offset below that overlaps the
+// previous entry, which the kernel and xfs_repair both reject.
+void CheckShortformChain(xfstest::FixtureImage& fixture, uint64_t ino) {
+  auto fs = fixture.Mount(/*read_write=*/false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  auto inode = fs.value()->OpenInode(ino);
+  CHECK(inode.ok());
+  if (!inode.ok()) return;
+  CHECK_EQ(inode.value().format, ondisk::inode::kFormatLocal);
+  const std::vector<uint8_t>& fork = inode.value().data_fork;
+  CHECK(fork.size() >= 6);
+  if (fork.size() < 6) return;
+  // di_size is the shortform literal length; data_fork is the whole fork area.
+  CHECK(inode.value().size <= fork.size());
+  const size_t literal = static_cast<size_t>(inode.value().size);
+  const uint32_t count = fork[0];
+  const bool i8 = fork[1] != 0;
+  size_t off = i8 ? 10 : 6;
+  const size_t inumber = i8 ? 8 : 4;
+  uint32_t need = 64 + static_cast<uint32_t>(DataEntsize(1)) +
+                  static_cast<uint32_t>(DataEntsize(2));
+  for (uint32_t i = 0; i < count; ++i) {
+    CHECK(off + 3 <= literal);
+    if (off + 3 > literal) return;
+    const uint8_t namelen = fork[off];
+    CHECK(namelen != 0);
+    const uint32_t offset = GetBE16(fork.data(), off + 1);
+    CHECK(offset >= need);
+    need = offset + static_cast<uint32_t>(DataEntsize(namelen));
+    off += 3 + namelen + 1 + inumber;
+  }
+  CHECK_EQ(off, literal);
 }
 
 std::string FixedName(int index, size_t width = 8) {
@@ -1023,6 +1126,118 @@ TEST(rw4_rmdir_of_a_nested_directory_repoints_the_child) {
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
     CHECK(fs.value()->Flush().ok());
   }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+// ---------------------------------------------------------------------------
+// On-disk inode images: a new inode must carry a valid attribute-fork format,
+// and a newly allocated inode chunk must initialise every free inode in its
+// clusters (xfs_ialloc_inode_init), not just the ones that get handed out.
+// xfs_repair runs the inode buffer verifier over whole clusters, so an
+// uninitialised free inode makes the filesystem unrepairable even though the
+// visible namespace looks fine.
+// ---------------------------------------------------------------------------
+
+TEST(rw4_new_inode_images_and_chunks_are_valid) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  std::vector<uint64_t> inos;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    for (int i = 0; i < 200; ++i) {
+      auto created =
+          fs.value()->CreateRegularFile(kRoot, FixedName(i), 0644, 0, 0);
+      CHECK(created.ok());
+      if (!created.ok()) return;
+      inos.push_back(created.value());
+    }
+    auto sym = fs.value()->CreateSymlink(kRoot, "sym", "target", 0777, 0, 0);
+    CHECK(sym.ok());
+    if (sym.ok()) inos.push_back(sym.value());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  auto fs = fixture.Mount(/*read_write=*/false);
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  const XfsGeometry& geo = fs.value()->geometry();
+  for (uint64_t ino : inos) {
+    auto inode = fs.value()->OpenInode(ino);
+    CHECK(inode.ok());
+    if (!inode.ok()) return;
+    CHECK_EQ(inode.value().aformat, ondisk::inode::kFormatExtents);
+    CHECK_EQ(inode.value().forkoff, 0);
+    CHECK_EQ(inode.value().next_unlinked, 0xffffffffu);
+  }
+  // The fixture already owns the chunk at inode 64; the files above forced
+  // new chunks, wherever the allocator put them. Every inode of a new chunk
+  // has to be initialised (xfs_ialloc_inode_init), because xfs_repair runs
+  // the inode buffer verifier over whole clusters.
+  CHECK_EQ(geo.inode_size, 512u);
+  CHECK_EQ(geo.block_size, 4096u);
+  int new_chunks = 0;
+  for (const InobtChunkView& chunk : ReadAg0InobtChunks(fixture)) {
+    if (chunk.startino < 128) continue;  // the fixture's own chunk
+    ++new_chunks;
+    for (uint32_t i = 0; i < 64; ++i) {
+      const uint64_t ino = geo.AginoToIno(0, chunk.startino + i);
+      std::vector<uint8_t> raw(geo.inode_size, 0);
+      CHECK(fixture.storage().Read(geo.InoToByteOffset(ino), raw.data(),
+                                   raw.size()));
+      CHECK_EQ(GetBE16(raw.data(), ondisk::inode::kMagic),
+               ondisk::kDinodeMagic);
+      CHECK_EQ(raw[ondisk::inode::kVersion], 3);
+      CHECK_EQ(GetBE64(raw.data(), ondisk::inode::kIno), ino);
+      CHECK(VerifyXfsChecksum(raw.data(), raw.size(), ondisk::inode::kCrc));
+      if ((chunk.free >> i) & 1) {
+        CHECK_EQ(GetBE16(raw.data(), ondisk::inode::kMode), 0u);
+        CHECK_EQ(GetBE32(raw.data(), ondisk::inode::kNlink), 0u);
+        CHECK_EQ(GetBE32(raw.data(), ondisk::inode::kNextUnlinked),
+                 kNullAgino);
+      }
+    }
+  }
+  CHECK(new_chunks > 0);
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+// ---------------------------------------------------------------------------
+// A shortform directory's stored offsets advance by xfs_dir2_data_entsize,
+// not by the smaller on-disk shortform entry size. A hole left by a rename
+// must therefore not be reused by a name that needs more data-space bytes:
+// xfs_dir2_sf_verify rejects the overlap ("entry contains offset out of
+// order") and the kernel refuses to mount the filesystem.
+// ---------------------------------------------------------------------------
+
+TEST(rw4_shortform_offsets_use_the_data_entry_size) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    auto hello = fs.value()->LookupName(kRoot, "hello.bin");
+    CHECK(hello.ok());
+    if (!hello.ok()) return;
+    CHECK(fs.value()->Mkdir(kRoot, "A", 0755, 0, 0).ok());
+    CHECK(fs.value()->Mkdir(kRoot, "B", 0755, 0, 0).ok());
+    auto b = fs.value()->LookupName(kRoot, "B");
+    CHECK(b.ok());
+    if (!b.ok()) return;
+    // Move "A" inside B: the root keeps a 16-byte hole where "A" was (a
+    // one-byte name needs 16 bytes of data space).
+    auto moved = fs.value()->Rename(kRoot, "A", b.value().ino, "A", false);
+    CHECK(moved.ok());
+    if (!moved.ok()) return;
+    // "hard.bin" needs 24 bytes, so it must not be squeezed into that hole.
+    CHECK(fs.value()->Link(hello.value().ino, kRoot, "hard.bin").ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckShortformChain(fixture, kRoot);
   CheckConsistent(fixture);
   fixture.Reset();
 }
