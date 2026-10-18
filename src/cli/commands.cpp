@@ -55,6 +55,8 @@ void PrintUsage() {
       "  check <device|image>          read-only consistency validation\n"
       "  recover <image>               replay the journal (RW-5)\n"
       "      --yes-i-really-mean-it    required: recovery writes metadata\n"
+      "  journal <device|image>        dump the internal log structure\n"
+      "      --json                    machine-readable (recovery differential)\n"
       "  mkimage <file> <size>         create a sparse test image (e.g. 300M)\n"
       "  ls <device|image> <path>      list a directory\n"
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
@@ -361,6 +363,235 @@ int CommandInfo(const std::string& target) {
   }
   std::cout << "  mountable        : yes (read-only, v5 supported subset)\n";
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// journal: read-only structural dump of the internal log. This is the input
+// of the recovery differential (tests/tools/recovery_probe.py and
+// xfs_logprint), and the first thing to look at when recovery refuses.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string LsnString(uint64_t lsn) {
+  char buffer[24];
+  std::snprintf(buffer, sizeof(buffer), "0x%llx",
+                static_cast<unsigned long long>(lsn));
+  return buffer;
+}
+
+const char* ItemTypeName(uint16_t type) {
+  const char* name = LogItemTypeName(type);
+  return name != nullptr ? name : "unknown";
+}
+
+void PrintJsonString(const std::string& text) {
+  std::cout << '"';
+  for (char c : text) {
+    switch (c) {
+      case '"': std::cout << "\\\""; break;
+      case '\\': std::cout << "\\\\"; break;
+      case '\n': std::cout << "\\n"; break;
+      default: std::cout << c; break;
+    }
+  }
+  std::cout << '"';
+}
+
+void PrintJournalText(const LogScan& scan, bool verbose) {
+  std::cout << "state: " << ToString(scan.state) << " (" << scan.detail << ")\n";
+  std::cout << "head: block=" << scan.head_block << " cycle="
+            << scan.head_cycle << "\n";
+  std::cout << "tail: block=" << scan.tail_block << " cycle="
+            << scan.tail_cycle << "\n";
+  std::cout << "records: " << scan.records.size() << "\n";
+  for (const LogRecordInfo& record : scan.records) {
+    std::cout << "record lsn=" << LsnString(record.lsn)
+              << " block=" << record.block << " cycle=" << record.cycle
+              << " len=" << record.data_blocks * 512 << " ops="
+              << record.num_ops << " prev=" << record.prev_block
+              << " tail_lsn=" << LsnString(record.tail_lsn) << "\n";
+  }
+  std::cout << "transactions: " << scan.transactions.size() << "\n";
+  uint64_t item_count = 0;
+  for (const RecoveredTransaction& trans : scan.transactions) {
+    item_count += trans.items.size();
+    std::cout << "transaction tid=" << trans.tid
+              << " lsn=" << LsnString(trans.lsn)
+              << " items=" << trans.items.size() << "\n";
+    for (const RecoveredItem& item : trans.items) {
+      std::cout << "  item " << ItemTypeName(item.type) << " type=0x"
+                << std::hex << item.type << std::dec
+                << " regions=" << item.regions.size();
+      if (item.type == logfmt::kItemBuf && item.regions[0].size() >= 20) {
+        const uint8_t* p = item.regions[0].data();
+        const uint16_t flags = LoadLE16(p + 4);
+        const uint16_t len = LoadLE16(p + 6);
+        const uint32_t lo = LoadLE32(p + 8);
+        const uint32_t hi = LoadLE32(p + 12);
+        std::cout << " blkno=" << ((static_cast<uint64_t>(hi) << 32) | lo)
+                  << " len=" << len << " flags=0x" << std::hex << flags
+                  << std::dec << " type_id="
+                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask);
+      } else if (item.type == logfmt::kItemInode && item.regions[0].size() >= 56) {
+        const uint8_t* p = item.regions[0].data();
+        const uint32_t fields = LoadLE32(p + logfmt::kIlfFields);
+        const uint64_t ino = static_cast<uint64_t>(LoadLE32(p + logfmt::kIlfIno)) |
+                             (static_cast<uint64_t>(LoadLE32(p + logfmt::kIlfIno + 4)) << 32);
+        const uint32_t boffset = LoadLE32(p + logfmt::kIlfBoffset);
+        const uint32_t lo = LoadLE32(p + logfmt::kIlfBlkno);
+        const uint32_t hi = LoadLE32(p + logfmt::kIlfBlkno + 4);
+        const uint32_t blen = LoadLE32(p + logfmt::kIlfLen);
+        std::cout << " ino=" << ino << " fields=0x" << std::hex << fields
+                  << std::dec << " blkno="
+                  << ((static_cast<uint64_t>(hi) << 32) | lo)
+                  << " len=" << blen << " boffset=" << boffset;
+      } else if (item.type == logfmt::kItemIcreate && item.regions[0].size() >= 28) {
+        const uint8_t* p = item.regions[0].data();
+        std::cout << " ag=" << GetBE32(p, logfmt::kIclAg)
+                  << " agbno=" << GetBE32(p, logfmt::kIclAgbno)
+                  << " count=" << GetBE32(p, logfmt::kIclCount)
+                  << " length=" << GetBE32(p, logfmt::kIclLength);
+      } else if ((item.type == logfmt::kItemEfi ||
+                  item.type == logfmt::kItemEfd ||
+                  item.type == logfmt::kItemBui ||
+                  item.type == logfmt::kItemBud) &&
+                 item.regions[0].size() >= logfmt::kIntentLogFormatSize) {
+        const uint8_t* p = item.regions[0].data();
+        uint64_t id = 0;
+        for (int byte = 7; byte >= 0; --byte) {
+          id = (id << 8) | p[logfmt::kIntentIdOffset + byte];
+        }
+        std::cout << " id=" << id << " extents="
+                  << LoadLE32(p + logfmt::kIntentNextentsOffset);
+      }
+      std::cout << "\n";
+      if (verbose) {
+        for (size_t r = 1; r < item.regions.size(); ++r) {
+          std::cout << "    region " << r << " bytes="
+                    << item.regions[r].size() << "\n";
+        }
+      }
+    }
+  }
+  std::cout << "items: " << item_count << "\n";
+  std::cout << "unsupported: " << scan.unsupported_items.size() << "\n";
+  for (const std::string& item : scan.unsupported_items) {
+    std::cout << "  " << item << "\n";
+  }
+  for (const std::string& warning : scan.warnings) {
+    std::cout << "warning: " << warning << "\n";
+  }
+}
+
+void PrintJournalJson(const LogScan& scan) {
+  std::cout << "{\n  \"state\": ";
+  PrintJsonString(ToString(scan.state));
+  std::cout << ",\n  \"head\": {\"block\": " << scan.head_block
+            << ", \"cycle\": " << scan.head_cycle << "},\n";
+  std::cout << "  \"tail\": {\"block\": " << scan.tail_block
+            << ", \"cycle\": " << scan.tail_cycle << "},\n";
+  std::cout << "  \"newest_lsn\": \"" << LsnString(scan.newest_lsn) << "\",\n";
+  std::cout << "  \"records\": [";
+  for (size_t i = 0; i < scan.records.size(); ++i) {
+    const LogRecordInfo& record = scan.records[i];
+    std::cout << (i == 0 ? "" : ",") << "\n    {\"lsn\": \""
+              << LsnString(record.lsn) << "\", \"block\": " << record.block
+              << ", \"cycle\": " << record.cycle
+              << ", \"len\": " << record.data_blocks * 512
+              << ", \"ops\": " << record.num_ops
+              << ", \"prev\": " << record.prev_block << ", \"tail_lsn\": \""
+              << LsnString(record.tail_lsn) << "\"}";
+  }
+  std::cout << "\n  ],\n  \"transactions\": [";
+  for (size_t i = 0; i < scan.transactions.size(); ++i) {
+    const RecoveredTransaction& trans = scan.transactions[i];
+    std::cout << (i == 0 ? "" : ",") << "\n    {\"tid\": " << trans.tid
+              << ", \"lsn\": \"" << LsnString(trans.lsn) << "\", \"items\": [";
+    for (size_t j = 0; j < trans.items.size(); ++j) {
+      const RecoveredItem& item = trans.items[j];
+      std::cout << (j == 0 ? "" : ", ") << "{\"type\": ";
+      PrintJsonString(ItemTypeName(item.type));
+      std::cout << ", \"type_id\": " << item.type
+                << ", \"regions\": " << item.regions.size();
+      if (item.type == logfmt::kItemBuf && item.regions[0].size() >= 20) {
+        const uint8_t* p = item.regions[0].data();
+        const uint16_t flags = LoadLE16(p + 4);
+        std::cout << ", \"blkno\": "
+                  << ((static_cast<uint64_t>(LoadLE32(p + 12)) << 32) |
+                      LoadLE32(p + 8))
+                  << ", \"len\": " << LoadLE16(p + 6) << ", \"flags\": "
+                  << flags << ", \"blft\": "
+                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask);
+      } else if (item.type == logfmt::kItemInode &&
+                 item.regions[0].size() >= 56) {
+        const uint8_t* p = item.regions[0].data();
+        std::cout << ", \"ino\": "
+                  << ((static_cast<uint64_t>(LoadLE32(p + logfmt::kIlfIno + 4))
+                       << 32) |
+                      LoadLE32(p + logfmt::kIlfIno))
+                  << ", \"fields\": "
+                  << LoadLE32(p + logfmt::kIlfFields)
+                  << ", \"blkno\": "
+                  << ((static_cast<uint64_t>(LoadLE32(p + logfmt::kIlfBlkno + 4))
+                       << 32) |
+                      LoadLE32(p + logfmt::kIlfBlkno))
+                  << ", \"boffset\": " << LoadLE32(p + logfmt::kIlfBoffset);
+      } else if (item.type == logfmt::kItemIcreate &&
+                 item.regions[0].size() >= 28) {
+        const uint8_t* p = item.regions[0].data();
+        std::cout << ", \"ag\": " << GetBE32(p, logfmt::kIclAg)
+                  << ", \"agbno\": " << GetBE32(p, logfmt::kIclAgbno)
+                  << ", \"count\": " << GetBE32(p, logfmt::kIclCount);
+      } else if ((item.type == logfmt::kItemEfi ||
+                  item.type == logfmt::kItemEfd ||
+                  item.type == logfmt::kItemBui ||
+                  item.type == logfmt::kItemBud) &&
+                 item.regions[0].size() >= logfmt::kIntentLogFormatSize) {
+        const uint8_t* p = item.regions[0].data();
+        uint64_t id = 0;
+        for (int byte = 7; byte >= 0; --byte) {
+          id = (id << 8) | p[logfmt::kIntentIdOffset + byte];
+        }
+        std::cout << ", \"id\": " << id;
+      }
+      std::cout << "}";
+    }
+    std::cout << "]}";
+  }
+  std::cout << "\n  ],\n  \"unsupported\": [";
+  for (size_t i = 0; i < scan.unsupported_items.size(); ++i) {
+    std::cout << (i == 0 ? "" : ", ");
+    PrintJsonString(scan.unsupported_items[i]);
+  }
+  std::cout << "]\n}\n";
+}
+
+}  // namespace
+
+int CommandJournal(const std::string& target, const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/false, /*exclusive=*/false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto sb = ReadSuperblock(*dev, 0, true);
+  if (!sb.ok()) {
+    PrintError(sb.error());
+    return 1;
+  }
+  XfsGeometry geo = MakeGeometry(sb.value());
+  auto scan = ScanLog(*dev, sb.value(), geo);
+  if (!scan.ok()) {
+    PrintError(scan.error());
+    return 1;
+  }
+  if (options.json) {
+    PrintJournalJson(scan.value());
+  } else {
+    PrintJournalText(scan.value(), options.verbose || options.debug);
+  }
+  return scan.value().state == LogState::kUnknown ? 2 : 0;
 }
 
 int CommandCheck(const std::string& target, const Options& options) {
@@ -1401,6 +1632,8 @@ int Run(const std::vector<std::string>& args) {
       options.yes_i_really_mean_it = true;
     } else if (arg == "--rw-experimental") {
       options.rw_experimental = true;
+    } else if (arg == "--json") {
+      options.json = true;
     } else if (arg == "--replace") {
       // rename only: overwrite an existing file or empty directory target.
       replace_existing = true;
@@ -1481,6 +1714,13 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandRecover(positional[1], options);
+  }
+  if (command == "journal") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin journal <device|image> [--json] [--verbose]\n";
+      return 1;
+    }
+    return CommandJournal(positional[1], options);
   }
   if (command == "mkimage") {
     if (positional.size() != 3) {
