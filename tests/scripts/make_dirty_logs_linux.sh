@@ -80,9 +80,12 @@ for scenario in $SCENARIOS; do
     DM="xfswin-rw5-$$"
     dmsetup create "$DM" --table "0 $(blockdev --getsz "$LOOP") linear $LOOP 0"
     DEV="/dev/mapper/$DM"
-    # The writable profile of this project, nothing else.
-    mkfs.xfs -f -q -m crc=1,rmapbt=0,reflink=0 \
-        -i sparse=0,finobt=0,bigtime=0,inobtcount=0 "$DEV"
+    # The writable profile of this project, nothing else. (mkfs.xfs: crc /
+    # finobt / rmapbt / reflink / inobtcount / bigtime are -m options; sparse
+    # is an -i option.)
+    mkfs.xfs -f -q \
+        -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 \
+        -i sparse=0 "$DEV"
     mount "$DEV" "$MOUNT"
     python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
     python3 "$REPO/tests/tools/dirty_ops.py" "$scenario" "$MOUNT" \
