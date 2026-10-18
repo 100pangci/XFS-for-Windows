@@ -1221,7 +1221,7 @@ class ReconstructionState {
     return it == open_.end() ? nullptr : &it->second;
   }
 
-  Status AddItem(TransBuilder* trans);
+  Status CloseItem(TransBuilder* trans);
   Status AddToTrans(TransBuilder* trans, const uint8_t* dp, uint32_t len);
   Status AddToContTrans(TransBuilder* trans, const uint8_t* dp, uint32_t len);
   Status CommitTrans(TransBuilder* trans);
@@ -1235,19 +1235,27 @@ class ReconstructionState {
   std::vector<std::string> unsupported_;
 };
 
-Status ReconstructionState::AddItem(TransBuilder* trans) {
-  if (trans->has_item) {
-    // The previous item must have all its regions (the kernel over-writes an
-    // in-use tail item only after checking ri_total == ri_cnt).
-    if (!trans->item.complete() && trans->item.total != 0) {
-      return XFS_ERR(XfsError::kCorruptBtree,
-                     "log item region count overflowed the item size")
-          .Metadata("log item");
-    }
+Status ReconstructionState::CloseItem(TransBuilder* trans) {
+  if (!trans->has_item) return OkStatus();
+  if (trans->item.regions.empty()) {
+    // The placeholder item of a transaction header that never received a
+    // region is not a log item.
+    trans->has_item = false;
     trans->item = ItemBuilder();
     return OkStatus();
   }
-  trans->has_item = true;
+  if (trans->item.regions[0].size() < 2) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "log item format header is too small")
+        .Metadata("log item");
+  }
+  RecoveredItem item;
+  item.tid = trans->tid;
+  item.type = LoadLE16(trans->item.regions[0].data());
+  item.regions = std::move(trans->item.regions);
+  trans->items.push_back(std::move(item));
+  trans->has_item = false;
+  trans->item = ItemBuilder();
   return OkStatus();
 }
 
@@ -1276,7 +1284,12 @@ Status ReconstructionState::AddToTrans(TransBuilder* trans, const uint8_t* dp,
   }
 
   if (trans->item.total != 0 && trans->item.regions.size() == trans->item.total) {
-    // The tail item is full: start a new one.
+    // The tail item is complete: keep it and start a new one.
+    Status closed = CloseItem(trans);
+    if (!closed.ok()) return closed;
+  }
+  if (!trans->has_item) {
+    trans->has_item = true;
     trans->item = ItemBuilder();
   }
   if (trans->item.total == 0) {
@@ -1335,29 +1348,12 @@ Status ReconstructionState::AddToContTrans(TransBuilder* trans,
 
 // xlog_recover_commit_trans(): reorder and close the transaction.
 Status ReconstructionState::CommitTrans(TransBuilder* trans) {
-  if (!trans->has_item && trans->items.empty()) {
+  Status closed = CloseItem(trans);
+  if (!closed.ok()) return closed;
+  if (trans->items.empty()) {
     return XFS_ERR(XfsError::kCorruptBtree,
                    "committed transaction with no items")
         .Metadata("log item");
-  }
-  if (trans->has_item) {
-    if (trans->item.regions.empty()) {
-      return XFS_ERR(XfsError::kCorruptBtree,
-                     "committed log item has no regions")
-          .Metadata("log item");
-    }
-    RecoveredItem item;
-    item.tid = trans->tid;
-    if (trans->item.regions[0].size() < 2) {
-      return XFS_ERR(XfsError::kCorruptBtree,
-                     "log item format header is too small")
-          .Metadata("log item");
-    }
-    item.type = LoadLE16(trans->item.regions[0].data());
-    item.regions = std::move(trans->item.regions);
-    trans->items.push_back(std::move(item));
-    trans->item = ItemBuilder();
-    trans->has_item = false;
   }
 
   // xlog_recover_reorder_trans(): buffer items first, then non-buffer items,

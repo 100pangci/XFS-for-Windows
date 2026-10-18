@@ -375,6 +375,43 @@ TEST(recovery_scan_unsupported_item_refuses) {
   }
 }
 
+TEST(recovery_scan_keeps_every_item_of_a_transaction) {
+  // Regression: a transaction with several items must keep all of them (the
+  // kernel keeps a list of items on the recover transaction; closing one item
+  // must not drop the ones before it).
+  SyntheticLog log;
+  auto inode = InodeItemRegions(128);
+  auto buf = BufItemRegions(4096, 1, lf::kBlftAgf, 0,
+                            std::vector<uint8_t>(lf::kBufChunkSize, 0));
+  std::vector<uint8_t> icreate(lf::kIcreateLogSize, 0);
+  PutLE16At(icreate.data(), 0, lf::kItemIcreate);
+  PutLE16At(icreate.data(), 2, 1);
+  std::vector<std::vector<uint8_t>> regions;
+  regions.push_back(inode[0]);
+  regions.push_back(inode[1]);
+  regions.push_back(buf[0]);
+  regions.push_back(buf[1]);
+  regions.push_back(icreate);
+  auto ops = CommitOps(5, std::move(regions));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 5, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (scan.value().transactions.empty()) return;
+  const auto& items = scan.value().transactions[0].items;
+  CHECK_EQ(items.size(), 3u);
+  if (items.size() != 3) return;
+  // xlog_recover_reorder_trans: buffers (and icreate) first, then other items.
+  CHECK_EQ(items[0].type, lf::kItemBuf);
+  CHECK_EQ(items[0].regions.size(), 2u);
+  CHECK_EQ(items[1].type, lf::kItemIcreate);
+  CHECK_EQ(items[1].regions.size(), 1u);
+  CHECK_EQ(items[2].type, lf::kItemInode);
+  CHECK_EQ(items[2].regions.size(), 2u);
+}
+
 TEST(recovery_scan_split_continuation_across_records) {
   SyntheticLog log;
   // Record A: START + transaction header + the first 8 bytes of the item
