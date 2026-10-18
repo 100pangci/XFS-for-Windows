@@ -1045,7 +1045,7 @@ Result<int> IterateRecords(LogImage& img, uint32_t head_blk, uint32_t tail_blk,
     info.lsn = header.lsn;
     info.block = rblk;
     info.cycle = header.cycle;
-    info.header_blocks = header.header_blocks;
+    info.header_blocks = hblks;  // the pass-wide header block count
     info.data_blocks = header.data_blocks();
     info.num_ops = header.num_ops;
     info.prev_block = header.prev_block;

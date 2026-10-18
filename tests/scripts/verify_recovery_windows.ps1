@@ -69,6 +69,18 @@ foreach ($image in $images) {
         $failed++
         continue
     }
+    # Differential against the kernel's own dump, when the fixture includes it
+    # (the Linux dirty-log generator writes <scenario>.logprint.txt).
+    $logprint = Join-Path $WorkDir ("{0}.logprint.txt" -f $image.BaseName)
+    if (Test-Path $logprint) {
+        & $Python (Join-Path $repo "tests/tools/compare_logprint.py") `
+            $beforeJson $logprint
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "  FAIL: xfs_logprint differential disagrees"
+            $failed++
+            continue
+        }
+    }
 
     & $Exe recover $target --yes-i-really-mean-it
     if ($LASTEXITCODE -ne 0) {
