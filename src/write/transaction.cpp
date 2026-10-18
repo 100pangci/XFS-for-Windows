@@ -13,6 +13,7 @@
 // The crash injection points sit between these steps; Linux recovery then has
 // to produce either the old or the new state (docs/JOURNAL.md).
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 #include "xfs/crash.h"
@@ -50,11 +51,12 @@ std::string TxnText(const XfsTransaction& txn, const char* what) {
 }  // namespace
 
 const std::vector<uint8_t>* XfsTransaction::QueuedBuffer(uint64_t offset) const {
-  auto it = logged_buffers_.find(offset);
-  if (it == logged_buffers_.end()) return nullptr;
-  const size_t index = it->second.op_index;
-  if (index + 1 >= ops_.size()) return nullptr;
-  return &ops_[index + 1].payload;
+  // The write-back copy is always the complete buffer: the log item only holds
+  // the chunks that differ from disk.
+  for (const TransactionWrite& write : writes_) {
+    if (write.offset == offset) return &write.data;
+  }
+  return nullptr;
 }
 
 size_t XfsTransaction::log_bytes() const {
@@ -106,10 +108,73 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   PutBE64(data.data(), lsn_offset, lsn_);
   UpdateXfsChecksum(data.data(), data.size(), crc_offset);
 
-  // One buffer log format header plus the whole buffer as one contiguous run
-  // of 128-byte chunks. `blf_size` counts the format plus the run(s).
+  // Dirty chunks: those that differ from the on-disk image. By the time a
+  // transaction is built, every earlier transaction has already written and
+  // flushed its metadata, so the difference to disk is exactly what this
+  // transaction changed - the same set of regions the kernel would have
+  // dirtied and logged. Logging the whole buffer instead would exceed the log
+  // record limit as soon as one transaction touches several b-trees.
   const size_t chunks = data.size() / lf::kBufChunkSize;
   const size_t map_words = (chunks + 31) / 32;
+  std::vector<uint8_t> map(map_words * 4, 0);
+  std::vector<uint8_t> logged;
+  const bool have_disk = device_ != nullptr;
+  std::vector<uint8_t> disk;
+  if (have_disk) {
+    disk.assign(data.size(), 0);
+    if (!device_->Read(offset, disk.data(), disk.size())) {
+      return XFS_ERR(XfsError::kIoError,
+                     "failed to read a metadata buffer before logging it: " +
+                         device_->LastError())
+          .Offset(offset)
+          .Metadata(what ? what : "metadata");
+    }
+  }
+  for (size_t i = 0; i < chunks; ++i) {
+    const size_t at = i * lf::kBufChunkSize;
+    if (have_disk && std::memcmp(disk.data() + at, data.data() + at,
+                                 lf::kBufChunkSize) == 0) {
+      continue;
+    }
+    map[(i / 32) * 4 + (i % 32) / 8] |= static_cast<uint8_t>(1u << (i % 8));
+    logged.insert(logged.end(), data.data() + at,
+                  data.data() + at + lf::kBufChunkSize);
+  }
+
+  // Replace a previous item for the same buffer (the caller re-dirtied it): the
+  // log carries the final contents, once. A buffer always has the same size, so
+  // the two operations can be replaced in place without shifting other items.
+  auto existing = logged_buffers_.find(offset);
+  if (logged.empty()) {
+    if (existing == logged_buffers_.end()) {
+      // Nothing changed on disk and nothing was logged before: no item is
+      // needed. The write-back still happens (the caller may have queued the
+      // buffer for its cache handling and for the LSN stamp).
+      for (TransactionWrite& write : writes_) {
+        if (write.offset == offset) {
+          write.data = std::move(data);
+          write.what = what ? what : "metadata";
+          return OkStatus();
+        }
+      }
+      TransactionWrite write;
+      write.offset = offset;
+      write.data = std::move(data);
+      write.what = what ? what : "metadata";
+      writes_.push_back(std::move(write));
+      return OkStatus();
+    }
+    // A previously logged version of this buffer is already in the record, but
+    // the buffer came back to its on-disk contents. Log one chunk of the
+    // current contents: replaying it is a no-op, and the item stays
+    // well-formed.
+    logged.insert(logged.end(), data.data(), data.data() + lf::kBufChunkSize);
+    map[0] |= 1;
+  }
+
+  // One buffer log format header plus the logged chunks as one contiguous run.
+  // `blf_size` counts the format plus the run(s); the data map names the
+  // chunks whose bytes follow in the payload.
   std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
   StoreLE16(format.data() + 0, lf::kItemBuf);
   StoreLE16(format.data() + 2, 2);
@@ -120,43 +185,34 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   StoreLE32(format.data() + 12,
             static_cast<uint32_t>((offset / 512) >> 32));
   StoreLE32(format.data() + 16, static_cast<uint32_t>(map_words));
-  for (size_t i = 0; i < chunks; ++i) {
-    // Host byte order bitmap (the kernel reads it with xfs_next_bit): bit i of
-    // word i/32, least significant bit first.
-    format[lf::kBufMapOffset + (i / 32) * 4 + (i % 32) / 8] |=
-        static_cast<uint8_t>(1u << (i % 8));
-  }
+  std::memcpy(format.data() + lf::kBufMapOffset, map.data(), map.size());
 
-  // Replace a previous item for the same buffer (the caller re-dirtied it): the
-  // log carries the final contents, once. A buffer always has the same size, so
-  // the two operations can be replaced in place without shifting other items.
-  auto existing = logged_buffers_.find(offset);
   if (existing != logged_buffers_.end()) {
     const size_t index = existing->second.op_index;
     ops_[index] = LogOp(0, std::move(format));
-    ops_[index + 1] = LogOp(0, std::move(data));
+    ops_[index + 1] = LogOp(0, std::move(logged));
     for (TransactionWrite& write : writes_) {
       if (write.offset == offset) {
-        write.data = ops_[index + 1].payload;
+        write.data = std::move(data);
         write.what = what ? what : "metadata";
         return OkStatus();
       }
     }
     TransactionWrite replacement;
     replacement.offset = offset;
-    replacement.data = ops_[index + 1].payload;
+    replacement.data = std::move(data);
     replacement.what = what ? what : "metadata";
     writes_.push_back(std::move(replacement));
     return OkStatus();
   }
   const size_t op_index = ops_.size();
   AddLogOp(std::move(format));
-  AddLogOp(std::move(data));
+  AddLogOp(std::move(logged));
   logged_buffers_[offset] = LoggedBufferRef{op_index};
 
   TransactionWrite write;
   write.offset = offset;
-  write.data = ops_[op_index + 1].payload;
+  write.data = std::move(data);
   write.what = what ? what : "metadata";
   writes_.push_back(std::move(write));
   return OkStatus();
@@ -194,6 +250,7 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
   txn.block_ = log_position_.next_block;
   txn.lsn_ = MakeLsn(txn.cycle_, txn.block_);
   txn.started_ = true;
+  txn.device_ = device_.get();
   return txn;
 }
 

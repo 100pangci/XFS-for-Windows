@@ -33,6 +33,8 @@
 
 namespace xfs {
 
+class BlockDevice;
+
 // One metadata buffer that becomes visible when the transaction commits.
 struct TransactionWrite {
   uint64_t offset = 0;          // device byte offset of the buffer
@@ -68,8 +70,10 @@ class XfsTransaction {
   //   - stamps the transaction LSN (big-endian) at `lsn_offset` - the value the
   //     kernel's buffer write verifier would store,
   //   - recomputes the checksum at `crc_offset`,
-  //   - logs the whole buffer as one contiguous dirty region (a legal superset
-  //     of the kernel's dirty regions; replay copies chunk-for-chunk),
+  //   - logs only the 128-byte chunks whose contents differ from the on-disk
+  //     image, exactly the dirty regions the kernel would log (the difference
+  //     to disk is what this transaction changed, because the previous
+  //     transaction wrote and flushed its metadata before this one was built),
   //   - queues the buffer write-back after the log record is durable.
   // Adding the same device offset twice keeps the latest contents and logs the
   // item once, so callers may re-queue a buffer they modified again.
@@ -98,6 +102,7 @@ class XfsTransaction {
   uint32_t cycle_ = 0;
   uint32_t block_ = 0;
   bool started_ = false;
+  BlockDevice* device_ = nullptr;  // for the dirty-chunk diff (null in tests)
   std::vector<LogOp> ops_;  // items only; start/trans-header/commit added later
   std::vector<TransactionWrite> writes_;
   // Logged buffer items by device offset (dedup for AddMetadataBuffer): the
