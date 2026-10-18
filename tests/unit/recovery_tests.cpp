@@ -412,6 +412,114 @@ TEST(recovery_scan_keeps_every_item_of_a_transaction) {
   CHECK_EQ(items[2].regions.size(), 2u);
 }
 
+// Builds a record larger than 32 KiB by hand (the writer refuses to produce
+// one): two header blocks, the second an xlog_rec_ext_header carrying the
+// cycle data of data blocks 64.., then the data blocks. Returns the record
+// image and the block/op counts.
+std::vector<uint8_t> BuildExtendedRecord(uint32_t cycle, uint32_t block,
+                                         uint32_t prev, uint64_t tail_lsn,
+                                         uint32_t tid,
+                                         const std::vector<LogOp>& ops,
+                                         uint32_t* data_blocks,
+                                         uint32_t* num_ops) {
+  std::vector<uint8_t> data;
+  uint32_t count = 0;
+  for (const LogOp& op : ops) {
+    xfs::AppendLogOp(&data, tid, op);
+    ++count;
+  }
+  CHECK(data.size() > lf::kHeaderCycleBytes);
+  const size_t rounded =
+      (data.size() + lf::kCycleBlockSize - 1) & ~(lf::kCycleBlockSize - 1);
+  data.resize(rounded, 0);
+  const size_t blocks = rounded / lf::kCycleBlockSize;
+  CHECK(blocks > lf::kRecCycleDataCount);
+
+  std::vector<uint32_t> saved(blocks, 0);
+  for (size_t i = 0; i < blocks; ++i) {
+    uint8_t* b = data.data() + i * lf::kCycleBlockSize;
+    saved[i] = xfs::GetBE32(b);
+    xfs::StoreBE32(b, cycle);
+  }
+
+  constexpr uint32_t kHSize = 65536;  // > 32 KiB: one extension header
+  std::vector<uint8_t> record(2 * lf::kRecordHeaderSize + rounded, 0);
+  uint8_t* h = record.data();
+  xfs::PutBE32(h, lf::kRecMagic, lf::kRecordMagic);
+  xfs::PutBE32(h, lf::kRecCycle, cycle);
+  xfs::PutBE32(h, lf::kRecVersion, lf::kVersion2);
+  xfs::PutBE32(h, lf::kRecLen, static_cast<uint32_t>(rounded));
+  xfs::PutBE64(h, lf::kRecLsn, xfs::MakeLsn(cycle, block));
+  xfs::PutBE64(h, lf::kRecTailLsn, tail_lsn);
+  xfs::PutBE32(h, lf::kRecPrevBlock, prev);
+  xfs::PutBE32(h, lf::kRecNumLogOps, count);
+  for (size_t i = 0; i < lf::kRecCycleDataCount; ++i) {
+    xfs::PutBE32(h, lf::kRecCycleData + i * 4, saved[i]);
+  }
+  xfs::PutBE32(h, lf::kRecFmt, lf::kFmtLinuxLe);
+  std::memcpy(h + lf::kRecUuid, kUuid, 16);
+  xfs::PutBE32(h, lf::kRecSize, kHSize);
+  uint8_t* ext = h + lf::kRecordHeaderSize;
+  xfs::PutBE32(ext, 0, cycle);  // xh_cycle
+  for (size_t i = lf::kRecCycleDataCount; i < blocks; ++i) {
+    xfs::PutBE32(ext, 4 + (i - lf::kRecCycleDataCount) * 4, saved[i]);
+  }
+  std::memcpy(record.data() + 2 * lf::kRecordHeaderSize, data.data(),
+              data.size());
+  std::vector<uint8_t> header(record.begin(), record.begin() + lf::kRecCrcCovered);
+  xfs::PutLE32(header.data(), lf::kRecCrc, 0);
+  uint32_t crc = xfs::Crc32cUpdate(0xFFFFFFFFu, header.data(), header.size());
+  crc = xfs::Crc32cUpdate(crc, record.data() + 2 * lf::kRecordHeaderSize,
+                          data.size());
+  xfs::PutLE32(record.data(), lf::kRecCrc, ~crc);
+  if (data_blocks != nullptr) *data_blocks = static_cast<uint32_t>(blocks);
+  if (num_ops != nullptr) *num_ops = count;
+  return record;
+}
+
+TEST(recovery_scan_large_record_with_extension_header) {
+  // A record above 32 KiB needs extension header blocks for the cycle data of
+  // data blocks 64.. (xlog_rec_ext_header). The writer cannot emit one, so the
+  // scanner is exercised independently of the writer's 32 KiB limit. The
+  // synthetic ring has to be larger than the record (2 + 65 blocks).
+  SyntheticLog log(96);
+  std::vector<uint8_t> payload(32 * 1024, 0);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+  }
+  auto regions = BufItemRegions(8192, 64, lf::kBlftAgf, 0, payload);
+  auto ops = CommitOps(9, regions);
+  uint32_t data_blocks = 0;
+  uint32_t num_ops = 0;
+  auto record = BuildExtendedRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 9,
+                                    ops, &data_blocks, &num_ops);
+  CHECK(data_blocks > 64u);
+  log.WriteRaw(log.log_byte(), record.data(), record.size());
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().state == xfs::LogState::kDirty);
+  CHECK_EQ(scan.value().records.size(), 1u);
+  if (!scan.value().records.empty()) {
+    CHECK_EQ(scan.value().records[0].header_blocks, 2u);
+    CHECK_EQ(scan.value().records[0].data_blocks, data_blocks);
+    CHECK_EQ(scan.value().records[0].num_ops, num_ops);
+  }
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (scan.value().transactions.empty()) return;
+  const auto& items = scan.value().transactions[0].items;
+  CHECK_EQ(items.size(), 1u);
+  if (items.empty()) return;
+  CHECK_EQ(items[0].type, lf::kItemBuf);
+  CHECK_EQ(items[0].regions.size(), 2u);
+  if (items[0].regions.size() == 2) {
+    // Every data block's cycle stamp was restored from the header or the
+    // extension header: the logged region must be byte-identical.
+    CHECK(items[0].regions[1] == payload);
+  }
+}
+
 TEST(recovery_scan_split_continuation_across_records) {
   SyntheticLog log;
   // Record A: START + transaction header + the first 8 bytes of the item
