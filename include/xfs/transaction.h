@@ -116,10 +116,12 @@ class XfsTransaction {
   std::vector<LogOp> ops_;  // items only; start/trans-header/commit added later
   std::vector<TransactionWrite> writes_;
   // Logged buffer items by device offset (dedup for AddMetadataBuffer): the
-  // value is (first log op index, format size) so re-adding a buffer can
-  // replace the previously logged region instead of logging it twice.
+  // value is where the item lives in ops_ (the format header and one op per
+  // contiguous dirty run) so re-adding a buffer can replace the previously
+  // logged regions instead of logging it twice.
   struct LoggedBufferRef {
     size_t op_index = 0;  // index into ops_ of the format header
+    size_t op_count = 0;  // format header plus one op per run
   };
   std::map<uint64_t, LoggedBufferRef> logged_buffers_;
 };

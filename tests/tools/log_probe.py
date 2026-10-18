@@ -329,12 +329,25 @@ def decode_items(rec: Record):
             break
         if len(op.payload) >= 24 and le16(op.payload, 0) == ITEM_BUF:
             # xfs_buf_log_format: blf_size is the number of regions of this
-            # item (the format header plus one op per logged chunk), so the
-            # chunk ops have to be skipped, not parsed as new items.
+            # item (the format header plus one op per contiguous dirty run of
+            # the data map), so the chunk ops have to be skipped, not parsed
+            # as new items.
             regions = le16(op.payload, 2)
+            data_map = op.payload[20:20 + le32(op.payload, 16) * 4]
+            bits = [i * 8 + b for i, byte in enumerate(data_map)
+                    for b in range(8) if (byte >> b) & 1]
+            runs = []
+            for bit in bits:
+                if runs and bit == runs[-1][0] + runs[-1][1]:
+                    runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+                else:
+                    runs.append((bit, 1))
             item = {"type": "buf", "regions": regions,
                     "blkno": struct.unpack_from("<q", op.payload, 8)[0],
-                    "blf_len": le16(op.payload, 6)}
+                    "blf_len": le16(op.payload, 6),
+                    "runs": [length for _, length in runs],
+                    "data_bytes": sum(len(rec.ops[index + k].payload)
+                                      for k in range(1, max(1, regions)))}
             rec.items.append(item)
             index += max(1, regions)
             continue
@@ -464,6 +477,26 @@ def verify(image_path: str, expect: str = "any", image: bytes = None):
         if not record.crc_ok and record is not newest_candidate:
             failures.append(f"block {record.block}: torn but not the newest "
                             f"record")
+
+    # A buffer item's blf_size counts the format header plus one region per
+    # contiguous run of the data map (xfs_buf_item_format_segment), and
+    # recovery consumes exactly one region per run (xlog_recover_do_reg_buffer):
+    # a mismatch makes it read past the item's iovecs.
+    for record in result["valid"]:
+        for item in record.items:
+            if item.get("type") != "buf" or item.get("runs") is None:
+                continue
+            runs = item["runs"]
+            if len(runs) != item["regions"] - 1:
+                failures.append(
+                    f"block {record.block}: buffer item at daddr "
+                    f"{item['blkno']}: blf_size {item['regions']} but the "
+                    f"data map has {len(runs)} contiguous runs")
+            elif item["data_bytes"] != sum(runs) * 128:
+                failures.append(
+                    f"block {record.block}: buffer item at daddr "
+                    f"{item['blkno']}: {item['data_bytes']} logged bytes but "
+                    f"the data map names {sum(runs) * 128}")
 
     newest = result["newest"]
     state = "dirty"
