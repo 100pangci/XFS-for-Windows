@@ -23,7 +23,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-build-test:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -168,6 +168,24 @@ jobs:
             -WorkDir "crash-rw3"
           if ($LASTEXITCODE -ne 0) { throw "RW-3 crash matrix failed" }
 
+      - name: RW-4 round-trip images (rename / hardlink / symlink)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw4_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "rw4"
+          if ($LASTEXITCODE -ne 0) { throw "RW-4 round-trip image generation failed" }
+
+      - name: RW-4 crash matrix (rename / hardlink / symlink)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_rw4_windows.ps1 `
+            -Exe "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Tests "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" `
+            -WorkDir "crash-rw4"
+          if ($LASTEXITCODE -ne 0) { throw "RW-4 crash matrix failed" }
+
       - name: Upload the crash images
         uses: actions/upload-artifact@v4
         with:
@@ -201,6 +219,20 @@ jobs:
         with:
           name: rw3-crash
           path: crash-rw3/
+          if-no-files-found: error
+
+      - name: Upload the RW-4 round-trip images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw4-images
+          path: rw4/
+          if-no-files-found: error
+
+      - name: Upload the RW-4 crash images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw4-crash
+          path: crash-rw4/
           if-no-files-found: error
 
       - name: Upload xfswin.exe
@@ -801,6 +833,100 @@ jobs:
             throw "reverse content '$content' != LINUX-AFTER-WINDOWS"
           }
           Write-Output "RW-3 reverse interoperability verified"
+
+  # ---------------------------------------------------------------------------
+  # Linux replays and verifies every RW-4 image: rename (same directory, cross
+  # directory, replace), directory moves with the ".." rewrite, hard links and
+  # local/remote symlinks. Then the kernel renames, links and symlinks inside
+  # the Windows-created namespace for the Windows reverse job.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw4:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw4-images
+          path: rw4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Mount, replay and verify every RW-4 image
+        run: |
+          ls -l rw4
+          sudo bash tests/scripts/verify_rw4_linux.sh rw4
+
+      - name: Upload the reverse-interoperability image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw4-reverse
+          path: rw4/reverse.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux replays every RW-4 crash image: rename, link and symlink at every
+  # crash point and transaction hit. The kernel must see the old or the
+  # complete new namespace (no dangling dirents, no wrong link counts, no
+  # half-migrated "..", no leaked unlinked inodes), and xfs_repair -n plus the
+  # structural oracle must stay silent.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw4-crash:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw4-crash
+          path: crash-rw4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Replay and verify every RW-4 crash window
+        run: |
+          ls -l crash-rw4 | head -20
+          sudo bash tests/scripts/verify_crash_rw4_linux.sh crash-rw4
+
+  # ---------------------------------------------------------------------------
+  # Windows reads back the image the Linux kernel modified: Linux renames,
+  # hard links and symlinks inside the Windows-created namespace, and Windows
+  # must resolve all of it (including the raw symlink targets and the shared
+  # hard-link inode) and mutate it again.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw4-reverse:
+    needs: linux-verify-rw4
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw4-reverse
+          path: rw4
+
+      - name: Read and re-mutate the Linux-modified image
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw4_reverse_windows.ps1 `
+            -Exe "bin\xfswin.exe" -WorkDir "rw4"
+          if ($LASTEXITCODE -ne 0) { throw "RW-4 reverse interoperability failed" }
 
   # ---------------------------------------------------------------------------
   # Raw device path (Case C): attach a fixed VHD as a real disk and format it

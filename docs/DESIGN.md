@@ -249,25 +249,26 @@ file data) to keep them coherent.
 Cold listings still read every inode once (metadata must be correct); warm
 listings of a 4000-entry directory take tens of milliseconds.
 
-## Read-write support (RW-0: data, RW-1: transactions, RW-2: allocator, RW-3: namespace)
+## Read-write support (RW-0: data, RW-1: transactions, RW-2: allocator, RW-3: namespace, RW-4: complex namespace)
 
 Status: an existing regular file can be overwritten in place, extended and
-truncated, and files and empty directories can be created and removed
-(`rw3`: inode allocator + directory writer + namespace layer). Every metadata
-change (inode, allocator, free-space btrees, superblock counters, directory
-blocks, inobt/AGI) goes through the journal as a real transaction; every block
-allocation/free is done through the RW-2 allocator and every directory mutation
-through the RW-3 writer. Rename, hard links, symlink creation, xattrs and ACLs
-are still refused.
-Roadmap: RW-4 rename/hardlink/symlink, RW-5 journal replay, RW-6 raw devices
+truncated; files, directories and symlinks can be created, renamed, hard-linked
+and removed (`rw3`: inode allocator + directory writer; `rw4`: atomic rename,
+hard links and symlinks). Every metadata change (inode, allocator, free-space
+btrees, superblock counters, directory blocks, inobt/AGI, symlink blocks) goes
+through the journal as a real transaction; every block allocation/free is done
+through the RW-2 allocator and every directory mutation through the RW-3
+writer. xattrs and ACLs are still refused.
+Roadmap: RW-5 journal replay, RW-6 raw devices
 (VHD first). `docs/JOURNAL.md` is the reference for the log format,
-`docs/ALLOCATOR.md` for the allocator and the data fork editor, and
+`docs/ALLOCATOR.md` for the allocator and the data fork editor,
 `docs/INODE_ALLOCATOR.md` for the inode chunks, the AGI unlinked list and the
-namespace transactions.
+namespace transactions, and `docs/NAMESPACE.md` for rename, hard links and
+symlinks.
 
-**Namespace path (RW-3).** `XfsFilesystem::CreateRegularFile` / `Mkdir` /
-`Unlink` / `RemoveEmptyDirectory` (`src/write/namespace.cpp`) follow the Linux
-transaction shapes: create and mkdir commit inode allocation, inode
+**Namespace path (RW-3, extended in RW-4).** `XfsFilesystem::CreateRegularFile` /
+`Mkdir` / `Unlink` / `RemoveEmptyDirectory` (`src/write/namespace.cpp`) follow
+the Linux transaction shapes: create and mkdir commit inode allocation, inode
 initialisation, the parent's dirent insertion, the parent timestamps/counters
 and the AGI/inobt/superblock updates in one record, so a crash leaves either no
 file or a complete file; unlink and rmdir commit the dirent removal, the link
@@ -279,7 +280,18 @@ cleans up after a crash. When no AG has a free inode, a chunk is allocated in
 its own transaction first (`EnsureInodeCapacity`), so the create record never
 carries a chunk allocation; a crash in between leaves one extra all-free chunk,
 never an unreachable inode. `src/write/dir_write.cpp` maintains all four
-directory formats and the conversions between them.
+directory formats and the conversions between them, plus the entry-replace
+primitive (`xfs_dir_replace`) that rename needs.
+
+RW-4 adds `Rename` (`xfs_rename` + `xfs_dir_rename_children`), `Link`
+(`xfs_link`) and `CreateSymlink` (`xfs_symlink`). A rename is one transaction:
+both dirent edits, both parents' timestamps and link counts, the moved inode's
+ctime and ".." rewrite, and the replaced target's link count plus AGI unlinked
+insertion. The target is never freed inside that transaction; the caller either
+defers the free until the last handle closes or lets `FreeUnlinkedInode` do the
+rolling truncate + `xfs_ifree`. Symlinks are real `S_IFLNK` inodes: inline
+targets in the literal area, longer targets in v5 `xfs_dsymlink_hdr` blocks with
+one header per contiguous extent. See `docs/NAMESPACE.md`.
 
 **Write path.** `XfsFilesystem::WriteFileData` (`src/write/file_write.cpp`) is
 the single entry point for `pwrite`/WinFsp `Write`/append:
@@ -475,10 +487,16 @@ Findings that the adapter must honor (all verified by the CI mount job):
   not clamp to `inode.size`; `ReadFileData` still clamps for regular reads.
 - `cat` must switch stdout to binary mode (`_setmode(_O_BINARY)`) or Windows
   translates every `\n` in file data to CRLF.
-- Write callbacks that are not implemented yet (`SetBasicInfo`, `Rename`,
+- Write callbacks that are not implemented yet (`SetBasicInfo`,
   `SetSecurity`, `SetVolumeLabel`) return `STATUS_MEDIA_WRITE_PROTECTED` on a
   read-only volume and `STATUS_NOT_SUPPORTED` on a read-write one: calling a
   read-write volume "write protected" would be false.
+- `Rename` calls `XfsFilesystem::Rename` with the FSD's `ReplaceIfExists` flag
+  and defers the replaced target's free; an open target node is marked
+  delete-pending so its handle keeps the old inode and the last `Close` frees
+  it, while the new path serves the moved inode. A pending delete disposition
+  on that old handle must not unlink the *new* name (the node is already
+  delete-pending, so `Cleanup` returns early).
 - `Create` is only called by the FSD when the target must be created
   (`FILE_CREATE`, or the `*_IF` dispositions after `Open` reported
   `OBJECT_NAME_NOT_FOUND`), so existence is a collision there; `Open` truncates
