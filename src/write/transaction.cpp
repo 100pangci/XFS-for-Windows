@@ -79,6 +79,33 @@ bool XfsTransaction::record_fits() const {
   return RoundUp64(log_bytes(), lf::kCycleBlockSize) <= lf::kHeaderCycleBytes;
 }
 
+Status XfsTransaction::AddOrderedBuffer(uint64_t offset,
+                                        std::vector<uint8_t> data,
+                                        uint64_t ino, const char* what) {
+  if (data.empty() || data.size() % 512 != 0 ||
+      data.size() > 0xffffull * 512) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "metadata buffer length must be a multiple of 512 bytes")
+        .Offset(offset)
+        .Metadata(what ? what : "metadata");
+  }
+  if (offset % 512 != 0) {
+    return XFS_ERR(XfsError::kInternal,
+                   "metadata buffer is not sector aligned")
+        .Offset(offset)
+        .Metadata(what ? what : "metadata");
+  }
+  TransactionWrite write;
+  write.offset = offset;
+  write.data = std::move(data);
+  write.ino = ino;
+  write.inode_metadata = ino != 0;
+  write.data_fork_changed = false;
+  write.what = what ? what : "metadata";
+  writes_.push_back(std::move(write));
+  return OkStatus();
+}
+
 Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
                                          std::vector<uint8_t> data,
                                          uint16_t blf_type, size_t lsn_offset,

@@ -80,6 +80,16 @@ class XfsTransaction {
   Status AddMetadataBuffer(uint64_t offset, std::vector<uint8_t> data,
                            uint16_t blf_type, size_t lsn_offset,
                            size_t crc_offset, const char* what);
+  // Queues a metadata buffer for write-back without a physical log item.
+  // Newly allocated inode clusters use this: the XFS_LI_ICREATE item in the
+  // same record is the logical intent and replay rebuilds the cluster from
+  // it, so physically logging 16 KiB per cluster would only consume the
+  // record budget (the kernel marks these buffers "ordered" for the same
+  // reason). The write still happens after the log record is durable, in
+  // CommitTransaction's metadata phase. `ino` is used only to drop the
+  // 16 KiB inode read-ahead chunk that now holds different bytes.
+  Status AddOrderedBuffer(uint64_t offset, std::vector<uint8_t> data,
+                          uint64_t ino, const char* what);
 
   const std::vector<LogOp>& ops() const { return ops_; }
   const std::vector<TransactionWrite>& writes() const { return writes_; }

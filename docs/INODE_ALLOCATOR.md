@@ -36,8 +36,9 @@ ialloc_inos  = max(64, inodes_per_block)          // 64 for this project
 ialloc_blks  = ialloc_inos >> inopblog            // 8 blocks for 512-byte inodes
 cluster_size = 8 KiB, scaled by inode_size/256 when the inode chunk
                alignment allows it (16 KiB for 512-byte inodes)
-cluster_align= sb_inoalignmt when the align feature is set and it fits,
-               otherwise 1 (the kernel's cluster_align)
+cluster_align= sb_inoalignmt when the align feature is set (v5
+               XFS_SB_VERSION_ALIGNBIT = 0x0080, not the v4 0x0010) and
+               it fits, otherwise 1 (the kernel's cluster_align)
 ```
 
 ## 2. Allocating an inode inside an existing chunk
@@ -71,9 +72,10 @@ The AGI, inobt and superblock updates are one transaction.
 6. hand out the first inode of the chunk (or leave all 64 free when the chunk
    was preallocated).
 
-The kernel logs the new cluster as an *ordered* buffer plus a logical
-`XFS_LI_ICREATE` item and writes the pristine cluster buffer at allocation
-time. This build emits the same icreate item (`xfs_icreate_log`, type `0x123f`,
+The kernel initialises the whole cluster (`xfs_ialloc_inode_init`) and marks it
+as an *ordered* buffer: the cluster bytes are not copied into the log record,
+only the logical `XFS_LI_ICREATE` item is, and replay rebuilds the cluster from
+it. This build emits the same icreate item (`xfs_icreate_log`, type `0x123f`,
 one region):
 
 ```text
@@ -81,6 +83,13 @@ xfs_icreate_log (28 bytes)
   icl_type 0x123f (host)   icl_size 1 (host)
   icl_ag / icl_agbno / icl_count / icl_isize / icl_length / icl_gen (be32)
 ```
+
+and writes each inode cluster the same way: an ordered buffer (no physical log
+item) that is flushed once the record is durable, with every inode of the
+cluster carrying the pristine free-inode image (`di_magic`, `di_version = 3`,
+`di_gen`, `di_next_unlinked = NULLAGINO`, `di_ino`, `di_uuid`, CRC). Logging
+those 16 KiB buffers physically would consume the whole 32 KiB record budget of
+one allocation, and the icreate item already guarantees the bytes on replay.
 
 Replay calls `xfs_ialloc_inode_init(mp, NULL, ...)`, which rebuilds the clusters
 from that geometry: the same guarantee the kernel has. An icreate item is
@@ -90,10 +99,11 @@ first and the inode core second (the kernel's ordering too).
 
 Every inode this build hands out is written as a complete image (magic,
 version, generation, `di_ino`, uuid, fork, CRC) by `LogPreparedInode`, so an
-allocated inode never depends on the icreate replay; the unused inodes of a
-chunk keep the old block contents until they are allocated (or until a crash
-replays the icreate item and makes the whole cluster pristine), which no reader
-inspects because the inobt marks them free.
+allocated inode never depends on the icreate replay - but the *free* inodes of a
+chunk do: xfs_repair reads whole inode clusters through the inode buffer
+verifier, so a new chunk whose remaining inodes kept the old free-block contents
+is rejected even when the namespace is consistent. The pristine cluster write
+above is what makes `xfs_repair -n` accept a newly grown filesystem.
 
 **Two-phase chunk allocation (namespace path).** A chunk allocation carries the
 block allocator's bnobt/cntbt/AGF/AGFL buffers, the inobt insert and the
