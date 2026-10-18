@@ -1274,6 +1274,7 @@ Result<ReplayStats> Replayer::Run(const LogScan& scan, RecoveredLogState* state)
   if (!status.ok()) return status.error();
 
   stats_.bytes_written = buffers_.bytes_written();
+  stats_.records_scanned = scan.records.size();
   stats_.intents_pending = intents_.size();
   if (cancel_.Size() != 0) {
     XFS_WARN("log recovery: " << cancel_.Size()

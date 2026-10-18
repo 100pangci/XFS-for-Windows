@@ -154,6 +154,7 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
 // Replay (pass1/pass2) - declared here, implemented in src/recovery/replay.cpp
 // ---------------------------------------------------------------------------
 struct ReplayStats {
+  uint64_t records_scanned = 0;         // records in the replay window
   uint64_t records_replayed = 0;
   uint64_t transactions_replayed = 0;
   uint64_t items_replayed = 0;

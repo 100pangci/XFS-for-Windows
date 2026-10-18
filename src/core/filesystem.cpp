@@ -1260,17 +1260,34 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
     }
   }
 
-  // Log state.
+  // Log state: classified with the recovery engine, read-only. A dirty log is
+  // a legal crash state, not corruption: it is reported with what a replay
+  // would do (recoverable transactions, unsupported items) so the caller can
+  // decide between `xfswin recover` and giving up.
   if (options.log) {
-    auto log = CheckLogClean(dev, geo, superblock_);
-    if (!log.ok()) {
-      report.Add("log", CheckStatus::kCorrupt, log.error().Format());
+    auto journal = AnalyzeJournal();
+    if (!journal.ok()) {
+      report.Add("log", CheckStatus::kCorrupt, journal.error().Format());
     } else {
-      LogState state = log.value().state;
-      CheckStatus cs = state == LogState::kUnknown ? CheckStatus::kWarning
-                                                   : CheckStatus::kOk;
-      report.Add("log", cs,
-                 std::string(ToString(state)) + " - " + log.value().detail);
+      const RecoverySummary& summary = journal.value();
+      std::string message =
+          std::string(ToString(summary.state)) + " - " + summary.detail;
+      CheckStatus cs = summary.state == LogState::kUnknown
+                           ? CheckStatus::kWarning
+                           : CheckStatus::kOk;
+      if (summary.needed) {
+        message += "; recovery required: recoverable transactions=" +
+                   std::to_string(summary.recoverable_transactions) +
+                   ", items=" + std::to_string(summary.items);
+        if (!summary.unsupported_items.empty()) {
+          message += ", unsupported items=" +
+                     std::to_string(summary.unsupported_items.size()) + " (" +
+                     summary.unsupported_items.front() + ")";
+        } else {
+          message += " (recoverable by `xfswin recover` or a read-write mount)";
+        }
+      }
+      report.Add("log", cs, message);
     }
   }
 
