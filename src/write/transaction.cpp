@@ -145,6 +145,14 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   const size_t map_words = (chunks + 31) / 32;
   std::vector<uint8_t> map(map_words * 4, 0);
   std::vector<uint8_t> logged;
+  // Contiguous runs of dirty chunks. The kernel logs one region per run
+  // (xfs_buf_item_format_segment) and recovery consumes one region per run
+  // (xlog_recover_do_reg_buffer), so the two have to match exactly.
+  struct ChunkRun {
+    size_t first;
+    size_t count;
+  };
+  std::vector<ChunkRun> runs;
   const bool have_disk = device_ != nullptr;
   std::vector<uint8_t> disk;
   if (have_disk) {
@@ -164,15 +172,21 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
       continue;
     }
     map[(i / 32) * 4 + (i % 32) / 8] |= static_cast<uint8_t>(1u << (i % 8));
+    if (!runs.empty() && runs.back().first + runs.back().count == i) {
+      ++runs.back().count;
+    } else {
+      runs.push_back(ChunkRun{i, 1});
+    }
     logged.insert(logged.end(), data.data() + at,
                   data.data() + at + lf::kBufChunkSize);
   }
 
   // Replace a previous item for the same buffer (the caller re-dirtied it): the
   // log carries the final contents, once. A buffer always has the same size, so
-  // the two operations can be replaced in place without shifting other items.
+  // the format stays the same size; the number of regions can shrink or grow,
+  // which the splice below accounts for.
   auto existing = logged_buffers_.find(offset);
-  if (logged.empty()) {
+  if (runs.empty()) {
     if (existing == logged_buffers_.end()) {
       // Nothing changed on disk and nothing was logged before: no item is
       // needed. The write-back still happens (the caller may have queued the
@@ -195,16 +209,15 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
     // the buffer came back to its on-disk contents. Log one chunk of the
     // current contents: replaying it is a no-op, and the item stays
     // well-formed.
-    logged.insert(logged.end(), data.data(), data.data() + lf::kBufChunkSize);
+    logged.assign(data.data(), data.data() + lf::kBufChunkSize);
     map[0] |= 1;
+    runs.push_back(ChunkRun{0, 1});
   }
 
-  // One buffer log format header plus the logged chunks as one contiguous run.
-  // `blf_size` counts the format plus the run(s); the data map names the
-  // chunks whose bytes follow in the payload.
+  // One buffer log format header plus one region per contiguous run.
   std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
   StoreLE16(format.data() + 0, lf::kItemBuf);
-  StoreLE16(format.data() + 2, 2);
+  StoreLE16(format.data() + 2, static_cast<uint16_t>(1 + runs.size()));
   StoreLE16(format.data() + 4,
             static_cast<uint16_t>(blf_type << lf::kBlftShift));
   StoreLE16(format.data() + 6, static_cast<uint16_t>(data.size() / 512));
@@ -214,10 +227,39 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   StoreLE32(format.data() + 16, static_cast<uint32_t>(map_words));
   std::memcpy(format.data() + lf::kBufMapOffset, map.data(), map.size());
 
+  // The item's payloads: the format header followed by one region per run, in
+  // map order.
+  std::vector<std::vector<uint8_t>> item;
+  item.push_back(std::move(format));
+  size_t run_at = 0;
+  for (const ChunkRun& run : runs) {
+    const size_t bytes = run.count * lf::kBufChunkSize;
+    item.emplace_back(logged.begin() + static_cast<ptrdiff_t>(run_at),
+                      logged.begin() + static_cast<ptrdiff_t>(run_at + bytes));
+    run_at += bytes;
+  }
+
   if (existing != logged_buffers_.end()) {
-    const size_t index = existing->second.op_index;
-    ops_[index] = LogOp(0, std::move(format));
-    ops_[index + 1] = LogOp(0, std::move(logged));
+    const size_t old_index = existing->second.op_index;
+    const size_t old_count = existing->second.op_count;
+    ops_.erase(ops_.begin() + static_cast<ptrdiff_t>(old_index),
+               ops_.begin() + static_cast<ptrdiff_t>(old_index + old_count));
+    auto at = ops_.begin() + static_cast<ptrdiff_t>(old_index);
+    for (std::vector<uint8_t>& payload : item) {
+      at = ops_.insert(at, LogOp(0, std::move(payload)));
+      ++at;
+    }
+    const ptrdiff_t delta = static_cast<ptrdiff_t>(item.size()) -
+                            static_cast<ptrdiff_t>(old_count);
+    if (delta != 0) {
+      for (auto& entry : logged_buffers_) {
+        if (entry.second.op_index > old_index) {
+          entry.second.op_index = static_cast<size_t>(
+              static_cast<ptrdiff_t>(entry.second.op_index) + delta);
+        }
+      }
+    }
+    existing->second.op_count = item.size();
     for (TransactionWrite& write : writes_) {
       if (write.offset == offset) {
         write.data = std::move(data);
@@ -233,9 +275,10 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
     return OkStatus();
   }
   const size_t op_index = ops_.size();
-  AddLogOp(std::move(format));
-  AddLogOp(std::move(logged));
-  logged_buffers_[offset] = LoggedBufferRef{op_index};
+  for (std::vector<uint8_t>& payload : item) {
+    AddLogOp(std::move(payload));
+  }
+  logged_buffers_[offset] = LoggedBufferRef{op_index, item.size()};
 
   TransactionWrite write;
   write.offset = offset;

@@ -103,7 +103,10 @@ the record is durable (`XfsTransaction::AddMetadataBuffer`):
 ```text
 xfs_buf_log_format (host order, little-endian on x86)
   blf_type   0x123c
-  blf_size   1 + number of contiguous logged runs (2 here: header + buffer)
+  blf_size   1 + number of contiguous runs of the data map: the item logs one
+             region per run (xfs_buf_item_format_segment) and recovery
+             consumes exactly one region per run
+             (xlog_recover_do_reg_buffer)
   blf_flags  buffer type << 11  (AGF=5, AGFL=6, btree=4, superblock=18)
   blf_len    buffer length in 512-byte units
   blf_blkno  daddr (512-byte units) of the buffer

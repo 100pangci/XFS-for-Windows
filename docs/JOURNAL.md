@@ -142,15 +142,16 @@ timestamps live in the core.
 | field | meaning |
 |---|---|
 | `blf_type` | `XFS_LI_BUF` |
-| `blf_size` | item size in 32-bit words |
+| `blf_size` | number of regions: the format header plus one per contiguous run of `blf_data_map` (the kernel's `xfs_buf_item_format_segment`; recovery's `xlog_recover_do_reg_buffer` consumes exactly one region per run, so the two must match) |
 | `blf_flags` | buffer type in bits 11..15 (`XFS_BLFT_*`: AGF/AGI/AGFL/btree/dir/inode/sb...) |
 | `blf_len` | buffer length in 512-byte units |
 | `blf_blkno` | daddr of the buffer |
 | `blf_map_size` | used words of the dirty bitmap |
 | `blf_data_map[]` | one bit per 128-byte chunk: 1 = that chunk is logged |
 
-followed by the logged 128-byte chunks, in bitmap order. Replay copies each
-logged chunk into the buffer at its offset, then writes the buffer with the
+followed by the logged 128-byte chunks, in bitmap order, one log op per
+contiguous run (never one op for several runs). Replay copies each logged
+region into the buffer at its offset, then writes the buffer with the
 transaction's LSN (the buffer verifiers stamp the LSN fields). The base
 metadata block header (magic/CRC/LSN) must be part of the logged chunks
 whenever the header changes - in practice the whole first chunk is logged for
