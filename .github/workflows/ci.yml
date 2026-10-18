@@ -1166,6 +1166,8 @@ jobs:
             dirty-logs/*.img
             dirty-logs/*.manifest.json
             dirty-logs/*.logprint.txt
+            dirty-logs/*.journal.json
+            dirty-logs/inventory.txt
             dirty-logs/summary.txt
           if-no-files-found: error
 
