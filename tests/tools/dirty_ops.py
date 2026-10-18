@@ -4,19 +4,25 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Dirty-log operation matrix helper (RW-5, runs on Linux).
 
-Two jobs:
+Three jobs:
 
   dirty_ops.py setup <mountpoint>
       builds the base tree every scenario starts from.
 
-  dirty_ops.py <scenario> <mountpoint> <manifest.json>
+  dirty_ops.py capture <scenario> <mountpoint> <manifest.json> <dm-name>
       performs one namespace/content operation, forces the *log* to be durable
       (fsync waits for the log record; the metadata behind it may still be in
       the journal - that is exactly the crash state recovery has to handle),
-      then writes the expected post-operation state (type, size, sha256, link
-      target, nlink) as JSON.
+      writes the expected post-operation state (type, size, sha256, link
+      target, nlink, mtime) as JSON, and then suspends the device-mapper device
+      right away, so the operation's transaction is still inside the recovery
+      window when the device bytes are copied.
 
-The snapshot itself is taken by make_dirty_logs_linux.sh after this script
+  dirty_ops.py verify <mountpoint> <manifest.json>
+      compares a mounted filesystem against a manifest (used by the Linux
+      verifier and by the generator's own kernel-replay sanity check).
+
+The snapshot itself is taken by make_dirty_logs_linux.sh after capture
 returns, so the manifest always describes the state at capture time.
 """
 
@@ -24,6 +30,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 
 BASE = "base"
@@ -186,40 +193,36 @@ def verify(mountpoint, manifest_path):
     return 0 if not problems else 1
 
 
-def pin(mountpoint):
-    """Forces one more fsync'd transaction right before the device freeze.
+def capture(scenario, mountpoint, manifest_path, dm):
+    """Runs the operation, records the expected state, then freezes the block
+    device - in one process.
 
-    fsync makes the log record durable; the metadata behind it stays dirty in
-    memory, so the recovery window (tail..head) cannot be empty at capture
-    time. The scratch path is outside base/ and therefore outside the
-    manifest.
+    fsync makes the log record durable but does not stop the AIL from writing
+    the metadata back, which would move the tail past the record. Freezing the
+    dm device a couple of milliseconds after the fsync (instead of after
+    another tool start) keeps the operation's transaction in the recovery
+    window.
     """
-    scratch = os.path.join(mountpoint, "scratch")
-    os.makedirs(scratch, exist_ok=True)
-    write_file(os.path.join(scratch, "pin"), b"pin\n")
-    fsync_dir(scratch)
+    run(scenario, mountpoint)
+    data = manifest(mountpoint)
+    with open(manifest_path, "w") as handle:
+        json.dump({"scenario": scenario, "entries": data}, handle,
+                  indent=2, sort_keys=True)
+    subprocess.run(["dmsetup", "suspend", dm], check=True)
+    print("%s: %d entries, device frozen" % (scenario, len(data)))
 
 
 def main(argv):
     if len(argv) == 3 and argv[1] == "setup":
         setup(argv[2])
         return 0
-    if len(argv) == 3 and argv[1] == "pin":
-        pin(argv[2])
-        return 0
     if len(argv) == 4 and argv[1] == "verify":
         return verify(argv[2], argv[3])
-    if len(argv) != 4:
-        print(__doc__)
-        return 2
-    scenario, mountpoint, manifest_path = argv[1], argv[2], argv[3]
-    run(scenario, mountpoint)
-    data = manifest(mountpoint)
-    with open(manifest_path, "w") as handle:
-        json.dump({"scenario": scenario, "entries": data}, handle,
-                  indent=2, sort_keys=True)
-    print("%s: %d entries" % (scenario, len(data)))
-    return 0
+    if len(argv) == 6 and argv[1] == "capture":
+        capture(argv[2], argv[3], argv[4], argv[5])
+        return 0
+    print(__doc__)
+    return 2
 
 
 if __name__ == "__main__":

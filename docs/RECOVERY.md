@@ -261,10 +261,14 @@ Two oracles are kept; neither side proves itself:
   `linux-verify-cross-recovery`): the operation matrix is timestamp, extend,
   truncate, create, unlink, mkdir, rmdir, rename (same/cross/replace),
   hardlink, symlink (inline/remote). Each fixture is a device-mapper snapshot
-  taken while I/O is frozen (a real crash-consistent block-device image, not a
-  copy of a live file), and the expected post-operation namespace/content is
-  recorded as a manifest before the capture. Windows must reproduce it and
-  Linux must accept it.
+  taken while I/O is frozen and with the operation, its manifest and the freeze
+  in one process, so the operation's transaction is still in the recovery
+  window (the generator retries a phase that captured only superblock counter
+  buffers). The expected post-operation namespace/content is recorded as a
+  manifest before the capture, and the generator replays a copy of every
+  snapshot with the Linux kernel and requires that replay to reach the
+  manifest: the fixture exists only if Linux itself recovers to the recorded
+  state. Windows must reproduce it and Linux must accept it.
 * **C - recovery itself crashes**: `windows-recovery-crash-matrix` kills
   `xfswin` inside recovery at every `recovery_*` point and requires the restart
   to converge (`linux-verify-recovery-crash` re-checks the result).
@@ -272,8 +276,12 @@ Two oracles are kept; neither side proves itself:
   read side (CRC, cycle restoration, head/tail, op chain, commit detection,
   item inventory) without calling the C++ code; the Windows recovery job runs
   the differential (`xfswin journal --json` vs the probe) before and after
-  recovery. `xfs_logprint -t` output for every Linux fixture is captured for
-  the same structural comparison (`dirty-logs/*.logprint.txt`).
+  recovery. The kernel's own `xfs_logprint -t` output is captured for every
+  Linux fixture and compared against the same dump
+  (`tests/tools/compare_logprint.py`): record chain (LSN cycle + block),
+  head/tail/state and the committed transaction ids must agree. (`-t` prints no
+  operation lines, so the operation-count checks apply only to default-mode
+  output.)
 
 ## 9. Behaviour
 
