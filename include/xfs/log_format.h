@@ -85,9 +85,37 @@ constexpr size_t kThNumItems = 12;  // u32
 // ---------------------------------------------------------------------------
 // Item types and item format headers, host byte order
 // ---------------------------------------------------------------------------
-constexpr uint16_t kItemInode = 0x123b;   // XFS_LI_INODE
-constexpr uint16_t kItemBuf = 0x123c;     // XFS_LI_BUF
-constexpr uint16_t kItemIcreate = 0x123f; // XFS_LI_ICREATE
+// XFS_LI_* item types (xfs_log_format.h). Recovery classifies every item it
+// finds: the ones this build replays, the intent items, and the refused ones.
+constexpr uint16_t kItemEfi = 0x1236;       // XFS_LI_EFI
+constexpr uint16_t kItemEfd = 0x1237;       // XFS_LI_EFD
+constexpr uint16_t kItemIunlink = 0x1238;   // XFS_LI_IUNLINK
+constexpr uint16_t kItemInode = 0x123b;     // XFS_LI_INODE
+constexpr uint16_t kItemBuf = 0x123c;       // XFS_LI_BUF
+constexpr uint16_t kItemDquot = 0x123d;     // XFS_LI_DQUOT
+constexpr uint16_t kItemQuotaoff = 0x123e;  // XFS_LI_QUOTAOFF
+constexpr uint16_t kItemIcreate = 0x123f;   // XFS_LI_ICREATE
+constexpr uint16_t kItemRui = 0x1240;       // XFS_LI_RUI
+constexpr uint16_t kItemRud = 0x1241;       // XFS_LI_RUD
+constexpr uint16_t kItemCui = 0x1242;       // XFS_LI_CUI
+constexpr uint16_t kItemCud = 0x1243;       // XFS_LI_CUD
+constexpr uint16_t kItemBui = 0x1244;       // XFS_LI_BUI
+constexpr uint16_t kItemBud = 0x1245;       // XFS_LI_BUD
+constexpr uint16_t kItemAttri = 0x1246;     // XFS_LI_ATTRI
+constexpr uint16_t kItemAttrd = 0x1247;     // XFS_LI_ATTRD
+
+// ---------------------------------------------------------------------------
+// Intent item formats (host byte order header, big-endian payload extents)
+// ---------------------------------------------------------------------------
+// xfs_efi_log_format: type u16, size u16 (= regions), nextents u32, id u64,
+// then xfs_extent[]. EFD carries the id of the EFI it completes, BUI/BUD the
+// same for bmap updates.
+constexpr size_t kIntentLogFormatSize = 16;  // header before the extent array
+constexpr size_t kIntentIdOffset = 8;        // be64 efi_id / bui_id / ...
+constexpr size_t kIntentNextentsOffset = 4;  // be32
+constexpr size_t kExtentSize = 16;           // xfs_extent: start be64, len be32
+constexpr size_t kExtentStartOffset = 0;     // be64
+constexpr size_t kExtentLenOffset = 8;       // be32
 
 // xfs_icreate_log, 28 bytes, host endian type/size then big-endian fields.
 // Replay calls xfs_ialloc_inode_init, which rebuilds the whole inode cluster
@@ -148,6 +176,13 @@ constexpr size_t kBufLogFormatSize = 20;
 constexpr size_t kBufMapOffset = 20;
 constexpr size_t kBufChunkSize = 128;  // XFS_BLF_CHUNK
 constexpr size_t kBufChunkShift = 7;   // XFS_BLF_SHIFT
+
+// XFS_BLF_* flags in the low bits of blf_flags.
+constexpr uint16_t kBlfInodeBuf = 1u << 0;  // XFS_BLF_INODE_BUF
+constexpr uint16_t kBlfCancel = 1u << 1;    // XFS_BLF_CANCEL
+constexpr uint16_t kBlfUdquot = 1u << 2;    // XFS_BLF_UDQUOT_BUF
+constexpr uint16_t kBlfPdquot = 1u << 3;    // XFS_BLF_PDQUOT_BUF
+constexpr uint16_t kBlfGdquot = 1u << 4;    // XFS_BLF_GDQUOT_BUF
 
 // XFS_BLFT_* buffer types (bits 11..15 of blf_flags), from xfs_log_format.h.
 constexpr uint16_t kBlftUnknown = 0;
