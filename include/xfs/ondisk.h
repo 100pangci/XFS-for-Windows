@@ -36,6 +36,7 @@ constexpr uint32_t kFibtMagic = 0x46494254;   // 'FIBT' finobt (v4)
 constexpr uint32_t kFibtCrcMagic = 0x46494233;// 'FIB3' finobt (v5)
 constexpr uint32_t kBmapMagic = 0x424d4150;   // 'BMAP' bmbt (v4)
 constexpr uint32_t kBmapCrcMagic = 0x424d4133;// 'BMA3' bmbt (v5)
+constexpr uint32_t kRmapCrcMagic = 0x524d4233; // 'RMB3' rmapbt (v5)
 
 constexpr uint16_t kDaNodeMagic = 0xfebe;    // node block (v4)
 constexpr uint16_t kDaNode3Magic = 0x3ebe;   // node block (v5)
@@ -346,6 +347,12 @@ constexpr size_t kBmbtKeySize = 8;    // startoff be64
 constexpr size_t kBmbtPtrSize = 8;    // be64
 constexpr size_t kBmbtRecSize = 16;   // xfs_bmbt_rec
 constexpr size_t kBmdrSize = 4;       // inode-embedded bmbt root header
+// The rmap btree keeps the short (56-byte) block header but packs two
+// 20-byte keys (low + high) per node entry before the 4-byte pointers
+// (XFS_RMAP_KEY_ADDR / XFS_RMAP_PTR_ADDR).
+constexpr size_t kRmapKeySize = 40;   // 2 x xfs_rmap_key (startblock 4 + owner 8 + offset 8)
+constexpr size_t kRmapPtrSize = 4;    // be32 agbno
+constexpr size_t kRmapRecSize = 24;   // xfs_rmap_rec
 }  // namespace btree
 
 // ---------------------------------------------------------------------------
