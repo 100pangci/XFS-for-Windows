@@ -30,7 +30,8 @@ set -euo pipefail
 
 OUT=${1:?usage: make_dirty_logs_linux.sh <outdir>}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-SIZE_MB=256
+# mkfs.xfs refuses to format anything below 300 MB.
+SIZE_MB=512
 SCENARIOS="timestamp extend truncate create unlink mkdir rmdir rename-same
 rename-cross rename-replace hardlink symlink-inline symlink-remote"
 
