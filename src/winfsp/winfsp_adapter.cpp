@@ -147,6 +147,8 @@ NTSTATUS NtFromError(XfsError code) {
     case XfsError::kNameTooLong: return STATUS_OBJECT_NAME_INVALID;
     case XfsError::kAlreadyExists: return STATUS_OBJECT_NAME_COLLISION;
     case XfsError::kDirectoryNotEmpty: return STATUS_DIRECTORY_NOT_EMPTY;
+    case XfsError::kTooManyLinks: return STATUS_TOO_MANY_LINKS;
+    case XfsError::kWouldCycle: return STATUS_ACCESS_DENIED;
     case XfsError::kInvalidArgument: return STATUS_INVALID_PARAMETER;
     case XfsError::kPermissionDenied: return STATUS_ACCESS_DENIED;
     case XfsError::kReadOnlyVolume: return STATUS_MEDIA_WRITE_PROTECTED;
@@ -297,13 +299,15 @@ Result<std::pair<uint64_t, std::string>> ResolveParentAndName(
 }
 
 // A namespace mutation changed the directory listing: drop the adapter's
-// per-directory listings (and the path memo, which may point at deleted
-// names). The core invalidated its own caches when the transaction committed.
-// `parent_ino` == 0 only drops the path memo.
-void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino) {
+// per-directory listings (and the path memo, which may point at deleted or
+// renamed names). The core invalidated its own caches when the transaction
+// committed. `parent_ino` == 0 only drops the path memo.
+void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino,
+                         uint64_t second_parent_ino = 0) {
   std::lock_guard<std::mutex> lock(state.node_mutex);
-  if (parent_ino != 0) {
-    auto it = state.dir_children.find(parent_ino);
+  for (uint64_t dir : {parent_ino, second_parent_ino}) {
+    if (dir == 0) continue;
+    auto it = state.dir_children.find(dir);
     if (it != state.dir_children.end()) {
       state.dir_children_entries -= it->second->size();
       state.dir_children.erase(it);
@@ -345,10 +349,11 @@ Status CheckDeletable(AdapterState& state, const XfsInode& inode) {
     }
     return OkStatus();
   }
-  if (!inode.IsRegular()) {
-    // Symlinks and the special files are not deleted by this build.
+  if (!inode.IsRegular() && !inode.IsSymlink()) {
+    // Only regular files, directories and symlinks may be deleted.
     return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "only regular files and directories can be deleted")
+                   "only regular files, symlinks and directories can be "
+                   "deleted")
         .Ino(inode.ino)
         .Metadata("delete");
   }
@@ -395,11 +400,11 @@ NTSTATUS NotImplementedWrite(const AdapterState& state) {
   return state.read_write ? STATUS_NOT_SUPPORTED : STATUS_MEDIA_WRITE_PROTECTED;
 }
 
-void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
-                      uint64_t size, const XfsTimestamp& atime,
-                      const XfsTimestamp& mtime, const XfsTimestamp& ctime,
-                      const XfsTimestamp& crtime, uint64_t ino,
-                      FSP_FSCTL_FILE_INFO* info) {
+void FillFileInfoCore(AdapterState& state, uint16_t mode, uint32_t nlink,
+                      uint64_t nblocks, uint64_t size,
+                      const XfsTimestamp& atime, const XfsTimestamp& mtime,
+                      const XfsTimestamp& ctime, const XfsTimestamp& crtime,
+                      uint64_t ino, FSP_FSCTL_FILE_INFO* info) {
   std::memset(info, 0, sizeof(*info));
   info->FileAttributes = FileAttributesFor(state, mode);
   // di_nblocks counts filesystem blocks: the kernel adds bmap extent lengths
@@ -411,21 +416,24 @@ void FillFileInfoCore(AdapterState& state, uint16_t mode, uint64_t nblocks,
   info->LastWriteTime = ToFileTime(mtime);
   info->ChangeTime = ToFileTime(ctime);
   info->IndexNumber = ino;
-  info->HardLinks = 0;
+  // The POSIX link count, so Explorer and fsutil see hard links correctly.
+  info->HardLinks = nlink;
   info->EaSize = 0;
   info->ReparseTag = 0;
 }
 
 void FillFileInfo(AdapterState& state, const XfsInode& inode,
                   FSP_FSCTL_FILE_INFO* info) {
-  FillFileInfoCore(state, inode.mode, inode.nblocks, inode.size, inode.atime,
-                   inode.mtime, inode.ctime, inode.crtime, inode.ino, info);
+  FillFileInfoCore(state, inode.mode, inode.nlink, inode.nblocks, inode.size,
+                   inode.atime, inode.mtime, inode.ctime, inode.crtime,
+                   inode.ino, info);
 }
 
 void FillFileInfo(AdapterState& state, const XfsFileInfo& inode,
                   FSP_FSCTL_FILE_INFO* info) {
-  FillFileInfoCore(state, inode.mode, inode.nblocks, inode.size, inode.atime,
-                   inode.mtime, inode.ctime, inode.crtime, inode.ino, info);
+  FillFileInfoCore(state, inode.mode, inode.nlink, inode.nblocks, inode.size,
+                   inode.atime, inode.mtime, inode.ctime, inode.crtime,
+                   inode.ino, info);
 }
 
 // Replaces a node's cached inode and extent list after a mutation. The core
@@ -726,12 +734,11 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
     }
   }
   Status status;
-  const bool deferred = !node->inode->IsDir();
-  if (deferred) {
-    status = state.fs->Unlink(parent_ino, name, /*defer_inode_free=*/true);
-  } else {
+  if (node->inode->IsDir()) {
     status = state.fs->RemoveEmptyDirectory(parent_ino, name,
                                             /*defer_inode_free=*/false);
+  } else {
+    status = state.fs->Unlink(parent_ino, name, /*defer_inode_free=*/true);
   }
   if (!status.ok()) {
     // CanDelete / SetDelete validated this beforehand; a failure here cannot
@@ -740,10 +747,16 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
                                      << ") failed: " << status.error().Format());
     return;
   }
+  // A file only needs the deferred free when this was its last link; with
+  // other hard links the inode stays fully reachable and nothing is yours to
+  // release here.
+  bool deferred = false;
+  if (!node->inode->IsDir()) {
+    auto fresh = state.fs->OpenInode(node->inode->ino);
+    deferred = fresh.ok() && fresh.value().nlink == 0;
+  }
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
-    // Only a deferred free leaves work for Close; a removed directory is
-    // already gone.
     node->delete_pending = deferred;
   }
   DropNamespaceCaches(state, parent_ino);
@@ -922,8 +935,68 @@ NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR) {
   return NtFromStatus(CheckDeletable(state, *node->inode));
 }
 
-NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID, PWSTR, PWSTR, BOOLEAN) {
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
+                PWSTR new_file_name, BOOLEAN replace_if_exists) {
+  AdapterState& state = *State(file_system);
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+  // The FSD hands over both names; the core owns the whole atomic operation
+  // (never DirRemove + DirInsert from here).
+  auto src = ResolveParentAndName(state, file_name);
+  if (!src.ok()) return NtFromError(src.error().code);
+  auto dst = ResolveParentAndName(state, new_file_name);
+  if (!dst.ok()) return NtFromError(dst.error().code);
+
+  // The replaced target may still have open handles: keep its inode alive
+  // (AGI unlinked list) and let the last Close free it.
+  auto outcome = state.fs->Rename(src.value().first, src.value().second,
+                                  dst.value().first, dst.value().second,
+                                  replace_if_exists != FALSE,
+                                  /*defer_replaced_free=*/true);
+  if (!outcome.ok()) {
+    XFS_DEBUG("Rename('" << WideToUtf8(file_name) << "' -> '"
+                         << WideToUtf8(new_file_name)
+                         << "') failed: " << outcome.error().Format());
+    return NtFromError(outcome.error().code);
+  }
+
+  uint64_t free_ino = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    // An open handle on the moved inode keeps following it under the new
+    // name; a pending delete-on-close on it now refers to the new name.
+    if (file_context != nullptr) {
+      auto it = state.nodes.find(NodeId(file_context));
+      if (it != state.nodes.end() &&
+          it->second->inode->ino == outcome.value().moved_ino) {
+        it->second->parent_ino = dst.value().first;
+        it->second->xfs_name = dst.value().second;
+      }
+    }
+    if (outcome.value().replaced_zero_link) {
+      auto it = state.node_by_inode.find(outcome.value().replaced_ino);
+      if (it == state.node_by_inode.end()) {
+        free_ino = outcome.value().replaced_ino;
+      } else {
+        // The old target stays valid through its handles; its namespace entry
+        // is gone, so Cleanup must not unlink anything and the last Close
+        // frees the inode (exactly the open-but-unlinked state).
+        state.nodes[it->second]->delete_pending = true;
+      }
+    }
+  }
+  if (free_ino != 0) {
+    Status freed = state.fs->FreeUnlinkedInode(free_ino);
+    if (!freed.ok()) {
+      XFS_ERROR("Rename: cannot free the replaced inode " << free_ino << ": "
+                                                          << freed.error().Format());
+    }
+  }
+  DropNamespaceCaches(state, src.value().first, dst.value().first);
+  XFS_DEBUG("renamed '" << WideToUtf8(file_name) << "' -> '"
+                        << WideToUtf8(new_file_name) << "' (moved ino "
+                        << outcome.value().moved_ino << ", replaced ino "
+                        << outcome.value().replaced_ino << ")");
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
@@ -1570,6 +1643,210 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
       // A failed create leaves nothing behind; report and continue.
       if (ctx) Close(&fake, ctx);
     }
+  }
+
+  // RW-4 self-test: atomic rename, hard links and symlinks, including the
+  // replace-an-open-target case. Rename goes through the real callback; hard
+  // links and symlinks have no WinFsp file-system callback, so they drive the
+  // core API the CLI uses (Windows sees the result through the namespace).
+  if (read_write && !failures) {
+    auto options_for = [](UINT32 disposition, UINT32 options) {
+      return (disposition << 24) | options;
+    };
+    constexpr UINT32 kFileCreate = 2;  // FILE_CREATE
+    PVOID ctx = nullptr;
+    FSP_FSCTL_FILE_INFO fi{};
+    std::vector<uint8_t> payload_a(4096);
+    std::vector<uint8_t> payload_w(1024, 0x77);
+    std::vector<uint8_t> payload_v(2048, 0x56);
+    for (size_t i = 0; i < payload_a.size(); ++i) {
+      payload_a[i] = static_cast<uint8_t>(i * 7 + 3);
+    }
+
+    // 1. Create /rw4-a.bin, then rename it to /rw4-b.bin.
+    NTSTATUS st = Create(&fake, const_cast<PWSTR>(L"\\rw4-a.bin"),
+                         options_for(kFileCreate, 0), 0, 0, nullptr, 0, &ctx,
+                         &fi);
+    check(st == STATUS_SUCCESS, "rw4 selftest: create rw4-a.bin");
+    if (st == STATUS_SUCCESS) {
+      ULONG written = 0;
+      check(Write(&fake, ctx, payload_a.data(), 0,
+                  static_cast<ULONG>(payload_a.size()), FALSE, FALSE, &written,
+                  &fi) == STATUS_SUCCESS &&
+                written == payload_a.size(),
+            "rw4 selftest: write rw4-a.bin");
+      Close(&fake, ctx);
+      ctx = nullptr;
+      check(Rename(&fake, nullptr, const_cast<PWSTR>(L"\\rw4-a.bin"),
+                   const_cast<PWSTR>(L"\\rw4-b.bin"), TRUE) == STATUS_SUCCESS,
+            "rw4 selftest: rename a -> b");
+      check(Open(&fake, const_cast<PWSTR>(L"\\rw4-a.bin"), kFileOpen, 0, &ctx,
+                 &fi) == STATUS_OBJECT_NAME_NOT_FOUND,
+            "rw4 selftest: old name is gone");
+      ctx = nullptr;
+      if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-b.bin"), kFileOpen, 0,
+                     &ctx, &fi) == STATUS_SUCCESS,
+                "rw4 selftest: open renamed file")) {
+        std::vector<uint8_t> readback(payload_a.size(), 0);
+        ULONG got = 0;
+        check(Read(&fake, ctx, readback.data(), 0,
+                   static_cast<ULONG>(readback.size()), &got) == STATUS_SUCCESS &&
+                  got == readback.size() && readback == payload_a,
+              "rw4 selftest: renamed file keeps content and inode");
+        const uint64_t moved_ino = fi.IndexNumber;
+
+        // 2. Hard link through the core (WinFsp has no link callback): both
+        // names must resolve to the same inode and share data.
+        Status linked =
+            state.fs->Link(moved_ino, state.fs->RootInode(), "rw4-hard.bin");
+        check(linked.ok(), "rw4 selftest: hard link");
+        if (linked.ok()) {
+          PVOID link_ctx = nullptr;
+          FSP_FSCTL_FILE_INFO link_fi{};
+          if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-hard.bin"), kFileOpen,
+                         0, &link_ctx, &link_fi) == STATUS_SUCCESS,
+                    "rw4 selftest: open the hard link")) {
+            check(link_fi.IndexNumber == moved_ino,
+                  "rw4 selftest: hard link shares the inode");
+            check(link_fi.HardLinks >= 2, "rw4 selftest: nlink >= 2");
+            std::vector<uint8_t> overlay(64, 0x42);
+            ULONG wrote = 0;
+            check(Write(&fake, link_ctx, overlay.data(), 0,
+                        static_cast<ULONG>(overlay.size()), FALSE, FALSE, &wrote,
+                        &link_fi) == STATUS_SUCCESS,
+                  "rw4 selftest: write through the hard link");
+            std::vector<uint8_t> via_other(64, 0);
+            ULONG got_other = 0;
+            check(Read(&fake, ctx, via_other.data(), 0,
+                       static_cast<ULONG>(via_other.size()), &got_other) ==
+                      STATUS_SUCCESS &&
+                      via_other == overlay,
+                  "rw4 selftest: the other name sees the write");
+            Close(&fake, link_ctx);
+          }
+        }
+      }
+      Close(&fake, ctx);
+      ctx = nullptr;
+    }
+
+    // 3. Replace an open target: the old handle keeps the old inode, the name
+    // points at the moved inode, and the last Close releases the old one.
+    auto make_file = [&](const wchar_t* name,
+                         const std::vector<uint8_t>& data) -> bool {
+      PVOID c = nullptr;
+      FSP_FSCTL_FILE_INFO info{};
+      if (Create(&fake, const_cast<PWSTR>(name), options_for(kFileCreate, 0), 0,
+                 0, nullptr, 0, &c, &info) != STATUS_SUCCESS) {
+        return false;
+      }
+      ULONG wrote = 0;
+      bool ok = Write(&fake, c, const_cast<uint8_t*>(data.data()), 0,
+                      static_cast<ULONG>(data.size()), FALSE, FALSE, &wrote,
+                      &info) == STATUS_SUCCESS &&
+                wrote == data.size();
+      Close(&fake, c);
+      return ok;
+    };
+    check(make_file(L"\\rw4-victim.bin", payload_v),
+          "rw4 selftest: create the replace target");
+    check(make_file(L"\\rw4-winner.bin", payload_w),
+          "rw4 selftest: create the replace source");
+    PVOID victim_ctx = nullptr;
+    FSP_FSCTL_FILE_INFO victim_fi{};
+    if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-victim.bin"), kFileOpen, 0,
+                   &victim_ctx, &victim_fi) == STATUS_SUCCESS,
+              "rw4 selftest: open the replace target")) {
+      const uint64_t old_ino = victim_fi.IndexNumber;
+      check(Rename(&fake, nullptr, const_cast<PWSTR>(L"\\rw4-winner.bin"),
+                   const_cast<PWSTR>(L"\\rw4-victim.bin"),
+                   TRUE) == STATUS_SUCCESS,
+            "rw4 selftest: replace rename");
+      // The old handle still reads the old inode's data.
+      std::vector<uint8_t> old_read(payload_v.size(), 0);
+      ULONG got = 0;
+      check(Read(&fake, victim_ctx, old_read.data(), 0,
+                 static_cast<ULONG>(old_read.size()), &got) == STATUS_SUCCESS &&
+                got == old_read.size() && old_read == payload_v,
+            "rw4 selftest: the replaced inode stays alive for its handle");
+      // The name now serves the moved inode.
+      PVOID new_ctx = nullptr;
+      FSP_FSCTL_FILE_INFO new_fi{};
+      if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-victim.bin"), kFileOpen,
+                     0, &new_ctx, &new_fi) == STATUS_SUCCESS,
+                "rw4 selftest: open the replaced name")) {
+        check(new_fi.IndexNumber != old_ino,
+              "rw4 selftest: the name points at the moved inode");
+        std::vector<uint8_t> new_read(payload_w.size(), 0);
+        ULONG got_new = 0;
+        check(Read(&fake, new_ctx, new_read.data(), 0,
+                   static_cast<ULONG>(new_read.size()), &got_new) ==
+                      STATUS_SUCCESS &&
+                  new_read == payload_w,
+              "rw4 selftest: the replaced name serves the new contents");
+        Close(&fake, new_ctx);
+      }
+      // Closing the old handle frees the unlinked inode.
+      Close(&fake, victim_ctx);
+    }
+
+    // 4. Symlink: create through the core, read through the adapter (the
+    // documented policy: the target is exposed as the file content), then
+    // delete it through SetDelete/Cleanup/Close.
+    {
+      auto link = state.fs->CreateSymlink(state.fs->RootInode(), "rw4-link",
+                                          "../rw4-b.bin", 0777, 0, 0);
+      check(link.ok(), "rw4 selftest: create symlink");
+      PVOID link_ctx = nullptr;
+      FSP_FSCTL_FILE_INFO link_fi{};
+      if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-link"), kFileOpen, 0,
+                     &link_ctx, &link_fi) == STATUS_SUCCESS,
+                "rw4 selftest: open the symlink")) {
+        std::vector<char> target(64, 0);
+        ULONG got = 0;
+        check(Read(&fake, link_ctx, target.data(), 0,
+                   static_cast<ULONG>(target.size()), &got) == STATUS_SUCCESS,
+              "rw4 selftest: read the symlink target");
+        check(got == 12 && std::memcmp(target.data(), "../rw4-b.bin", 12) == 0,
+              "rw4 selftest: symlink target is byte-exact");
+        check(SetDelete(&fake, link_ctx, const_cast<PWSTR>(L"\\rw4-link"),
+                        TRUE) == STATUS_SUCCESS,
+              "rw4 selftest: symlink deletable");
+        Cleanup(&fake, link_ctx, const_cast<PWSTR>(L"\\rw4-link"),
+                FspCleanupDelete);
+        Close(&fake, link_ctx);
+        PVOID gone = nullptr;
+        check(Open(&fake, const_cast<PWSTR>(L"\\rw4-link"), kFileOpen, 0, &gone,
+                   &link_fi) == STATUS_OBJECT_NAME_NOT_FOUND,
+              "rw4 selftest: symlink name is gone");
+      }
+    }
+
+    // 5. Delete the two remaining hard-linked names; the inode stays valid
+    // until the last one is gone.
+    {
+      PVOID hard = nullptr;
+      FSP_FSCTL_FILE_INFO hard_fi{};
+      if (check(Open(&fake, const_cast<PWSTR>(L"\\rw4-hard.bin"), kFileOpen, 0,
+                     &hard, &hard_fi) == STATUS_SUCCESS,
+                "rw4 selftest: reopen the hard link")) {
+        check(SetDelete(&fake, hard, const_cast<PWSTR>(L"\\rw4-hard.bin"),
+                        TRUE) == STATUS_SUCCESS,
+              "rw4 selftest: unlink one hard link");
+        Cleanup(&fake, hard, const_cast<PWSTR>(L"\\rw4-hard.bin"),
+                FspCleanupDelete);
+        Close(&fake, hard);
+        PVOID other = nullptr;
+        check(Open(&fake, const_cast<PWSTR>(L"\\rw4-b.bin"), kFileOpen, 0,
+                   &other, &hard_fi) == STATUS_SUCCESS,
+              "rw4 selftest: the other name still resolves");
+        if (other) Close(&fake, other);
+      }
+    }
+
+    std::fprintf(stderr,
+                 "selftest: RW-4 rename/hardlink/symlink verified through the "
+                 "callbacks\n");
   }
 
   LocalFree(state.security_descriptor);

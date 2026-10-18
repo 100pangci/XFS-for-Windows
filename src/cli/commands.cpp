@@ -71,11 +71,18 @@ void PrintUsage() {
       "      --rw-experimental\n"
       "  rmdir <image> <path>          remove an empty directory\n"
       "      --rw-experimental\n"
+      "  rename <image> <src> <dst>    atomically rename (file, symlink or dir)\n"
+      "      --rw-experimental [--replace]  --replace overwrites an existing\n"
+      "                                     file or empty directory target\n"
+      "  link <image> <existing> <new> create a hard link\n"
+      "      --rw-experimental\n"
+      "  symlink <image> <target> <path>  create a symlink (target kept verbatim)\n"
+      "      --rw-experimental\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
-      "                                created, overwritten, extended, truncated\n"
-      "                                and removed; rename is not supported)\n"
+      "                                created, overwritten, extended, truncated,\n"
+      "                                removed, renamed and hard-linked)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -558,6 +565,12 @@ int CommandStat(const std::string& target, const std::string& path) {
   std::cout << "  mtime    : " << FormatTime(i.mtime) << "\n";
   std::cout << "  ctime    : " << FormatTime(i.ctime) << "\n";
   std::cout << "  crtime   : " << FormatTime(i.crtime) << "\n";
+  if ((i.mode & kSIfmt) == kSIflnk) {
+    auto link = fs.value()->ReadSymlink(ino);
+    if (link.ok()) {
+      std::cout << "  target   : " << link.value() << "\n";
+    }
+  }
   if (i.immutable || i.append_only) {
     std::cout << "  flags    : " << (i.immutable ? "immutable " : "")
               << (i.append_only ? "append-only" : "") << "\n";
@@ -1180,6 +1193,101 @@ int CommandRmdir(const std::string& target, const std::string& path,
   return 0;
 }
 
+// RW-4: rename, hard link and symlink creation. The atomic namespace work
+// lives in XfsFilesystem::Rename/Link/CreateSymlink - these commands only
+// resolve paths, choose the replace policy and report the result.
+int CommandRename(const std::string& target, const std::string& src_path,
+                  const std::string& dst_path, bool replace,
+                  const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto src = ParentAndName(*fs, src_path);
+  if (!src.ok()) {
+    PrintError(src.error());
+    return 1;
+  }
+  auto dst = ParentAndName(*fs, dst_path);
+  if (!dst.ok()) {
+    PrintError(dst.error());
+    return 1;
+  }
+  auto outcome = fs->Rename(src.value().first, src.value().second,
+                            dst.value().first, dst.value().second, replace,
+                            /*defer_replaced_free=*/false);
+  if (!outcome.ok()) {
+    PrintError(outcome.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "renamed " << src_path << " -> " << dst_path << " (inode "
+            << outcome.value().moved_ino;
+  if (outcome.value().replaced_ino != 0) {
+    std::cout << ", replaced inode " << outcome.value().replaced_ino;
+    if (outcome.value().replaced_zero_link) {
+      std::cout << " (freed)";
+    } else {
+      std::cout << " (nlink " << outcome.value().replaced_new_nlink << ")";
+    }
+  }
+  std::cout << ")\n";
+  return 0;
+}
+
+int CommandLink(const std::string& target, const std::string& existing_path,
+                const std::string& new_path, const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto existing = fs->LookupPath(existing_path);
+  if (!existing.ok()) {
+    PrintError(existing.error());
+    return 1;
+  }
+  if (existing.value().IsDir()) {
+    std::cerr << "error: cannot hard link a directory\n";
+    return 1;
+  }
+  auto dest = ParentAndName(*fs, new_path);
+  if (!dest.ok()) {
+    PrintError(dest.error());
+    return 1;
+  }
+  Status status =
+      fs->Link(existing.value().ino, dest.value().first, dest.value().second);
+  if (!status.ok()) {
+    PrintError(status.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "linked " << existing_path << " -> " << new_path << " (inode "
+            << existing.value().ino << ", nlink "
+            << existing.value().nlink + 1 << ")\n";
+  return 0;
+}
+
+int CommandSymlink(const std::string& target, const std::string& link_target,
+                   const std::string& link_path, const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto split = ParentAndName(*fs, link_path);
+  if (!split.ok()) {
+    PrintError(split.error());
+    return 1;
+  }
+  auto created = fs->CreateSymlink(split.value().first, split.value().second,
+                                   link_target, 0777, 0, 0);
+  if (!created.ok()) {
+    PrintError(created.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "created symlink " << link_path << " -> " << link_target
+            << " (inode " << created.value() << ")\n";
+  return 0;
+}
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
@@ -1192,6 +1300,7 @@ int Run(const std::vector<std::string>& args) {
   uint32_t namespace_mode = 0;
   bool have_mode = false;
   bool explicit_rw = false;
+  bool replace_existing = false;
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
@@ -1204,6 +1313,9 @@ int Run(const std::vector<std::string>& args) {
       options.yes_i_really_mean_it = true;
     } else if (arg == "--rw-experimental") {
       options.rw_experimental = true;
+    } else if (arg == "--replace") {
+      // rename only: overwrite an existing file or empty directory target.
+      replace_existing = true;
     } else if (arg == "--rw") {
       explicit_rw = true;
     } else if (StartsWith(arg, "--text=")) {
@@ -1360,6 +1472,31 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandRmdir(positional[1], positional[2], options);
+  }
+  if (command == "rename") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin rename <image> <src> <dst> "
+                   "--rw-experimental [--replace]\n";
+      return 1;
+    }
+    return CommandRename(positional[1], positional[2], positional[3],
+                         replace_existing, options);
+  }
+  if (command == "link") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin link <image> <existing> <new> "
+                   "--rw-experimental\n";
+      return 1;
+    }
+    return CommandLink(positional[1], positional[2], positional[3], options);
+  }
+  if (command == "symlink") {
+    if (positional.size() != 4) {
+      std::cerr << "usage: xfswin symlink <image> <target> <linkpath> "
+                   "--rw-experimental\n";
+      return 1;
+    }
+    return CommandSymlink(positional[1], positional[2], positional[3], options);
   }
   if (command == "format") {
     if (positional.size() != 2) {
