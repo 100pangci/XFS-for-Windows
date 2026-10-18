@@ -559,3 +559,76 @@ Every push runs eighteen jobs:
 
 This is the environment-independent version of the Linux/WinFsp acceptance
 checks; see the jobs for the exact commands.
+
+## RW-5: journal recovery
+
+The recovery milestone adds three independent verification layers on top of the
+writer crash matrices:
+
+19. **windows-recover-windows-crash** (windows-2022, matrix rw/rw2/rw3/rw4):
+    takes the crash images the existing matrix jobs already produce, runs
+    `xfswin recover --yes-i-really-mean-it` on a copy of each, and requires from
+    Windows: the structural differential (`xfswin journal --json` vs
+    `tests/tools/recovery_probe.py`) before and after recovery, a clean journal
+    afterwards and `xfswin check` to pass. Uploads the recovered copies.
+20. **linux-verify-windows-recovery** (ubuntu-24.04, same matrix): for every
+    image Windows recovered: the independent probe must see a clean log,
+    `xfs_repair -n` must be silent, the filesystem must mount (so Linux must
+    *not* have to replay anything) and the root directory must be readable.
+    The clean log after the read-only mount is re-checked.
+21. **linux-generate-dirty-logs** (ubuntu-24.04, root): builds the operation
+    matrix (timestamp, extend, truncate, create, unlink, mkdir, rmdir, rename
+    same/cross/replace, hardlink, symlink inline/remote) on freshly formatted
+    minimal-profile filesystems, and captures each one with a device-mapper
+    suspend + copy of the loop backing file - a crash-consistent block-device
+    snapshot, not a copy of a live image. The expected post-operation
+    namespace/content is recorded in a manifest before the capture, and
+    `xfs_logprint -t` output is kept for the differential. The generator
+    itself uses the independent probe and fails if a snapshot is not dirty.
+22. **windows-recover-linux-logs** (windows-2022): replays those real
+    Linux-written dirty logs with `xfswin recover`, with the same differential
+    and clean-journal/check requirements as (19), and keeps the manifests next
+    to the recovered images.
+23. **linux-verify-cross-recovery** (ubuntu-24.04): mounts the Windows-replayed
+    Linux logs, compares namespace/content against the manifests recorded
+    before the crash, requires `xfs_repair -n` silence and a clean log. This is
+    the most important acceptance chain of RW-5: Linux kernel -> dirty log ->
+    Windows replay -> Linux accepts.
+24. **windows-recovery-crash-matrix** (windows-2022, matrix rw2/rw3/rw4):
+    kills `xfswin` inside recovery at every `recovery_*` crash point
+    (`recovery_scan`, `recovery_before_pass2`, `recovery_after_transaction`,
+    `recovery_mid_buffer`, `recovery_after_metadata_flush`,
+    `recovery_before_intents`, `recovery_mid_intents`,
+    `recovery_before_iunlinks`, `recovery_mid_iunlinks`,
+    `recovery_before_log_clean`, `recovery_after_log_clean`), restarts recovery
+    on the same copy and requires convergence: a clean journal and a passing
+    `check`. Points that need a phase the image does not contain (e.g.
+    `recovery_mid_intents` without intents) are allowed to complete normally.
+25. **linux-verify-recovery-crash** (ubuntu-24.04): runs the same Linux
+    verification as (20) on the crash-restarted images.
+
+Local equivalents (the unit tests cover the same contracts without processes):
+
+```powershell
+# recover a crash image and check it end to end
+pwsh tests/scripts/verify_recovery_windows.ps1 -Exe build\src\RelWithDebInfo\xfswin.exe `
+    -WorkDir crash-rw4 -OutDir recovered -MaxImages 4
+
+# crash recovery at every recovery phase, restart, converge
+pwsh tests/scripts/verify_recovery_crash_windows.ps1 -Exe build\src\RelWithDebInfo\xfswin.exe `
+    -WorkDir crash-rw4 -OutDir recovery-crash -Images 1
+```
+
+On Linux (root):
+
+```bash
+sudo bash tests/scripts/make_dirty_logs_linux.sh dirty-logs
+sudo bash tests/scripts/verify_recovery_linux.sh recovered-linux
+```
+
+The unit tests in `tests/unit/recovery_tests.cpp` pin the scanner (clean /
+dirty / wrap / cycle bump / torn tail / uncommitted / unsupported / split
+continuation / multi-item transactions), the replay (buffer LSN+CRC stamping,
+newer-metadata skip, cancellation, refusal before any write), the completion
+phases (EFI free + EFD + no double free after a second recovery, AGI unlinked
+freeing) and recovery restartability at every write (`FailAfterWrites`).

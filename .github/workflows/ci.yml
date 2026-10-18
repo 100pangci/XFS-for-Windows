@@ -986,3 +986,246 @@ jobs:
           head -c $((size - 512)) vhd/xfswin.vhd > rawdevice.img
           ls -l rawdevice.img
           sudo bash tests/scripts/verify_windows_image_linux.sh rawdevice.img
+
+  # ===========================================================================
+  # RW-5: Windows-native journal recovery.
+  #
+  # Oracle A (already above): the dirty image is replayed by the Linux kernel.
+  # Oracle B (here): the same class of dirty image is replayed by XFS for
+  # Windows, then verified back on Linux. The two oracles are kept separate on
+  # purpose: neither side may "prove itself".
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Recover every Windows-generated crash image (RW-1..RW-4) with xfswin, and
+  # check the result from Windows itself (clean journal, `check`, and the
+  # independent parser differential). The recovered copies are the artifact the
+  # Linux job verifies.
+  # ---------------------------------------------------------------------------
+  windows-recover-windows-crash:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [rw, rw2, rw3, rw4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-crash
+          path: crash-${{ matrix.suite }}
+
+      - name: Recover the RW crash images
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_recovery_windows.ps1 `
+            -Exe "bin\xfswin.exe" `
+            -WorkDir "crash-${{ matrix.suite }}" `
+            -OutDir "recovered-${{ matrix.suite }}" `
+            -MaxImages 16
+          if ($LASTEXITCODE -ne 0) { throw "Windows recovery of the ${{ matrix.suite }} crash matrix failed" }
+
+      - name: Upload the recovered images
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-${{ matrix.suite }}
+          path: recovered-${{ matrix.suite }}/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux mounts every image Windows recovered: no replay may be needed, the
+  # metadata must be intact (xfs_repair -n silent) and the namespace readable.
+  # ---------------------------------------------------------------------------
+  linux-verify-windows-recovery:
+    needs: windows-recover-windows-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [rw, rw2, rw3, rw4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-${{ matrix.suite }}
+          path: recovered-${{ matrix.suite }}
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-recovered images with the Linux kernel
+        run: |
+          ls -l "recovered-${{ matrix.suite }}" | head -20
+          sudo bash tests/scripts/verify_recovery_linux.sh "recovered-${{ matrix.suite }}"
+
+  # ---------------------------------------------------------------------------
+  # RW-5 crash-safety of recovery itself: kill xfswin inside recovery at every
+  # recovery crash point, restart it, and require convergence.
+  # ---------------------------------------------------------------------------
+  windows-recovery-crash-matrix:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [rw2, rw3, rw4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-crash
+          path: crash-${{ matrix.suite }}
+
+      - name: Crash recovery at every recovery phase and restart it
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_recovery_crash_windows.ps1 `
+            -Exe "bin\xfswin.exe" `
+            -WorkDir "crash-${{ matrix.suite }}" `
+            -OutDir "recovery-crash-${{ matrix.suite }}" `
+            -Images 1
+          if ($LASTEXITCODE -ne 0) { throw "recovery crash matrix failed for ${{ matrix.suite }}" }
+
+      - name: Upload the restarted images
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-crash-${{ matrix.suite }}
+          path: recovery-crash-${{ matrix.suite }}/
+          if-no-files-found: error
+
+  linux-verify-recovery-crash:
+    needs: windows-recovery-crash-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [rw2, rw3, rw4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovery-crash-${{ matrix.suite }}
+          path: recovery-crash-${{ matrix.suite }}
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the crash-restarted recoveries on Linux
+        run: |
+          sudo bash tests/scripts/verify_recovery_linux.sh "recovery-crash-${{ matrix.suite }}"
+
+  # ---------------------------------------------------------------------------
+  # The other direction (spec 34/53): the Linux kernel itself writes real dirty
+  # logs (device-mapper snapshots of a mounted filesystem), Windows replays
+  # them, Linux verifies namespace/content/allocator state.
+  # ---------------------------------------------------------------------------
+  linux-generate-dirty-logs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Generate the Linux dirty-log operation matrix
+        run: |
+          sudo bash tests/scripts/make_dirty_logs_linux.sh dirty-logs
+          ls -l dirty-logs | head -40
+
+      - name: Upload the Linux dirty logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dirty-logs
+          path: |
+            dirty-logs/*.img
+            dirty-logs/*.manifest.json
+            dirty-logs/*.logprint.txt
+            dirty-logs/summary.txt
+          if-no-files-found: error
+
+  windows-recover-linux-logs:
+    needs: linux-generate-dirty-logs
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-dirty-logs
+          path: dirty-logs
+
+      - name: Replay the Linux-written dirty logs with xfswin
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_recovery_windows.ps1 `
+            -Exe "bin\xfswin.exe" `
+            -WorkDir "dirty-logs" `
+            -OutDir "recovered-linux"
+          if ($LASTEXITCODE -ne 0) { throw "Windows recovery of the Linux dirty logs failed" }
+
+      - name: Keep the manifests next to the recovered images
+        shell: pwsh
+        run: |
+          Copy-Item "dirty-logs\*.manifest.json" "recovered-linux\" -Force
+          Get-ChildItem "recovered-linux" | Select-Object Name, Length
+
+      - name: Upload the recovered Linux logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-linux-logs
+          path: recovered-linux/
+          if-no-files-found: error
+
+  linux-verify-cross-recovery:
+    needs: windows-recover-linux-logs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-linux-logs
+          path: recovered-linux
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Linux verifies the Windows replay of its own logs
+        run: |
+          ls -l recovered-linux | head -40
+          sudo bash tests/scripts/verify_recovery_linux.sh recovered-linux
