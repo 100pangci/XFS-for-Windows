@@ -186,8 +186,10 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                 "read-write option)";
             return error;
           }
-          auto report =
-              fs->RecoverScannedLog(log, RecoveryFinish::kMount);
+          auto report = fs->RecoverScannedLog(
+              log, options.clean_log_after_recovery
+                       ? RecoveryFinish::kCleanLog
+                       : RecoveryFinish::kMount);
           if (!report.ok()) return report.error();
           recovered = true;
           fs->recovery_report_ = report.value();

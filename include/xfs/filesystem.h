@@ -50,6 +50,9 @@ struct MountOptions {
   // mounts only; the default). `false` is the "norecovery" behaviour: a dirty
   // log refuses the mount unless force_unsafe_ro is set.
   bool recover_dirty_log = true;
+  // Finish a mount-time recovery with a clean-unmount record (the standalone
+  // `xfswin recover` shape). Read-write mounts keep the log writable instead.
+  bool clean_log_after_recovery = false;
 };
 
 struct XfsFileInfo {

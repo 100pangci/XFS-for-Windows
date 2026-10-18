@@ -1362,6 +1362,9 @@ int CommandRecover(const std::string& target, const Options& options) {
   }
   MountOptions mount_options;
   mount_options.read_write = true;  // scans, replays and finishes the log
+  // The standalone shape ends with a clean unmount record so every later
+  // mount (Linux or this build) starts from a recovered, clean log.
+  mount_options.clean_log_after_recovery = true;
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1369,12 +1372,12 @@ int CommandRecover(const std::string& target, const Options& options) {
   }
   const auto& report = fs.value()->recovery_report();
   if (!report.has_value()) {
+    // Already clean. (The mount may still have freed unlinked inodes, which
+    // writes transactions; close them so the image leaves clean either way.)
+    if (!CloseWritable(*fs.value())) return 1;
     std::cout << "log is clean; nothing to recover\n";
     return 0;
   }
-  // The standalone shape ends with a clean unmount record so every later
-  // mount (Linux or this build) starts from a recovered, clean log.
-  if (!CloseWritable(*fs.value())) return 1;
   const ReplayStats& replay = report->replay;
   std::cout << "recovery complete\n";
   std::cout << "  records scanned          : " << replay.records_scanned << "\n";

@@ -40,10 +40,11 @@ realtime device, no writes to existing filesystems.**
 | Directories: shortform, block, leaf, node | all four formats unit-tested |
 | Remote and inline symlinks | read (target returned) |
 | Multi-block directories | read |
-| Internal log cleanliness check | yes; replay is **not** implemented |
+| Internal log cleanliness check | yes; dirty logs are classified by the recovery scanner |
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
-| `xfs_repair`-style read-only consistency check | yes (`xfswin check`) |
+| `xfs_repair`-style read-only consistency check | yes (`xfswin check`), including the recovery inventory of a dirty log |
+| **Journal replay (RW-5)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI intent completion and AGI unlinked processing |
 | **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
 | Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
 | Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
@@ -54,7 +55,6 @@ realtime device, no writes to existing filesystems.**
 | xattr / ACL mutation | **not implemented** (refused) |
 | Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
 | Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt and the superblock free block counter |
-| Journal replay (reading a dirty log) | **not implemented** (dirty logs are refused unless `--force-unsafe-ro`; Linux replays ours) |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
 
@@ -110,6 +110,36 @@ with a replace inside it, and inline/remote/dangling/Unicode symlinks, then
 checks `readlink`/`stat`/content byte-exactly and lists the hard-link inode;
 `linux-verify-rw4-crash` replays every crash window of rename, replace,
 directory move, link and symlink and requires a legal old or new namespace.
+
+RW-5 makes Windows independent of Linux for recovery: the internal log is
+parsed, validated, reconstructed and replayed by `xfswin` itself, including
+logs the Linux kernel wrote. [`docs/RECOVERY.md`](docs/RECOVERY.md) documents
+the engine (head/tail discovery, cycle wrap-around, torn-tail trimming,
+transaction reassembly, buffer cancellation, the metadata LSN rule, buffer /
+inode / icreate items, EFI intent completion and AGI unlinked processing) and
+the exact refusal table. Recovery refuses - before the first write - anything
+it cannot prove replayable. Two oracles stay separate: Linux still replays the
+dirty images (`linux-verify-rw*-crash`), and the Windows-recovered copies are
+verified back on Linux (`linux-verify-windows-recovery`,
+`linux-verify-cross-recovery`, `linux-verify-recovery-crash`) with the journal
+clean, `xfs_repair -n` silent and the namespace/content matching the recorded
+manifests. An independent Python parser (`tests/tools/recovery_probe.py`)
+reimplements the read side for the structural differential.
+
+## Journal recovery (RW-5)
+
+```text
+xfswin recover test.img --yes-i-really-mean-it   # explicit, writes metadata
+xfswin journal test.img [--json]                 # read-only structural dump
+xfswin check test.img                            # reports "recovery required: ..."
+
+xfswin mount crash.img X: --rw-experimental      # recovers, then mounts writable
+```
+
+A read-only mount still refuses a dirty log (use `--force-unsafe-ro` to get the
+clearly-warned pre-recovery view). Recovery finishes with a clean unmount
+record in the standalone command; a mounted filesystem writes it at unmount.
+Scope and refusals are listed in `docs/RECOVERY.md` section 10.
 
 ## Read-write support (experimental, RW-2: overwrite, extend, truncate)
 
