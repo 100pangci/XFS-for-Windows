@@ -937,6 +937,126 @@ TEST(recovery_mount_finishes_extent_free_intents) {
   fixture.Reset();
 }
 
+// A device that accepts writes up to a limit and then fails every further
+// write/flush, emulating a power loss in the middle of recovery: everything
+// before the cut is durable, nothing after it happens.
+class FailAfterWrites final : public xfs::BlockDevice {
+ public:
+  explicit FailAfterWrites(xfs::BlockDevice* backing) : backing_(backing) {}
+  void FailAfter(uint64_t writes) { fail_after_ = writes; }
+  void Disable() { fail_after_ = kNoLimit; }
+  uint64_t writes() const { return writes_; }
+
+  bool Read(uint64_t offset, void* buffer, size_t size) override {
+    return backing_->Read(offset, buffer, size);
+  }
+  bool Write(uint64_t offset, const void* buffer, size_t size) override {
+    if (writes_ >= fail_after_) {
+      last_error_ = "injected crash";
+      return false;
+    }
+    ++writes_;
+    return backing_->Write(offset, buffer, size);
+  }
+  bool Flush() override {
+    if (writes_ >= fail_after_) {
+      last_error_ = "injected crash";
+      return false;
+    }
+    return backing_->Flush();
+  }
+  uint64_t Size() const override { return backing_->Size(); }
+  uint32_t SectorSize() const override { return backing_->SectorSize(); }
+  const xfs::DeviceInfo& Info() const override { return backing_->Info(); }
+  void Close() override {}
+
+ private:
+  static constexpr uint64_t kNoLimit = ~0ull;
+  xfs::BlockDevice* backing_;
+  uint64_t fail_after_ = kNoLimit;
+  uint64_t writes_ = 0;
+};
+
+// Recovery must be restartable: crash at any write, restart it, and the final
+// image must equal a recovery that ran without a crash.
+TEST(recovery_crash_and_rerun_converges) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) return;
+  const uint64_t ino = fixture.info().file_ino;
+
+  // A dirty log with several committed transactions.
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    for (int i = 0; i < 3; ++i) {
+      const xfs::XfsTimestamp stamp{1700010000 + i, static_cast<uint32_t>(i)};
+      CHECK(fs.value()->SetFileTimes(ino, stamp, stamp, stamp).ok());
+    }
+  }
+  const std::vector<uint8_t> dirty = memory->bytes();
+
+  xfs::MountOptions options;
+  options.read_write = true;
+
+  // Reference: a complete recovery.
+  {
+    auto fs = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+        options);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+  }
+  const std::vector<uint8_t> expected = memory->bytes();
+  uint64_t verified_cuts = 0;
+  for (uint64_t cut = 0; cut < 16; ++cut) {
+    memory->bytes() = dirty;
+    bool crashed_early = false;
+    {
+      auto device = std::make_unique<FailAfterWrites>(&fixture.storage());
+      device->FailAfter(cut);
+      auto crashed = xfs::XfsFilesystem::Mount(std::move(device), options);
+      crashed_early = !crashed.ok();
+    }
+    if (!crashed_early) break;  // the cut is past the last recovery write
+    // Power is back: recovery runs again, without a write limit.
+    auto retry = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+        options);
+    if (!retry.ok()) {
+      std::fprintf(stderr, "restart after cut %llu failed: %s\n",
+                   static_cast<unsigned long long>(cut),
+                   retry.error().Format().c_str());
+      CHECK(retry.ok());
+      fixture.Reset();
+      return;
+    }
+    if (memory->bytes() != expected) {
+      size_t diff = 0;
+      while (diff < expected.size() && memory->bytes()[diff] == expected[diff]) {
+        ++diff;
+      }
+      std::fprintf(stderr, "cut %llu: image diverges at byte 0x%zx\n",
+                   static_cast<unsigned long long>(cut), diff);
+      CHECK(memory->bytes() == expected);
+      fixture.Reset();
+      return;
+    }
+    ++verified_cuts;
+  }
+  CHECK(verified_cuts >= 3);  // several replay writes were cut and restarted
+  fixture.Reset();
+}
+
 TEST(recovery_mount_frees_unlinked_inodes) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
