@@ -5,16 +5,20 @@
 """Structural differential: `xfs_logprint -t` vs `xfswin journal --json`.
 
 The text does not need to match (xfs_logprint prints details this project does
-not); the *structure* does. This compares what both tools know:
+not); the *structure* does. What both tools know and this compares:
 
-  * clean/dirty classification and the head/tail blocks
-    (`    log tail: T head: H state: <CLEAN|DIRTY>`),
-  * the total number of log operations (`Oper (n): ...` lines against the sum
-    of h_num_logops),
-  * the committed transaction ids (`TRANS: tid:0x...` lines),
-  * the START/COMMIT flag counts.
+  * clean/dirty classification and the head/tail blocks, from the summary line
+    `    log tail: T head: H state: <CLEAN|DIRTY>`;
+  * the record order and per-record LSN cycle and block, from
+    `LOG REC AT LSN cycle C block B (0xcycle, 0xblock)`;
+  * the committed transaction ids, from `TRANS: tid:0x...` lines.
 
-usage: compare_logprint.py <xfswin-journal.json> <xfs_logprint-t.txt>
+`xfs_logprint -t` (transaction mode) does not print the per-operation lines, so
+the operation-count/START/COMMIT checks are only made when `Oper (n):` lines
+are present (the default mode). Its `#items` counter is not comparable: it
+counts the recovered item fragments (one per logged region), not log items.
+
+usage: compare_logprint.py <xfswin-journal.json> <xfs_logprint-output.txt>
 """
 
 import json
@@ -22,6 +26,7 @@ import re
 import sys
 
 TAIL_HEAD = re.compile(r"log tail:\s*(\d+)\s+head:\s*(\d+)\s+state:\s*<(\w+)>")
+LOG_REC = re.compile(r"^LOG REC AT LSN cycle (\d+) block (\d+)")
 OPER = re.compile(r"^Oper \((\d+)\): tid: ([0-9a-fA-F]+)\s+len: (\d+)\s+"
                   r"clientid: (\S+)\s+flags: (.*)$")
 TRANS = re.compile(r"^TRANS: tid:0x([0-9a-fA-F]+)\s+#items:(\d+)")
@@ -30,7 +35,8 @@ TRANS = re.compile(r"^TRANS: tid:0x([0-9a-fA-F]+)\s+#items:(\d+)")
 def parse_logprint(path):
     data = {
         "tail": None, "head": None, "state": None,
-        "oper_count": 0, "tids": set(), "starts": 0, "commits": 0,
+        "records": [], "oper_count": 0, "tids": set(),
+        "starts": 0, "commits": 0,
     }
     with open(path, "r", errors="replace") as handle:
         for line in handle:
@@ -40,6 +46,10 @@ def parse_logprint(path):
                 data["tail"] = int(match.group(1))
                 data["head"] = int(match.group(2))
                 data["state"] = match.group(3)
+                continue
+            match = LOG_REC.match(line)
+            if match:
+                data["records"].append((int(match.group(1)), int(match.group(2))))
                 continue
             match = OPER.match(line)
             if match:
@@ -78,29 +88,38 @@ def main(argv):
         problems.append("head block: xfs_logprint=%d xfswin=%d" %
                         (logprint["head"], journal["head"]["block"]))
 
-    record_ops = sum(record["ops"] for record in journal["records"])
-    if logprint["oper_count"] != record_ops:
-        problems.append("operation count: xfs_logprint=%d xfswin=%d" %
-                        (logprint["oper_count"], record_ops))
+    # The record chain: same count, same (cycle, block) in the same order.
+    ours = [(record["cycle"], record["block"]) for record in journal["records"]]
+    if logprint["records"] != ours:
+        problems.append("record chain: xfs_logprint=%s xfswin=%s" %
+                        (logprint["records"], ours))
 
     committed_tids = {trans["tid"] for trans in journal["transactions"]}
     missing = committed_tids - logprint["tids"]
     if missing:
         problems.append("transactions missing from xfs_logprint: %s" %
                         sorted(missing))
-    if logprint["starts"] not in (0, len(committed_tids)):
-        problems.append("START count: xfs_logprint=%d xfswin=%d" %
-                        (logprint["starts"], len(committed_tids)))
-    if logprint["commits"] != len(committed_tids):
-        problems.append("COMMIT count: xfs_logprint=%d xfswin=%d" %
-                        (logprint["commits"], len(committed_tids)))
+
+    # `xfs_logprint -t` prints no operation lines; when they are there, hold
+    # both tools to the same operation/START/COMMIT counts.
+    if logprint["oper_count"]:
+        record_ops = sum(record["ops"] for record in journal["records"])
+        if logprint["oper_count"] != record_ops:
+            problems.append("operation count: xfs_logprint=%d xfswin=%d" %
+                            (logprint["oper_count"], record_ops))
+        if logprint["starts"] not in (0, len(committed_tids)):
+            problems.append("START count: xfs_logprint=%d xfswin=%d" %
+                            (logprint["starts"], len(committed_tids)))
+        if logprint["commits"] != len(committed_tids):
+            problems.append("COMMIT count: xfs_logprint=%d xfswin=%d" %
+                            (logprint["commits"], len(committed_tids)))
 
     for problem in problems:
         print("DIFF: " + problem)
     if problems:
         return 1
-    print("compare_logprint: structure matches (%d records, %d ops, %d commits)"
-          % (len(journal["records"]), record_ops, len(committed_tids)))
+    print("compare_logprint: structure matches (%d records, %d transactions)"
+          % (len(ours), len(committed_tids)))
     return 0
 
 

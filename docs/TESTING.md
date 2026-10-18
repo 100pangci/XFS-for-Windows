@@ -581,10 +581,16 @@ writer crash matrices:
     same/cross/replace, hardlink, symlink inline/remote) on freshly formatted
     minimal-profile filesystems, and captures each one with a device-mapper
     suspend + copy of the loop backing file - a crash-consistent block-device
-    snapshot, not a copy of a live image. The expected post-operation
-    namespace/content is recorded in a manifest before the capture, and
-    `xfs_logprint -t` output is kept for the differential. The generator
-    itself uses the independent probe and fails if a snapshot is not dirty.
+    snapshot, not a copy of a live image. The operation, its manifest and the
+    device freeze run in a single process, so the operation's own transaction is
+    still inside the recovery window at capture time (a phase that produces
+    nothing but one-block superblock buffers is retried, up to three attempts).
+    The expected post-operation namespace/content (including `mtime_ns`) is
+    recorded in a manifest before the capture, `xfs_logprint -t` output is kept
+    for the differential, and the generator itself replays a copy of every
+    snapshot with the Linux kernel and requires it to reach the manifest state:
+    a fixture is only uploaded if Linux itself can replay it. The generator
+    fails if a snapshot is not dirty or carries no operation.
 22. **windows-recover-linux-logs** (windows-2022): replays those real
     Linux-written dirty logs with `xfswin recover`, with the same differential
     and clean-journal/check requirements as (19), and keeps the manifests next

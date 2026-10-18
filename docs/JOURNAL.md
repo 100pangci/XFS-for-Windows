@@ -312,7 +312,9 @@ Two more facts learned while implementing:
   the points before the record is durable and the *logged* new ones after it,
   require the data to be old or new, require a clean log after the unmount and
   `xfs_repair -n` to stay silent.
-- Still to do: a differential dump (`xfs_logprint -t`) against a
-  Linux-created transaction, and replaying our log with the real `xfs_logprint`
-  in CI once the record shapes are common (RW-2 items).
+- Differential dump: `tests/tools/compare_logprint.py` compares the kernel's
+  `xfs_logprint -t` output against `xfswin journal --json` (record chain with
+  LSN cycle + block, head/tail/state, committed transaction ids) on the
+  Linux-written dirty-log matrix; CI job `windows-recover-linux-logs` runs it
+  for every fixture before replaying it (RW-5, `docs/RECOVERY.md` section 8).
 - Next: RW-2 (allocator, growth, unwritten extents) and RW-3 (create/unlink).

@@ -11,11 +11,13 @@
 #             inobtcount=0)
 #   mount on a device-mapper linear device over a loop file
 #   build the base tree, run one operation, fsync the affected file/dir
-#     (the transaction is now durable in the log; the metadata behind it may
-#     still be in the journal - the crash state recovery has to handle)
-#   suspend the dm device (completed writes are now the whole truth)
-#   copy the loop backing file (bit-for-bit snapshot of the block device)
+#     (the transaction is now durable in the log; the metadata behind it is
+#     still in the journal - the crash state recovery has to handle)
+#   freeze the dm device in the same process as the operation, then copy the
+#     loop backing file (bit-for-bit snapshot of the block device)
 #   resume, unmount
+#   the kernel's own recovery of a copy of the snapshot must reach the manifest
+#     state (the fixture is replayable by definition, not just by Windows)
 #
 # The device-mapper suspend is what makes this a crash-consistent block-device
 # snapshot instead of "cp of a live image": no write can be in flight while the
@@ -74,6 +76,7 @@ stop_device() {
 for scenario in $SCENARIOS; do
     echo "== $scenario =="
     captured=0
+    reason=""
     for attempt in 1 2 3; do
         stop_device
         LIVE="$WORK/live.img"
@@ -91,38 +94,57 @@ for scenario in $SCENARIOS; do
             -i sparse=0 "$DEV"
         mount "$DEV" "$MOUNT"
         python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
-        python3 "$REPO/tests/tools/dirty_ops.py" "$scenario" "$MOUNT" \
-            "$OUT/$scenario.manifest.json"
-        # Freeze a replayable window: one more fsync'd transaction keeps the
-        # metadata behind the log records dirty, so the tail cannot have moved
-        # past them yet. (The AIL could in principle still win the race, hence
-        # the retry loop.)
-        python3 "$REPO/tests/tools/dirty_ops.py" pin "$MOUNT"
-        dmsetup suspend "$DM"
+        # The operation, its manifest and the device freeze all happen inside
+        # one process: freezing a couple of milliseconds after the fsync keeps
+        # the operation's own transaction in the recovery window instead of
+        # letting the AIL write the metadata back first. (It can still win the
+        # race every now and then, hence the retry loop.)
+        python3 "$REPO/tests/tools/dirty_ops.py" capture "$scenario" "$MOUNT" \
+            "$OUT/$scenario.manifest.json" "$DM"
+        # The device is frozen: take the bytes.
         dd if="$LIVE" of="$OUT/$scenario.img" bs=1M status=none conv=sparse
         dmsetup resume "$DM"
         umount "$MOUNT"
         # Record what the kernel's own log dump says, then let the independent
         # probe classify the snapshot (it must be dirty, otherwise the capture
-        # method is wrong).
+        # method is wrong) and check that the window really carries the
+        # operation: a window with nothing but one-block superblock buffers is
+        # only a counter update, not a namespace/content test.
         xfs_logprint -t "$OUT/$scenario.img" > "$OUT/$scenario.logprint.txt" 2>&1 || true
-        STATE=$(python3 "$REPO/tests/tools/recovery_probe.py" \
-                    "$OUT/$scenario.img" | head -1 || true)
-        if [ "$STATE" = "state: dirty" ]; then
+        python3 "$REPO/tests/tools/recovery_probe.py" \
+            "$OUT/$scenario.img" --json > "$OUT/$scenario.journal.json" || true
+        STATE=$(python3 -c "import json,sys; print('state: %s' % json.load(open(sys.argv[1]))['state'])" \
+                    "$OUT/$scenario.journal.json" 2>/dev/null || true)
+        has_op=$(python3 - "$OUT/$scenario.journal.json" <<'PY'
+import json
+import sys
+
+def sb_only(item):
+    return (item["type"] == "XFS_LI_BUF" and item.get("blkno") == 0
+            and item.get("len") == 1)
+
+try:
+    data = json.load(open(sys.argv[1]))
+    items = [item for trans in data["transactions"] for item in trans["items"]]
+    print("yes" if any(not sb_only(item) for item in items) else "no")
+except Exception:
+    print("no")
+PY
+)
+        if [ "$STATE" = "state: dirty" ] && [ "$has_op" = "yes" ]; then
             captured=1
             break
         fi
-        echo "  attempt $attempt: not dirty ($STATE), retrying"
+        reason="$STATE, operation in window: $has_op"
+        echo "  attempt $attempt: $reason, retrying"
     done
     echo "$scenario $STATE" >> "$OUT/summary.txt"
     if [ "$captured" -ne 1 ]; then
-        echo "ERROR: $scenario is not a dirty log ($STATE)" >&2
+        echo "ERROR: $scenario did not capture a replayable window ($reason)" >&2
         exit 1
     fi
     # Record the real item inventory of this operation (docs/RECOVERY.md's
     # operation -> item table is built from this evidence, not from guesses).
-    python3 "$REPO/tests/tools/recovery_probe.py" \
-        "$OUT/$scenario.img" --json > "$OUT/$scenario.journal.json"
     python3 - "$scenario" "$OUT/$scenario.journal.json" >> "$OUT/inventory.txt" <<'PY'
 import json
 import sys
@@ -137,7 +159,17 @@ print("%-16s records=%d transactions=%d items: %s" % (
     scenario, len(data["records"]), len(data["transactions"]),
     ", ".join("%s=%d" % (k, counts[k]) for k in sorted(counts)) or "none"))
 PY
-    echo "  $STATE ($(stat -c %s "$OUT/$scenario.img") bytes)"
+    # Independent fixture sanity: the Linux kernel's own recovery of the
+    # snapshot must reach the manifest state as well - a fixture nobody can
+    # replay is not a fixture. Done on a copy, so the uploaded image is exactly
+    # the bytes that were captured.
+    cp --sparse=always "$OUT/$scenario.img" "$WORK/sanity.img"
+    mount -o loop "$WORK/sanity.img" "$MOUNT"
+    python3 "$REPO/tests/tools/dirty_ops.py" verify "$MOUNT" \
+        "$OUT/$scenario.manifest.json"
+    umount "$MOUNT"
+    rm -f "$WORK/sanity.img"
+    echo "  $STATE ($(stat -c %s "$OUT/$scenario.img") bytes, op in window, kernel replay matches the manifest)"
     stop_device
 done
 
