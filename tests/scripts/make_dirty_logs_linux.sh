@@ -72,6 +72,35 @@ stop_device() {
     LOOP=""
 }
 
+# Diagnostics for a captured phase that carries no operation: print the window
+# the independent probe found and what the kernel's own dump says.
+dump_window() {
+    local scenario=$1
+    echo "  window for $scenario (probe):"
+    python3 - "$OUT/$scenario.journal.json" <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception as exc:
+    print("    no probe data: %s" % exc)
+    raise SystemExit(0)
+for rec in data["records"]:
+    print("    rec lsn=%s block=%d cycle=%d len=%d ops=%d prev=%d tail=%s"
+          % (rec["lsn"], rec["block"], rec["cycle"], rec["len"], rec["ops"],
+             rec["prev"], rec["tail_lsn"]))
+for trans in data["transactions"]:
+    items = ", ".join("%s(blkno=%s)" % (item["type"], item.get("blkno", "-"))
+                      for item in trans["items"])
+    print("    trans tid=%d items=%d: %s"
+          % (trans["tid"], len(trans["items"]), items))
+print("    head=%s tail=%s" % (data["head"], data["tail"]))
+PY
+    echo "  window for $scenario (xfs_logprint -t):"
+    sed 's/^/    | /' "$OUT/$scenario.logprint.txt" | head -40
+}
+
 : > "$OUT/summary.txt"
 for scenario in $SCENARIOS; do
     echo "== $scenario =="
@@ -137,6 +166,7 @@ PY
         fi
         reason="$STATE, operation in window: $has_op"
         echo "  attempt $attempt: $reason, retrying"
+        dump_window "$scenario"
     done
     echo "$scenario $STATE" >> "$OUT/summary.txt"
     if [ "$captured" -ne 1 ]; then

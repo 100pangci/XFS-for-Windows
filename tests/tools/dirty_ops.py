@@ -32,6 +32,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 
 BASE = "base"
 
@@ -193,16 +195,41 @@ def verify(mountpoint, manifest_path):
     return 0 if not problems else 1
 
 
-def capture(scenario, mountpoint, manifest_path, dm):
+def _noise(mountpoint, count):
+    """Dumps a burst of fsync'd transactions into the log.
+
+    The kernel covers an idle log (empty CIL and AIL): it syncs the
+    superblock, pushes the AIL and moves the log tail past everything that was
+    just logged, which would leave the recovery window with nothing but the
+    covering transaction. A burst of real transactions keeps the AIL
+    non-empty, so the covering cannot run and the next transaction - the
+    operation under test - stays inside the window. The noise lives in
+    noise/ (outside base/, so outside the manifest).
+    """
+    directory = os.path.join(mountpoint, "noise")
+    for i in range(count):
+        try:
+            write_file(os.path.join(directory, "n%d" % (i % 64)),
+                       b"n" * 512)
+        except OSError:
+            break
+
+
+def capture(scenario, mountpoint, manifest_path, dm, noise=True):
     """Runs the operation, records the expected state, then freezes the block
     device - in one process.
 
-    fsync makes the log record durable but does not stop the AIL from writing
-    the metadata back, which would move the tail past the record. Freezing the
-    dm device a couple of milliseconds after the fsync (instead of after
-    another tool start) keeps the operation's transaction in the recovery
-    window.
+    fsync makes the log record durable but does not stop the kernel from
+    syncing the metadata back (which moves the tail past the record). The
+    noise burst keeps the AIL non-empty so the log covering stays away, and
+    the device freeze follows the fsync immediately.
     """
+    os.makedirs(os.path.join(mountpoint, "noise"), exist_ok=True)
+    if noise:
+        worker = threading.Thread(target=_noise, args=(mountpoint, 400),
+                                  daemon=True)
+        worker.start()
+        worker.join()
     run(scenario, mountpoint)
     data = manifest(mountpoint)
     with open(manifest_path, "w") as handle:
@@ -218,8 +245,9 @@ def main(argv):
         return 0
     if len(argv) == 4 and argv[1] == "verify":
         return verify(argv[2], argv[3])
-    if len(argv) == 6 and argv[1] == "capture":
-        capture(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) in (6, 7) and argv[1] == "capture":
+        capture(argv[2], argv[3], argv[4], argv[5],
+                noise=(len(argv) == 6 or argv[6] != "no-noise"))
         return 0
     print(__doc__)
     return 2
