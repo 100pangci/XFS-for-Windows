@@ -3,10 +3,12 @@
 [![CI](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml/badge.svg)](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
 
-A Windows-native XFS tool: format XFS v5 filesystems and read existing ones,
-including a read-only WinFsp mount as a normal drive letter. No WSL, no Linux
-VM, no compatibility layer — the parser and formatter talk to
-`\\.\PhysicalDriveN`, `\\.\HarddiskVolumeX` or image files directly.
+A Windows-native XFS tool: format XFS v5 filesystems, read them through a
+WinFsp mount, write to them with an experimental transaction writer, and
+recover their internal journal - including logs written by the Linux kernel.
+No WSL, no Linux VM, no compatibility layer — the parser, formatter, writer and
+recovery engine talk to `\\.\PhysicalDriveN`, `\\.\HarddiskVolumeX` or image
+files directly.
 
 ```
 Windows / WinFsp
@@ -23,8 +25,11 @@ Block Device Abstraction  (Image, Windows raw device, memory (tests))
 
 ## Status
 
-First version scope: **XFS v5 (`crc=1`), internal log, single data device, no
-realtime device, no writes to existing filesystems.**
+Scope: **XFS v5 (`crc=1`), internal log, single data device, no realtime
+device.** Reading and formatting are complete; writing is an experimental,
+allow-listed subset (RW-1..RW-4) and journal recovery is native (RW-5). A
+filesystem is only modified when this build maintains every structure it uses;
+anything else is refused for read-write and stays readable.
 
 | Feature | Status |
 |---|---|
@@ -344,6 +349,8 @@ xfswin mkimage test.img 300M                  # create a sparse test image
 xfswin format test.img --yes-i-really-mean-it # create a fresh XFS v5 fs
 xfswin info test.img                          # superblock + geometry
 xfswin check test.img                         # read-only consistency validation
+xfswin recover test.img --yes-i-really-mean-it # replay a dirty internal log
+xfswin journal test.img [--json]              # log structure dump
 xfswin ls test.img /                          # list a directory
 xfswin cat test.img /hello.txt                # stream file data to stdout
 xfswin stat test.img /hello.txt               # inode details
@@ -404,8 +411,10 @@ destructive flag), `3` refused for safety reasons.
   build cannot keep consistent is refused for read-write instead of being
   modified best-effort.
 - xattr and ACL mutation are refused; the core has no transaction for them yet.
-  The journal is only ever *read* on mount (cleanliness check); a dirty log
-  refuses mount (Linux replays logs written by this build).
+  A dirty journal is replayed by this build before a read-write mount becomes
+  visible (`xfswin recover` does the same offline); a read-only mount refuses a
+  dirty log instead of showing a pre-recovery view
+  (`--force-unsafe-ro` is the explicit, clearly-warned exception).
 - `xfswin format` is still the only writer of a whole filesystem, and the only
   path that can destroy existing data.
 
@@ -472,6 +481,16 @@ Linux verification of Windows-created images and generation of golden images
 from Linux are scripted in `tests/scripts/`; see `docs/TESTING.md`. In CI they
 run on Linux runners and feed the Windows reader/mount jobs.
 
+Recovery has its own matrices: `tests/unit/recovery_tests.cpp` pins the scanner
+and the replay rules, `tests/scripts/verify_recovery_*` drive the Windows
+recovery with an independent Python oracle (`tests/tools/recovery_probe.py`)
+and an `xfs_logprint` differential, the `recovery_*` crash points kill the
+process inside every recovery phase and require the restart to converge, and
+`tests/scripts/make_dirty_logs_linux.sh` generates real kernel-written dirty
+logs that Linux itself validates after Windows replayed them. See
+[`docs/RECOVERY.md`](docs/RECOVERY.md) and
+[`docs/TESTING.md`](docs/TESTING.md).
+
 The WinFsp adapter can also be exercised without the driver:
 
 ```powershell
@@ -492,7 +511,12 @@ src/core/            parser, verifier, geometry, directories, check, caches
 src/block/           image and Windows raw block devices
 src/mkfs/            geometry, superblock/AG/inode/log builders, formatter
 src/write/           read-write layer: policy, range mapping, in-place data
-                     writes, transactions, log record writer, flush
+                     writes, transactions, log record writer, flush, recovery
+                     host (intent completion, AGI unlinked lists, superblock
+                     counters and LSN)
+src/recovery/        internal-log recovery: head/tail discovery, record
+                     validation, transaction reassembly, pass1/pass2 replay,
+                     buffer cancellation
 src/winfsp/          WinFsp adapter and mount host
 src/cli/             xfswin.exe
 tests/               unit + integration tests, fixture builder, scripts for
