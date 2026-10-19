@@ -582,12 +582,12 @@ writer crash matrices:
     minimal-profile filesystems, and captures each one with a device-mapper
     suspend + copy of the loop backing file - a crash-consistent block-device
     snapshot, not a copy of a live image. The operation, its manifest and the
-    device freeze run in a single process, and a stream of fsync'd noise writes
-    (outside the manifest tree) keeps the log busy until the freeze: the kernel
-    covers an idle log every syncd period, which would move the tail past the
-    operation and leave nothing but superblock-counter records in the window.
-    A captured phase whose transactions contain no operation item is retried
-    (up to three attempts). The expected post-operation namespace/content
+    device freeze run in a single process, and a stream of unforced noise
+    writes (outside the manifest tree) keeps the CIL busy until the freeze: the
+    kernel covers an idle log every syncd period, which would move the tail
+    past the operation and leave nothing but superblock-counter records in the
+    window. A captured phase whose transactions contain no operation item is
+    retried (up to three attempts). The expected post-operation namespace/content
     (including `mtime_ns`) is recorded in a manifest before the capture,
     `xfs_logprint -t` output is kept for the differential, and the generator
     itself replays a copy of every snapshot with the Linux kernel and requires

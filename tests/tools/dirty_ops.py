@@ -213,16 +213,26 @@ def _noise(directory, stop):
     pushes the whole AIL and moves the tail past everything that was just
     logged, which leaves the recovery window with nothing but the covering
     transaction (superblock buffers). Covering cannot start while the CIL or
-    the AIL is non-empty, so a stream of fsync'd in-place writes keeps the
-    operation under test inside the window until the device is frozen.
+    the AIL is non-empty, so this stream of committed inode-timestamp
+    transactions keeps the log busy until the device is frozen; the operation's
+    own fsync then pushes the whole CIL - noise and operation together - into
+    the log.
+
+    The writes are deliberately *not* fsync'd: they only have to commit
+    transactions into the CIL, and not waiting for I/O keeps this thread out of
+    uninterruptible sleep, where a suspend of the block device would keep the
+    process from ever exiting.
     """
     i = 0
     while not stop.is_set():
         try:
-            write_file(os.path.join(directory, "n%d" % (i % 64)), b"n" * 512)
+            with open(os.path.join(directory, "n%d" % (i % 64)), "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"n" * 512)
         except OSError:
             break
         i += 1
+        time.sleep(0.002)  # ~500 transactions/s, a few dozen per capture
 
 
 def capture(scenario, mountpoint, manifest_path, dm, noise=True):
@@ -231,10 +241,11 @@ def capture(scenario, mountpoint, manifest_path, dm, noise=True):
 
     fsync makes the log record durable but does not stop the kernel from
     syncing the metadata back (which moves the tail past the record). The
-    noise stream keeps the AIL non-empty so the log covering stays away, and
-    the device freeze follows the fsync immediately. The noise thread is still
-    running when the device is suspended (its next write blocks there), so the
-    window is frozen mid-noise, exactly like a crash on a busy filesystem.
+    noise stream keeps the CIL/AIL non-empty so the log covering stays away,
+    and the device freeze follows the fsync immediately. The noise thread is
+    still running when the device is suspended; its writes only touch the page
+    cache, so no thread is left in uninterruptible sleep on the frozen device
+    (that would keep this process from exiting).
     """
     stop = threading.Event()
     worker = None

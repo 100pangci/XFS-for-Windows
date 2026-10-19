@@ -156,6 +156,13 @@ whole inode and the result is verified (`xfs_dinode_verify` equivalent). The
 LSN rule is strictly greater (`di_lsn > current_lsn` skips), so checkpoints
 sharing a start LSN are all applied.
 
+A *freed* inode (unlink/rmdir/rename-replace: `xfs_difree` zeroed the core,
+`mode == 0`) is a legal log item, and the kernel's verifier only applies the
+mode/type, extent-count, fork-offset and realtime checks when the mode is
+non-zero. Replay accepts it with exactly that scope (magic, version, checksum,
+`di_ino` and the UUID must still hold) and never decodes forks for it; the
+readers keep refusing a mode-0 inode, it is not a file.
+
 ### 4.4 ICREATE
 
 `XFS_LI_ICREATE` rebuilds whole inode clusters from the logged geometry
@@ -262,7 +269,7 @@ Two oracles are kept; neither side proves itself:
   truncate, create, unlink, mkdir, rmdir, rename (same/cross/replace),
   hardlink, symlink (inline/remote). Each fixture is a device-mapper snapshot
   taken while I/O is frozen and with the operation, its manifest and the freeze
-  in one process, while a stream of fsync'd noise writes keeps the log busy so
+  in one process, while a stream of unforced noise writes keeps the CIL busy so
   the kernel cannot cover the log and the operation's transaction is still in
   the window (a phase whose window carries no operation item is retried). The
   expected post-operation namespace/content is recorded as a manifest before
