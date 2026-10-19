@@ -267,16 +267,18 @@ Two oracles are kept; neither side proves itself:
   (`linux-generate-dirty-logs` -> `windows-recover-linux-logs` ->
   `linux-verify-cross-recovery`): the operation matrix is timestamp, extend,
   truncate, create, unlink, mkdir, rmdir, rename (same/cross/replace),
-  hardlink, symlink (inline/remote). Each fixture is a device-mapper snapshot
-  taken while I/O is frozen and with the operation, its manifest and the freeze
-  in one process, while a stream of unforced noise writes keeps the CIL busy so
-  the kernel cannot cover the log and the operation's transaction is still in
-  the window (a phase whose window carries no operation item is retried). The
-  expected post-operation namespace/content is recorded as a manifest before
-  the capture, and the generator replays a copy of every snapshot with the
-  Linux kernel and requires that replay to reach the manifest: the fixture
-  exists only if Linux itself recovers to the recorded state. Windows must
-  reproduce it and Linux must accept it.
+  hardlink, symlink (inline/remote). Each fixture is a copy of the loop block
+  device taken right after the operation's fsync and before the unmount, in the
+  same process, while a stream of unforced noise writes keeps the CIL busy. The
+  device is not frozen on purpose: a freeze quiesces the log, writes the
+  metadata back and moves the tail past the operation, leaving only covering
+  records in the window; right after the fsync nothing is in flight, so the
+  copy sees every completed write whole and a torn newest record is what
+  recovery trims. The expected post-operation namespace/content is recorded as
+  a manifest before the capture, and the generator replays a copy of every
+  snapshot with the Linux kernel and requires that replay to reach the
+  manifest: the fixture exists only if Linux itself recovers to the recorded
+  state. Windows must reproduce it and Linux must accept it.
 * **C - recovery itself crashes**: `windows-recovery-crash-matrix` kills
   `xfswin` inside recovery at every `recovery_*` point and requires the restart
   to converge (`linux-verify-recovery-crash` re-checks the result).

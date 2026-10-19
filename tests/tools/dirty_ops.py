@@ -9,17 +9,18 @@ Three jobs:
   dirty_ops.py setup <mountpoint>
       builds the base tree every scenario starts from.
 
-  dirty_ops.py capture <scenario> <mountpoint> <manifest.json> <dm> <live> <img>
+  dirty_ops.py capture <scenario> <mountpoint> <manifest.json> <live> <img>
       performs one namespace/content operation, forces the *log* to be durable
       (fsync waits for the log record; the metadata behind it may still be in
       the journal - that is exactly the crash state recovery has to handle),
       writes the expected post-operation state (type, size, sha256, link
-      target, nlink, mtime) as JSON, freezes the device-mapper device, copies
-      the loop backing file to <img> and resumes the device - all in one
-      process, so the operation's transaction is still inside the recovery
-      window when the bytes are copied. An unforced noise stream in noise/
-      keeps the CIL busy until the freeze, so the kernel cannot cover the log
-      (which would move the tail past the operation).
+      target, nlink, mtime) as JSON, and copies the loop backing file (a
+      sparse copy of the block device) right away - all in one process, so the
+      operation's transaction is still inside the recovery window when the
+      bytes are copied. The device is not frozen: a freeze quiesces the log.
+      An unforced noise stream in noise/ keeps the CIL busy until the copy, so
+      the kernel cannot cover the log (which would move the tail past the
+      operation).
 
   dirty_ops.py verify <mountpoint> <manifest.json>
       compares a mounted filesystem against a manifest (used by the Linux
@@ -33,7 +34,6 @@ import hashlib
 import json
 import os
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -252,18 +252,19 @@ def _copy_sparse(source, target):
         dst.truncate(offset)
 
 
-def capture(scenario, mountpoint, manifest_path, dm, live, image, noise=True):
-    """Runs the operation, records the expected state, freezes the block device,
-    copies the device bytes and resumes it - in one process.
+def capture(scenario, mountpoint, manifest_path, live, image, noise=True):
+    """Runs the operation, records the expected state, then copies the device
+    bytes - in one process.
 
-    fsync makes the log record durable but does not stop the kernel from
-    syncing the metadata back (which moves the tail past the record). The
-    noise stream keeps the CIL/AIL non-empty so the log covering stays away,
-    and the device freeze follows the fsync immediately. The noise thread is
-    still running when the device is suspended; its next file operation blocks,
-    so the device is resumed again before this process exits (a thread left in
-    uninterruptible sleep on a frozen device would keep the process - and the
-    shell waiting for it - from ever finishing).
+    There is deliberately no device-mapper suspend: suspending a device with a
+    mounted filesystem freezes it (lockfs), the kernel quiesces the log on
+    freeze and the frozen log contains nothing but the covering records - the
+    operation's transaction has already been written back and the tail moved
+    past it. Right after the fsync nothing is in flight (the fsync waited for
+    the log record, and no metadata writeback has been started), so the copy
+    sees every completed write whole; a torn newest record is exactly what
+    recovery trims. The noise stream keeps the CIL busy so the log cannot be
+    covered between the operation and the copy.
     """
     stop = threading.Event()
     worker = None
@@ -279,15 +280,13 @@ def capture(scenario, mountpoint, manifest_path, dm, live, image, noise=True):
         with open(manifest_path, "w") as handle:
             json.dump({"scenario": scenario, "entries": data}, handle,
                       indent=2, sort_keys=True)
-        subprocess.run(["dmsetup", "suspend", dm], check=True)
-        # The device is frozen: these are exactly the bytes that reached it.
+        # These are the bytes the device has accepted so far.
         _copy_sparse(live, image)
-        subprocess.run(["dmsetup", "resume", dm], check=True)
     finally:
         stop.set()
         if worker is not None:
             worker.join(timeout=2.0)
-    print("%s: %d entries, device frozen and copied" % (scenario, len(data)))
+    print("%s: %d entries, device copied" % (scenario, len(data)))
 
 
 def main(argv):
@@ -296,9 +295,9 @@ def main(argv):
         return 0
     if len(argv) == 4 and argv[1] == "verify":
         return verify(argv[2], argv[3])
-    if len(argv) in (8, 9) and argv[1] == "capture":
-        capture(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
-                noise=(len(argv) == 8 or argv[8] != "no-noise"))
+    if len(argv) in (7, 8) and argv[1] == "capture":
+        capture(argv[2], argv[3], argv[4], argv[5], argv[6],
+                noise=(len(argv) == 7 or argv[7] != "no-noise"))
         return 0
     print(__doc__)
     return 2
