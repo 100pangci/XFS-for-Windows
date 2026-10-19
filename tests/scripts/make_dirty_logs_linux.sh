@@ -13,16 +13,15 @@
 #   build the base tree, run one operation, fsync the affected file/dir
 #     (the transaction is now durable in the log; the metadata behind it is
 #     still in the journal - the crash state recovery has to handle)
-#   freeze the dm device in the same process as the operation, then copy the
-#     loop backing file (bit-for-bit snapshot of the block device)
-#   resume, unmount
+#   freeze the dm device, copy the loop backing file and resume, all inside the
+#     capture process (bit-for-bit snapshot of the block device)
+#   unmount
 #   the kernel's own recovery of a copy of the snapshot must reach the manifest
 #     state (the fixture is replayable by definition, not just by Windows)
 #
 # The device-mapper suspend is what makes this a crash-consistent block-device
 # snapshot instead of "cp of a live image": no write can be in flight while the
-# snapshot is copied, and the backup file is exactly the bytes that reached the
-# device.
+# snapshot is copied, and the copy is exactly the bytes that reached the device.
 #
 # Output: <outdir>/<scenario>.img, <scenario>.manifest.json (expected post-op
 # state), <scenario>.logprint.txt (xfs_logprint -t) and summary.txt.
@@ -123,16 +122,14 @@ for scenario in $SCENARIOS; do
             -i sparse=0 "$DEV"
         mount "$DEV" "$MOUNT"
         python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
-        # The operation, its manifest and the device freeze all happen inside
-        # one process: freezing a couple of milliseconds after the fsync keeps
-        # the operation's own transaction in the recovery window instead of
-        # letting the AIL write the metadata back first. (It can still win the
-        # race every now and then, hence the retry loop.)
-        python3 "$REPO/tests/tools/dirty_ops.py" capture "$scenario" "$MOUNT" \
-            "$OUT/$scenario.manifest.json" "$DM"
-        # The device is frozen: take the bytes.
-        dd if="$LIVE" of="$OUT/$scenario.img" bs=1M status=none conv=sparse
-        dmsetup resume "$DM"
+        # The operation, its manifest, the freeze and the snapshot copy all
+        # happen inside one process: freezing right after the fsync (while a
+        # noise stream keeps the CIL busy) keeps the operation's own transaction
+        # in the recovery window instead of letting the AIL write the metadata
+        # back. The device is resumed before the process returns, so the noise
+        # thread cannot leave the process stuck on a frozen device.
+        timeout 240 python3 "$REPO/tests/tools/dirty_ops.py" capture "$scenario" "$MOUNT" \
+            "$OUT/$scenario.manifest.json" "$DM" "$LIVE" "$OUT/$scenario.img"
         umount "$MOUNT"
         # Record what the kernel's own log dump says, then let the independent
         # probe classify the snapshot (it must be dirty, otherwise the capture
