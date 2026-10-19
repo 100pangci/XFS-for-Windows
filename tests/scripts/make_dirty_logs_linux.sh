@@ -9,19 +9,23 @@
 #
 #   mkfs.xfs (crc=1, finobt=0, rmapbt=0, reflink=0, sparse=0, bigtime=0,
 #             inobtcount=0)
-#   mount on a device-mapper linear device over a loop file
+#   mount a loop device over a file
 #   build the base tree, run one operation, fsync the affected file/dir
 #     (the transaction is now durable in the log; the metadata behind it is
 #     still in the journal - the crash state recovery has to handle)
-#   freeze the dm device, copy the loop backing file and resume, all inside the
-#     capture process (bit-for-bit snapshot of the block device)
+#   copy the loop backing file right away, inside the same process as the
+#     operation (a sparse copy of the block device)
 #   unmount
 #   the kernel's own recovery of a copy of the snapshot must reach the manifest
 #     state (the fixture is replayable by definition, not just by Windows)
 #
-# The device-mapper suspend is what makes this a crash-consistent block-device
-# snapshot instead of "cp of a live image": no write can be in flight while the
-# snapshot is copied, and the copy is exactly the bytes that reached the device.
+# The copy happens without freezing the filesystem on purpose: a freeze (what
+# a device-mapper suspend of a mounted device does) quiesces the log, which
+# writes the metadata back, moves the tail past the operation and leaves
+# nothing but covering records in the window. Right after the fsync no I/O is
+# in flight - the fsync waited for the log record and no metadata writeback has
+# been started - so the copy contains every completed write whole; a torn
+# newest record is exactly what recovery trims.
 #
 # Output: <outdir>/<scenario>.img, <scenario>.manifest.json (expected post-op
 # state), <scenario>.logprint.txt (xfs_logprint -t) and summary.txt.
@@ -39,7 +43,6 @@ rename-cross rename-replace hardlink symlink-inline symlink-remote"
 mkdir -p "$OUT"
 WORK=$(mktemp -d)
 LOOP=""
-DM=""
 LIVE=""
 MOUNT="$WORK/mnt"
 mkdir -p "$MOUNT"
@@ -47,27 +50,24 @@ mkdir -p "$MOUNT"
 cleanup() {
     set +e
     mountpoint -q "$MOUNT" && umount -l "$MOUNT"
-    if [ -n "$DM" ]; then dmsetup remove -f "$DM" >/dev/null 2>&1; fi
     if [ -n "$LOOP" ]; then losetup -d "$LOOP" >/dev/null 2>&1; fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 if [ "$(id -u)" != "0" ]; then
-    echo "must run as root (loop devices, device-mapper, mount)" >&2
+    echo "must run as root (loop devices, mount)" >&2
     exit 1
 fi
-for tool in mkfs.xfs xfs_logprint losetup dmsetup dd python3; do
+for tool in mkfs.xfs xfs_logprint losetup python3; do
     command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
 
 stop_device() {
     set +e
     mountpoint -q "$MOUNT" && umount -l "$MOUNT"
-    if [ -n "$DM" ]; then dmsetup remove -f "$DM" >/dev/null 2>&1; fi
     if [ -n "$LOOP" ]; then losetup -d "$LOOP" >/dev/null 2>&1; fi
     set -e
-    DM=""
     LOOP=""
 }
 
@@ -111,9 +111,7 @@ for scenario in $SCENARIOS; do
         rm -f "$LIVE"
         truncate -s "${SIZE_MB}M" "$LIVE"
         LOOP=$(losetup --find --show "$LIVE")
-        DM="xfswin-rw5-$$"
-        dmsetup create "$DM" --table "0 $(blockdev --getsz "$LOOP") linear $LOOP 0"
-        DEV="/dev/mapper/$DM"
+        DEV="$LOOP"
         # The writable profile of this project, nothing else. (mkfs.xfs: crc /
         # finobt / rmapbt / reflink / inobtcount / bigtime are -m options;
         # sparse is an -i option.)
@@ -122,14 +120,13 @@ for scenario in $SCENARIOS; do
             -i sparse=0 "$DEV"
         mount "$DEV" "$MOUNT"
         python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
-        # The operation, its manifest, the freeze and the snapshot copy all
-        # happen inside one process: freezing right after the fsync (while a
-        # noise stream keeps the CIL busy) keeps the operation's own transaction
-        # in the recovery window instead of letting the AIL write the metadata
-        # back. The device is resumed before the process returns, so the noise
-        # thread cannot leave the process stuck on a frozen device.
+        # The operation, its manifest and the snapshot copy all happen inside
+        # one process: copying right after the fsync (while a noise stream keeps
+        # the CIL busy) keeps the operation's own transaction in the recovery
+        # window instead of letting a log freeze/covering write the metadata
+        # back and move the tail past it.
         timeout 240 python3 "$REPO/tests/tools/dirty_ops.py" capture "$scenario" "$MOUNT" \
-            "$OUT/$scenario.manifest.json" "$DM" "$LIVE" "$OUT/$scenario.img"
+            "$OUT/$scenario.manifest.json" "$LIVE" "$OUT/$scenario.img"
         umount "$MOUNT"
         # Record what the kernel's own log dump says, then let the independent
         # probe classify the snapshot (it must be dirty, otherwise the capture
