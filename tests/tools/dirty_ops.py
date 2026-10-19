@@ -9,16 +9,17 @@ Three jobs:
   dirty_ops.py setup <mountpoint>
       builds the base tree every scenario starts from.
 
-  dirty_ops.py capture <scenario> <mountpoint> <manifest.json> <dm-name>
+  dirty_ops.py capture <scenario> <mountpoint> <manifest.json> <dm> <live> <img>
       performs one namespace/content operation, forces the *log* to be durable
       (fsync waits for the log record; the metadata behind it may still be in
       the journal - that is exactly the crash state recovery has to handle),
       writes the expected post-operation state (type, size, sha256, link
-      target, nlink, mtime) as JSON, and then suspends the device-mapper device
-      right away. An fsync'd noise stream in noise/ keeps the log busy until
-      the freeze, so the kernel cannot cover the log (which would move the tail
-      past the operation) and the operation's transaction is still inside the
-      recovery window when the device bytes are copied.
+      target, nlink, mtime) as JSON, freezes the device-mapper device, copies
+      the loop backing file to <img> and resumes the device - all in one
+      process, so the operation's transaction is still inside the recovery
+      window when the bytes are copied. An unforced noise stream in noise/
+      keeps the CIL busy until the freeze, so the kernel cannot cover the log
+      (which would move the tail past the operation).
 
   dirty_ops.py verify <mountpoint> <manifest.json>
       compares a mounted filesystem against a manifest (used by the Linux
@@ -235,17 +236,34 @@ def _noise(directory, stop):
         time.sleep(0.002)  # ~500 transactions/s, a few dozen per capture
 
 
-def capture(scenario, mountpoint, manifest_path, dm, noise=True):
-    """Runs the operation, records the expected state, then freezes the block
-    device - in one process.
+def _copy_sparse(source, target):
+    """Copies `source` to `target`, skipping all-zero chunks (conv=sparse)."""
+    offset = 0
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            if chunk.count(0) == len(chunk):
+                dst.seek(len(chunk), os.SEEK_CUR)
+            else:
+                dst.write(chunk)
+            offset += len(chunk)
+        dst.truncate(offset)
+
+
+def capture(scenario, mountpoint, manifest_path, dm, live, image, noise=True):
+    """Runs the operation, records the expected state, freezes the block device,
+    copies the device bytes and resumes it - in one process.
 
     fsync makes the log record durable but does not stop the kernel from
     syncing the metadata back (which moves the tail past the record). The
     noise stream keeps the CIL/AIL non-empty so the log covering stays away,
     and the device freeze follows the fsync immediately. The noise thread is
-    still running when the device is suspended; its writes only touch the page
-    cache, so no thread is left in uninterruptible sleep on the frozen device
-    (that would keep this process from exiting).
+    still running when the device is suspended; its next file operation blocks,
+    so the device is resumed again before this process exits (a thread left in
+    uninterruptible sleep on a frozen device would keep the process - and the
+    shell waiting for it - from ever finishing).
     """
     stop = threading.Event()
     worker = None
@@ -262,14 +280,14 @@ def capture(scenario, mountpoint, manifest_path, dm, noise=True):
             json.dump({"scenario": scenario, "entries": data}, handle,
                       indent=2, sort_keys=True)
         subprocess.run(["dmsetup", "suspend", dm], check=True)
+        # The device is frozen: these are exactly the bytes that reached it.
+        _copy_sparse(live, image)
+        subprocess.run(["dmsetup", "resume", dm], check=True)
     finally:
         stop.set()
         if worker is not None:
-            # The noise thread is usually blocked in an fsync on the suspended
-            # device; the process exits right after this and kills it, so a
-            # short join is enough to let an idle iteration finish.
-            worker.join(timeout=0.2)
-    print("%s: %d entries, device frozen" % (scenario, len(data)))
+            worker.join(timeout=2.0)
+    print("%s: %d entries, device frozen and copied" % (scenario, len(data)))
 
 
 def main(argv):
@@ -278,9 +296,9 @@ def main(argv):
         return 0
     if len(argv) == 4 and argv[1] == "verify":
         return verify(argv[2], argv[3])
-    if len(argv) in (6, 7) and argv[1] == "capture":
-        capture(argv[2], argv[3], argv[4], argv[5],
-                noise=(len(argv) == 6 or argv[6] != "no-noise"))
+    if len(argv) in (8, 9) and argv[1] == "capture":
+        capture(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                noise=(len(argv) == 8 or argv[8] != "no-noise"))
         return 0
     print(__doc__)
     return 2
