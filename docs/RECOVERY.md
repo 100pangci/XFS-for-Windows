@@ -178,6 +178,19 @@ Partial writes in front of the head are overwritten with empty records of the
 previous cycle (`xlog_clear_stale_blocks`), step by step and capped at
 `XLOG_TOTAL_REC_SHIFT` blocks, so a later crash cannot mistake them for data.
 
+Superblock counters and LSN (both after the replay, before the completion
+transactions):
+
+* lazy counters (`sb_icount`, `sb_ifree`, `sb_fdblocks`) are not authoritative
+  after a crash. They are rebuilt from the AGI/AGF headers and written to the
+  superblock sector, exactly like `xfs_initialize_perag_data()` does after log
+  mount - the completion transactions read them back, and a value that is too
+  small makes freeing an inode chunk fail;
+* closing the log stamps the superblock's LSN with the LSN of the unmount
+  record (the kernel's covering write does the same). Without it every replay
+  of kernel-written metadata would leave blocks whose LSN is *ahead of the
+  superblock*, which `xfswin check` (like a repair scan) treats as corruption.
+
 ## 5. Completion phases (normal transactions)
 
 These run after the metadata replay has been flushed, through the normal

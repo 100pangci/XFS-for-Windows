@@ -306,6 +306,17 @@ class XfsFilesystem {
   // read-only mount or when the log is already clean.
   Status WriteCleanUnmountRecord();
 
+  // Writes the primary superblock sector with its LSN set to `lsn` and a fresh
+  // CRC. The kernel does the same when it covers the log: every metadata LSN
+  // must stay at or below the superblock's LSN, otherwise a later check of the
+  // clean image reports metadata "ahead of superblock".
+  Status StampSuperblockLsn(uint64_t lsn);
+
+  // Rebuilds the in-core superblock counters from the AGI/AGF headers
+  // (xfs_initialize_perag_data). Lazy counters are not authoritative after a
+  // crash, and the completion transactions need correct values.
+  Status RefreshSuperblockCounters();
+
   // ---- journal recovery (RW-5, writable devices) ----
   // Read-only analysis of the internal log for `xfswin check` and for mount
   // diagnostics: head/tail, record validation, committed transactions and the

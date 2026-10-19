@@ -199,6 +199,13 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
                                               << " fdblocks="
                                               << superblock_.fdblocks);
 
+  // Lazy superblock counters are not authoritative after a crash: the kernel
+  // waits for recovery and then rebuilds them from the AGI/AGF headers
+  // (xfs_initialize_perag_data), and the completion transactions below update
+  // them, so do it before they run.
+  Status refreshed = RefreshSuperblockCounters();
+  if (!refreshed.ok()) return refreshed.error();
+
   // Adopt the recovered log position: the next record continues at the head
   // and the tail stays pinned until every intent is complete.
   log_position_ = LogPosition{};
@@ -377,7 +384,7 @@ Result<uint64_t> XfsFilesystem::ProcessAgiUnlinkedLists(
         Status freed = FreeUnlinkedInode(ino);
         if (!freed.ok()) {
           XFS_WARN("recovery: freeing unlinked inode " << ino << " failed: "
-                                                       << freed.error().message);
+                                                       << freed.error().Format());
           Status s = ClearAgiBucket(agno, bucket, "free failed");
           if (!s.ok()) return s.error();
           ++cleared;

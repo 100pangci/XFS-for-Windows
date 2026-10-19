@@ -16,12 +16,14 @@
 #include <cstring>
 #include <utility>
 
+#include "xfs/ag.h"
 #include "xfs/crash.h"
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
+#include "xfs/ondisk.h"
 #include "xfs/transaction.h"
 
 namespace xfs {
@@ -539,6 +541,12 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
         .Metadata("log");
   }
   MaybeCrash(CrashPoint::kAfterLogCommit, "clean-unmount");
+  // The kernel stamps the superblock with the covering LSN when it closes the
+  // log; every metadata LSN has to stay at or below it. Do the same before the
+  // position moves on, so a later check of this clean image is consistent.
+  Status stamped = StampSuperblockLsn(
+      MakeLsn(params.cycle, params.block) /* the record just written */);
+  if (!stamped.ok()) return stamped;
   log_position_.next_block += record_blocks;
   if (log_position_.next_block >= log_position_.log_blocks) {
     log_position_.next_block = 0;
@@ -552,6 +560,98 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
   XFS_DEBUG("clean unmount record written at block " << params.block
                                                      << " cycle "
                                                      << params.cycle);
+  return OkStatus();
+}
+
+Status XfsFilesystem::RefreshSuperblockCounters() {
+  // xfs_initialize_perag_data(): lazy superblock counters are not
+  // authoritative after a crash. Sum the per-AG headers and adopt the result.
+  uint64_t ifree = 0;
+  uint64_t icount = 0;
+  uint64_t fdblocks = 0;
+  for (uint32_t agno = 0; agno < geometry_.agcount; ++agno) {
+    auto agf = ReadAgf(*device_, geometry_, agno);
+    if (!agf.ok()) return agf.error();
+    auto agi = ReadAgi(*device_, geometry_, agno);
+    if (!agi.ok()) return agi.error();
+    ifree += agi.value().freecount;
+    icount += agi.value().count;
+    fdblocks += static_cast<uint64_t>(agf.value().freeblks) +
+                agf.value().flcount + agf.value().btreeblks;
+  }
+  if (fdblocks > superblock_.dblocks || ifree > icount) {
+    return XFS_ERR(XfsError::kCorruptSuperblock,
+                   "AG headers disagree with the superblock counters")
+        .Expected(superblock_.dblocks)
+        .Actual(fdblocks)
+        .Metadata("recovery");
+  }
+  superblock_.ifree = ifree;
+  superblock_.icount = icount;
+  superblock_.fdblocks = fdblocks;
+  // The completion transactions read the counters back from the on-disk
+  // superblock sector (ApplySuperblockDeltas), so persist the rebuilt values
+  // now. The LSN stays as recovered; the clean close stamps it afterwards.
+  const size_t sector = geometry_.sector_size;
+  if (sector < ondisk::sb::kLsn + 8 || sector > (64u << 10)) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "cannot rewrite the superblock counters with this sector "
+                   "size")
+        .Expected(sector)
+        .Metadata("superblock");
+  }
+  std::vector<uint8_t> buf(sector);
+  if (!device_->Read(0, buf.data(), sector)) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to read the superblock: " + device_->LastError())
+        .Metadata("superblock");
+  }
+  PutBE64(buf.data(), ondisk::sb::kIcount, icount);
+  PutBE64(buf.data(), ondisk::sb::kIfree, ifree);
+  PutBE64(buf.data(), ondisk::sb::kFdblocks, fdblocks);
+  UpdateXfsChecksum(buf.data(), sector, ondisk::sb::kCrc);
+  if (!device_->Write(0, buf.data(), sector) || !device_->Flush()) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to write the superblock counters: " +
+                       device_->LastError())
+        .Metadata("superblock");
+  }
+  XFS_SB_INFO("rebuilt superblock counters: icount=" << icount << " ifree="
+                                                     << ifree << " fdblocks="
+                                                     << fdblocks);
+  return OkStatus();
+}
+
+Status XfsFilesystem::StampSuperblockLsn(uint64_t lsn) {
+  const size_t sector = geometry_.sector_size;
+  if (sector < ondisk::sb::kLsn + 8 || sector > (64u << 10)) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "cannot stamp the superblock LSN with this sector size")
+        .Expected(sector)
+        .Metadata("superblock");
+  }
+  std::vector<uint8_t> buf(sector);
+  if (!device_->Read(0, buf.data(), sector)) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to read the superblock: " + device_->LastError())
+        .Metadata("superblock");
+  }
+  if (GetBE32(buf.data(), ondisk::sb::kMagic) != ondisk::kSbMagic) {
+    return XFS_ERR(XfsError::kBadMagic, "superblock magic mismatch")
+        .Metadata("superblock")
+        .Expected(ondisk::kSbMagic)
+        .Actual(GetBE32(buf.data(), ondisk::sb::kMagic));
+  }
+  PutBE64(buf.data(), ondisk::sb::kLsn, lsn);
+  UpdateXfsChecksum(buf.data(), sector, ondisk::sb::kCrc);
+  if (!device_->Write(0, buf.data(), sector) || !device_->Flush()) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to write the superblock LSN: " +
+                       device_->LastError())
+        .Metadata("superblock");
+  }
+  superblock_.lsn = lsn;
+  XFS_DEBUG("superblock LSN stamped: 0x" << std::hex << lsn << std::dec);
   return OkStatus();
 }
 
