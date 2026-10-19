@@ -1139,7 +1139,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # The other direction (spec 34/53): the Linux kernel itself writes real dirty
-  # logs (device-mapper snapshots of a mounted filesystem), Windows replays
+  # logs (block-device snapshots of a mounted filesystem), Windows replays
   # them, Linux verifies namespace/content/allocator state.
   # ---------------------------------------------------------------------------
   linux-generate-dirty-logs:

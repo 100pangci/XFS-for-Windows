@@ -221,8 +221,7 @@ def _noise(directory, stop):
 
     The writes are deliberately *not* fsync'd: they only have to commit
     transactions into the CIL, and not waiting for I/O keeps this thread out of
-    uninterruptible sleep, where a suspend of the block device would keep the
-    process from ever exiting.
+    uninterruptible I/O wait, so the capture process always exits promptly.
     """
     i = 0
     while not stop.is_set():
