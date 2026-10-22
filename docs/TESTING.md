@@ -663,6 +663,12 @@ freeing) and recovery restartability at every write (`FailAfterWrites`).
   `count=32` sparse record, allocating/freeing all backed inodes removes the
   record and frees exactly the 16 backing blocks.
 
+Related regression tests in `journal_tests.cpp` and `unit_tests.cpp` cover
+log positions beyond `sb_logblocks` (LSNs count 512-byte basic blocks, not
+filesystem blocks) and encoded extent addresses in non-power-of-two AGs.
+The latter accepts valid last-AG extents even when their encoded addresses
+exceed `sb_dblocks`, but still rejects AG padding and cross-AG ranges.
+
 ### Independent oracle (`tests/tools/rw6_inode_probe.py`)
 
 A standalone Python implementation parses the superblock, AGI, every inobt and
@@ -695,6 +701,10 @@ linux-generate-rw6-dirty         Linux dirty logs with modern features
 windows-recover-rw6-dirty        RW-5 replay + rw6 oracle
 linux-verify-rw6-cross-recovery  Linux mounts/replays the result
 ```
+
+Linux crash verification expands and verifies one archive at a time, then
+removes that image before expanding the next. All 176 cases remain mandatory;
+the runner need not hold roughly 69 GiB of uncompressed images simultaneously.
 
 `xfs_tests --make-rw6-sparse out/sparse.img` creates a 1 KiB-block modern
 filesystem with a formatter chunk plus a real sparse chunk: the allocator has

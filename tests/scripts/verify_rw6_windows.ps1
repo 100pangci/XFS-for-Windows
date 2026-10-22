@@ -22,10 +22,15 @@ $image = Join-Path $WorkDir 'modern-windows.img'
 Copy-Item $SourceImage $image -Force
 
 function Invoke-Ok([string]$what, [string[]]$arguments) {
-    & $Exe @arguments | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" }
+    $output = & $Exe @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $code = $LASTEXITCODE
+        $output | ForEach-Object { Write-Host $_ }
+        throw "$what failed (exit $code)"
+    }
 }
 
+Invoke-Ok 'check Linux source image' @('check', $image)
 Invoke-Ok 'mkdir /win' @('mkdir', $image, '/win', '--rw-experimental')
 Invoke-Ok 'create /win/created.bin' @('create', $image, '/win/created.bin',
     '--rw-experimental')

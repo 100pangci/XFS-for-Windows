@@ -535,13 +535,20 @@ jobs:
 
       - name: Verify recovered crash images with Linux
         run: |
+          mkdir -p empty-dirty crash-rw6/current
+          checked=0
           for archive in crash-rw6/*.zip; do
             [ -e "$archive" ] || continue
-            unzip -o "$archive" -d crash-rw6
+            # 176 images are ~69 GiB expanded. Verify one at a time rather
+            # than filling the runner disk before the first repair check.
+            unzip -o "$archive" -d crash-rw6/current
+            sudo bash tests/scripts/verify_recovery_rw6_linux.sh \
+              empty-dirty crash-rw6/current
+            rm crash-rw6/current/*.img
+            checked=$((checked + 1))
           done
-          ls -l crash-rw6 | head -20
-          mkdir -p empty-dirty
-          sudo bash tests/scripts/verify_recovery_rw6_linux.sh empty-dirty crash-rw6
+          test "$checked" -eq 176
+          echo "Verified all $checked crash archives"
 
   # ---------------------------------------------------------------------------
   # Linux dirty logs on the modern profile -> Windows RW-5 recovery -> Linux

@@ -179,6 +179,47 @@ TEST(read_file_across_extents_holes_and_unwritten) {
   CHECK(mapped.value().is_hole);
 }
 
+TEST(extent_addresses_in_non_power_of_two_allocation_groups) {
+  XfsGeometry geo = MakeTestGeometry();
+  geo.agcount = 4;
+  geo.agblocks = 768;
+  geo.agblklog = 10;
+  geo.dblocks = 3 * geo.agblocks + 600;  // shorter final AG
+  xfstest::MemoryBlockDevice dev(geo.dblocks * geo.block_size);
+  const uint64_t fsb = geo.AgFsb(3, 599);
+  CHECK(fsb > geo.dblocks);
+  std::memset(dev.bytes().data() + geo.FsbToByte(fsb), 'Q', geo.block_size);
+
+  XfsInode inode;
+  inode.ino = 64;
+  inode.mode = 0x81a4;
+  inode.format = ondisk::inode::kFormatExtents;
+  inode.size = geo.block_size;
+  AddExtent(&inode, {0, fsb, 1, false});
+  uint8_t data[8];
+  auto read = ReadFileData(dev, geo, inode, 0, data, sizeof(data));
+  CHECK(read.ok());
+  CHECK_EQ(read.value(), sizeof(data));
+  for (uint8_t byte : data) CHECK_EQ(byte, 'Q');
+
+  auto rejects = [&](uint64_t start, uint32_t count) {
+    XfsInode invalid = inode;
+    invalid.data_fork.clear();
+    invalid.nextents = 0;
+    AddExtent(&invalid, {0, start, count, false});
+    std::vector<XfsExtent> extents;
+    auto status = LoadDataForkExtents(dev, geo, invalid, &extents);
+    CHECK(!status.ok());
+    CHECK(status.error().code == XfsError::kCorruptExtent);
+  };
+  rejects(fsb, 2);                   // extends beyond the last AG
+  rejects(geo.AgFsb(3, 600), 1);      // first block past that AG
+  rejects(geo.AgFsb(1, 800), 1);      // encoded padding, not an AG block
+  rejects(geo.AgFsb(1, 767), 2);      // crosses an AG boundary
+  rejects(geo.AgFsb(4, 0), 1);        // nonexistent AG
+  rejects((uint64_t{1} << 42) | fsb, 1);  // AG number must not truncate to u32
+}
+
 TEST(read_file_via_bmbt_btree) {
   const uint64_t kBlock = 4096;
   auto dev = std::make_unique<xfstest::MemoryBlockDevice>(kBlock * 1024, 512);

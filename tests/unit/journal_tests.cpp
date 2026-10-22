@@ -276,6 +276,58 @@ TEST(clean_unmount_record_closes_the_log) {
   fixture.Reset();
 }
 
+TEST(log_position_crosses_filesystem_block_count_boundary) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  const auto& geo = fs.value()->geometry();
+  const auto& sb = fs.value()->superblock();
+  const uint64_t log_start = geo.FsbToByte(sb.logstart);
+
+  // sb_logblocks counts filesystem blocks, but record LSNs and the log head
+  // count 512-byte basic blocks. Seed a clean close just before the old
+  // scanner's erroneous boundary and let the next transaction cross it.
+  LogRecordParams params = BaseParams();
+  params.uuid = sb.uuid;
+  params.log_blocks = static_cast<uint32_t>(
+      (static_cast<uint64_t>(sb.logblocks) << geo.block_log) / 512);
+  CHECK(params.log_blocks > sb.logblocks + 4);
+  params.cycle = 7;
+  params.block = sb.logblocks - 2;
+  params.prev_block = 0xffffffffu;
+  params.tail_lsn = xfs::MakeLsn(params.cycle, params.block);
+  auto record = xfs::BuildLogRecord(params, {xfs::MakeUnmountOp()});
+  CHECK(record.ok());
+  CHECK_EQ(record.value().size(), 1024u);
+  CHECK(memory->Write(log_start + uint64_t{params.block} * 512,
+                      record.value().data(), record.value().size()));
+
+  auto position = xfs::ReadLogPosition(*memory, geo, sb);
+  CHECK(position.ok());
+  CHECK_EQ(position.value().next_block, sb.logblocks);
+  const uint8_t byte = 0x7e;
+  CHECK(fs.value()->OverwriteFileData(fixture.info().file_ino, 0, &byte, 1)
+            .ok());
+  auto check = xfs::CheckLogClean(*memory, geo, sb);
+  CHECK(check.ok());
+  CHECK(check.value().state == xfs::LogState::kDirty);
+  CHECK_EQ(check.value().block, sb.logblocks);
+  CHECK(!xfs::ReadLogPosition(*memory, geo, sb).ok());
+
+  CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+  check = xfs::CheckLogClean(*memory, geo, sb);
+  CHECK(check.ok());
+  CHECK(check.value().state == xfs::LogState::kClean);
+  CHECK(check.value().block > sb.logblocks);
+  position = xfs::ReadLogPosition(*memory, geo, sb);
+  CHECK(position.ok());
+  CHECK(position.value().next_block > sb.logblocks);
+  fixture.Reset();
+}
+
 TEST(set_file_times_writes_inode_and_log) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
