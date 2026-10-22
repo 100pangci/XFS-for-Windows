@@ -79,6 +79,18 @@ jobs:
           python tests/tools/rw6_inode_probe.py out/modern.img
           if ($LASTEXITCODE -ne 0) { throw "RW-6A oracle rejected the image" }
 
+      - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = "build\tests\$env:BUILD_CONFIG\xfs_tests.exe"
+          & $tests --make-rw6-sparse out\rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture build failed" }
+          python tests/tools/rw6_inode_probe.py out/rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture oracle failed" }
+          & "build\src\$env:BUILD_CONFIG\xfswin.exe" check out\rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture check failed" }
+
       - name: Fixture image (one allocated file) for the RW tests
         shell: pwsh
         run: |
@@ -281,6 +293,13 @@ jobs:
           path: out/modern.img
           if-no-files-found: error
 
+      - name: Upload the RW-6A sparse-chunk fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6-sparse-fixture
+          path: out/rw6-sparse.img
+          if-no-files-found: error
+
   # ===========================================================================
   # RW-6A: modern inode feature profile
   # (finobt + inobtcount + sparse inodes + bigtime + NREXT64)
@@ -340,6 +359,33 @@ jobs:
           sudo bash tests/scripts/verify_windows_image_linux.sh \
             rw6-formatted/modern.img
           python3 tests/tools/rw6_inode_probe.py rw6-formatted/modern.img
+
+  # ---------------------------------------------------------------------------
+  # A Windows-written sparse chunk (nonzero holemask, ICREATE + subsequent
+  # inode allocation) must be accepted by the real Linux kernel and xfs_repair.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6-sparse:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-sparse-fixture
+          path: rw6-sparse
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows sparse-chunk fixture
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6-sparse/rw6-sparse.img
+          python3 tests/tools/rw6_inode_probe.py rw6-sparse/rw6-sparse.img
 
   # ---------------------------------------------------------------------------
   # Windows mutates the Linux-created image (create/write/truncate/rename/

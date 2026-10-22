@@ -216,6 +216,13 @@ of the same structures (including the superblock cross-accounting identities
 `sum(AGI) == sb_icount/ifree` and `sum(AGF) == sb_fdblocks`). It is used on
 Windows-mutated and Linux-recovered images in CI.
 
+CI also builds a dedicated sparse-chunk image with
+`xfs_tests --make-rw6-sparse`: a full formatter chunk plus a later
+cluster-sized chunk with a nonzero `ir_holemask` and one allocated inode. The
+real Linux kernel mounts it, `xfs_repair -n` scans it, and the independent
+oracle re-checks the hole/backing split. This covers sparse records produced by
+the Windows writer, not just sparse records read from a Linux fixture.
+
 ## Current limits
 
 * rmapbt and reflink remain read/refused-for-write.

@@ -675,7 +675,7 @@ sum(AGF freeblks + flcount + btreeblks) == sb_fdblocks
 agi_iblocks/agi_fblocks == reachable inobt/finobt blocks
 finobt record == inobt record for every free chunk
 freecount == popcount(ir_free & allocmask)
-backed inode blocks ∉ free-space tree
+backed inode blocks not in the free-space tree
 ```
 
 `xfs_repair -n` remains the hard gate; the oracle cannot replace it.
@@ -684,6 +684,8 @@ backed inode blocks ∉ free-space tree
 
 ```text
 linux-generate-rw6-modern        distro mkfs.xfs + populated modern image
+linux-verify-rw6-formatted       Windows formatter image through xfs_repair/mount
+linux-verify-rw6-sparse          Windows sparse-chunk fixture (nonzero holemask)
 windows-rw6-modern-roundtrip     Windows mutations + rw6 oracle
 linux-verify-rw6-modern          xfs_repair/mount + Linux reverse mutation
 windows-verify-rw6-reverse       Windows rereads Linux-mutated image
@@ -693,6 +695,12 @@ linux-generate-rw6-dirty         Linux dirty logs with modern features
 windows-recover-rw6-dirty        RW-5 replay + rw6 oracle
 linux-verify-rw6-cross-recovery  Linux mounts/replays the result
 ```
+
+`xfs_tests --make-rw6-sparse out/sparse.img` creates a 1 KiB-block modern
+filesystem with a formatter chunk plus a real sparse chunk: the allocator has
+backed 16 of the 64 logical slots, so the record has a nonzero `ir_holemask`.
+CI runs the independent oracle on it, then the Linux kernel and `xfs_repair`
+on a read-only mount and a writable copy.
 
 The Linux images are created with the distribution's `mkfs.xfs` using
 `finobt=1,inobtcount=1,bigtime=1,sparse=1,nrext64=1` and explicitly
