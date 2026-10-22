@@ -16,6 +16,7 @@
 #include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/rmap.h"
 #include "xfs/symlink.h"
 #include "xfs/verifier.h"
 #include "xfs/write.h"
@@ -1139,42 +1140,22 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         uint32_t rmap_blocks = 0;
         bool rmap_ok = true;
         if (live_sb.features.rmapbt) {
-          BtreeSpec rmap;
-          rmap.name = "rmapbt";
-          // Short block header (56 bytes, CRC at 52) but two 20-byte keys per
-          // node entry and 4-byte pointers (XFS_RMAP_KEY_ADDR etc).
-          rmap.format = BtreeFormat::kShort;
-          rmap.block_size = geo.block_size;
-          rmap.key_size = bt::kRmapKeySize;
-          rmap.ptr_size = bt::kRmapPtrSize;
-          rmap.rec_size = bt::kRmapRecSize;
-          rmap.magic = ondisk::kRmapCrcMagic;
-          rmap.max_depth = bt::kMaxTraversalLevels;
-          rmap.null_ptr = kNullAgBlock;
-          rmap.expected_owner = agno;
-          rmap.owner_size = 4;
-          rmap.uuid = geo.meta_uuid;
-          rmap.sb_lsn = live_sb.lsn;
-          rmap.ptr_to_daddr = bnobt.ptr_to_daddr;
-          BtreeWalkCallbacks rcb;
-          rcb.read_block = read_ag_block;
-          rcb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
-          rcb.visit = [&](uint64_t, const BtreeBlockMeta&,
-                          const uint8_t*) -> Status {
-            ++rmap_blocks;
-            return OkStatus();
-          };
-          const Status rs = WalkBtree(rmap, agf.rmap_root, rcb);
-          if (!rs.ok()) {
+          // The generic WalkBtree cannot decode the overlapping tree's
+          // interleaved low/high key pairs. The typed reader also validates
+          // both child keys, record ownership and the AGF block counter.
+          auto tree = LoadRmapTree(dev, geo, agno, live_sb.lsn);
+          if (!tree.ok()) {
             report.Add("AG" + std::to_string(agno) + " rmapbt",
-                       CheckStatus::kCorrupt, rs.error().Format());
+                       CheckStatus::kCorrupt, tree.error().Format());
             rmap_ok = false;
-          } else if (rmap_blocks != agf.rmap_blocks) {
-            report.Add("AG" + std::to_string(agno) + " rmapbt blocks",
-                       CheckStatus::kCorrupt,
-                       "AGF rmap_blocks " + std::to_string(agf.rmap_blocks) +
-                           " != counted " + std::to_string(rmap_blocks));
-            rmap_ok = false;
+          } else {
+            rmap_blocks = tree.value().blocks;
+            report.Add("AG" + std::to_string(agno) + " rmapbt",
+                       CheckStatus::kOk,
+                       "level " + std::to_string(tree.value().level) + ", " +
+                           std::to_string(rmap_blocks) + " blocks, " +
+                           std::to_string(tree.value().records.size()) +
+                           " records (structurally verified)");
           }
         }
         if (bno_ok && cnt_ok && rmap_ok) {

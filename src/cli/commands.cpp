@@ -29,6 +29,7 @@
 #include "xfs/inode.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/rmap.h"
 #include "xfs/superblock.h"
 #include "xfs/win_name_map.h"
 #include "xfs/windows_raw_device.h"
@@ -53,6 +54,7 @@ void PrintUsage() {
       "  list                          list physical disks (with safety info)\n"
       "  info <device|image>           show superblock and geometry\n"
       "  check <device|image>          read-only consistency validation\n"
+      "  rmap <device|image> [--ag N]  human-readable reverse mappings\n"
       "  recover <image>               replay the journal (RW-5)\n"
       "      --yes-i-really-mean-it    required: recovery writes metadata\n"
       "  journal <device|image>        dump the internal log structure\n"
@@ -597,6 +599,59 @@ int CommandJournal(const std::string& target, const Options& options) {
     PrintJournalText(scan.value(), options.verbose || options.debug);
   }
   return scan.value().state == LogState::kUnknown ? 2 : 0;
+}
+
+int CommandRmap(const std::string& target, int only_ag) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto sb = ReadSuperblock(*dev, 0, true);
+  if (!sb.ok()) {
+    PrintError(sb.error());
+    return 1;
+  }
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  if (!geo.features.rmapbt) {
+    std::cout << "rmapbt: disabled\n";
+    return 0;
+  }
+  if (only_ag >= static_cast<int>(geo.agcount)) {
+    std::cerr << "error: AG " << only_ag << " is out of range\n";
+    return 1;
+  }
+  int failures = 0;
+  for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
+    if (only_ag >= 0 && static_cast<uint32_t>(only_ag) != agno) continue;
+    auto tree = LoadRmapTree(*dev, geo, agno, sb.value().lsn);
+    if (!tree.ok()) {
+      std::cout << "AG " << agno << ": CORRUPT - "
+                << tree.error().Format() << "\n";
+      ++failures;
+      continue;
+    }
+    std::cout << "AG " << agno << "\n"
+              << "  level: " << tree.value().level << "\n"
+              << "  blocks: " << tree.value().blocks << "\n"
+              << "  records: " << tree.value().records.size() << "\n";
+    for (const RmapRecord& r : tree.value().records) {
+      std::cout << "  block " << r.key.startblock << ".."
+                << (r.EndBlock() - 1) << " owner "
+                << RmapOwnerName(r.key.owner);
+      if (!RmapNonInodeOwner(r.key.owner)) {
+        std::cout << " offset " << r.key.offset;
+        if (r.key.flags & kRmapAttrFork) std::cout << " attr";
+        else std::cout << " data";
+        if (r.key.flags & kRmapBmbtBlock) std::cout << " bmbt";
+        if (r.unwritten()) std::cout << " unwritten";
+        else std::cout << " written";
+      }
+      std::cout << "\n";
+    }
+  }
+  return failures == 0 ? 0 : 1;
 }
 
 int CommandCheck(const std::string& target, const Options& options) {
@@ -1631,6 +1686,7 @@ int Run(const std::vector<std::string>& args) {
   bool have_fill = false;
   uint32_t namespace_mode = 0;
   bool have_mode = false;
+  int rmap_ag = -1;
   bool explicit_rw = false;
   bool replace_existing = false;
   for (const auto& arg : args) {
@@ -1680,6 +1736,13 @@ int Run(const std::vector<std::string>& args) {
       }
       extend_fill = static_cast<uint8_t>(value);
       have_fill = true;
+    } else if (StartsWith(arg, "--ag=")) {
+      uint64_t value = 0;
+      if (!ParseU64(arg.substr(5), &value) || value > 0xffffffffu) {
+        std::cerr << "error: --ag must be an AG number\n";
+        return 1;
+      }
+      rmap_ag = static_cast<int>(value);
     } else if (StartsWith(arg, "--mode=")) {
       if (!ParseOctal(arg.substr(7), &namespace_mode) ||
           namespace_mode > 07777) {
@@ -1735,6 +1798,13 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandCheck(positional[1], options);
+  }
+  if (command == "rmap") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin rmap <device|image> [--ag N]\n";
+      return 1;
+    }
+    return CommandRmap(positional[1], rmap_ag);
   }
   if (command == "recover") {
     if (positional.size() != 2) {

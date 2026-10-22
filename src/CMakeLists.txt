@@ -14,6 +14,7 @@ add_library(xfs_core STATIC
   core/superblock.cpp
   core/ag.cpp
   core/btree.cpp
+  core/rmap.cpp
   core/inode.cpp
   core/extent.cpp
   core/directory.cpp
