@@ -38,6 +38,14 @@ Invoke-Ok 'create /base.bin' @('create', $base, '/base.bin',
 $payload = 'A' * 8192
 Invoke-Ok 'write /base.bin' @('pwrite', $base, '/base.bin', '0',
     '--rw-experimental', "--text=$payload")
+# The formatter's initial chunk has 61 free inodes; /base.bin uses one, so
+# these fillers consume the other 60. The crash cases below then have to
+# allocate a new inode chunk (ICREATE, finobt insertion and inobtcount
+# accounting) rather than always reusing the formatter chunk.
+for ($i = 0; $i -lt 60; $i++) {
+    Invoke-Ok ("fill {0}" -f $i) @('create', $base,
+        ("/fill{0:D2}.bin" -f $i), '--rw-experimental')
+}
 Copy-Item $base $pristine -Force
 
 $points = @(

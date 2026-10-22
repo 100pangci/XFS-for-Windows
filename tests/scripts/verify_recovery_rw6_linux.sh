@@ -33,7 +33,8 @@ for image in "$RECOVERED"/*.img; do
         FAILED=$((FAILED + 1))
         continue
     fi
-    if grep -Eiq "corrupt|bad |error|warn" "$RECOVERED/$name.repair.txt"; then
+    if grep -Eiq 'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
+            "$RECOVERED/$name.repair.txt"; then
         echo "  FAIL: xfs_repair -n was not silent"
         sed 's/^/    /' "$RECOVERED/$name.repair.txt" | head -40
         FAILED=$((FAILED + 1))

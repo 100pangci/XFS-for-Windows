@@ -72,7 +72,9 @@ xfs_repair -n "$IMG" > "$WORK/repair.txt" 2>&1 || {
     cat "$WORK/repair.txt" >&2
     exit 1
 }
-if grep -qiE 'corrupt|would fix|bad ' "$WORK/repair.txt"; then
+if grep -qiE \
+        'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
+        "$WORK/repair.txt"; then
     cat "$WORK/repair.txt" >&2
     exit 1
 fi

@@ -515,7 +515,7 @@ jobs:
 
       - name: Capture modern-profile dirty logs
         run: |
-          sudo env SIZE_MB=1024 \
+          sudo env SIZE_MB=512 \
             MKFS_OPTS='-m crc=1,finobt=1,inobtcount=1,bigtime=1,rmapbt=0,reflink=0 -i sparse=1,nrext64=1' \
             bash tests/scripts/make_dirty_logs_linux.sh rw6-dirty
           sudo chown -R "$USER" rw6-dirty

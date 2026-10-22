@@ -65,6 +65,13 @@ fi
 for tool in mkfs.xfs xfs_logprint losetup python3; do
     command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
+# Newer xfsprogs enable parent pointers by default; that feature is outside the
+# writable profile. Disable it when this mkfs.xfs understands the option.
+PARENT_OPT=""
+MKFS_HELP=$(mkfs.xfs 2>&1 || true)
+if printf '%s\n' "$MKFS_HELP" | grep -q 'parent='; then
+    PARENT_OPT="-n parent=0"
+fi
 
 stop_device() {
     set +e
@@ -118,7 +125,7 @@ for scenario in $SCENARIOS; do
         # MKFS_OPTS selects the writable profile (mkfs.xfs: crc / finobt /
         # rmapbt / reflink / inobtcount / bigtime are -m options; sparse and
         # nrext64 are -i options; parent pointers are -n parent=).
-        mkfs.xfs -f -q $MKFS_OPTS "$DEV"
+        mkfs.xfs -f -q $MKFS_OPTS $PARENT_OPT "$DEV"
         mount "$DEV" "$MOUNT"
         python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
         # The operation, its manifest and the snapshot copy all happen inside

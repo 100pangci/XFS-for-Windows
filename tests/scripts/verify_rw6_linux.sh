@@ -40,7 +40,9 @@ xfs_repair -n "$IMG" > "$OUT" 2>&1
 RC=$?
 set -e
 cat "$OUT"
-if [ "$RC" -ne 0 ] || grep -qiE 'corrupt|would fix|bad ' "$OUT"; then
+if [ "$RC" -ne 0 ] || grep -qiE \
+        'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
+        "$OUT"; then
     echo "xfs_repair rejected the image" >&2
     exit 1
 fi

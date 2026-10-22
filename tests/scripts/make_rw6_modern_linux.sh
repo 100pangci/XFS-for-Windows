@@ -41,7 +41,8 @@ for tool in mkfs.xfs xfs_info xfs_repair losetup python3; do
 done
 
 PARENT_OPT=""
-if mkfs.xfs 2>&1 | grep -q 'parent='; then
+MKFS_HELP=$(mkfs.xfs 2>&1 || true)
+if printf '%s\n' "$MKFS_HELP" | grep -q 'parent='; then
     PARENT_OPT="-n parent=0"
 fi
 MKFS_OPTS="-m crc=1,finobt=1,inobtcount=1,bigtime=1,rmapbt=0,reflink=0 -i sparse=1,nrext64=1"
@@ -148,7 +149,8 @@ umount "$MOUNT"
 losetup -d "$LOOP"
 LOOP=""
 xfs_repair -n "$IMG" > "$OUT/modern.repair.txt" 2>&1
-if grep -qi 'corrupt\|would fix' "$OUT/modern.repair.txt"; then
+if grep -Eiq 'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
+        "$OUT/modern.repair.txt"; then
     echo "xfs_repair rejected the fixture" >&2
     cat "$OUT/modern.repair.txt" >&2
     exit 1

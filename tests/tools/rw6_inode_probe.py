@@ -373,7 +373,7 @@ def check_image(path, quiet, allow_empty_finobt):
     total_count = 0
     total_free = 0
     total_fdblocks = 0
-    sparse_images = 0
+    inode_images = 0
     for agno in range(geo.agcount):
         agf = read_agf(img, geo, agno)
         agi = read_agi(img, geo, agno)
@@ -459,8 +459,23 @@ def check_image(path, quiet, allow_empty_finobt):
                 fail("AG%d: agi_fblocks %d != reachable %d" %
                      (agno, agi["fblocks"], finobt_blocks))
 
-        # Sparse backing must not be in the free-space tree, and every backed
-        # inode image has to verify.
+        # Every backed inode image has to verify. On a sparse filesystem this
+        # skips hole slots; on a normal filesystem all 64 slots are backed.
+        for rec in inobt:
+            start = rec["startino"]
+            backed = alloc_mask(rec["holemask"]) if geo.sparse else \
+                (1 << 64) - 1
+            for ino_i in range(64):
+                if not (backed >> ino_i) & 1:
+                    continue
+                agino = start + ino_i
+                ino = (agno << (geo.agblklog + geo.inopblog)) | agino
+                free_bit = bool((rec["free"] >> ino_i) & 1)
+                verify_inode(img, geo, ino, free_bit)
+                inode_images += 1
+
+        # Sparse backing must not be in the free-space tree. (A full chunk is
+        # also a backed chunk, but its blocks cannot be free by definition.)
         if geo.sparse:
             free_extents, _ = read_btree(
                 img, geo, agno, agf["bno_root"], BNO_MAGIC, 8, 8, 4,
@@ -490,14 +505,6 @@ def check_image(path, quiet, allow_empty_finobt):
                                 extent_start < agbno + blocks:
                             fail("AG%d: backed inode block %d is free" %
                                  (agno, agbno))
-                for ino_i in range(64):
-                    if not (alloc_mask(rec["holemask"]) >> ino_i) & 1:
-                        continue
-                    agino = start + ino_i
-                    ino = (agno << (geo.agblklog + geo.inopblog)) | agino
-                    free_bit = bool((rec["free"] >> ino_i) & 1)
-                    verify_inode(img, geo, ino, free_bit)
-                    sparse_images += 1
 
     if total_count != geo.icount:
         fail("superblock icount %d != sum of AGI %d" %
@@ -510,9 +517,9 @@ def check_image(path, quiet, allow_empty_finobt):
              (geo.fdblocks, total_fdblocks))
 
     if not quiet:
-        print("ok: %d AGs, inodes %d/%d free, fdblocks %d, %d sparse inode "
-              "images" % (geo.agcount, total_free, total_count,
-                          total_fdblocks, sparse_images))
+        print("ok: %d AGs, inodes %d/%d free, fdblocks %d, %d inode images"
+              % (geo.agcount, total_free, total_count, total_fdblocks,
+                 inode_images))
     return 0
 
 

@@ -27,6 +27,7 @@ using namespace xfs;
 
 namespace {
 
+namespace bt = ondisk::btree;
 namespace di = ondisk::inode;
 
 struct ModernImage {
@@ -443,6 +444,22 @@ TEST(rw6_sparse_chunk_alloc_free_and_holes) {
   CHECK_EQ(sparse->freecount, 32u);
   CHECK_EQ(sparse->free, ~0ULL);
   CHECK_EQ(InobtAllocMask(sparse->holemask) & ~sparse->free, 0ULL);
+
+  // A logical inode number in the hole must be reported as not allocated,
+  // not decoded from whatever happens to be in the unused block.
+  uint32_t hole_offset = 64;
+  for (uint32_t bit = 0; bit < bt::kInobtHolemaskBits; ++bit) {
+    if ((sparse->holemask >> bit) & 1u) {
+      hole_offset = bit * ondisk::kInodesPerHolemaskBit;
+      break;
+    }
+  }
+  CHECK(hole_offset < ondisk::kInodesPerChunk);
+  const uint64_t hole_ino =
+      geo.AginoToIno(0, sparse->startino + hole_offset);
+  auto hole = image.fs->OpenInode(hole_ino);
+  CHECK(!hole.ok());
+  CHECK_EQ(hole.error().code, XfsError::kNotFound);
 
   // Allocate every backed inode, then free them again: the chunk becomes
   // fully free and both the record and exactly the 16 backed blocks go away.
