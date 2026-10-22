@@ -51,8 +51,8 @@ rm -f "$IMG"
 truncate -s "${SIZE_MB}M" "$IMG"
 LOOP=$(losetup --find --show "$IMG")
 mkfs.xfs -f -q $MKFS_OPTS $PARENT_OPT "$LOOP"
-xfs_info "$LOOP" > "$OUT/modern.xfs_info.txt"
 mount "$LOOP" "$MOUNT"
+xfs_info "$MOUNT" > "$OUT/modern.xfs_info.txt"
 
 python3 - "$MOUNT" <<'PY'
 import calendar
