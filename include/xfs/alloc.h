@@ -74,6 +74,14 @@ class BlockAllocator {
   Status AllocateFromAg(uint32_t agno, uint32_t len, uint32_t align,
                         Allocation* out);
 
+  // Like AllocateFromAg, but the run must start at or after `min_agbno` and
+  // end at or before `max_agbno` (both AG-relative blocks, max exclusive).
+  // This is the sparse inode chunk allocation window
+  // (xfs_ialloc_ag_alloc's sparse_alloc path).
+  Status AllocateFromAgRange(uint32_t agno, uint32_t len, uint32_t align,
+                             uint32_t min_agbno, uint32_t max_agbno,
+                             Allocation* out);
+
   // Frees [fsb, fsb+len), which must lie inside one AG and be currently
   // allocated. Contiguous free neighbours are merged.
   Status Free(uint64_t fsb, uint32_t len);

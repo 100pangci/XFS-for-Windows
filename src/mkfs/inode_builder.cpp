@@ -7,6 +7,7 @@
 #include "mkfs/mkfs_internal.h"
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
+#include "xfs/inode.h"
 #include "xfs/ondisk.h"
 
 namespace xfs::mkfs::internal {
@@ -19,6 +20,17 @@ namespace bt = ondisk::btree;
 constexpr uint32_t kNullAgino = 0xffffffffu;
 constexpr uint32_t kInodesPerChunk = 64;
 constexpr uint64_t kBigClusterBytes = 8192;
+
+XfsTimestamp FormatterNow() {
+  XfsTimestamp ts;
+  ts.sec = static_cast<int64_t>(std::time(nullptr));
+  return ts;
+}
+
+void StoreFormatTime(uint8_t* field, const XfsTimestamp& ts, bool bigtime) {
+  // The current wall clock is always representable in both encodings.
+  (void)EncodeTimestamp(field, ts, bigtime);
+}
 
 // Writes the bare v3 inode core that xfs_ialloc_inode_init() leaves behind:
 // magic, version, gen, next_unlinked, ino, uuid, crc; everything else zero.
@@ -73,17 +85,19 @@ void InitRootInode(const FormatGeometry& geo, uint8_t* core, uint32_t gen,
   PutBE32(core, di::kNextUnlinked, kNullAgino);
   PutBE64(core, di::kSize, sf.size);
 
-  // Timestamps: now, in the legacy 32:32 encoding (bigtime is not enabled).
-  int64_t now = static_cast<int64_t>(std::time(nullptr));
-  uint64_t ts = (static_cast<uint64_t>(static_cast<uint32_t>(now)) << 32);
-  PutBE64(core, di::kAtime, ts);
-  PutBE64(core, di::kMtime, ts);
-  PutBE64(core, di::kCtime, ts);
+  const XfsTimestamp now = FormatterNow();
+  const bool bigtime = geo.bigtime;
+  StoreFormatTime(core + di::kAtime, now, bigtime);
+  StoreFormatTime(core + di::kMtime, now, bigtime);
+  StoreFormatTime(core + di::kCtime, now, bigtime);
   PutBE64(core, di::kChangecount, 0);
   PutBE64(core, di::kLsn, 0);
-  PutBE64(core, di::kFlags2, 0);
+  uint64_t flags2 = 0;
+  if (geo.bigtime) flags2 |= di::kDiFlag2Bigtime;
+  if (geo.nrext64) flags2 |= di::kDiFlag2Nrext64;
+  PutBE64(core, di::kFlags2, flags2);
   PutBE32(core, di::kCowextsize, 0);
-  PutBE64(core, di::kCrtime, ts);
+  StoreFormatTime(core + di::kCrtime, now, bigtime);
   PutBE64(core, di::kIno, geo.rootino);
   std::memcpy(core + di::kUuid, geo.meta_uuid.data(), 16);
 
@@ -112,14 +126,18 @@ void InitRtMetadataInode(const FormatGeometry& geo, uint8_t* core, uint64_t ino,
   PutBE32(core, di::kNextUnlinked, kNullAgino);
   PutBE64(core, di::kSize, 0);
 
-  int64_t now = static_cast<int64_t>(std::time(nullptr));
-  uint64_t ts = (static_cast<uint64_t>(static_cast<uint32_t>(now)) << 32);
+  const XfsTimestamp now = FormatterNow();
+  const bool bigtime = geo.bigtime;
   if (!bitmap) {
-    PutBE64(core, di::kAtime, ts);
+    StoreFormatTime(core + di::kAtime, now, bigtime);
   }
-  PutBE64(core, di::kMtime, ts);
-  PutBE64(core, di::kCtime, ts);
-  PutBE64(core, di::kCrtime, ts);
+  StoreFormatTime(core + di::kMtime, now, bigtime);
+  StoreFormatTime(core + di::kCtime, now, bigtime);
+  StoreFormatTime(core + di::kCrtime, now, bigtime);
+  uint64_t flags2 = 0;
+  if (geo.bigtime) flags2 |= di::kDiFlag2Bigtime;
+  if (geo.nrext64) flags2 |= di::kDiFlag2Nrext64;
+  PutBE64(core, di::kFlags2, flags2);
   if (bitmap) {
     PutBE16(core, di::kFlags, 0x0004);  // XFS_DIFLAG_NEWRTBM
   }

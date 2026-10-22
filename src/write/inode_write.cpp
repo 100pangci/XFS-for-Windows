@@ -80,6 +80,7 @@ void CopyCoreToLogDinode(const uint8_t* disk, size_t inode_size,
                          std::vector<uint8_t>* log_dinode) {
   log_dinode->assign(lf::kLogDinodeSize, 0);
   uint8_t* out = log_dinode->data();
+  const bool bigtime = InodeImageHasBigtime(disk);
   for (const CoreField& field : kCoreFields) {
     if (field.offset + field.size > inode_size) continue;
     const uint8_t* src = disk + field.offset;
@@ -95,9 +96,16 @@ void CopyCoreToLogDinode(const uint8_t* disk, size_t inode_size,
         StoreLE32(dst, LoadBE32(src));
         break;
       case 8: {
-        // Timestamps are (seconds, nanoseconds) pairs: convert each half.
-        if (field.offset == di::kAtime || field.offset == di::kMtime ||
-            field.offset == di::kCtime || field.offset == di::kCrtime) {
+        const bool timestamp =
+            field.offset == di::kAtime || field.offset == di::kMtime ||
+            field.offset == di::kCtime || field.offset == di::kCrtime;
+        if (timestamp && bigtime) {
+          // Bigtime is a single host-order nanoseconds value in the log
+          // dinode (xfs_inode_to_log_dinode_ts).
+          StoreLE64(dst, LoadBE64(src));
+        } else if (timestamp) {
+          // Legacy timestamps are (seconds, nanoseconds) pairs; both halves
+          // are 32-bit host-order fields.
           StoreLE32(dst, LoadBE32(src));
           StoreLE32(dst + 4, LoadBE32(src + 4));
         } else {
@@ -114,17 +122,6 @@ void CopyCoreToLogDinode(const uint8_t* disk, size_t inode_size,
   if (di::kUuid + 16 <= inode_size && di::kUuid + 16 <= lf::kLogDinodeSize) {
     std::memcpy(out + di::kUuid, disk + di::kUuid, 16);
   }
-}
-
-// Stores a timestamp into the legacy 32:32 on-disk encoding (big-endian) or
-// the log dinode's host-order copy of the same pair.
-void StoreTimestampBE(uint8_t* field, const XfsTimestamp& ts) {
-  StoreBE32(field, static_cast<uint32_t>(ts.sec));
-  StoreBE32(field + 4, ts.nsec);
-}
-void StoreTimestampLE(uint8_t* field, const XfsTimestamp& ts) {
-  StoreLE32(field, static_cast<uint32_t>(ts.sec));
-  StoreLE32(field + 4, ts.nsec);
 }
 
 }  // namespace
@@ -149,20 +146,19 @@ Result<std::vector<uint8_t>> XfsFilesystem::ReadRawInode(uint64_t ino) const {
 Status XfsFilesystem::UpdateInodeInTransaction(
     XfsTransaction& txn, uint64_t ino, uint32_t ilog_fields,
     const std::vector<uint8_t>& fork_region,
-    const std::function<void(uint8_t* raw)>& mutate) {
+    const std::function<Status(uint8_t* raw)>& mutate) {
   auto raw = ReadRawInode(ino);
   if (!raw.ok()) return raw.error();
   std::vector<uint8_t> inode = std::move(raw.value());
   XfsInode parsed;
   Status s = ParseInode(inode.data(), inode.size(), geometry_, ino, &parsed);
   if (!s.ok()) return s;
-  if (parsed.bigtime) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "cannot update a bigtime inode")
-        .Ino(ino)
-        .Metadata("inode");
-  }
-  mutate(inode.data());
+  // Any inode core update upgrades a legacy-timestamp inode on a bigtime
+  // filesystem (xfs_inode_item_precommit).
+  s = UpgradeInodeTimestampsToBigtime(inode.data(), inode.size(), geometry_);
+  if (!s.ok()) return s;
+  s = mutate(inode.data());
+  if (!s.ok()) return s;
   return LogPreparedInode(txn, ino, std::move(inode), ilog_fields, fork_region);
 }
 
@@ -200,6 +196,25 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
         .Ino(ino)
         .Ag(agno)
         .Metadata("inode");
+  }
+
+  // Every inode item logs the core, so a bigtime filesystem upgrades this
+  // inode's timestamps now even when the caller only changed a fork.
+  Status upgrade =
+      UpgradeInodeTimestampsToBigtime(inode.data(), inode.size(), geometry_);
+  if (!upgrade.ok()) return upgrade;
+
+  // The legacy extent counters are 31/15 bits in the kernel (the high bit is
+  // reserved); the large counters are the only way past them.
+  if (!InodeImageHasNrext64(inode.data())) {
+    if (InodeDataExtentCount(inode.data()) > 0x7fffffffull ||
+        InodeAttrExtentCount(inode.data()) > 0x7fffu) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "extent count requires NREXT64 but the inode does not "
+                     "use large counters")
+          .Ino(ino)
+          .Metadata("inode");
+    }
   }
 
   std::vector<uint8_t> log_dinode;
@@ -281,10 +296,12 @@ Status XfsFilesystem::UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino
                                                const XfsTimestamp& ctime) {
   return UpdateInodeInTransaction(
       txn, ino, 0, {},
-      [&](uint8_t* raw) {
-        StoreTimestampBE(raw + di::kAtime, atime);
-        StoreTimestampBE(raw + di::kMtime, mtime);
-        StoreTimestampBE(raw + di::kCtime, ctime);
+      [&](uint8_t* raw) -> Status {
+        Status s = StoreInodeTimestamp(raw, di::kAtime, atime);
+        if (!s.ok()) return s;
+        s = StoreInodeTimestamp(raw, di::kMtime, mtime);
+        if (!s.ok()) return s;
+        return StoreInodeTimestamp(raw, di::kCtime, ctime);
       });
 }
 

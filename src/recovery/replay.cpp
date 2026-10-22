@@ -1050,9 +1050,13 @@ Status Replayer::ReplayIcreateItem(const RecoveredItem& item,
   const uint32_t length = GetBE32(region.data(), lf::kIclLength);
   const uint32_t gen = GetBE32(region.data(), lf::kIclGen);
   const XfsInodeGeometry igeo = MakeInodeGeometry(sb_, geo_);
+  const bool length_ok =
+      length == igeo.ialloc_blks ||
+      (geo_.features.spinodes && length == igeo.ialloc_min_blks);
   if (agno >= geo_.agcount || agbno == 0 || agbno >= geo_.AgBlocksFor(agno) ||
-      isize != geo_.inode_size || count != igeo.ialloc_inos ||
-      length != igeo.ialloc_blks) {
+      length > geo_.AgBlocksFor(agno) - agbno ||
+      isize != geo_.inode_size || !length_ok ||
+      (count >> geo_.inopblog) != length || count == 0) {
     return XFS_ERR(XfsError::kCorruptBtree, "bad icreate geometry")
         .Ag(agno)
         .Agbno(agbno)
@@ -1089,7 +1093,7 @@ Status Replayer::ReplayIcreateItem(const RecoveredItem& item,
     auto buffer = buffers_.Get({cluster_daddr, cluster_bb}, current_lsn);
     if (!buffer.ok()) return buffer.error();
     std::vector<uint8_t>& data = *buffer.value();
-    std::fill(data.begin(), data.end(), 0);
+    std::fill(data.begin(), data.end(), uint8_t{0});
     for (uint32_t i = 0; i < inodes_per_cluster; ++i) {
       uint8_t* inode = data.data() + static_cast<size_t>(i) * geo_.inode_size;
       PutBE16(inode, di::kMagic, ondisk::kDinodeMagic);

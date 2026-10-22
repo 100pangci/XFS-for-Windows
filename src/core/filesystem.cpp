@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 
 #include "xfs/ag.h"
 #include "xfs/btree.h"
@@ -12,6 +13,7 @@
 #include "xfs/crash.h"
 #include "xfs/endian.h"
 #include "xfs/extent.h"
+#include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
 #include "xfs/symlink.h"
@@ -31,6 +33,80 @@ std::string Hex(uint64_t v) {
   char buf[32];
   std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
   return buf;
+}
+
+// Looks up the inobt record that contains `agino`. Sparse filesystems use
+// this on the read path so an inode number in a hole is reported as "not
+// allocated" instead of reading whatever bytes happen to be on the device.
+Result<InobtRecord> LookupInodeRecord(BlockDevice& dev, const XfsGeometry& geo,
+                                      uint32_t agno, uint32_t agino) {
+  auto agi = ReadAgi(dev, geo, agno);
+  if (!agi.ok()) return agi.error();
+  BtreeSpec spec;
+  spec.name = "inobt";
+  spec.format = BtreeFormat::kShort;
+  spec.block_size = geo.block_size;
+  spec.key_size = bt::kInobtKeySize;
+  spec.ptr_size = bt::kInobtPtrSize;
+  spec.rec_size = bt::kInobtRecSize;
+  spec.magic = ondisk::kIbtCrcMagic;
+  spec.null_ptr = kNullAgBlock;
+  spec.expected_owner = agno;
+  spec.owner_size = 4;
+  spec.uuid = geo.meta_uuid;
+  spec.ptr_to_daddr = [&](uint64_t agbno, uint64_t* daddr) {
+    if (agbno >= geo.AgBlocksFor(agno)) return false;
+    *daddr = geo.FsbToByte(geo.AgFsb(agno, static_cast<uint32_t>(agbno))) /
+             512;
+    return true;
+  };
+  InobtRecord found;
+  bool have = false;
+  BtreeWalkCallbacks cb;
+  cb.read_block = [&](uint64_t agbno, std::vector<uint8_t>* buf) {
+    if (agbno >= geo.AgBlocksFor(agno)) return false;
+    buf->resize(geo.block_size);
+    return dev.Read(geo.FsbToByte(geo.AgFsb(agno, static_cast<uint32_t>(agbno))),
+                    buf->data(), buf->size());
+  };
+  cb.ptr_in_range = [&](uint64_t agbno) {
+    return agbno < geo.AgBlocksFor(agno);
+  };
+  cb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
+                 const uint8_t* buf) -> Status {
+    if (meta.level != 0) return OkStatus();
+    for (uint16_t i = 0; i < meta.numrecs; ++i) {
+      const uint8_t* rec = BtreeLeafRec(buf, meta, spec, i);
+      InobtRecord r;
+      r.startino = GetBE32(rec);
+      r.free = GetBE64(rec + 8);
+      if (geo.features.spinodes) {
+        r.holemask = GetBE16(rec + 4);
+        r.count = GetU8(rec + 6);
+        r.freecount = GetU8(rec + 7);
+      } else {
+        r.holemask = 0;
+        r.count = ondisk::kInodesPerChunk;
+        r.freecount = GetBE32(rec + 4);
+      }
+      if (agino >= r.startino &&
+          agino < r.startino + ondisk::kInodesPerChunk) {
+        found = r;
+        have = true;
+      }
+    }
+    return OkStatus();
+  };
+  Status s = WalkBtreePath(spec, agi.value().root, agino, cb);
+  if (!s.ok()) return s.error();
+  if (!have) {
+    return XFS_ERR(XfsError::kNotFound,
+                   "inode number has no inobt record")
+        .Ag(agno)
+        .Metadata("inobt")
+        .Actual(agino);
+  }
+  return found;
 }
 
 }  // namespace
@@ -321,6 +397,24 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
     return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
         .Ino(ino)
         .Metadata("inode");
+  }
+
+  // Sparse-inode filesystems have 64 logical slots per inode record but may
+  // back only some of them. A hole slot has no inode cluster at all; report it
+  // as not allocated instead of reading unrelated device bytes.
+  if (geometry_.features.spinodes) {
+    const uint32_t agno = geometry_.InoAgno(ino);
+    const uint32_t agino = geometry_.InoAgino(ino);
+    auto rec = LookupInodeRecord(*device_, geometry_, agno, agino);
+    if (!rec.ok()) return rec.error();
+    const uint32_t offset = agino - rec.value().startino;
+    if (!((InobtAllocMask(rec.value().holemask) >> offset) & 1ULL)) {
+      return XFS_ERR(XfsError::kNotFound,
+                     "inode number is a sparse inode chunk hole")
+          .Ino(ino)
+          .Metadata("inode")
+          .Actual(agino);
+    }
   }
 
   // Read a whole 16 KiB inode chunk once; a directory full of files usually
@@ -813,9 +907,15 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   const XfsGeometry& geo = geometry_;
   BlockDevice& dev = *device_;
 
+  // Counters and the metadata LSN move with every mutation, so read the
+  // primary superblock again instead of trusting the mount-time copy.
+  XfsSuperblock live_sb = superblock_;
+  auto fresh_sb = ReadSuperblock(dev, 0, /*verify_crc=*/true);
+  if (fresh_sb.ok()) live_sb = fresh_sb.value();
+
   report.Add("superblock", CheckStatus::kOk,
              "magic/uuid/geometry OK, crc " +
-                 std::string(superblock_.crc_verified ? "verified" : "skipped"));
+                 std::string(live_sb.crc_verified ? "verified" : "skipped"));
 
   // Secondary superblocks.
   if (options.secondary_superblocks && geo.agcount > 1) {
@@ -835,18 +935,18 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
       // Like xfs_repair's compare_sb: only the geometry fields must match.
       // Counters, version numbers, root inode, feature bits and other fields
       // may legitimately differ in secondary copies.
-      bool same = s.blocksize == superblock_.blocksize &&
-                  s.dblocks == superblock_.dblocks &&
-                  s.rblocks == superblock_.rblocks &&
-                  s.rextents == superblock_.rextents &&
-                  s.logstart == superblock_.logstart &&
-                  s.rextsize == superblock_.rextsize &&
-                  s.agblocks == superblock_.agblocks &&
-                  s.agcount == superblock_.agcount &&
-                  s.rbmblocks == superblock_.rbmblocks &&
-                  s.logblocks == superblock_.logblocks &&
-                  s.sectsize == superblock_.sectsize &&
-                  s.inodesize == superblock_.inodesize;
+      bool same = s.blocksize == live_sb.blocksize &&
+                  s.dblocks == live_sb.dblocks &&
+                  s.rblocks == live_sb.rblocks &&
+                  s.rextents == live_sb.rextents &&
+                  s.logstart == live_sb.logstart &&
+                  s.rextsize == live_sb.rextsize &&
+                  s.agblocks == live_sb.agblocks &&
+                  s.agcount == live_sb.agcount &&
+                  s.rbmblocks == live_sb.rbmblocks &&
+                  s.logblocks == live_sb.logblocks &&
+                  s.sectsize == live_sb.sectsize &&
+                  s.inodesize == live_sb.inodesize;
       if (!same) {
         report.Add("superblock AG" + std::to_string(agno),
                    CheckStatus::kWarning,
@@ -895,7 +995,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         bnobt.expected_owner = agno;
         bnobt.owner_size = 4;
         bnobt.uuid = geo.meta_uuid;
-        bnobt.sb_lsn = superblock_.lsn;
+        bnobt.sb_lsn = live_sb.lsn;
         bnobt.ptr_to_daddr = [&](uint64_t agbno, uint64_t* daddr) {
           if (agbno >= agf.length) return false;
           *daddr = geo.FsbToByte(geo.AgFsb(agno, static_cast<uint32_t>(agbno))) / 512;
@@ -910,6 +1010,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         };
 
         FreeSpaceCounts bno;
+        std::vector<std::pair<uint32_t, uint32_t>> free_ranges;
         uint32_t last_end = 0;
         bool first = true;
         uint32_t bno_blocks = 0;
@@ -942,6 +1043,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
             }
             first = false;
             last_end = start + len - 1;
+            free_ranges.push_back({start, len});
             bno.blocks += len;
             bno.longest = std::max(bno.longest, len);
             ++bno.records;
@@ -1036,7 +1138,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         // blocks are tracked by agf_flcount instead.
         uint32_t rmap_blocks = 0;
         bool rmap_ok = true;
-        if (superblock_.features.rmapbt) {
+        if (live_sb.features.rmapbt) {
           BtreeSpec rmap;
           rmap.name = "rmapbt";
           // Short block header (56 bytes, CRC at 52) but two 20-byte keys per
@@ -1052,7 +1154,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
           rmap.expected_owner = agno;
           rmap.owner_size = 4;
           rmap.uuid = geo.meta_uuid;
-          rmap.sb_lsn = superblock_.lsn;
+          rmap.sb_lsn = live_sb.lsn;
           rmap.ptr_to_daddr = bnobt.ptr_to_daddr;
           BtreeWalkCallbacks rcb;
           rcb.read_block = read_ag_block;
@@ -1101,10 +1203,12 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         inobt.expected_owner = agno;
         inobt.owner_size = 4;
         inobt.uuid = geo.meta_uuid;
-        inobt.sb_lsn = superblock_.lsn;
+        inobt.sb_lsn = live_sb.lsn;
         inobt.ptr_to_daddr = bnobt.ptr_to_daddr;
 
         InodeCounts ino;
+        std::map<uint32_t, InobtRecord> inobt_records;
+        uint32_t inobt_blocks = 0;
         uint32_t last_startino = 0;
         bool ino_first = true;
         BtreeWalkCallbacks icb;
@@ -1112,73 +1216,76 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         icb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
         icb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
                         const uint8_t* buf) -> Status {
+          ++inobt_blocks;
           if (meta.level != 0) return OkStatus();
           for (uint16_t i = 0; i < meta.numrecs; ++i) {
             const uint8_t* rec = BtreeLeafRec(buf, meta, inobt, i);
-            uint32_t startino = GetBE32(rec);
-            uint64_t free_mask = GetBE64(rec + 8);
+            InobtRecord r;
+            r.startino = GetBE32(rec);
+            r.free = GetBE64(rec + 8);
             if (geo.features.spinodes) {
-              uint16_t holemask = GetBE16(rec + 4);
-              uint8_t count = GetU8(rec + 6);
-              uint8_t freecount = GetU8(rec + 7);
+              r.holemask = GetBE16(rec + 4);
+              r.count = GetU8(rec + 6);
+              r.freecount = GetU8(rec + 7);
+            } else {
+              r.holemask = 0;
+              r.count = ondisk::kInodesPerChunk;
+              r.freecount = GetBE32(rec + 4);
+            }
+            if (static_cast<uint64_t>(r.startino) +
+                        ondisk::kInodesPerChunk >
+                    static_cast<uint64_t>(agf.length) * geo.inopblock) {
+              return XFS_ERR(XfsError::kCorruptBtree,
+                             "inobt record startino out of range")
+                  .Ag(agno)
+                  .Metadata("inobt")
+                  .Actual(r.startino);
+            }
+            const uint64_t allocmask = geo.features.spinodes
+                                           ? InobtAllocMask(r.holemask)
+                                           : ~0ULL;
+            if (geo.features.spinodes) {
               uint32_t chunk_count = 0;
-              for (int biti = 0; biti < 16; ++biti) {
-                if (!(holemask & (1u << biti))) chunk_count += 4;
+              for (uint32_t biti = 0; biti < bt::kInobtHolemaskBits;
+                   ++biti) {
+                if (!(r.holemask & (1u << biti))) {
+                  chunk_count += ondisk::kInodesPerHolemaskBit;
+                }
               }
-              if (count != chunk_count) {
+              if (r.count != chunk_count) {
                 return XFS_ERR(XfsError::kCorruptBtree,
                                "sparse inode record count mismatch")
                     .Ag(agno)
                     .Metadata("inobt")
                     .Expected(chunk_count)
-                    .Actual(count);
+                    .Actual(r.count);
               }
-              uint32_t actual_free = 0;
-              for (int ino_i = 0; ino_i < 64; ++ino_i) {
-                bool hole = false;
-                if (geo.features.spinodes) {
-                  uint16_t holemask2 = GetBE16(rec + 4);
-                  hole = (holemask2 & (1u << (ino_i / 4))) != 0;
-                }
-                if (hole) continue;
-                if (free_mask & (1ULL << ino_i)) ++actual_free;
-              }
-              if (actual_free != freecount) {
-                return XFS_ERR(XfsError::kCorruptBtree,
-                               "sparse inode freecount mismatch")
-                    .Ag(agno)
-                    .Metadata("inobt")
-                    .Expected(actual_free)
-                    .Actual(freecount);
-              }
-              ino.count += count;
-              ino.freecount += freecount;
-            } else {
-              uint32_t freecount = GetBE32(rec + 4);
-              uint32_t actual_free = 0;
-              for (int ino_i = 0; ino_i < 64; ++ino_i) {
-                if (free_mask & (1ULL << ino_i)) ++actual_free;
-              }
-              if (actual_free != freecount) {
-                return XFS_ERR(XfsError::kCorruptBtree,
-                               "inobt freecount does not match mask")
-                    .Ag(agno)
-                    .Metadata("inobt")
-                    .Expected(actual_free)
-                    .Actual(freecount);
-              }
-              ino.count += 64;
-              ino.freecount += freecount;
             }
-            if (!ino_first && startino <= last_startino) {
+            uint32_t actual_free = 0;
+            for (uint32_t ino_i = 0; ino_i < ondisk::kInodesPerChunk; ++ino_i) {
+              if (!((allocmask >> ino_i) & 1ULL)) continue;
+              if (r.free & (1ULL << ino_i)) ++actual_free;
+            }
+            if (actual_free != r.freecount) {
+              return XFS_ERR(XfsError::kCorruptBtree,
+                             "inobt freecount does not match the free mask")
+                  .Ag(agno)
+                  .Metadata("inobt")
+                  .Expected(actual_free)
+                  .Actual(r.freecount);
+            }
+            if (!ino_first && r.startino <= last_startino) {
               return XFS_ERR(XfsError::kCorruptBtree,
                              "inobt records out of order")
                   .Ag(agno)
                   .Metadata("inobt");
             }
             ino_first = false;
-            last_startino = startino;
+            last_startino = r.startino;
+            ino.count += r.count;
+            ino.freecount += r.freecount;
             ++ino.records;
+            inobt_records.emplace(r.startino, r);
           }
           return OkStatus();
         };
@@ -1199,29 +1306,224 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                      std::to_string(ino.records) + " chunks, " +
                          std::to_string(ino.count) + " inodes");
         }
+
+        // Sparse chunks: every backed block belongs to the inode chunk and
+        // must not also be in the free-space tree; every backed inode image
+        // must pass the inode verifier (hole slots have no such image).
+        if (s.ok() && geo.features.spinodes) {
+          auto overlaps_free = [&](uint32_t start, uint32_t len) {
+            for (const auto& fr : free_ranges) {
+              if (start < fr.first + fr.second && fr.first < start + len) {
+                return true;
+              }
+            }
+            return false;
+          };
+          uint32_t checked_inodes = 0;
+          bool sparse_ok = true;
+          for (const auto& entry : inobt_records) {
+            const InobtRecord& r = entry.second;
+            const uint32_t sagbno = r.startino >> geo.inopblog;
+            uint32_t bit = 0;
+            while (bit < bt::kInobtHolemaskBits) {
+              if ((r.holemask >> bit) & 1u) {
+                ++bit;
+                continue;
+              }
+              const uint32_t run_start = bit;
+              while (bit < bt::kInobtHolemaskBits &&
+                     ((r.holemask >> bit) & 1u) == 0) {
+                ++bit;
+              }
+              const uint32_t inode_offset =
+                  run_start * ondisk::kInodesPerHolemaskBit;
+              const uint32_t inode_count =
+                  (bit - run_start) * ondisk::kInodesPerHolemaskBit;
+              if (inode_offset % geo.inopblock != 0 ||
+                  inode_count % geo.inopblock != 0) {
+                report.Add("AG" + std::to_string(agno) + " sparse backing",
+                           CheckStatus::kCorrupt,
+                           "unaligned backing run in chunk " +
+                               std::to_string(r.startino));
+                sparse_ok = false;
+                break;
+              }
+              const uint32_t agbno = sagbno + inode_offset / geo.inopblock;
+              const uint32_t blocks = inode_count / geo.inopblock;
+              if (overlaps_free(agbno, blocks)) {
+                report.Add("AG" + std::to_string(agno) + " sparse backing",
+                           CheckStatus::kCorrupt,
+                           "backed inode block " + std::to_string(agbno) +
+                               " is in the free-space tree");
+                sparse_ok = false;
+              }
+              for (uint32_t i = 0; i < inode_count; ++i) {
+                const uint64_t backed_ino =
+                    geo.AginoToIno(agno, r.startino + inode_offset + i);
+                std::vector<uint8_t> image(geo.inode_size);
+                if (!dev.Read(geo.InoToByteOffset(backed_ino), image.data(),
+                              image.size())) {
+                  report.Add("AG" + std::to_string(agno) + " sparse inode",
+                             CheckStatus::kCorrupt,
+                             "cannot read inode " +
+                                 std::to_string(backed_ino));
+                  sparse_ok = false;
+                  break;
+                }
+                XfsInode parsed;
+                Status ps = ParseInode(image.data(), image.size(), geo,
+                                       backed_ino, &parsed,
+                                       /*allow_free_inode=*/true);
+                if (!ps.ok()) {
+                  report.Add("AG" + std::to_string(agno) + " sparse inode",
+                             CheckStatus::kCorrupt,
+                             "inode " + std::to_string(backed_ino) + ": " +
+                                 ps.error().Format());
+                  sparse_ok = false;
+                  break;
+                }
+                ++checked_inodes;
+              }
+              if (!sparse_ok) break;
+            }
+            if (!sparse_ok) break;
+          }
+          if (sparse_ok) {
+            report.Add("AG" + std::to_string(agno) + " sparse backing",
+                       CheckStatus::kOk,
+                       std::to_string(checked_inodes) +
+                           " backed inode images verified, holes unowned");
+          }
+        }
+
+        // finobt: a filtered view of the inobt with an independent record
+        // lifecycle. Every finobt record must match its inobt record, refer
+        // to a real chunk with free inodes, and the recorded free mask must
+        // account for the hole mask.
+        uint32_t finobt_blocks = 0;
+        if (geo.features.finobt) {
+          BtreeSpec fibt = inobt;
+          fibt.name = "finobt";
+          fibt.magic = ondisk::kFibtCrcMagic;
+          std::map<uint32_t, InobtRecord> free_records;
+          BtreeWalkCallbacks fcb;
+          fcb.read_block = read_ag_block;
+          fcb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
+          fcb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
+                          const uint8_t* buf) -> Status {
+            ++finobt_blocks;
+            if (meta.level != 0) return OkStatus();
+            for (uint16_t i = 0; i < meta.numrecs; ++i) {
+              const uint8_t* rec = BtreeLeafRec(buf, meta, fibt, i);
+              InobtRecord f;
+              f.startino = GetBE32(rec);
+              f.free = GetBE64(rec + 8);
+              if (geo.features.spinodes) {
+                f.holemask = GetBE16(rec + 4);
+                f.count = GetU8(rec + 6);
+                f.freecount = GetU8(rec + 7);
+              } else {
+                f.holemask = 0;
+                f.count = ondisk::kInodesPerChunk;
+                f.freecount = GetBE32(rec + 4);
+              }
+              auto it = inobt_records.find(f.startino);
+              if (it == inobt_records.end()) {
+                return XFS_ERR(XfsError::kCorruptBtree,
+                               "finobt record has no inobt record")
+                    .Ag(agno)
+                    .Metadata("finobt")
+                    .Actual(f.startino);
+              }
+              const InobtRecord& r = it->second;
+              if (f.holemask != r.holemask || f.count != r.count ||
+                  f.free != r.free || f.freecount != r.freecount) {
+                return XFS_ERR(XfsError::kCorruptBtree,
+                               "finobt record does not match the inobt")
+                    .Ag(agno)
+                    .Metadata("finobt")
+                    .Actual(f.startino);
+              }
+              if (f.freecount == 0) {
+                return XFS_ERR(XfsError::kCorruptBtree,
+                               "finobt tracks a fully allocated chunk")
+                    .Ag(agno)
+                    .Metadata("finobt")
+                    .Actual(f.startino);
+              }
+              free_records.emplace(f.startino, f);
+            }
+            return OkStatus();
+          };
+          s = WalkBtree(fibt, agi.free_root, fcb);
+          if (!s.ok()) {
+            report.Add("AG" + std::to_string(agno) + " finobt",
+                       CheckStatus::kCorrupt, s.error().Format());
+          } else {
+            bool missing = false;
+            for (const auto& entry : inobt_records) {
+              if (entry.second.freecount == 0) continue;
+              if (free_records.find(entry.first) == free_records.end()) {
+                report.Add("AG" + std::to_string(agno) + " finobt",
+                           CheckStatus::kCorrupt,
+                           "chunk " + std::to_string(entry.first) +
+                               " has free inodes but no finobt record");
+                missing = true;
+                break;
+              }
+            }
+            if (!missing) {
+              report.Add("AG" + std::to_string(agno) + " finobt",
+                         CheckStatus::kOk,
+                         std::to_string(free_records.size()) +
+                             " free chunks match the inobt");
+            }
+          }
+        }
+
+        // inobtcount: the AGI counters are the reachable block counts,
+        // including each tree's root.
+        if (geo.features.inobtcnt) {
+          const bool ib_ok = agi.iblocks == inobt_blocks;
+          const bool fb_ok =
+              !geo.features.finobt || agi.fblocks == finobt_blocks;
+          if (!ib_ok || !fb_ok) {
+            report.Add("AG" + std::to_string(agno) + " inode btree blocks",
+                       CheckStatus::kCorrupt,
+                       "AGI iblocks/fblocks " + std::to_string(agi.iblocks) +
+                           "/" + std::to_string(agi.fblocks) +
+                           " != reachable " + std::to_string(inobt_blocks) +
+                           "/" + std::to_string(finobt_blocks));
+          } else {
+            report.Add("AG" + std::to_string(agno) + " inode btree blocks",
+                       CheckStatus::kOk,
+                       std::to_string(inobt_blocks) + "/" +
+                           std::to_string(finobt_blocks) + " blocks");
+          }
+        }
       }
     }
   }
 
   if (options.allocation_groups) {
-    if (total_free != superblock_.fdblocks) {
+    if (total_free != live_sb.fdblocks) {
       report.Add("superblock counters", CheckStatus::kWarning,
                  "sum of AG free blocks " + std::to_string(total_free) +
-                     " != sb_fdblocks " + std::to_string(superblock_.fdblocks) +
-                     (superblock_.features2 & ondisk::kVersion2LazySbCount
+                     " != sb_fdblocks " + std::to_string(live_sb.fdblocks) +
+                     (live_sb.features2 & ondisk::kVersion2LazySbCount
                           ? " (lazy counter)"
                           : ""));
     } else {
       report.Add("superblock counters", CheckStatus::kOk,
                  "free block counters match");
     }
-    if (total_icount != superblock_.icount ||
-        total_ifree != superblock_.ifree) {
+    if (total_icount != live_sb.icount ||
+        total_ifree != live_sb.ifree) {
       report.Add("superblock inode counters", CheckStatus::kWarning,
                  "AGI inode counts " + std::to_string(total_icount) + "/" +
                      std::to_string(total_ifree) + " != sb " +
-                     std::to_string(superblock_.icount) + "/" +
-                     std::to_string(superblock_.ifree));
+                     std::to_string(live_sb.icount) + "/" +
+                     std::to_string(live_sb.ifree));
     } else {
       report.Add("superblock inode counters", CheckStatus::kOk,
                  "inode counters match");

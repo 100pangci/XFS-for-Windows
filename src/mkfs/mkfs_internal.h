@@ -37,13 +37,21 @@ struct FormatGeometry {
   uint32_t bno_block = 0;        // AG-relative block numbers
   uint32_t cnt_block = 0;
   uint32_t ibt_block = 0;
+  uint32_t fibt_block = 0;
   uint32_t agfl_block = 0;
+
+  bool finobt = false;
+  bool inobtcount = false;
+  bool sparse_inodes = false;
+  bool bigtime = false;
+  bool nrext64 = false;
 
   uint64_t logstart = 0;   // absolute fsb
   uint32_t logblocks = 0;
   uint32_t log_agno = 0;
 
   uint32_t ino_align = 0;    // sb_inoalignmt (blocks)
+  uint32_t spino_align = 0;  // sb_spino_align (0 without sparse inodes)
   uint32_t chunk_blocks = 0; // inode chunk size in blocks
   uint64_t first_chunk_fsb = 0;  // absolute fsb of the AG0 inode chunk
   uint32_t rootino_agino = 0;    // agino of the root inode within AG0
@@ -116,6 +124,9 @@ void BuildCntbtRoot(const FormatGeometry& geo,
 void BuildInobtRoot(const FormatGeometry& geo,
                     const FormatGeometry::AgState& ag,
                     std::vector<uint8_t>* buf);
+void BuildFinobtRoot(const FormatGeometry& geo,
+                     const FormatGeometry::AgState& ag,
+                     std::vector<uint8_t>* buf);
 
 // Writes (and returns) the inode chunk contents for AG0: 64 v3 inode cores
 // with the root inode fully populated. `buf` receives chunk_blocks * block_size

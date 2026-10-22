@@ -219,16 +219,34 @@ TEST(writable_profile_allow_list) {
                "': " + s.error().message);
     }
   };
-  refused(ondisk::kIncompatFtype | ondisk::kIncompatSpinodes, 0, "sparse");
-  refused(ondisk::kIncompatFtype | ondisk::kIncompatNrext64, 0, "nrext64");
-  refused(ondisk::kIncompatFtype | ondisk::kIncompatBigtime, 0, "bigtime");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatParent, 0, "parent");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatMetadir, 0, "metadir");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatZoned, 0, "zoned");
-  refused(ondisk::kIncompatFtype, ondisk::kRoCompatFinobt, "finobt");
   refused(ondisk::kIncompatFtype, ondisk::kRoCompatRmapbt, "rmapbt");
   refused(ondisk::kIncompatFtype, ondisk::kRoCompatReflink, "reflink");
-  refused(ondisk::kIncompatFtype, ondisk::kRoCompatInobtcnt, "inobtcount");
+
+  // RW-6A features are part of the writable profile.
+  const uint32_t modern_incompat = ondisk::kIncompatFtype |
+                                   ondisk::kIncompatSpinodes |
+                                   ondisk::kIncompatBigtime |
+                                   ondisk::kIncompatNrext64;
+  const uint32_t modern_ro =
+      ondisk::kRoCompatFinobt | ondisk::kRoCompatInobtcnt;
+  {
+    XfsSuperblock modern = sb;
+    modern.features_incompat = modern_incompat;
+    modern.features_ro_compat = modern_ro;
+    modern.spino_align = 2;
+    modern.inoalignmt = 8;
+    modern.blocksize = 4096;
+    modern.inodesize = 512;
+    modern.inopblock = 8;
+    modern.inopblog = 3;
+    modern.blocklog = 12;
+    modern.inodelog = 9;
+    XfsGeometry g = MakeGeometry(modern);
+    CHECK(CheckWritableProfile(modern, g).ok());
+  }
 
   // Features with no on-disk impact for our mutations are allowed.
   XfsSuperblock allowed = sb;

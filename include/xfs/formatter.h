@@ -29,6 +29,13 @@ struct FormatOptions {
   std::string label;            // up to 12 bytes
   Uuid uuid{};                  // all-zero = generate random
   bool quiet = false;
+  // Optional modern inode feature profile (RW-6A). None are enabled by
+  // default, matching the historical image profile used by the older tests.
+  bool finobt = false;
+  bool inobtcount = false;
+  bool sparse_inodes = false;
+  bool bigtime = false;
+  bool nrext64 = false;
 };
 
 struct FormatReport {

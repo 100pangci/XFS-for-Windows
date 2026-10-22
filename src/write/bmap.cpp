@@ -1171,7 +1171,9 @@ Status DataForkEditor::Finalize(std::vector<uint8_t>* raw_inode,
   }
 
   uint8_t* core = raw_inode->data();
-  PutBE32(core, di::kNextents, static_cast<uint32_t>(extents_.size()));
+  // di_nextents/di_big_nextents share a union; write the field selected by
+  // the inode's own NREXT64 flag (the attr-fork counter is left untouched).
+  SetInodeDataExtentCount(core, extents_.size());
   PutBE64(core, di::kNblocks,
           GetBE64(core, di::kNblocks) +
               static_cast<uint64_t>(nblocks_delta_));

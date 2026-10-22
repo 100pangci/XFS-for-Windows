@@ -27,7 +27,7 @@ Block Device Abstraction  (Image, Windows raw device, memory (tests))
 
 Scope: **XFS v5 (`crc=1`), internal log, single data device, no realtime
 device.** Reading and formatting are complete; writing is an experimental,
-allow-listed subset (RW-1..RW-4) and journal recovery is native (RW-5). A
+allow-listed subset (RW-0..RW-6A) and journal recovery is native (RW-5). A
 filesystem is only modified when this build maintains every structure it uses;
 anything else is refused for read-write and stays readable.
 
@@ -47,7 +47,7 @@ anything else is refused for read-write and stays readable.
 | Multi-block directories | read |
 | Internal log cleanliness check | yes; dirty logs are classified by the recovery scanner |
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
-| Formatter (mkfs) | yes: standard v5 filesystem, no finobt/rmapbt/reflink |
+| Formatter (mkfs) | yes: standard v5, plus optional finobt/inobtcount/sparse/bigtime/NREXT64 (`--modern-inode-profile`); no rmapbt/reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`), including the recovery inventory of a dirty log |
 | **Journal replay (RW-5)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI intent completion and AGI unlinked processing |
 | **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
@@ -59,7 +59,8 @@ anything else is refused for read-write and stays readable.
 | symlink creation (inline + remote) | yes (RW-4): real `S_IFLNK` inodes, v5 `xfs_dsymlink_hdr` remote blocks |
 | xattr / ACL mutation | **not implemented** (refused) |
 | Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
-| Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt and the superblock free block counter |
+| Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt, inobt, finobt, AGI and the superblock counters |
+| Modern inode features | **read/write/recovery**: finobt, inobtcount, sparse inode chunks, bigtime, NREXT64 |
 | Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
 
@@ -131,6 +132,38 @@ clean, `xfs_repair -n` silent and the namespace/content matching the recorded
 manifests. An independent Python parser (`tests/tools/recovery_probe.py`)
 reimplements the read side for the structural differential.
 
+RW-6A adds the modern inode feature profile:
+[`docs/MODERN_INODE_FEATURES.md`](docs/MODERN_INODE_FEATURES.md) documents
+finobt, inobtcount, sparse inode chunks, bigtime and NREXT64 on disk and in the
+writer/recovery paths. Linux-created modern filesystems can now be mutated:
+inode allocation/free maintains the inobt, finobt, AGI (`agi_iblocks` /
+`agi_fblocks`) and superblock counters in one transaction; sparse chunks are
+allocated cluster-wise and only their real backing blocks are freed; timestamps
+use the 64-bit bigtime encoding; extent counters use the NREXT64 fields. CI
+generates the fixture with the distribution's `mkfs.xfs`, mutates it on
+Windows, verifies it with the Linux kernel and `xfs_repair -n`, lets Linux
+mutate it again, and rereads it on Windows. Linux dirty logs on the same
+profile are replayed by the RW-5 engine and verified back on Linux; the
+independent `tests/tools/rw6_inode_probe.py` cross-checks every tree, hole
+mask, counter and inode image.
+
+## Writable feature table (RW-6A)
+
+| Feature | Read | Write | Recovery |
+|---|---|---|---|
+| finobt | yes | yes | yes |
+| inobtcount | yes | yes | yes |
+| sparse inode chunks | yes | yes | yes |
+| bigtime | yes | yes | yes |
+| NREXT64 | yes | yes | yes |
+| rmapbt | yes (`check` walks it; the reader does not need it) | **no** | n/a (refused on write) |
+| reflink / refcount | yes (extents are read normally) | **no** | n/a (refused on write) |
+| xattr | preserved byte-for-byte | **no mutation** | preserved by inode items |
+
+The writable profile is XFS v5 with an internal log and a single data device.
+A filesystem using rmapbt, reflink, parent pointers, quotas, realtime, an
+external log, metadir or zoned mode is refused before the first write.
+
 ## Journal recovery (RW-5)
 
 ```text
@@ -144,7 +177,7 @@ xfswin mount crash.img X: --rw-experimental      # recovers, then mounts writabl
 A read-only mount still refuses a dirty log (use `--force-unsafe-ro` to get the
 clearly-warned pre-recovery view). Recovery finishes with a clean unmount
 record in the standalone command; a mounted filesystem writes it at unmount.
-Scope and refusals are listed in `docs/RECOVERY.md` section 10.
+Scope and refusals are listed in `docs/RECOVERY.md` section 11.
 
 ## Read-write support (experimental, RW-2: overwrite, extend, truncate)
 
@@ -177,11 +210,12 @@ Scope of this milestone:
   agf_btreeblks)` after every operation, which is what the kernel's
   `xfs_initialize_perag_data` and `xfs_repair` recompute.
 - **Allow-list mount policy.** A filesystem may be mounted read-write only if
-  this build can maintain every structure it uses. finobt, rmapbt, reflink,
-  sparse inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas,
-  realtime devices, external logs, metadir, zoned and case-insensitive
-  directories are all refused for read-write (they remain readable), with the
-  blocking feature named in the error.
+  this build can maintain every structure it uses. RW-6A added finobt,
+  inobtcount, sparse inode chunks, bigtime and NREXT64 to the writable profile.
+  rmapbt, reflink, parent pointers, quotas, realtime devices, external logs,
+  metadir, zoned and case-insensitive directories are still refused for
+  read-write (they remain readable), with the blocking feature named in the
+  error.
 - **Images only.** `\\.\PhysicalDriveN` and volumes refuse `--rw-experimental`
   (exit code 3) until the writer has passed crash-consistency and
   interoperability testing. `--rw` is not accepted yet either: it will be the
@@ -194,8 +228,9 @@ Scope of this milestone:
 - **Limits.** A single truncate is split over multiple transactions (like
   Linux's rolling truncate) when it would remove more than ~48 extents; a
   transaction that would produce more than 32 KiB of log data is refused before
-  anything is written. There is no reflink/rmap/finobt support, and a
-  multi-level free-space tree is only collapsed one leaf at a time.
+  anything is written. There is no rmapbt/reflink support yet; multi-level
+  inobt/finobt roots are fully edited, while the free-space trees are only
+  collapsed one leaf at a time.
 - **Flush is real.** `FlushFileBuffers` failure is an error
   (`STATUS_IO_DEVICE_ERROR`), never success; unmount flushes before the mount
   point disappears.
@@ -437,8 +472,10 @@ Fixed, conservative profile that Linux mounts natively:
   `.`/`..`; they are implicit), root inode CRC over the whole inode
 - AGFL blocks counted as free in `sb_fdblocks` (they are excluded from
   `agf_freeblks`), `agf_btreeblks = 0` for a fresh filesystem
-- no finobt, rmapbt, reflink, sparse inodes, bigtime, NREXT64, parent
-  pointers or metadir (all optional features are off)
+- optional RW-6A profile (`--modern-inode-profile`, or the individual
+  `--finobt`, `--inobtcount`, `--sparse-inodes`, `--bigtime`, `--nrext64`
+  switches): finobt, inobtcount, sparse inode chunks, bigtime and NREXT64
+- rmapbt, reflink, parent pointers and metadir remain off
 
 The formatter refuses devices that are too small for this profile (a 64 MiB
 log must fit inside one AG).

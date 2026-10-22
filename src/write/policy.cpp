@@ -36,12 +36,9 @@ struct IncompatReason {
 };
 
 constexpr IncompatReason kIncompatReasons[] = {
-    {ondisk::kIncompatSpinodes, "sparse inodes",
-     "the inode allocator must understand hole masks"},
-    {ondisk::kIncompatBigtime, "bigtime",
-     "timestamps use the 64-bit nanoseconds encoding"},
-    {ondisk::kIncompatNrext64, "nrext64",
-     "extent counters use the 64-bit inode fields"},
+    // RW-6A implements sparse chunks, bigtime and NREXT64; they are no longer
+    // in the refusal list. Parent pointers still change the attribute fork on
+    // every rename and are a later milestone.
     {ondisk::kIncompatParent, "parent pointers",
      "parent pointer xattrs must be written on every rename"},
 };
@@ -53,14 +50,12 @@ struct RoCompatReason {
 };
 
 constexpr RoCompatReason kRoCompatReasons[] = {
-    {ondisk::kRoCompatFinobt, "finobt",
-     "the free inode btree must be updated on inode allocation"},
+    // RW-6A maintains finobt and the AGI btree block counters. rmapbt and
+    // reflink still require metadata this writer does not maintain.
     {ondisk::kRoCompatRmapbt, "rmapbt",
      "the reverse mapping btree must track every allocation"},
     {ondisk::kRoCompatReflink, "reflink",
      "the refcount btree must track every shared extent"},
-    {ondisk::kRoCompatInobtcnt, "inobtcount",
-     "AGI btree block counters (iblocks/fblocks) must be maintained"},
 };
 
 }  // namespace
@@ -149,6 +144,18 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo) {
         .Actual(sb.qflags);
   }
 
+  // An inode chunk is one inobt record (64 inodes). When a block holds more
+  // than 64 inodes a chunk spans several records; that geometry is outside
+  // the tested profile (the allocator would refuse before writing, but a
+  // clean preflight is better).
+  if (sb.inopblock > ondisk::kInodesPerChunk) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "inodes per block above 64 are not supported for "
+                   "read-write")
+        .Metadata("superblock")
+        .Actual(sb.inopblock);
+  }
+
   // Directory blocks larger than one filesystem block would need multi-block
   // directory block allocation in the allocator.
   if (sb.dirblklog != 0) {
@@ -182,6 +189,11 @@ std::string WritableProfileSummary(const XfsSuperblock& sb) {
   std::string summary = "XFS v5, crc=1, internal log, single data device";
   if (sb.features.meta_uuid) summary += ", meta-uuid";
   if (sb.features.ftype) summary += ", ftype=1";
+  if (sb.features.finobt) summary += ", finobt";
+  if (sb.features.inobtcnt) summary += ", inobtcount";
+  if (sb.features.spinodes) summary += ", sparse-inodes";
+  if (sb.features.bigtime) summary += ", bigtime";
+  if (sb.features.nrext64) summary += ", nrext64";
   if (sb.features.exchrange) summary += ", exchrange";
   return summary;
 }

@@ -55,14 +55,14 @@ CLI (xfswin.exe)                       WinFsp host
    validation. Corrupt trees stop the walk.
 5. A read-only mount never writes: the device is opened read-only, the volume
    declares itself read-only and every write callback is rejected.
-6. Dirty or unknown logs cause mount refusal by default. This build never
-   replays the journal.
+6. Dirty logs are replayed by the Windows recovery engine (RW-5); an unknown
+   or unreplayable log still causes mount refusal by default.
 7. A read-write mount is an allow-list (`CheckWritableProfile`): read-write is
    permitted only if this build can maintain every structure the filesystem
-   uses. Features that are only *understood* (finobt, rmapbt, reflink, sparse
-   inodes, bigtime, NREXT64, parent pointers, inobtcount, quotas, realtime,
-   external logs, metadir, zoned) are refused for read-write with the blocking
-   feature named, never updated best-effort.
+   uses. RW-6A maintains finobt, inobtcount, sparse inode chunks, bigtime and
+   NREXT64. Features still only *understood* (rmapbt, reflink, parent
+   pointers, quotas, realtime, external logs, metadir, zoned) are refused for
+   read-write with the blocking feature named, never updated best-effort.
 8. A fast-path mutation validates its whole effect before it writes anything
    (`MapWrittenRange`): a partially valid range is refused as a whole, so a
    failed request cannot leave half of it applied. Multi-transaction
@@ -113,8 +113,10 @@ Feature policy:
   layouts are unchanged; parent pointers are stored as private `parent`
   xattrs (parent inode + generation) in each child's attribute fork, which the
   reader never parses and the mount never writes.
-- Accepted ro-compat features (read-only safe): `FINOBT`, `RMAPBT`,
-  `REFLINK`, `INOBTCNT`.
+- Accepted ro-compat features: `FINOBT` and `INOBTCNT` are maintained on
+  write; `RMAPBT` and `REFLINK` are read-only safe and refused for write.
+- Modern inode layouts: `SPINODES`, `BIGTIME` and `NREXT64` are readable and
+  writable (RW-6A); see `MODERN_INODE_FEATURES.md`.
 - Rejected: `NEEDSREPAIR`, `METADIR`, `ZONED`, `ZONE_GAPS`,
   unknown incompat bits, unknown v4-era version/features2 bits, `asciici`
   (case-insensitive) directories.

@@ -20,6 +20,12 @@ struct Options {
   // RW-0 writer can only overwrite existing allocated blocks, metadata
   // mutations (timestamps, allocation) are not implemented yet.
   bool rw_experimental = false;
+  // Formatter-only modern inode feature switches (RW-6A).
+  bool finobt = false;
+  bool inobtcount = false;
+  bool sparse_inodes = false;
+  bool bigtime = false;
+  bool nrext64 = false;
 };
 
 // Runs the CLI. argv excludes the program name.

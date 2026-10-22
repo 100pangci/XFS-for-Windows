@@ -102,6 +102,14 @@ void BuildAgiImage(const FormatGeometry& geo, const FormatGeometry::AgState& ag,
   for (size_t i = 0; i < agi::kUnlinkedBuckets; ++i) {
     PutBE32(p, agi::kUnlinked + i * 4, kNullAgino);
   }
+  if (geo.finobt) {
+    PutBE32(p, agi::kFreeRoot, geo.fibt_block);
+    PutBE32(p, agi::kFreeLevel, 1);
+  }
+  if (geo.inobtcount) {
+    PutBE32(p, agi::kIblocks, 1);
+    PutBE32(p, agi::kFblocks, geo.finobt ? 1 : 0);
+  }
   std::memcpy(p + agi::kUuid, geo.meta_uuid.data(), 16);
   PutBE64(p, agi::kLsn, 0);
   UpdateXfsChecksum(p, geo.sector_size, agi::kCrc);
@@ -178,8 +186,37 @@ void BuildInobtRoot(const FormatGeometry& geo,
     uint32_t startino = ag.chunk_agbno << geo.inopblog;
     PutBE32(rec, 0, startino);       // ir_startino
     // Root directory plus rt bitmap/summary inodes are allocated.
-    PutBE32(rec, 4, 61);             // ir_freecount (full record format)
+    if (geo.sparse_inodes) {
+      PutBE16(rec, bt::kInobtRecHolemask, bt::kInobtHolemaskFull);
+      rec[bt::kInobtRecCount] = 64;  // ir_count
+      rec[bt::kInobtRecSparseFreecount] = 61;
+    } else {
+      PutBE32(rec, bt::kInobtRecFreecount, 61);
+    }
     PutBE64(rec, 8, ~7ULL);          // ir_free: bits 0-2 used
+  }
+  FinishBtreeCrc(geo, buf);
+}
+
+void BuildFinobtRoot(const FormatGeometry& geo,
+                     const FormatGeometry::AgState& ag,
+                     std::vector<uint8_t>* buf) {
+  buf->assign(geo.block_size, 0);
+  uint16_t numrecs = ag.has_inodes ? 1 : 0;
+  InitBtreeHeader(geo, buf, ondisk::kFibtCrcMagic, numrecs, ag.agno,
+                  geo.fibt_block);
+  if (ag.has_inodes) {
+    uint8_t* rec = buf->data() + bt::kSHeaderLenV5;
+    uint32_t startino = ag.chunk_agbno << geo.inopblog;
+    PutBE32(rec, 0, startino);
+    if (geo.sparse_inodes) {
+      PutBE16(rec, bt::kInobtRecHolemask, bt::kInobtHolemaskFull);
+      rec[bt::kInobtRecCount] = 64;
+      rec[bt::kInobtRecSparseFreecount] = 61;
+    } else {
+      PutBE32(rec, bt::kInobtRecFreecount, 61);
+    }
+    PutBE64(rec, 8, ~7ULL);
   }
   FinishBtreeCrc(geo, buf);
 }

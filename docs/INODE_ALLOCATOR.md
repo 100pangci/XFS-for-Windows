@@ -16,9 +16,14 @@ Scope: the writable profile (`CheckWritableProfile`):
 
 ```text
 XFS v5, crc=1, internal log, single data device
-no finobt, no rmapbt, no reflink, no sparse inodes, no bigtime, no NREXT64,
-no parent pointers, no inobtcount, no quotas, no realtime, no external log
+optional finobt, inobtcount, sparse inode chunks, bigtime, NREXT64
+no rmapbt, no reflink, no parent pointers, no quotas, no realtime,
+no external log, no metadir
 ```
+
+RW-6A extended this document's original inobt-only model; the finobt,
+sparse-chunk and inobtcount rules are described in section 10 and in
+[MODERN_INODE_FEATURES.md](MODERN_INODE_FEATURES.md).
 
 ## 1. What an inode allocation changes
 
@@ -56,6 +61,13 @@ cluster_align= sb_inoalignmt when the align feature is set (v5
 
 The AGI, inobt and superblock updates are one transaction.
 
+With `finobt`, the search is the `xfs_dialloc_ag_finobt_near` /
+`xfs_dialloc_ag_finobt_newino` algorithm over the finobt: the parent's chunk,
+then the closer neighbouring chunk (ties left), then `agi_newino`, then the
+first free record. The selected record is updated in both trees; if the last
+free inode is taken, the finobt record is deleted. Without finobt the inobt
+scan above is used and no finobt is touched.
+
 ## 3. Allocating a new chunk
 
 `xfs_ialloc_ag_alloc`:
@@ -66,11 +78,21 @@ The AGI, inobt and superblock updates are one transaction.
    `di_next_unlinked = NULLAGINO`, `di_ino`, `di_uuid`, CRC. This is the
    `xfs_ialloc_inode_init` template;
 4. insert a full record: `holemask` 0 (`ir_freecount` be32 in the no-sparse
-   layout), `count` 64, `freecount` 64, `free` all ones;
+   layout), `count` 64, `freecount` 64, `free` all ones; with finobt insert
+   the same record there too;
 5. `agi_count += 64`, `agi_freecount += 64`, `agi_newino = startino`,
    `sb_icount += 64`, `sb_ifree += 64`;
 6. hand out the first inode of the chunk (or leave all 64 free when the chunk
    was preallocated).
+
+With sparse inodes and no room for a full chunk, step 2 falls back to one
+cluster-sized allocation (`ialloc_min_blks = sb_spino_align`) inside the
+sparse window. The start inode is rounded down to the full-chunk boundary,
+the allocation mask is shifted with it, and the record is inserted or merged
+into the existing sparse record at that startino
+(`xfs_inobt_insert_sprec` / `xfs_finobt_insert_sprec`). Only the allocated
+clusters are initialised and recorded by ICREATE; the hole bits are not
+backing storage.
 
 The kernel initialises the whole cluster (`xfs_ialloc_inode_init`) and marks it
 as an *ordered* buffer: the cluster bytes are not copied into the log record,
@@ -124,12 +146,17 @@ before an inode is handed out - never an allocated inode that is unreachable.
 1. set the inode's free bit, `ir_freecount++`, `agi_freecount++`,
    `sb_ifree++` (`xfs_ifree` has already truncated the file to zero and
    removed the inode from the AGI unlinked list);
-2. when the chunk becomes **completely free** and the filesystem stores at
+2. with finobt, apply the same transition to the finobt record (insert it if
+   the chunk was fully allocated, update it otherwise) and require both trees
+   to agree;
+3. when the chunk becomes **completely free** and the filesystem stores at
    most 64 inodes per block (`sb_inopblock <= 64`, true here):
-   - remove the whole inobt record,
-   - `agi_count -= 64`, `agi_freecount -= 63`, `sb_icount -= 64`,
-     `sb_ifree -= 63`,
-   - free the chunk's `ialloc_blks` blocks through the block allocator.
+   - remove the whole inobt record and its finobt record,
+   - `agi_count -= count`, `agi_freecount -= (count-1)`,
+     `sb_icount -= count`, `sb_ifree -= (count-1)`,
+   - free the chunk's backing blocks through the block allocator. For a sparse
+     chunk, only contiguous zero runs of `ir_holemask` are freed; hole slots
+     were never owned by the chunk.
 
 Keeping a fully free chunk in the inobt would not be a legal state for this
 geometry: Linux removes it (`xfs_difree_inobt`) and `xfs_repair` recomputes the
@@ -187,18 +214,40 @@ cached data can never be served for a reused inode number.
 
 ## 8. Current limitations
 
-- `finobt`, sparse inodes, `inobtcount` and any other inode-btree feature are
-  refused for read-write by `CheckWritableProfile`;
-- the inobt editor supports the same depth as the other btrees (16 levels) and
-  refuses (before writing) any structural case it cannot complete;
+- rmapbt and reflink remain refused for read-write by
+  `CheckWritableProfile`; parent pointers, xattr mutation and quota mutation
+  are still out of scope;
+- the inobt/finobt editor supports the same depth as the other btrees
+  (16 levels) and refuses (before writing) any structural case it cannot
+  complete;
 - the exact-block "continue after the last chunk" allocation of
   `xfs_ialloc_ag_alloc` is not implemented: a new chunk is allocated with the
   geometry's alignment, which is a legal placement Linux continues from;
-- rename, hard links and symlink creation are refused, so an inode never has
-  more than one namespace entry and never moves between directories; the
-  adapter can therefore remember `(parent, name)` per open node.
+- inodes-per-block greater than 64 (very large blocks with very small inodes)
+  is outside the tested geometry: a chunk then needs more than one inobt
+  record and is refused before writing.
 
-## 9. Where it is wired in
+## 9. RW-6A: finobt, sparse chunks and inobtcount
+
+- `InobtTree` is shared by both trees. The finobt uses magic `FIB3`; its
+  records must exactly match the inobt record for the same `startino`, and
+  every record has `freecount > 0`.
+- Freeing an inode first updates the inobt, then independently applies the
+  same transition to the finobt and compares the results. A free into a fully
+  allocated chunk inserts the finobt record; taking the last free inode
+  deletes it.
+- A fully free chunk is removed from the inobt and (when present) the finobt,
+  and its blocks are freed. For sparse chunks the free path walks contiguous
+  zero bits of `ir_holemask` and frees only those backing extents, never a
+  hole.
+- `agi_iblocks` and `agi_fblocks` (when inobtcount is on) are recomputed as
+  the number of reachable blocks of each tree including the root on every AGI
+  write. This is the identity `xfs_repair` checks in `repair/scan.c`.
+- Allocation/free of chunk backing, inobt/finobt splits and merges, AGI and
+  superblock counters are all in one transaction; a record that would exceed
+  the 32 KiB log record limit is refused before writing.
+
+## 10. Where it is wired in
 
 | piece | file |
 |---|---|

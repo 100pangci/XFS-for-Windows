@@ -404,7 +404,7 @@ class XfsFilesystem {
   Status UpdateInodeInTransaction(
       XfsTransaction& txn, uint64_t ino, uint32_t ilog_fields,
       const std::vector<uint8_t>& fork_region,
-      const std::function<void(uint8_t* raw)>& mutate);
+      const std::function<Status(uint8_t* raw)>& mutate);
   // Logs an already prepared inode image (the LSN and CRC are stamped here).
   Status LogPreparedInode(XfsTransaction& txn, uint64_t ino,
                           std::vector<uint8_t> inode, uint32_t ilog_fields,

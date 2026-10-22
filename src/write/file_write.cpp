@@ -38,10 +38,10 @@ namespace di = ondisk::inode;
 
 constexpr size_t kMaxWriteBytes = 1ull << 30;  // one call, sanity bound
 
-// Stores a timestamp in the legacy 32:32 big-endian encoding.
-void StoreTimestamp(uint8_t* field, const XfsTimestamp& ts) {
-  StoreBE32(field, static_cast<uint32_t>(ts.sec));
-  StoreBE32(field + 4, ts.nsec);
+Status StoreModifiedTimes(uint8_t* raw, const XfsTimestamp& now) {
+  Status s = StoreInodeTimestamp(raw, di::kMtime, now);
+  if (!s.ok()) return s;
+  return StoreInodeTimestamp(raw, di::kCtime, now);
 }
 
 // The blocks a write touches.
@@ -287,8 +287,8 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
     s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
     if (!s.ok()) return s.error();
     const XfsTimestamp now = CurrentTimestamp();
-    StoreTimestamp(raw_inode.data() + di::kMtime, now);
-    StoreTimestamp(raw_inode.data() + di::kCtime, now);
+    s = StoreModifiedTimes(raw_inode.data(), now);
+    if (!s.ok()) return s.error();
     s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
                          fork_region);
     if (!s.ok()) return s.error();
@@ -406,8 +406,8 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
     if (!s.ok()) return s.error();
     const XfsTimestamp now = CurrentTimestamp();
     PutBE64(raw_inode.data(), di::kSize, plan.new_size);
-    StoreTimestamp(raw_inode.data() + di::kMtime, now);
-    StoreTimestamp(raw_inode.data() + di::kCtime, now);
+    s = StoreModifiedTimes(raw_inode.data(), now);
+    if (!s.ok()) return s.error();
     s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
                          fork_region);
     if (!s.ok()) return s.error();
@@ -517,10 +517,9 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
     const XfsTimestamp now = CurrentTimestamp();
     Status status = UpdateInodeInTransaction(
         txn.value(), ino, 0, {},
-        [&](uint8_t* raw) {
+        [&](uint8_t* raw) -> Status {
           PutBE64(raw, di::kSize, new_size);
-          StoreTimestamp(raw + di::kMtime, now);
-          StoreTimestamp(raw + di::kCtime, now);
+          return StoreModifiedTimes(raw, now);
         });
     if (status.ok()) status = CommitTransaction(txn.value());
     if (!status.ok()) return status.error();
@@ -621,8 +620,8 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
       if (!more) {
         PutBE64(raw_inode.data(), di::kSize, new_size);
       }
-      StoreTimestamp(raw_inode.data() + di::kMtime, now);
-      StoreTimestamp(raw_inode.data() + di::kCtime, now);
+      s = StoreModifiedTimes(raw_inode.data(), now);
+      if (!s.ok()) return s.error();
       s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
                            fork_region);
       if (!s.ok()) return s.error();

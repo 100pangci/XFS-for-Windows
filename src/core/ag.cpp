@@ -221,11 +221,12 @@ Result<XfsAgi> ReadAgi(BlockDevice& dev, const XfsGeometry& geo, uint32_t agno) 
         .Expected(max_inodes)
         .Actual(out.count);
   }
-  if (out.level > ondisk::btree::kMaxTraversalLevels ||
+  if (out.level == 0 || out.level > ondisk::btree::kMaxTraversalLevels ||
       out.free_level > ondisk::btree::kMaxTraversalLevels) {
-    return XFS_ERR(XfsError::kCorruptAgHeader, "AGI btree level too deep")
+    return XFS_ERR(XfsError::kCorruptAgHeader, "AGI btree level out of range")
         .Ag(agno)
-        .Metadata("AGI");
+        .Metadata("AGI")
+        .Actual(out.level);
   }
   if (!geo.AgbnoValid(agno, out.root)) {
     return XFS_ERR(XfsError::kCorruptAgHeader, "AGI inobt root out of range")
@@ -233,12 +234,19 @@ Result<XfsAgi> ReadAgi(BlockDevice& dev, const XfsGeometry& geo, uint32_t agno) 
         .Metadata("AGI")
         .Actual(out.root);
   }
-  if (geo.features.finobt && out.free_level != 0 &&
-      !geo.AgbnoValid(agno, out.free_root)) {
-    return XFS_ERR(XfsError::kCorruptAgHeader, "AGI finobt root out of range")
+  if (geo.features.finobt) {
+    if (out.free_level == 0 || !geo.AgbnoValid(agno, out.free_root)) {
+      return XFS_ERR(XfsError::kCorruptAgHeader,
+                     "AGI finobt root out of range or level zero")
+          .Ag(agno)
+          .Metadata("AGI")
+          .Actual(out.free_root);
+    }
+  } else if (out.free_level != 0) {
+    return XFS_ERR(XfsError::kCorruptAgHeader,
+                   "AGI finobt root set without the finobt feature")
         .Ag(agno)
-        .Metadata("AGI")
-        .Actual(out.free_root);
+        .Metadata("AGI");
   }
   return out;
 }

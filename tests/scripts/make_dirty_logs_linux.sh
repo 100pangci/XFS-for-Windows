@@ -36,7 +36,10 @@ set -euo pipefail
 OUT=${1:?usage: make_dirty_logs_linux.sh <outdir>}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 # mkfs.xfs refuses to format anything below 300 MB.
-SIZE_MB=512
+SIZE_MB=${SIZE_MB:-512}
+# Default: the RW-0..RW-5 minimal profile. RW-6 jobs override this with the
+# modern inode profile (finobt/inobtcount/sparse/bigtime/nrext64).
+MKFS_OPTS=${MKFS_OPTS:--m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 -i sparse=0}
 SCENARIOS="timestamp extend truncate create unlink mkdir rmdir rename-same
 rename-cross rename-replace hardlink symlink-inline symlink-remote"
 
@@ -112,12 +115,10 @@ for scenario in $SCENARIOS; do
         truncate -s "${SIZE_MB}M" "$LIVE"
         LOOP=$(losetup --find --show "$LIVE")
         DEV="$LOOP"
-        # The writable profile of this project, nothing else. (mkfs.xfs: crc /
-        # finobt / rmapbt / reflink / inobtcount / bigtime are -m options;
-        # sparse is an -i option.)
-        mkfs.xfs -f -q \
-            -m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 \
-            -i sparse=0 "$DEV"
+        # MKFS_OPTS selects the writable profile (mkfs.xfs: crc / finobt /
+        # rmapbt / reflink / inobtcount / bigtime are -m options; sparse and
+        # nrext64 are -i options; parent pointers are -n parent=).
+        mkfs.xfs -f -q $MKFS_OPTS "$DEV"
         mount "$DEV" "$MOUNT"
         python3 "$REPO/tests/tools/dirty_ops.py" setup "$MOUNT" >/dev/null
         # The operation, its manifest and the snapshot copy all happen inside

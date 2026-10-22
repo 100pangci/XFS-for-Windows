@@ -170,21 +170,37 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
                                           : HighBit32(geo.agcount - 1) + 1);
   geo.agino_log = static_cast<uint8_t>(geo.agblklog + geo.inopblog);
 
+  if (options.inobtcount && !options.finobt) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "inobtcount requires finobt (mkfs.xfs has the same "
+                   "dependency)")
+        .Metadata("formatter");
+  }
+  geo.finobt = options.finobt;
+  geo.inobtcount = options.inobtcount;
+  geo.sparse_inodes = options.sparse_inodes;
+  geo.bigtime = options.bigtime;
+  geo.nrext64 = options.nrext64;
+
   // Pre-allocated per-AG metadata blocks: block 0 (sb [+ agf/agi/agfl]) then
-  // bno root, cnt root and inobt root.
+  // bno root, cnt root, inobt root and (with finobt) the finobt root.
   uint32_t agfl_block =
       (3 * geo.sector_size) >> geo.blocklog;  // byte 3*sectors -> block
   geo.agfl_block = agfl_block;
   geo.bno_block = agfl_block + 1;
   geo.cnt_block = agfl_block + 2;
   geo.ibt_block = agfl_block + 3;
-  geo.prealloc_blocks = geo.ibt_block + 1;
+  geo.fibt_block = geo.finobt ? geo.ibt_block + 1 : 0;
+  geo.prealloc_blocks = (geo.finobt ? geo.fibt_block : geo.ibt_block) + 1;
 
   // Minimum AGFL length for a 1-level bno+cnt btree pair:
   // per tree: min(level+1, maxlevels)*2 - 2 = 2; two trees -> 4.
   geo.min_freelist = 4;
 
-  // Inode chunk geometry.
+  // Inode chunk geometry. The cluster alignment is sb_inoalignmt when sparse
+  // inodes are off. With sparse inodes, sb_spino_align keeps the cluster
+  // alignment and sb_inoalignmt becomes the full chunk alignment, exactly
+  // what mkfs.xfs writes.
   geo.ino_align = std::max<uint32_t>(1, (kBigClusterBytes *
                                           (geo.inode_size / 256)) >>
                                              geo.blocklog);
@@ -193,6 +209,12 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
                              geo.block_size - 1) >>
                             geo.blocklog);
   if (geo.chunk_blocks == 0) geo.chunk_blocks = 1;
+  if (geo.sparse_inodes) {
+    geo.spino_align = geo.ino_align;
+    geo.ino_align = geo.chunk_blocks;
+  } else {
+    geo.spino_align = 0;
+  }
 
   // Internal log: middle AG, immediately after the pre-allocated metadata.
   uint32_t log_agno = geo.agcount / 2;

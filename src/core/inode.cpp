@@ -38,17 +38,108 @@ Status DecodeAndCheckTimestamps(const uint8_t* buf, XfsInode* out) {
 XfsTimestamp DecodeTimestamp(const uint8_t* field, bool bigtime) {
   XfsTimestamp ts;
   if (bigtime) {
-    // Unsigned 64-bit nanoseconds since 1901-12-13 (Unix epoch + 2^31 sec).
-    uint64_t raw = GetBE64(field);
-    constexpr uint64_t kNsecPerSec = 1000000000ULL;
-    uint64_t secs = raw / kNsecPerSec;
+    // Unsigned 64-bit nanoseconds since the legacy minimum timestamp
+    // (1901-12-13, i.e. Unix epoch + 2^31 seconds).
+    const uint64_t raw = GetBE64(field);
+    const uint64_t secs = raw / kNsecPerSec;
     ts.nsec = static_cast<uint32_t>(raw % kNsecPerSec);
-    ts.sec = static_cast<int64_t>(secs) - (1LL << 31);
+    ts.sec = static_cast<int64_t>(secs) - kBigtimeEpochOffset;
   } else {
     ts.sec = static_cast<int32_t>(GetBE32(field));
     ts.nsec = GetBE32(field + 4);
   }
   return ts;
+}
+
+Status EncodeTimestamp(uint8_t* field, const XfsTimestamp& ts, bool bigtime) {
+  if (ts.nsec >= kNsecPerSec) {
+    return XFS_ERR(XfsError::kOutOfRange,
+                   "timestamp nanoseconds outside [0, 1e9)")
+        .Metadata("inode")
+        .Actual(ts.nsec);
+  }
+  if (bigtime) {
+    if (ts.sec < kBigtimeTimeMinUnix || ts.sec > kBigtimeTimeMaxUnix) {
+      return XFS_ERR(XfsError::kOutOfRange,
+                     "timestamp outside the XFS bigtime range")
+          .Metadata("inode")
+          .Actual(static_cast<uint64_t>(ts.sec));
+    }
+    const uint64_t ondisk_seconds =
+        static_cast<uint64_t>(ts.sec + kBigtimeEpochOffset);
+    StoreBE64(field, ondisk_seconds * kNsecPerSec + ts.nsec);
+    return OkStatus();
+  }
+  if (ts.sec < kLegacyTimeMin || ts.sec > kLegacyTimeMax) {
+    return XFS_ERR(XfsError::kOutOfRange,
+                   "timestamp outside the legacy 32-bit XFS range")
+        .Metadata("inode")
+        .Actual(static_cast<uint64_t>(ts.sec));
+  }
+  StoreBE32(field, static_cast<uint32_t>(ts.sec));
+  StoreBE32(field + 4, ts.nsec);
+  return OkStatus();
+}
+
+bool InodeImageHasBigtime(const uint8_t* inode) {
+  return (GetBE64(inode, di::kFlags2) & di::kDiFlag2Bigtime) != 0;
+}
+
+bool InodeImageHasNrext64(const uint8_t* inode) {
+  return (GetBE64(inode, di::kFlags2) & di::kDiFlag2Nrext64) != 0;
+}
+
+Status StoreInodeTimestamp(uint8_t* inode, size_t field_offset,
+                           const XfsTimestamp& ts) {
+  return EncodeTimestamp(inode + field_offset, ts,
+                         InodeImageHasBigtime(inode));
+}
+
+Status UpgradeInodeTimestampsToBigtime(uint8_t* inode, size_t inode_size,
+                                       const XfsGeometry& geo) {
+  if (inode_size < di::kCoreSizeV3 || !geo.features.bigtime ||
+      InodeImageHasBigtime(inode)) {
+    return OkStatus();
+  }
+  // Decode with the legacy encoding before changing the flag.
+  const size_t fields[] = {di::kAtime, di::kMtime, di::kCtime, di::kCrtime};
+  XfsTimestamp ts[4];
+  for (size_t i = 0; i < 4; ++i) ts[i] = DecodeTimestamp(inode + fields[i], false);
+
+  PutBE64(inode, di::kFlags2,
+          GetBE64(inode, di::kFlags2) | di::kDiFlag2Bigtime);
+  for (size_t i = 0; i < 4; ++i) {
+    Status s = EncodeTimestamp(inode + fields[i], ts[i], true);
+    if (!s.ok()) return s;
+  }
+  return OkStatus();
+}
+
+uint64_t InodeDataExtentCount(const uint8_t* inode) {
+  if (InodeImageHasNrext64(inode)) return GetBE64(inode, di::kBigNextents);
+  return GetBE32(inode, di::kNextents);
+}
+
+uint32_t InodeAttrExtentCount(const uint8_t* inode) {
+  if (InodeImageHasNrext64(inode)) return GetBE32(inode, di::kBigAnextents);
+  return GetBE16(inode, di::kAnextents);
+}
+
+void SetInodeDataExtentCount(uint8_t* inode, uint64_t count) {
+  if (InodeImageHasNrext64(inode)) {
+    PutBE64(inode, di::kBigNextents, count);
+  } else {
+    PutBE32(inode, di::kNextents, static_cast<uint32_t>(count));
+  }
+}
+
+void SetInodeAttrExtentCount(uint8_t* inode, uint32_t count) {
+  if (InodeImageHasNrext64(inode)) {
+    PutBE32(inode, di::kBigAnextents, count);
+    PutBE16(inode, di::kAnextents, 0);  // di_nrext64_pad
+  } else {
+    PutBE16(inode, di::kAnextents, static_cast<uint16_t>(count));
+  }
 }
 
 XfsTimestamp CurrentTimestamp() {
@@ -144,11 +235,33 @@ Status ParseInode(const uint8_t* buf, size_t len, const XfsGeometry& geo,
   }
 
   if (inode.nrext64) {
-    inode.nextents = static_cast<uint32_t>(GetBE64(buf, di::kBigNextents));
+    const uint64_t big_nextents = GetBE64(buf, di::kBigNextents);
+    if ((big_nextents >> 32) != 0) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "inode has more data extents than this build can address")
+          .Ino(ino)
+          .Metadata("inode")
+          .Actual(big_nextents);
+    }
+    inode.nextents = static_cast<uint32_t>(big_nextents);
     inode.anextents = GetBE32(buf, di::kBigAnextents);
+    // xfs_dinode_verify_nrext64: the unused counter slot must be zero.
+    if (GetBE16(buf, di::kAnextents) != 0) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "NREXT64 inode has a nonzero di_nrext64_pad")
+          .Ino(ino)
+          .Metadata("inode")
+          .Actual(GetBE16(buf, di::kAnextents));
+    }
   } else {
     inode.nextents = GetBE32(buf, di::kNextents);
     inode.anextents = GetBE16(buf, di::kAnextents);
+    if (inode.version >= 3 && GetBE64(buf, di::kV3Pad) != 0) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "v3 inode without NREXT64 has nonzero padding")
+          .Ino(ino)
+          .Metadata("inode");
+    }
   }
 
   Status s = DecodeAndCheckTimestamps(buf, &inode);

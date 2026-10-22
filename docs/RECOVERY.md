@@ -1,9 +1,10 @@
 # Journal recovery (RW-5)
 
 Status: **implemented** for the writable profile (XFS v5, CRC enabled, internal
-log, no finobt/rmapbt/reflink/sparse inodes/bigtime/inobtcount/quota/metadir).
-This note documents what the Windows recovery engine does, what it refuses, and
-how it is verified. It is the recovery counterpart of `JOURNAL.md` (the writer).
+log, optional finobt/inobtcount/sparse inodes/bigtime/NREXT64; still no
+rmapbt/reflink/quota/metadir/parent pointers). This note documents what the
+Windows recovery engine does, what it refuses, and how it is verified. It is
+the recovery counterpart of `JOURNAL.md` (the writer).
 
 ```
 Windows crash / Linux crash
@@ -240,9 +241,9 @@ zero-link inodes on the lists), every AGI bucket is walked:
 
 | item | replay | notes |
 |---|---|---|
-| `XFS_LI_BUF` | yes | bitmap chunks, cancellation, inode-buffer special case |
-| `XFS_LI_INODE` | yes | core + data/attr fork regions, fields mask |
-| `XFS_LI_ICREATE` | yes | cluster rebuild |
+| `XFS_LI_BUF` | yes | bitmap chunks, cancellation, inode-buffer special case; recognises `IAB3` inobt and `FIB3` finobt with the shared btree LSN/CRC offsets |
+| `XFS_LI_INODE` | yes | core + data/attr fork regions, fields mask; legacy and bigtime timestamps, NREXT64 counters |
+| `XFS_LI_ICREATE` | yes | cluster rebuild; full and sparse (`ialloc_min_blks`) chunk lengths |
 | `XFS_LI_EFI` / `XFS_LI_EFD` | yes | deferred extent free completion + done item |
 | `XFS_LI_BUI` / `XFS_LI_BUD` | replay only | a *surviving* BUI refuses (no bmap completion yet) |
 | `XFS_LI_RUI/RUD`, `CUI/CUD`, `ATTRI/ATTRD`, `DQUOT`, `QUOTAOFF`, `IUNLINK` | **refused** | rmap/reflink/attr/quota are outside the writable profile |
@@ -328,9 +329,34 @@ Two oracles are kept; neither side proves itself:
 * `xfswin journal <image> [--json]`: structural dump of the log (records,
   transactions, items, unsupported inventory) - the differential/debug tool.
 
-## 10. Not in this milestone
+## 10. RW-6A modern inode layouts
+
+The RW-5 engine already treated metadata by magic, not by the RW-5 feature
+list, so the extension is deliberate and small:
+
+* **finobt buffers** are `FIB3` short-form blocks. They use the same LSN
+  (`bb_lsn` + 24) and CRC (`bb_crc` + 52) offsets as the inobt, the same owner
+  (AG number) and the same UUID. Replay recognition, cancellation, the
+  on-disk-LSN skip rule and the write verifier therefore apply unchanged.
+* **AGI replay** copies the whole buffer; `agi_iblocks`/`agi_fblocks` and the
+  finobt root/level are preserved exactly as logged.
+* **ICREATE** accepts both the full chunk length and the cluster-sized sparse
+  length, requires `count == length << sb_inopblog`, and rebuilds only the
+  captured clusters. The sparse hole slots are not part of the ICREATE.
+* **inode items** carry the host-order `xfs_log_dinode`. Legacy timestamps are
+  two 32-bit values, bigtime is one 64-bit nanoseconds value; NREXT64 uses
+  `di_big_nextents`/`di_big_anextents` and zero `di_nrext64_pad`. Recovery
+  converts them exactly like `xfs_log_dinode_to_disk`, re-checksums the inode
+  and runs the full inode verifier, including the feature-flag consistency
+  checks.
+* The independent RW-6A oracle (`tests/tools/rw6_inode_probe.py`) is run on
+  every Windows-recovered image in addition to `xfswin check`; Linux then
+  mounts it read-only (proving the log is clean) and runs `xfs_repair -n`.
+
+## 11. Not in this milestone
 
 Not replayed and refused when encountered: external logs, realtime devices,
 reflink/refcount, rmap (including writable rmapbt), quota, attribute intents,
 ACL translation, parent pointers, metadir, zoned filesystems. The writable
-feature profile is unchanged.
+feature profile is still allow-listed; RW-6A only removed finobt, inobtcount,
+sparse inodes, bigtime and NREXT64 from the refusal list.
