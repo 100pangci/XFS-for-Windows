@@ -83,6 +83,10 @@ void PrintUsage() {
       "  symlink <image> <target> <path>  create a symlink (target kept verbatim)\n"
       "      --rw-experimental\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
+      "      [--modern-inode-profile]  enable finobt + inobtcount + sparse\n"
+      "                                inodes + bigtime + NREXT64\n"
+      "      [--finobt] [--inobtcount] [--sparse-inodes] [--bigtime]\n"
+      "      [--nrext64]               select individual RW-6A features\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
       "                                created, overwritten, extended, truncated,\n"
@@ -294,6 +298,7 @@ void PrintGeometry(const XfsSuperblock& sb, const XfsGeometry& geo) {
   std::cout << "  features         :"
             << " ftype=" << flags_on(sb.features.ftype)
             << " finobt=" << flags_on(sb.features.finobt)
+            << " inobtcnt=" << flags_on(sb.features.inobtcnt)
             << " spinodes=" << flags_on(sb.features.spinodes)
             << " rmapbt=" << flags_on(sb.features.rmapbt)
             << " reflink=" << flags_on(sb.features.reflink)
@@ -934,6 +939,11 @@ int CommandFormat(const std::string& target, const Options& options) {
 
   mkfs::FormatOptions format_options;
   format_options.quiet = !options.verbose && !options.debug;
+  format_options.finobt = options.finobt;
+  format_options.inobtcount = options.inobtcount;
+  format_options.sparse_inodes = options.sparse_inodes;
+  format_options.bigtime = options.bigtime;
+  format_options.nrext64 = options.nrext64;
   auto report = mkfs::Format(*dev, format_options);
   if (!report.ok()) {
     PrintError(report.error());
@@ -1640,6 +1650,22 @@ int Run(const std::vector<std::string>& args) {
     } else if (arg == "--replace") {
       // rename only: overwrite an existing file or empty directory target.
       replace_existing = true;
+    } else if (arg == "--finobt") {
+      options.finobt = true;
+    } else if (arg == "--inobtcount") {
+      options.inobtcount = true;
+    } else if (arg == "--sparse-inodes") {
+      options.sparse_inodes = true;
+    } else if (arg == "--bigtime") {
+      options.bigtime = true;
+    } else if (arg == "--nrext64") {
+      options.nrext64 = true;
+    } else if (arg == "--modern-inode-profile") {
+      options.finobt = true;
+      options.inobtcount = true;
+      options.sparse_inodes = true;
+      options.bigtime = true;
+      options.nrext64 = true;
     } else if (arg == "--rw") {
       explicit_rw = true;
     } else if (StartsWith(arg, "--text=")) {

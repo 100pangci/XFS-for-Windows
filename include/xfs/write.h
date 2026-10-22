@@ -36,12 +36,12 @@ namespace xfs {
 // ---------------------------------------------------------------------------
 // Writable mount policy
 // ---------------------------------------------------------------------------
-// Checks that the filesystem uses the exact feature profile this build can
-// modify. Anything else must be mounted read-only: a writer that only
-// *understands* a feature for reading (finobt, rmapbt, reflink, sparse inodes,
-// bigtime, NREXT64, parent pointers, quotas, realtime, external log, metadir,
-// zoned) cannot update it consistently, and a best-effort update would corrupt
-// the filesystem.
+// Checks that the filesystem uses a feature profile this build can modify.
+// RW-6A maintains finobt, inobtcount, sparse inode chunks, bigtime and
+// NREXT64. A writer that only *understands* a feature for reading (rmapbt,
+// reflink, parent pointers, quotas, realtime, external log, metadir, zoned)
+// cannot update it consistently, and a best-effort update would corrupt the
+// filesystem; those are refused.
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo);
 
 // Human readable one-line profile description for logs/diagnostics.

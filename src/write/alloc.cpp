@@ -232,7 +232,9 @@ struct AgState {
   Status PutTreeBlock(uint32_t agbno);
   Status RefillAgfl(uint32_t want);
   Status AllocateBestFit(uint32_t want, Allocation* out);
-  Status AllocateAligned(uint32_t want, uint32_t align, Allocation* out);
+  Status AllocateAligned(uint32_t want, uint32_t align, Allocation* out,
+                         uint32_t min_agbno = 0,
+                         uint32_t max_agbno = 0xffffffffu);
   void RecomputeLongest();
   uint32_t Contribution() const;
 };
@@ -1244,20 +1246,34 @@ Status AgState::AllocateBestFit(uint32_t want, Allocation* out) {
   return OkStatus();
 }
 
-Status AgState::AllocateAligned(uint32_t want, uint32_t align, Allocation* out) {
-  if (align <= 1) return AllocateBestFit(want, out);
+Status AgState::AllocateAligned(uint32_t want, uint32_t align, Allocation* out,
+                                uint32_t min_agbno, uint32_t max_agbno) {
+  if (align <= 1 && min_agbno == 0 && max_agbno >= length) {
+    return AllocateBestFit(want, out);
+  }
+  if (align <= 1) align = 1;
   // Best fit among the free extents that contain an aligned run of `want`
-  // blocks: the candidate with the smallest extent wins, then the one whose
-  // aligned start is closest to the extent start, then the lowest start.
+  // blocks inside [min_agbno, max_agbno]. The candidate with the smallest
+  // extent wins, then the one whose aligned start is closest to the extent
+  // start, then the lowest start.
   const FreeRec* best = nullptr;
   uint32_t best_off = 0;
   uint32_t best_slack = 0;
   for (const FreeRec& r : recs) {
     if (r.len < want) continue;
+    const uint64_t range_end = std::min<uint64_t>(
+        static_cast<uint64_t>(r.start) + r.len, max_agbno);
+    if (range_end < r.start + want) continue;
     uint32_t off = (r.start + align - 1) & ~(align - 1);
     if (off < r.start) continue;  // overflow cannot happen inside an AG
+    if (off < min_agbno) {
+      off = (min_agbno + align - 1) & ~(align - 1);
+    }
+    if (off < r.start || off > range_end ||
+        want > range_end - off) {
+      continue;
+    }
     const uint32_t slack = off - r.start;
-    if (slack > r.len - want) continue;
     if (best == nullptr || r.len < best->len ||
         (r.len == best->len &&
          (slack < best_slack || (slack == best_slack && r.start < best->start)))) {
@@ -1490,6 +1506,34 @@ Status BlockAllocator::AllocateFromAg(uint32_t agno, uint32_t len,
   Status s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
   return ag->AllocateAligned(len, align, out);
+}
+
+Status BlockAllocator::AllocateFromAgRange(uint32_t agno, uint32_t len,
+                                           uint32_t align, uint32_t min_agbno,
+                                           uint32_t max_agbno,
+                                           Allocation* out) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (agno >= geo->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  if (len == 0 || min_agbno >= max_agbno) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "invalid allocation range")
+        .Metadata("allocator");
+  }
+  if (align <= 1) align = 1;
+  if ((align & (align - 1)) != 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "alignment must be a power of two")
+        .Metadata("allocator")
+        .Actual(align);
+  }
+  AgState* ag = nullptr;
+  Status s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  return ag->AllocateAligned(len, align, out, min_agbno, max_agbno);
 }
 
 Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {

@@ -74,9 +74,15 @@ uint8_t FtypeForMode(uint16_t mode) {
   }
 }
 
-void StoreTimestamp(uint8_t* field, const XfsTimestamp& ts) {
-  PutBE32(field, 0, static_cast<uint32_t>(ts.sec));
-  PutBE32(field, 4, ts.nsec);
+Status StoreTimestamp(uint8_t* inode, size_t field_offset,
+                      const XfsTimestamp& ts) {
+  return StoreInodeTimestamp(inode, field_offset, ts);
+}
+
+Status StoreModifiedTimes(uint8_t* inode, const XfsTimestamp& now) {
+  Status s = StoreTimestamp(inode, di::kMtime, now);
+  if (!s.ok()) return s;
+  return StoreTimestamp(inode, di::kCtime, now);
 }
 
 // Builds a complete new v3 inode image. For a directory `sf` is the initial
@@ -104,10 +110,18 @@ std::vector<uint8_t> BuildNewInode(const XfsGeometry& geo, uint64_t ino,
   // xfs_dinode_verify/xfs_repair require a valid attr-fork format whenever
   // di_forkoff is zero: EXTENTS, not the zero-filled FMT_DEV value.
   b[di::kAformat] = di::kFormatExtents;
-  StoreTimestamp(b + di::kAtime, now);
-  StoreTimestamp(b + di::kMtime, now);
-  StoreTimestamp(b + di::kCtime, now);
-  StoreTimestamp(b + di::kCrtime, now);
+  // New inodes inherit the filesystem's modern inode flags exactly like
+  // xfs_ialloc_setup_geometry's new_diflags2.
+  uint64_t flags2 = 0;
+  if (geo.features.bigtime) flags2 |= di::kDiFlag2Bigtime;
+  if (geo.features.nrext64) flags2 |= di::kDiFlag2Nrext64;
+  PutBE64(b, di::kFlags2, flags2);
+  const bool bigtime = (flags2 & di::kDiFlag2Bigtime) != 0;
+  const size_t stamp_fields[] = {di::kAtime, di::kMtime, di::kCtime,
+                                 di::kCrtime};
+  for (size_t field : stamp_fields) {
+    if (!EncodeTimestamp(b + field, now, bigtime).ok()) return {};
+  }
   PutBE64(b, di::kIno, ino);
   std::memcpy(b + di::kUuid, geo.meta_uuid.data(), 16);
   if (is_dir) {
@@ -120,8 +134,8 @@ std::vector<uint8_t> BuildNewInode(const XfsGeometry& geo, uint64_t ino,
     PutBE64(b, di::kSize, 0);
   }
   PutBE64(b, di::kNblocks, 0);
-  PutBE32(b, di::kNextents, 0);
-  PutBE16(b, di::kAnextents, 0);
+  SetInodeDataExtentCount(b, 0);
+  SetInodeAttrExtentCount(b, 0);
   PutBE32(b, di::kExtsize, 0);
   PutBE32(b, di::kCowextsize, 0);
   return image;
@@ -272,8 +286,8 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
     std::vector<uint8_t> fork_region;
     s = dir.FinalizeInode(&raw_inode, &ilog_fields, &fork_region);
     if (!s.ok()) return s;
-    StoreTimestamp(raw_inode.data() + di::kMtime, now);
-    StoreTimestamp(raw_inode.data() + di::kCtime, now);
+    s = StoreModifiedTimes(raw_inode.data(), now);
+    if (!s.ok()) return s;
     s = LogPreparedInode(txn, parent_ino, std::move(raw_inode), ilog_fields,
                          fork_region);
     if (!s.ok()) return s;
@@ -368,8 +382,8 @@ Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
     // A subdirectory adds one link to the parent (".." in the child).
     PutBE32(raw_inode.data(), di::kNlink,
             GetBE32(raw_inode.data(), di::kNlink) + 1);
-    StoreTimestamp(raw_inode.data() + di::kMtime, now);
-    StoreTimestamp(raw_inode.data() + di::kCtime, now);
+    s = StoreModifiedTimes(raw_inode.data(), now);
+    if (!s.ok()) return s;
     s = LogPreparedInode(txn, parent_ino, std::move(raw_inode), ilog_fields,
                          fork_region);
     if (!s.ok()) return s;
@@ -485,8 +499,8 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
       }
       PutBE32(parent_image.data(), di::kNlink, nlink - 1);
     }
-    StoreTimestamp(parent_image.data() + di::kMtime, now);
-    StoreTimestamp(parent_image.data() + di::kCtime, now);
+    s = StoreModifiedTimes(parent_image.data(), now);
+    if (!s.ok()) return s;
     s = LogPreparedInode(txn, parent_ino, std::move(parent_image),
                          ilog_fields, fork_region);
     if (!s.ok()) return s;
@@ -540,7 +554,8 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
       PutBE32(child_image.data(), di::kNextUnlinked,
               RawNextUnlinked(child_image));
     }
-    StoreTimestamp(child_image.data() + di::kCtime, now);
+    s = StoreTimestamp(child_image.data(), di::kCtime, now);
+    if (!s.ok()) return s;
     s = LogPreparedInode(txn, entry.ino, std::move(child_image), child_ilog,
                          child_fork_region);
     if (!s.ok()) return s;
@@ -649,7 +664,8 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
         if (next == agino) {
           std::vector<uint8_t> prev_image = std::move(previous_raw.value());
           PutBE32(prev_image.data(), di::kNextUnlinked, next_unlinked);
-          StoreTimestamp(prev_image.data() + di::kCtime, now);
+          status = StoreTimestamp(prev_image.data(), di::kCtime, now);
+          if (!status.ok()) return status;
           status = LogPreparedInode(txn, geometry_.AginoToIno(agno, previous),
                                     std::move(prev_image), 0, {});
           if (!status.ok()) return status;
@@ -674,17 +690,32 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
     PutBE32(image.data(), di::kGen, GetBE32(image.data(), di::kGen) + 1);
     PutBE32(image.data(), di::kNextUnlinked, kNullAgino);
     PutBE16(image.data(), di::kFlags, 0);
-    PutBE64(image.data(), di::kFlags2, 0);
+    // xfs_inode_uninit resets di_flags2 to the filesystem's new_diflags2
+    // rather than zero, so a freed inode keeps BIGTIME/NREXT64 on a
+    // filesystem that has those features.
+    uint64_t flags2 = 0;
+    if (geometry_.features.bigtime) flags2 |= di::kDiFlag2Bigtime;
+    if (geometry_.features.nrext64) flags2 |= di::kDiFlag2Nrext64;
+    PutBE64(image.data(), di::kFlags2, flags2);
+    if ((flags2 & di::kDiFlag2Nrext64) == 0) {
+      // Offset 24 is the v3 pad without NREXT64 and must be zero.
+      PutBE64(image.data(), di::kV3Pad, 0);
+    }
     image[di::kForkoff] = 0;
     image[di::kAformat] = di::kFormatExtents;
     image[di::kFormat] = di::kFormatExtents;
     PutBE64(image.data(), di::kSize, 0);
     PutBE64(image.data(), di::kNblocks, 0);
-    PutBE32(image.data(), di::kNextents, 0);
-    PutBE16(image.data(), di::kAnextents, 0);
+    SetInodeDataExtentCount(image.data(), 0);
+    SetInodeAttrExtentCount(image.data(), 0);
     PutBE32(image.data(), di::kDmevmask, 0);
     PutBE16(image.data(), di::kDmstate, 0);
-    StoreTimestamp(image.data() + di::kCtime, now);
+    const size_t free_time_fields[] = {di::kAtime, di::kMtime, di::kCtime,
+                                       di::kCrtime};
+    for (size_t field : free_time_fields) {
+      status = StoreTimestamp(image.data(), field, now);
+      if (!status.ok()) return status;
+    }
     status = LogPreparedInode(txn, ino, std::move(image), 0, {});
     if (!status.ok()) return status;
     status = blocks.Commit();
@@ -1031,7 +1062,8 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
         s = moved_dir->FinalizeInode(&image, &ilog_fields, &fork_region);
         if (!s.ok()) return s;
       }
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreTimestamp(image.data(), di::kCtime, now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, moved.value().ino, std::move(image), ilog_fields,
                            fork_region);
       if (!s.ok()) return s;
@@ -1072,7 +1104,8 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
         PutBE32(image.data(), di::kNextUnlinked,
                 RawNextUnlinked(image));
       }
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreTimestamp(image.data(), di::kCtime, now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, target.ino, std::move(image), 0, {});
       if (!s.ok()) return s;
       outcome.replaced_ino = target.ino;
@@ -1099,8 +1132,8 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
         }
         PutBE32(image.data(), di::kNlink, nlink - 1);
       }
-      StoreTimestamp(image.data() + di::kMtime, now);
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreModifiedTimes(image.data(), now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, src_parent, std::move(image), ilog_fields,
                            fork_region);
       if (!s.ok()) return s;
@@ -1118,8 +1151,8 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
         const uint32_t nlink = GetBE32(image.data(), di::kNlink);
         PutBE32(image.data(), di::kNlink, nlink + 1);
       }
-      StoreTimestamp(image.data() + di::kMtime, now);
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreModifiedTimes(image.data(), now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, dst_parent, std::move(image), ilog_fields,
                            fork_region);
       if (!s.ok()) return s;
@@ -1234,8 +1267,8 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
       std::vector<uint8_t> fork_region;
       s = dir.FinalizeInode(&image, &ilog_fields, &fork_region);
       if (!s.ok()) return s;
-      StoreTimestamp(image.data() + di::kMtime, now);
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreModifiedTimes(image.data(), now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, dst_parent, std::move(image), ilog_fields,
                            fork_region);
       if (!s.ok()) return s;
@@ -1254,7 +1287,8 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
             .Metadata("link");
       }
       PutBE32(image.data(), di::kNlink, nlink + 1);
-      StoreTimestamp(image.data() + di::kCtime, now);
+      s = StoreTimestamp(image.data(), di::kCtime, now);
+      if (!s.ok()) return s;
       s = LogPreparedInode(txn, ino, std::move(image), 0, {});
       if (!s.ok()) return s;
     }
@@ -1395,7 +1429,7 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
       PutBE64(fork_region.data(), 0, l0);
       PutBE64(fork_region.data(), 8, l1);
       child[di::kFormat] = di::kFormatExtents;
-      PutBE32(child.data(), di::kNextents, 1);
+      SetInodeDataExtentCount(child.data(), 1);
       PutBE64(child.data(), di::kNblocks, alloc.len);
       PutBE64(child.data(), di::kSize, target.size());
       std::memcpy(child.data() + di::kCoreSizeV3, fork_region.data(), 16);
@@ -1440,8 +1474,8 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
     std::vector<uint8_t> fork_region;
     s = dir.FinalizeInode(&image, &ilog_fields, &fork_region);
     if (!s.ok()) return s;
-    StoreTimestamp(image.data() + di::kMtime, now);
-    StoreTimestamp(image.data() + di::kCtime, now);
+    s = StoreModifiedTimes(image.data(), now);
+    if (!s.ok()) return s;
     s = LogPreparedInode(txn, parent_ino, std::move(image), ilog_fields,
                          fork_region);
     if (!s.ok()) return s;

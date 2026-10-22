@@ -9,9 +9,15 @@ Scope: the writable profile this build accepts (`CheckWritableProfile`):
 
 ```text
 XFS v5, crc=1, internal log, single data device
-no finobt, no rmapbt, no reflink, no sparse inodes, no bigtime, no NREXT64,
-no parent pointers, no inobtcount, no quotas, no realtime, no external log
+optional finobt, inobtcount, sparse inode chunks, bigtime, NREXT64
+no rmapbt, no reflink, no parent pointers, no quotas, no realtime,
+no external log, no metadir
 ```
+
+RW-6A does not change the free-space btree algorithm; it adds inode-btree
+blocks and sparse inode backing as ordinary consumers of this allocator. The
+allocator's fdblocks identity still holds because inobt/finobt blocks are not
+free-space metadata and therefore never enter `agf_btreeblks`.
 
 ## 1. What a block allocation changes
 

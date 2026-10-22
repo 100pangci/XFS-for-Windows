@@ -28,6 +28,19 @@ struct XfsTimestamp {
   uint32_t nsec = 0;     // 0..999999999
 };
 
+// Timestamp ranges from libxfs/xfs_format.h.
+constexpr int64_t kLegacyTimeMin = INT32_MIN;
+constexpr int64_t kLegacyTimeMax = INT32_MAX;
+constexpr int64_t kBigtimeEpochOffset = -(int64_t)INT32_MIN;  // 2^31
+constexpr uint64_t kNsecPerSec = 1000000000ULL;
+// Largest on-disk bigtime seconds value (XFS_BIGTIME_TIME_MAX is rounded down
+// to a multiple of 4 so quota and inode limits agree).
+constexpr uint64_t kBigtimeMaxSeconds = (~0ULL / kNsecPerSec) & ~0x3ULL;
+constexpr uint64_t kBigtimeTimeMax = kBigtimeMaxSeconds * kNsecPerSec;
+constexpr int64_t kBigtimeTimeMaxUnix =
+    static_cast<int64_t>(kBigtimeMaxSeconds) - kBigtimeEpochOffset;
+constexpr int64_t kBigtimeTimeMinUnix = -kBigtimeEpochOffset;
+
 // Parsed inode. Fork data is copied out of the on-disk buffer so an XfsInode
 // is self-contained and can outlive the read buffer.
 struct XfsInode {
@@ -89,6 +102,32 @@ Result<XfsInode> ReadInode(BlockDevice& dev, const XfsGeometry& geo,
 
 // Decodes an on-disk timestamp field.
 XfsTimestamp DecodeTimestamp(const uint8_t* field, bool bigtime);
+
+// Encodes a timestamp into the on-disk (big-endian) representation. Fails
+// with kOutOfRange when the filesystem's encoding cannot represent it.
+Status EncodeTimestamp(uint8_t* field, const XfsTimestamp& ts, bool bigtime);
+
+// True when the raw inode image has XFS_DIFLAG2_BIGTIME set.
+bool InodeImageHasBigtime(const uint8_t* inode);
+bool InodeImageHasNrext64(const uint8_t* inode);
+
+// Stores one timestamp in a raw inode image, choosing the encoding from the
+// inode's own di_flags2 (the kernel does the same in xfs_inode_to_disk_ts).
+Status StoreInodeTimestamp(uint8_t* inode, size_t field_offset,
+                           const XfsTimestamp& ts);
+
+// Converts a legacy inode to bigtime in place when the filesystem supports
+// bigtime: all four timestamps are decoded and re-encoded and
+// XFS_DIFLAG2_BIGTIME is set. This is what xfs_inode_item_precommit does for
+// any inode core/timestamp update on a bigtime filesystem. No-op otherwise.
+Status UpgradeInodeTimestampsToBigtime(uint8_t* inode, size_t inode_size,
+                                       const XfsGeometry& geo);
+
+// Extent counters: the layout depends on XFS_DIFLAG2_NREXT64.
+uint64_t InodeDataExtentCount(const uint8_t* inode);
+uint32_t InodeAttrExtentCount(const uint8_t* inode);
+void SetInodeDataExtentCount(uint8_t* inode, uint64_t count);
+void SetInodeAttrExtentCount(uint8_t* inode, uint32_t count);
 
 // Current wall-clock time, for metadata updates.
 XfsTimestamp CurrentTimestamp();

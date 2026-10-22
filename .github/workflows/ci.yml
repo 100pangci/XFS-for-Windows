@@ -61,6 +61,36 @@ jobs:
         shell: pwsh
         run: python tests/tools/xfs_probe.py out/windows.img
 
+      - name: RW-6A modern inode profile (formatter + oracle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe mkimage out\modern.img 400M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
+          & $exe format out\modern.img --yes-i-really-mean-it --modern-inode-profile
+          if ($LASTEXITCODE -ne 0) { throw "modern format failed" }
+          & $exe create out\modern.img /modern.bin --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "modern create failed" }
+          & $exe pwrite out\modern.img /modern.bin 0 --rw-experimental --text=modern
+          if ($LASTEXITCODE -ne 0) { throw "modern write failed" }
+          & $exe check out\modern.img --verbose
+          if ($LASTEXITCODE -ne 0) { throw "modern check failed" }
+          python tests/tools/rw6_inode_probe.py out/modern.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6A oracle rejected the image" }
+
+      - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = "build\tests\$env:BUILD_CONFIG\xfs_tests.exe"
+          & $tests --make-rw6-sparse out\rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture build failed" }
+          python tests/tools/rw6_inode_probe.py out/rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture oracle failed" }
+          & "build\src\$env:BUILD_CONFIG\xfswin.exe" check out\rw6-sparse.img
+          if ($LASTEXITCODE -ne 0) { throw "sparse fixture check failed" }
+
       - name: Fixture image (one allocated file) for the RW tests
         shell: pwsh
         run: |
@@ -255,6 +285,357 @@ jobs:
           name: fixture-image
           path: out/fixture.img
           if-no-files-found: error
+
+      - name: Upload the RW-6A Windows-formatted image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6-windows-formatted
+          path: out/modern.img
+          if-no-files-found: error
+
+      - name: Upload the RW-6A sparse-chunk fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6-sparse-fixture
+          path: out/rw6-sparse.img
+          if-no-files-found: error
+
+  # ===========================================================================
+  # RW-6A: modern inode feature profile
+  # (finobt + inobtcount + sparse inodes + bigtime + NREXT64)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Linux creates the canonical modern-inode fixture with the distribution's
+  # mkfs.xfs: no rmapbt/reflink/parent pointers (still refused by the writer).
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6-modern:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Create and populate the modern-inode image
+        run: |
+          mkfs.xfs -V
+          sudo env SIZE_MB=1536 bash tests/scripts/make_rw6_modern_linux.sh rw6
+          sudo chown -R "$USER" rw6
+          cat rw6/modern.xfs_info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-linux-modern
+          path: rw6/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The Windows formatter's optional modern profile is checked by real xfs_db,
+  # xfs_repair and a Linux writable mount.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6-formatted:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-windows-formatted
+          path: rw6-formatted
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-formatted modern profile
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6-formatted/modern.img
+          python3 tests/tools/rw6_inode_probe.py rw6-formatted/modern.img
+
+  # ---------------------------------------------------------------------------
+  # A Windows-written sparse chunk (nonzero holemask, ICREATE + subsequent
+  # inode allocation) must be accepted by the real Linux kernel and xfs_repair.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6-sparse:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-sparse-fixture
+          path: rw6-sparse
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows sparse-chunk fixture
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6-sparse/rw6-sparse.img
+          python3 tests/tools/rw6_inode_probe.py rw6-sparse/rw6-sparse.img
+
+  # ---------------------------------------------------------------------------
+  # Windows mutates the Linux-created image (create/write/truncate/rename/
+  # link/symlink/inode churn), then the independent RW-6A oracle checks it.
+  # ---------------------------------------------------------------------------
+  windows-rw6-modern-roundtrip:
+    needs: [windows-build-test, linux-generate-rw6-modern]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-linux-modern
+          path: rw6
+
+      - name: Mutate and validate the modern image
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6\modern.img" `
+            -WorkDir "rw6-windows"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6A Windows roundtrip failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-windows-mutated
+          path: rw6-windows/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the Windows mutation, then mutates the same image again
+  # (reverse interoperability).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6-modern:
+    needs: windows-rw6-modern-roundtrip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-windows-mutated
+          path: rw6-windows
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows mutation with Linux and xfs_repair
+        run: |
+          sudo bash tests/scripts/verify_rw6_linux.sh \
+            rw6-windows/modern-windows.img --windows-mutated
+
+      - name: Linux mutates the image again
+        run: |
+          cp rw6-windows/modern-windows.img rw6-windows/reverse.img
+          sudo bash tests/scripts/verify_rw6_linux_reverse.sh \
+            rw6-windows/reverse.img
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-linux-reverse
+          path: rw6-windows/reverse.img
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows re-reads and mutates the Linux-reverse image.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw6-reverse:
+    needs: linux-verify-rw6-modern
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-linux-reverse
+          path: rw6-reverse
+
+      - name: Read and mutate after the Linux pass
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6_reverse_windows.ps1 `
+            -Exe "bin\xfswin.exe" -Image "rw6-reverse\reverse.img"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6A reverse interoperability failed" }
+
+  # ---------------------------------------------------------------------------
+  # Windows crash matrix on the modern profile, then Linux validates every
+  # recovered image (clean log, xfs_repair -n, mount).
+  # ---------------------------------------------------------------------------
+  windows-rw6-crash:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: Run the RW-6A crash matrix
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_rw6_windows.ps1 `
+            -Exe "bin\xfswin.exe" -WorkDir "crash-rw6"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6A crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-crash
+          path: crash-rw6/*.zip
+          if-no-files-found: error
+
+  linux-verify-rw6-crash:
+    needs: windows-rw6-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-crash
+          path: crash-rw6
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify recovered crash images with Linux
+        run: |
+          mkdir -p empty-dirty crash-rw6/current
+          checked=0
+          for archive in crash-rw6/*.zip; do
+            [ -e "$archive" ] || continue
+            # 176 images are ~69 GiB expanded. Verify one at a time rather
+            # than filling the runner disk before the first repair check.
+            unzip -o "$archive" -d crash-rw6/current
+            sudo bash tests/scripts/verify_recovery_rw6_linux.sh \
+              empty-dirty crash-rw6/current
+            rm crash-rw6/current/*.img
+            checked=$((checked + 1))
+          done
+          test "$checked" -eq 176
+          echo "Verified all $checked crash archives"
+
+  # ---------------------------------------------------------------------------
+  # Linux dirty logs on the modern profile -> Windows RW-5 recovery -> Linux
+  # verification. This covers finobt/finobt buffers, sparse ICREATE and bigtime
+  # inode items in the real kernel log format.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6-dirty:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Capture modern-profile dirty logs
+        run: |
+          sudo env SIZE_MB=512 \
+            MKFS_OPTS='-m crc=1,finobt=1,inobtcount=1,bigtime=1,rmapbt=0,reflink=0 -i sparse=1,nrext64=1' \
+            bash tests/scripts/make_dirty_logs_linux.sh rw6-dirty
+          sudo chown -R "$USER" rw6-dirty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-dirty
+          path: rw6-dirty/
+          if-no-files-found: error
+
+  windows-recover-rw6-dirty:
+    needs: [windows-build-test, linux-generate-rw6-dirty]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-dirty
+          path: rw6-dirty
+
+      - name: Recover Linux modern-profile dirty logs
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_recovery_rw6_windows.ps1 `
+            -Exe "bin\xfswin.exe" -WorkDir "rw6-dirty" `
+            -OutDir "rw6-recovered"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6A cross-recovery failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6-recovered
+          path: rw6-recovered/
+          if-no-files-found: error
+
+  linux-verify-rw6-cross-recovery:
+    needs: windows-recover-rw6-dirty
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-recovered
+          path: rw6-recovered
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6-dirty
+          path: rw6-dirty
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify Windows-recovered modern logs with Linux
+        run: |
+          sudo bash tests/scripts/verify_recovery_rw6_linux.sh \
+            rw6-dirty rw6-recovered
 
   # ---------------------------------------------------------------------------
   # Diagnostic job: dump the layout produced by the distro's real mkfs.xfs so

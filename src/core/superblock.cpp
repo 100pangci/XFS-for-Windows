@@ -374,7 +374,11 @@ Status ParseSuperblockBuffer(const uint8_t* buf, size_t len, bool verify_crc,
         .Actual(sb.qflags);
   }
 
-  // Sparse inode alignment rules.
+  // Sparse inode alignment rules (xfs_sb_validate_v5_features and
+  // xfs_mountfs):
+  //   - the full inode chunk is 64 inodes, so sb_inoalignmt is the chunk size;
+  //   - sb_spino_align is the inode cluster size, which is also the minimum
+  //     sparse allocation.
   if (f.spinodes) {
     uint32_t align =
         (ondisk::kInodesPerChunk * sb.inodesize) >> sb.blocklog;
@@ -386,11 +390,23 @@ Status ParseSuperblockBuffer(const uint8_t* buf, size_t len, bool verify_crc,
           .Expected(align)
           .Actual(sb.inoalignmt);
     }
-    if (sb.spino_align && (sb.spino_align > sb.inoalignmt ||
-                           sb.inoalignmt % sb.spino_align != 0)) {
+    // The cluster size is scaled with the inode size on v3 filesystems,
+    // exactly like xfs_ialloc_setup_geometry, and only when mkfs raised
+    // sb_inoalignmt enough to hold it.
+    uint64_t cluster_raw = 8192;
+    const uint64_t scaled =
+        cluster_raw * (static_cast<uint64_t>(sb.inodesize) / 256);
+    if (sb.inoalignmt >= (scaled >> sb.blocklog)) cluster_raw = scaled;
+    // xfs_mountfs compares against XFS_B_TO_FSBT(inode_cluster_size_raw):
+    // the value is zero when a cluster is smaller than one filesystem block.
+    const uint32_t expected_cluster =
+        static_cast<uint32_t>(cluster_raw >> sb.blocklog);
+    if (sb.spino_align != expected_cluster) {
       return XFS_ERR(XfsError::kCorruptSuperblock,
-                     "invalid sparse inode alignment")
+                     "sparse inode alignment must match the inode cluster "
+                     "size")
           .Metadata("superblock")
+          .Expected(expected_cluster)
           .Actual(sb.spino_align);
     }
   } else if (sb.spino_align != 0) {

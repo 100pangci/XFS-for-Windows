@@ -102,11 +102,19 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
       kFeat2LazySbCount | kFeat2Attr2 | kFeat2Projid32 | kFeat2Crc;
   PutBE32(p, sb::kFeatures2, features2);
   PutBE32(p, sb::kBadFeatures2, features2);
+  uint32_t ro_compat = 0;
+  if (geo.finobt) ro_compat |= ondisk::kRoCompatFinobt;
+  if (geo.inobtcount) ro_compat |= ondisk::kRoCompatInobtcnt;
+  uint32_t incompat = ondisk::kIncompatFtype;
+  if (geo.sparse_inodes) incompat |= ondisk::kIncompatSpinodes;
+  if (geo.bigtime) incompat |= ondisk::kIncompatBigtime;
+  if (geo.nrext64) incompat |= ondisk::kIncompatNrext64;
+
   PutBE32(p, sb::kFeaturesCompat, 0);
-  PutBE32(p, sb::kFeaturesRoCompat, 0);
-  PutBE32(p, sb::kFeaturesIncompat, ondisk::kIncompatFtype);
+  PutBE32(p, sb::kFeaturesRoCompat, ro_compat);
+  PutBE32(p, sb::kFeaturesIncompat, incompat);
   PutBE32(p, sb::kFeaturesLogIncompat, 0);
-  PutBE32(p, sb::kSpinoAlign, 0);
+  PutBE32(p, sb::kSpinoAlign, geo.spino_align);
   PutBE64(p, sb::kPquotino, 0);
   PutBE64(p, sb::kLsn, 0);
   // sb_meta_uuid is only written when XFS_SB_FEAT_INCOMPAT_META_UUID is set;

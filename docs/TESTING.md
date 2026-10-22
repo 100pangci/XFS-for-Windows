@@ -642,3 +642,79 @@ continuation / multi-item transactions), the replay (buffer LSN+CRC stamping,
 newer-metadata skip, cancellation, refusal before any write), the completion
 phases (EFI free + EFD + no double free after a second recovery, AGI unlinked
 freeing) and recovery restartability at every write (`FailAfterWrites`).
+
+## RW-6A: modern inode features
+
+### Unit tests (`tests/unit/rw6_tests.cpp`)
+
+- formatter modern profile: feature bits, `sb_spino_align`, new inode
+  `BIGTIME|NREXT64`, NREXT64 padding, `check` clean;
+- finobt/inobtcount split: a 1 KiB-block filesystem grows 64 chunks, forces
+  both trees to level 2, then fills every chunk (finobt collapse to a leaf
+  root) and frees them again (records removed, `agi_iblocks/fblocks == 1`);
+- bigtime: pre-1970, 2100 and ~2223 timestamps survive
+  `SetFileTimes`/`GetFileInfo` exactly; a legacy filesystem refuses a 2100
+  timestamp instead of truncating it;
+- NREXT64: 30 separated extents force btree format; `di_big_nextents`,
+  `di_big_anextents == 0`, `di_nrext64_pad == 0` and the independent count
+  reader agree;
+- sparse chunks: AG0 free space is fragmented, a full 32-block chunk cannot
+  fit, a 16-block aligned range is freed, `PreallocateChunk` creates a
+  `count=32` sparse record, allocating/freeing all backed inodes removes the
+  record and frees exactly the 16 backing blocks.
+
+Related regression tests in `journal_tests.cpp` and `unit_tests.cpp` cover
+log positions beyond `sb_logblocks` (LSNs count 512-byte basic blocks, not
+filesystem blocks) and encoded extent addresses in non-power-of-two AGs.
+The latter accepts valid last-AG extents even when their encoded addresses
+exceed `sb_dblocks`, but still rejects AG padding and cross-AG ranges.
+
+### Independent oracle (`tests/tools/rw6_inode_probe.py`)
+
+A standalone Python implementation parses the superblock, AGI, every inobt and
+finobt level, the bnobt free space, sparse backing runs and every backed inode
+image. It checks the identities:
+
+```text
+sum(AGI count/free) == sb_icount/sb_ifree
+sum(AGF freeblks + flcount + btreeblks) == sb_fdblocks
+agi_iblocks/agi_fblocks == reachable inobt/finobt blocks
+finobt record == inobt record for every free chunk
+freecount == popcount(ir_free & allocmask)
+backed inode blocks not in the free-space tree
+```
+
+`xfs_repair -n` remains the hard gate; the oracle cannot replace it.
+
+### CI jobs
+
+```text
+linux-generate-rw6-modern        distro mkfs.xfs + populated modern image
+linux-verify-rw6-formatted       Windows formatter image through xfs_repair/mount
+linux-verify-rw6-sparse          Windows sparse-chunk fixture (nonzero holemask)
+windows-rw6-modern-roundtrip     Windows mutations + rw6 oracle
+linux-verify-rw6-modern          xfs_repair/mount + Linux reverse mutation
+windows-verify-rw6-reverse       Windows rereads Linux-mutated image
+windows-rw6-crash                every crash point on the modern profile
+linux-verify-rw6-crash           recovered crash images through the kernel
+linux-generate-rw6-dirty         Linux dirty logs with modern features
+windows-recover-rw6-dirty        RW-5 replay + rw6 oracle
+linux-verify-rw6-cross-recovery  Linux mounts/replays the result
+```
+
+Linux crash verification expands and verifies one archive at a time, then
+removes that image before expanding the next. All 176 cases remain mandatory;
+the runner need not hold roughly 69 GiB of uncompressed images simultaneously.
+
+`xfs_tests --make-rw6-sparse out/sparse.img` creates a 1 KiB-block modern
+filesystem with a formatter chunk plus a real sparse chunk: the allocator has
+backed 16 of the 64 logical slots, so the record has a nonzero `ir_holemask`.
+CI runs the independent oracle on it, then the Linux kernel and `xfs_repair`
+on a read-only mount and a writable copy.
+
+The Linux images are created with the distribution's `mkfs.xfs` using
+`finobt=1,inobtcount=1,bigtime=1,sparse=1,nrext64=1` and explicitly
+`rmapbt=0,reflink=0` (parent pointers are disabled when the local mkfs
+supports `-n parent=`). The default profile keeps the old minimal tests
+unchanged; `xfswin format --modern-inode-profile` creates the same feature set
+locally, which is also what the Windows-only tests and crash matrix use.

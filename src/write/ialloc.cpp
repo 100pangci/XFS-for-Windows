@@ -55,6 +55,15 @@ constexpr size_t kPtrSize = bt::kInobtPtrSize;       // 4 bytes
 constexpr size_t kRecSize = bt::kInobtRecSize;       // 16 bytes
 constexpr size_t kMaxTreeBlocks = 4096;
 
+uint32_t HolemaskCount(uint16_t holemask) {
+  uint32_t bits = 0;
+  for (uint32_t i = 0; i < bt::kInobtHolemaskBits; ++i) {
+    if ((holemask >> i) & 1u) ++bits;
+  }
+  return ondisk::kInodesPerChunk -
+         bits * ondisk::kInodesPerHolemaskBit;
+}
+
 uint64_t PopCount64(uint64_t v) {
   uint64_t n = 0;
   while (v) {
@@ -87,6 +96,7 @@ struct AgiState {
   uint32_t orig_freecount = 0;
 
   std::unique_ptr<InobtTree> inobt;
+  std::unique_ptr<InobtTree> finobt;
 };
 
 // ---------------------------------------------------------------------------
@@ -95,8 +105,14 @@ struct AgiState {
 class InobtTree {
  public:
   InobtTree(BlockDevice* device, BlockAllocator* alloc,
-            const XfsGeometry* geo, uint32_t agno)
-      : device_(device), alloc_(alloc), geo_(geo), agno_(agno) {}
+            const XfsGeometry* geo, uint32_t agno, bool finobt)
+      : device_(device),
+        alloc_(alloc),
+        geo_(geo),
+        agno_(agno),
+        finobt_(finobt),
+        magic_(finobt ? ondisk::kFibtCrcMagic : ondisk::kIbtCrcMagic),
+        name_(finobt ? "finobt" : "inobt") {}
 
   Status Load(uint32_t root, uint32_t level);
   // Iterates the records in key order.
@@ -105,6 +121,8 @@ class InobtTree {
   Result<InobtRecord> Find(uint32_t startino) const;
   // The record with the largest startino <= `startino`.
   Result<InobtRecord> FindLE(uint32_t startino) const;
+  // The record with the smallest startino >= `startino`.
+  Result<InobtRecord> FindGE(uint32_t startino) const;
   // Inserts a new record (startino must not exist yet). Handles leaf/interior
   // splits and root growth.
   Status Insert(const InobtRecord& rec);
@@ -171,18 +189,32 @@ class InobtTree {
     PutBE32(b, kShortHeader + max_node() * kKeySize + i * kPtrSize, v);
   }
   InobtRecord RecAt(const uint8_t* b, size_t i) const {
+    const uint8_t* p = b + kShortHeader + i * kRecSize;
     InobtRecord r;
-    r.startino = GetBE32(b, kShortHeader + i * kRecSize + bt::kInobtRecStartino);
-    r.freecount =
-        GetBE32(b, kShortHeader + i * kRecSize + bt::kInobtRecFreecount);
-    r.free = GetBE64(b, kShortHeader + i * kRecSize + bt::kInobtRecFree);
+    r.startino = GetBE32(p, bt::kInobtRecStartino);
+    if (geo_->features.spinodes) {
+      r.holemask = GetBE16(p, bt::kInobtRecHolemask);
+      r.count = GetU8(p, bt::kInobtRecCount);
+      r.freecount = GetU8(p, bt::kInobtRecSparseFreecount);
+    } else {
+      r.holemask = 0;
+      r.count = ondisk::kInodesPerChunk;
+      r.freecount = GetBE32(p, bt::kInobtRecFreecount);
+    }
+    r.free = GetBE64(p, bt::kInobtRecFree);
     return r;
   }
   void SetRecAt(uint8_t* b, size_t i, const InobtRecord& r) {
-    PutBE32(b, kShortHeader + i * kRecSize + bt::kInobtRecStartino, r.startino);
-    PutBE32(b, kShortHeader + i * kRecSize + bt::kInobtRecFreecount,
-            r.freecount);
-    PutBE64(b, kShortHeader + i * kRecSize + bt::kInobtRecFree, r.free);
+    uint8_t* p = b + kShortHeader + i * kRecSize;
+    PutBE32(p, bt::kInobtRecStartino, r.startino);
+    if (geo_->features.spinodes) {
+      PutBE16(p, bt::kInobtRecHolemask, r.holemask);
+      p[bt::kInobtRecCount] = r.count;
+      p[bt::kInobtRecSparseFreecount] = static_cast<uint8_t>(r.freecount);
+    } else {
+      PutBE32(p, bt::kInobtRecFreecount, r.freecount);
+    }
+    PutBE64(p, bt::kInobtRecFree, r.free);
   }
   uint32_t LeftSib(const uint8_t* b) const { return GetBE32(b, bt::kSLeftsib); }
   uint32_t RightSib(const uint8_t* b) const {
@@ -213,6 +245,9 @@ class InobtTree {
   BlockAllocator* alloc_;
   const XfsGeometry* geo_;
   uint32_t agno_ = 0;
+  bool finobt_ = false;
+  uint32_t magic_ = ondisk::kIbtCrcMagic;
+  const char* name_ = "inobt";
   uint32_t root_ = 0;
   uint32_t level_ = 1;
   std::map<uint32_t, std::vector<uint8_t>> blocks_;
@@ -229,7 +264,7 @@ Status InobtTree::InitBlock(uint32_t agbno, uint32_t level, uint32_t numrecs) {
   }
   std::vector<uint8_t>& data = it->second;
   std::memset(data.data(), 0, data.size());
-  PutBE32(data.data(), bt::kMagic, ondisk::kIbtCrcMagic);
+  PutBE32(data.data(), bt::kMagic, magic_);
   PutBE16(data.data(), bt::kLevel, static_cast<uint16_t>(level));
   PutBE16(data.data(), bt::kNumrecs, static_cast<uint16_t>(numrecs));
   PutBE32(data.data(), bt::kSLeftsib, kNullAgBlock);
@@ -307,11 +342,11 @@ Status InobtTree::Load(uint32_t root, uint32_t level) {
           .Metadata("inobt");
     }
     const uint32_t magic = GetBE32(data.data(), bt::kMagic);
-    if (magic != ondisk::kIbtCrcMagic) {
-      return XFS_ERR(XfsError::kBadMagic, "inobt magic mismatch")
+    if (magic != magic_) {
+      return XFS_ERR(XfsError::kBadMagic, std::string(name_) + " magic mismatch")
           .Ag(agno_)
-          .Metadata("inobt")
-          .Expected(ondisk::kIbtCrcMagic)
+          .Metadata(name_)
+          .Expected(magic_)
           .Actual(magic);
     }
     const uint32_t blk_level = GetBE16(data.data(), bt::kLevel);
@@ -380,17 +415,41 @@ Status InobtTree::Collect(std::vector<InobtRecord>* out) const {
     const uint32_t n = NumRecs(b);
     for (uint32_t i = 0; i < n; ++i) {
       const InobtRecord r = RecAt(b, i);
-      if (r.startino + 64 > geo_->AgBlocksFor(agno_) * geo_->inopblock) {
+      const uint64_t max_agino =
+          static_cast<uint64_t>(geo_->AgBlocksFor(agno_)) * geo_->inopblock;
+      if (static_cast<uint64_t>(r.startino) + ondisk::kInodesPerChunk >
+          max_agino) {
         return XFS_ERR(XfsError::kCorruptBtree, "inobt record out of range")
             .Ag(agno_)
-            .Metadata("inobt")
+            .Metadata(name_)
             .Actual(r.startino);
       }
-      if (PopCount64(r.free) != r.freecount) {
+      uint32_t expected_count = ondisk::kInodesPerChunk;
+      uint64_t real_free = r.free;
+      if (geo_->features.spinodes) {
+        expected_count = HolemaskCount(r.holemask);
+        if (r.count != expected_count) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "sparse inode count does not match the hole mask")
+              .Ag(agno_)
+              .Metadata(name_)
+              .Expected(expected_count)
+              .Actual(r.count);
+        }
+        real_free &= InobtAllocMask(r.holemask);
+      }
+      if (PopCount64(real_free) != r.freecount) {
         return XFS_ERR(XfsError::kCorruptBtree,
-                       "inobt freecount does not match the free mask")
+                       "inode btree freecount does not match the free mask")
             .Ag(agno_)
-            .Metadata("inobt")
+            .Metadata(name_)
+            .Actual(r.startino);
+      }
+      if (finobt_ && r.freecount == 0) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "finobt contains a fully allocated chunk")
+            .Ag(agno_)
+            .Metadata(name_)
             .Actual(r.startino);
       }
       if (!out->empty() && out->back().startino >= r.startino) {
@@ -684,6 +743,39 @@ Status InobtTree::Update(const InobtRecord& rec) {
       .Actual(rec.startino);
 }
 
+Result<InobtRecord> InobtTree::FindGE(uint32_t startino) const {
+  uint32_t cur = root_;
+  while (LevelOf(cur) > 0) {
+    const uint8_t* b = Block(cur);
+    const uint32_t n = NumRecs(b);
+    size_t chosen = n == 0 ? 0 : n - 1;
+    for (size_t i = 0; i < n; ++i) {
+      if (KeyAt(b, i) >= startino) {
+        chosen = i;
+        break;
+      }
+    }
+    cur = PtrAt(b, chosen);
+    if (cur == kNullAgBlock || Block(cur) == nullptr) {
+      return XFS_ERR(XfsError::kCorruptBtree, "inobt pointer not loaded")
+          .Ag(agno_)
+          .Metadata(name_)
+          .Actual(cur);
+    }
+  }
+  const uint8_t* b = Block(cur);
+  const uint32_t n = NumRecs(b);
+  for (uint32_t i = 0; i < n; ++i) {
+    const InobtRecord r = RecAt(b, i);
+    if (r.startino >= startino) return r;
+  }
+  return XFS_ERR(XfsError::kNotFound, "no inode btree record at or above the "
+                                      "inode")
+      .Ag(agno_)
+      .Metadata(name_)
+      .Actual(startino);
+}
+
 Result<InobtRecord> InobtTree::FindLE(uint32_t startino) const {
   uint32_t cur = root_;
   while (LevelOf(cur) > 0) {
@@ -882,29 +974,56 @@ Status InobtTree::Remove(uint32_t startino) {
     }
   }
 
-  if (level_ > 1 && NumRecs(Block(root_)) == 1) {
+  // Collapse a root with a single child one level at a time until either the
+  // root has multiple children or it is a leaf (xfs_btree_delrec's root
+  // collapse). The child may itself be an interior node.
+  while (level_ > 1 && NumRecs(Block(root_)) == 1) {
     uint8_t* root_block = MutableBlock(root_);
     const uint32_t child = PtrAt(root_block, 0);
-    if (LevelOf(child) != 0) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "cannot collapse a multi-level inobt")
+    if (LevelOf(child) != level_ - 2) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "inobt root child has the wrong level")
           .Ag(agno_)
-          .Metadata("inobt");
+          .Metadata(name_)
+          .Expected(level_ - 2)
+          .Actual(LevelOf(child));
     }
     const std::vector<Entry> children = ReadEntries(child);
-    PutBE32(root_block, bt::kMagic, ondisk::kIbtCrcMagic);
-    PutBE16(root_block, bt::kLevel, 0);
+    PutBE32(root_block, bt::kMagic, magic_);
+    PutBE16(root_block, bt::kLevel, static_cast<uint16_t>(level_ - 2));
     PutBE32(root_block, bt::kSLeftsib, kNullAgBlock);
     PutBE32(root_block, bt::kSRightSib, kNullAgBlock);
     SetNumRecs(root_block, static_cast<uint32_t>(children.size()));
     for (size_t i = 0; i < children.size(); ++i) {
-      SetRecAt(root_block, i, children[i].rec);
+      if (level_ - 2 == 0) {
+        SetRecAt(root_block, i, children[i].rec);
+      } else {
+        SetKeyAt(root_block, i, children[i].key);
+        SetPtrAt(root_block, i, children[i].ptr);
+      }
     }
     Status sr = FreeTreeBlock(child);
     if (!sr.ok()) return sr;
-    level_ = 1;
+    level_ -= 1;
   }
   return OkStatus();
+}
+
+// Inode-granularity free mask for a record. Holes are not allocatable.
+uint64_t RealFreeMask(const InobtRecord& rec, bool sparse) {
+  return sparse ? (rec.free & InobtAllocMask(rec.holemask)) : rec.free;
+}
+
+// xfs_inobt_first_free_inode: lowest clear bit in the free mask.
+Result<uint32_t> FirstFreeOffset(const InobtRecord& rec, bool sparse) {
+  const uint64_t real_free = RealFreeMask(rec, sparse);
+  for (uint32_t offset = 0; offset < ondisk::kInodesPerChunk; ++offset) {
+    if ((real_free >> offset) & 1ULL) return offset;
+  }
+  return XFS_ERR(XfsError::kCorruptBtree,
+                 "inode btree record has no free allocatable inode")
+      .Metadata("inobt")
+      .Actual(rec.startino);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1057,11 @@ class AllocImpl {
   Status CreateChunk(AgiState* ag, InobtRecord* rec_out);
   Status AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
                           uint32_t* offset_out);
+  Status UpdateFinobtForInobt(AgiState* ag, const InobtRecord& rec,
+                              bool allow_merge);
+  Status UpdateFinobtOnFree(AgiState* ag, const InobtRecord& rec,
+                             uint32_t offset);
+  Status FreeChunkBlocks(AgiState* ag, const InobtRecord& rec);
   Status ApplySuperblockDeltas();
   Status AddAgiBuffer(AgiState* ag);
 
@@ -975,7 +1099,8 @@ Status AllocImpl::LoadAg(uint32_t agno, AgiState** out) {
   ag->newino = checked.value().newino;
   ag->orig_count = ag->count;
   ag->orig_freecount = ag->freecount;
-  ag->inobt = std::make_unique<InobtTree>(device_, alloc_, geo_, agno);
+  ag->inobt = std::make_unique<InobtTree>(device_, alloc_, geo_, agno,
+                                          /*finobt=*/false);
   Status s = ag->inobt->Load(checked.value().root, checked.value().level);
   if (!s.ok()) return s;
 
@@ -984,9 +1109,11 @@ Status AllocImpl::LoadAg(uint32_t agno, AgiState** out) {
   s = ag->inobt->Collect(&recs);
   if (!s.ok()) return s;
   uint64_t count = 0, freecount = 0;
+  std::map<uint32_t, InobtRecord> by_startino;
   for (const InobtRecord& r : recs) {
-    count += 64;
+    count += geo_->features.spinodes ? r.count : ondisk::kInodesPerChunk;
     freecount += r.freecount;
+    by_startino.emplace(r.startino, r);
   }
   if (count != ag->count || freecount != ag->freecount) {
     return XFS_ERR(XfsError::kCorruptAgHeader,
@@ -997,6 +1124,54 @@ Status AllocImpl::LoadAg(uint32_t agno, AgiState** out) {
         .Actual(count);
   }
 
+  if (geo_->features.finobt) {
+    if (checked.value().free_level == 0) {
+      return XFS_ERR(XfsError::kCorruptAgHeader,
+                     "finobt feature is set but AGI has no finobt root")
+          .Ag(agno)
+          .Metadata("AGI");
+    }
+    ag->finobt = std::make_unique<InobtTree>(device_, alloc_, geo_, agno,
+                                             /*finobt=*/true);
+    s = ag->finobt->Load(checked.value().free_root,
+                         checked.value().free_level);
+    if (!s.ok()) return s;
+    std::vector<InobtRecord> frecs;
+    s = ag->finobt->Collect(&frecs);
+    if (!s.ok()) return s;
+    for (const InobtRecord& f : frecs) {
+      auto rec_it = by_startino.find(f.startino);
+      if (rec_it == by_startino.end()) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "finobt record has no inobt record")
+            .Ag(agno)
+            .Metadata("finobt")
+            .Actual(f.startino);
+      }
+      const InobtRecord& r = rec_it->second;
+      if (f.holemask != r.holemask || f.count != r.count ||
+          f.free != r.free || f.freecount != r.freecount) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "finobt record does not match the inobt")
+            .Ag(agno)
+            .Metadata("finobt")
+            .Actual(f.startino);
+      }
+    }
+    // Every inobt chunk with free inodes must have a finobt record.
+    for (const InobtRecord& r : recs) {
+      if (r.freecount == 0) continue;
+      auto found = ag->finobt->Find(r.startino);
+      if (!found.ok()) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "finobt is missing a chunk with free inodes")
+            .Ag(agno)
+            .Metadata("finobt")
+            .Actual(r.startino);
+      }
+    }
+  }
+
   AgiState* raw = ag.get();
   ags_.emplace(agno, std::move(ag));
   *out = raw;
@@ -1005,77 +1180,107 @@ Status AllocImpl::LoadAg(uint32_t agno, AgiState** out) {
 
 Status AllocImpl::FindAllocationRecord(AgiState* ag, uint32_t preferred_agino,
                                   InobtRecord* rec_out, uint32_t* offset_out) {
+  // With finobt, only chunks with at least one free inode are present and
+  // the search is the xfs_dialloc_ag_finobt_* algorithm. Without it, scan the
+  // inobt and ignore fully allocated chunks (xfs_dialloc_ag_inobt).
   std::vector<InobtRecord> recs;
-  Status s = ag->inobt->Collect(&recs);
+  Status s = geo_->features.finobt ? ag->finobt->Collect(&recs)
+                                  : ag->inobt->Collect(&recs);
   if (!s.ok()) return s;
-  auto has_free = [](const InobtRecord& r) { return r.freecount > 0; };
-  // 1. The record containing the parent's agino (same AG), like
-  //    xfs_dialloc_ag_inobt.
+  if (!geo_->features.finobt) {
+    recs.erase(std::remove_if(recs.begin(), recs.end(),
+                              [](const InobtRecord& r) {
+                                return r.freecount == 0;
+                              }),
+               recs.end());
+  }
+  if (recs.empty()) {
+    return XFS_ERR(XfsError::kNoSpace, "AG has no free inode")
+        .Ag(ag->agno)
+        .Metadata(geo_->features.finobt ? "finobt" : "inobt");
+  }
+
   size_t chosen = recs.size();
   if (preferred_agino != 0) {
-    size_t containing = recs.size();
-    for (size_t i = 0; i < recs.size(); ++i) {
-      if (recs[i].startino <= preferred_agino &&
-          preferred_agino < recs[i].startino + 64) {
-        containing = i;
-        break;
-      }
+    size_t right = 0;
+    while (right < recs.size() && recs[right].startino <= preferred_agino) {
+      ++right;
     }
-    if (containing != recs.size() && has_free(recs[containing])) {
-      chosen = containing;
-    } else if (containing != recs.size()) {
-      // 2. Scan outward from the parent's chunk (searchdistance = 10).
-      for (size_t d = 1; d < 10; ++d) {
-        const bool left = containing >= d;
-        const bool right = containing + d < recs.size();
-        if (left && has_free(recs[containing - d])) {
-          chosen = containing - d;
-          break;
-        }
-        if (right && has_free(recs[containing + d])) {
-          chosen = containing + d;
-          break;
-        }
+    // Prefer the parent's own chunk (finobt only tracks free chunks, so a
+    // record that contains the parent is enough).
+    if (right > 0 && preferred_agino <
+                         recs[right - 1].startino + ondisk::kInodesPerChunk) {
+      chosen = right - 1;
+    } else {
+      // Otherwise the closer of the neighbouring chunks, ties to the left
+      // (xfs_dialloc_ag_finobt_near).
+      const size_t left = right > 0 ? right - 1 : recs.size();
+      const size_t right_rec = right < recs.size() ? right : recs.size();
+      if (left != recs.size() && right_rec != recs.size()) {
+        const uint32_t left_dist =
+            preferred_agino -
+            (recs[left].startino + ondisk::kInodesPerChunk - 1);
+        const uint32_t right_dist = recs[right_rec].startino - preferred_agino;
+        chosen = right_dist < left_dist ? right_rec : left;
+      } else if (left != recs.size()) {
+        chosen = left;
+      } else if (right_rec != recs.size()) {
+        chosen = right_rec;
       }
     }
   }
-  // 3. Otherwise the first record with a free inode.
-  if (chosen == recs.size()) {
+  // Different AG from the parent: honour agi_newino, else the first free
+  // chunk (xfs_dialloc_ag_finobt_newino).
+  if (chosen == recs.size() && ag->newino != kNullAgino) {
     for (size_t i = 0; i < recs.size(); ++i) {
-      if (has_free(recs[i])) {
+      if (recs[i].startino == ag->newino) {
         chosen = i;
         break;
       }
     }
   }
-  if (chosen == recs.size()) {
-    return XFS_ERR(XfsError::kNoSpace, "AG has no free inode")
-        .Ag(ag->agno)
-        .Metadata("inobt");
-  }
+  if (chosen == recs.size()) chosen = 0;
+
   const InobtRecord& rec = recs[chosen];
-  // xfs_inobt_first_free_inode: the lowest clear bit in the free mask.
-  uint32_t offset = 0;
-  while (offset < 64 && ((rec.free >> offset) & 1ULL) == 0) ++offset;
-  if (offset == 64) {
-    return XFS_ERR(XfsError::kCorruptBtree,
-                   "inobt record freecount does not match its mask")
-        .Ag(ag->agno)
-        .Metadata("inobt")
-        .Actual(rec.startino);
-  }
+  auto first = FirstFreeOffset(rec, geo_->features.spinodes);
+  if (!first.ok()) return first.error();
   *rec_out = rec;
-  *offset_out = offset;
+  *offset_out = first.value();
   return OkStatus();
 }
 
 Status AllocImpl::AllocateFromRecord(AgiState* ag, const InobtRecord& rec,
                                 uint32_t offset) {
+  if (offset >= ondisk::kInodesPerChunk ||
+      (geo_->features.spinodes &&
+       !((InobtAllocMask(rec.holemask) >> offset) & 1ULL))) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "allocating an inode in a sparse hole")
+        .Ag(ag->agno)
+        .Metadata("inobt")
+        .Actual(rec.startino + offset);
+  }
   InobtRecord updated = rec;
   updated.free &= ~(1ULL << offset);
   updated.freecount--;
   Status s = ag->inobt->Update(updated);
   if (!s.ok()) return s;
+  if (geo_->features.finobt) {
+    auto f = ag->finobt->Find(updated.startino);
+    if (!f.ok()) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "finobt is missing the allocated chunk")
+          .Ag(ag->agno)
+          .Metadata("finobt")
+          .Actual(updated.startino);
+    }
+    if (updated.freecount == 0) {
+      s = ag->finobt->Remove(updated.startino);
+    } else {
+      s = ag->finobt->Update(updated);
+    }
+    if (!s.ok()) return s;
+  }
   ag->freecount--;
   ag->dirty = true;
   --ifree_delta_;
@@ -1083,35 +1288,80 @@ Status AllocImpl::AllocateFromRecord(AgiState* ag, const InobtRecord& rec,
 }
 
 Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
-  // Allocate the chunk blocks: ialloc_blks contiguous blocks, aligned like
-  // xfs_ialloc_ag_alloc (cluster_align, which is sb_inoalignmt when the
-  // filesystem has the align feature and the value is usable).
+  // xfs_ialloc_ag_alloc: first try a full 64-inode chunk aligned like the
+  // filesystem's chunk alignment. When that fails and sparse inodes are
+  // enabled, fall back to a single minimum (cluster-sized) allocation inside
+  // the valid sparse window.
   Allocation alloc;
+  bool sparse = false;
   Status s = alloc_->AllocateFromAg(ag->agno, igeo_.ialloc_blks,
                                     igeo_.cluster_align, &alloc);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    if (!geo_->features.spinodes ||
+        igeo_.ialloc_min_blks >= igeo_.ialloc_blks) {
+      return s;
+    }
+    const uint32_t aglen = geo_->AgBlocksFor(ag->agno);
+    const uint32_t max_agbno =
+        igeo_.cluster_align > 1
+            ? (aglen / igeo_.cluster_align) * igeo_.cluster_align
+            : aglen;
+    s = alloc_->AllocateFromAgRange(ag->agno, igeo_.ialloc_min_blks,
+                                    igeo_.spino_align, igeo_.cluster_align,
+                                    max_agbno, &alloc);
+    if (!s.ok()) return s;
+    sparse = true;
+  }
   const uint32_t agbno =
       static_cast<uint32_t>(alloc.fsb & ((1ULL << geo_->agblklog) - 1));
-  if (agbno == 0 ||
-      agbno + igeo_.ialloc_blks > geo_->AgBlocksFor(ag->agno)) {
+  const uint32_t length = alloc.len;
+  if (agbno == 0 || agbno + length > geo_->AgBlocksFor(ag->agno)) {
     return XFS_ERR(XfsError::kInternal, "chunk allocation out of range")
         .Ag(ag->agno)
         .Agbno(agbno)
         .Metadata("inobt");
   }
-  const uint32_t startino = agbno << geo_->inopblog;
+  const uint32_t newlen = length << geo_->inopblog;
+  if (newlen == 0 || newlen > ondisk::kInodesPerChunk) {
+    return XFS_ERR(XfsError::kInternal, "invalid inode chunk length")
+        .Ag(ag->agno)
+        .Agbno(agbno)
+        .Metadata("inobt");
+  }
 
-  // The icreate item makes replay rebuild the whole inode cluster from the
-  // recorded geometry; the kernel's mechanism for a new chunk.
+  InobtRecord rec;
+  rec.startino = agbno << geo_->inopblog;
+  rec.count = static_cast<uint8_t>(newlen);
+  rec.holemask = bt::kInobtHolemaskFull;
+  rec.free = ~0ULL;
+  rec.freecount = newlen;
+  if (sparse) {
+    // xfs_align_sparse_ino: align startino down to the full chunk and shift
+    // the allocation mask with it.
+    const uint32_t mod = agbno % igeo_.cluster_align;
+    const uint32_t ino_offset = mod << geo_->inopblog;
+    rec.startino -= ino_offset;
+    uint32_t allocmask =
+        (1u << (newlen / ondisk::kInodesPerHolemaskBit)) - 1u;
+    allocmask <<= ino_offset / ondisk::kInodesPerHolemaskBit;
+    rec.holemask = static_cast<uint16_t>(~allocmask);
+    rec.count = static_cast<uint8_t>(newlen);
+    rec.freecount = newlen;
+    rec.free = ~0ULL;
+  }
+
+  // The icreate item makes replay rebuild the allocated inode clusters from
+  // the recorded geometry; the kernel's mechanism for a new chunk. Sparse
+  // chunks record the real (cluster-sized) count and length.
   const uint32_t gen = NextInodeGeneration();
   std::vector<uint8_t> icreate(lf::kIcreateLogSize, 0);
   StoreLE16(icreate.data() + lf::kIclType, lf::kItemIcreate);
   StoreLE16(icreate.data() + lf::kIclSize, 1);
   PutBE32(icreate.data(), lf::kIclAg, ag->agno);
   PutBE32(icreate.data(), lf::kIclAgbno, agbno);
-  PutBE32(icreate.data(), lf::kIclCount, igeo_.ialloc_inos);
+  PutBE32(icreate.data(), lf::kIclCount, newlen);
   PutBE32(icreate.data(), lf::kIclIsize, geo_->inode_size);
-  PutBE32(icreate.data(), lf::kIclLength, igeo_.ialloc_blks);
+  PutBE32(icreate.data(), lf::kIclLength, length);
   PutBE32(icreate.data(), lf::kIclGen, gen);
   txn_->AddLogOp(std::move(icreate));
 
@@ -1128,7 +1378,7 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
   const uint32_t blocks_per_cluster = igeo_.blocks_per_cluster;
   const uint32_t inodes_per_cluster = igeo_.inodes_per_cluster;
   if (blocks_per_cluster == 0 ||
-      igeo_.ialloc_blks % blocks_per_cluster != 0 ||
+      length % blocks_per_cluster != 0 ||
       inodes_per_cluster != (blocks_per_cluster << geo_->inopblog) ||
       static_cast<uint64_t>(inodes_per_cluster) * geo_->inode_size !=
           static_cast<uint64_t>(blocks_per_cluster) * geo_->block_size) {
@@ -1138,7 +1388,7 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
         .Agbno(agbno)
         .Metadata("inobt");
   }
-  const uint32_t clusters = igeo_.ialloc_blks / blocks_per_cluster;
+  const uint32_t clusters = length / blocks_per_cluster;
   for (uint32_t j = 0; j < clusters; ++j) {
     const uint32_t cluster_agbno = agbno + j * blocks_per_cluster;
     std::vector<uint8_t> image(
@@ -1165,19 +1415,61 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
     if (!s.ok()) return s;
   }
 
-  // Insert the full (holemask 0) chunk record with all inodes free.
-  InobtRecord rec;
-  rec.startino = startino;
-  rec.free = ~0ULL;
-  rec.freecount = 64;
-  s = ag->inobt->Insert(rec);
+  // Insert the chunk record. Full chunks use the one-record form; sparse
+  // chunks merge into an existing aligned record when one is present
+  // (xfs_inobt_insert_sprec).
+  if (sparse) {
+    auto existing = ag->inobt->Find(rec.startino);
+    if (existing.ok()) {
+      InobtRecord merged = rec;
+      const InobtRecord& old = existing.value();
+      if (!InobtIsSparse(old.holemask) || !InobtIsSparse(rec.holemask) ||
+          static_cast<uint32_t>(old.count) + rec.count >
+              ondisk::kInodesPerChunk ||
+          (InobtAllocMask(old.holemask) & InobtAllocMask(rec.holemask))) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "sparse inode records cannot merge")
+            .Ag(ag->agno)
+            .Metadata("inobt")
+            .Actual(rec.startino);
+      }
+      merged.count = static_cast<uint8_t>(old.count + rec.count);
+      merged.freecount = old.freecount + rec.freecount;
+      merged.holemask =
+          static_cast<uint16_t>(old.holemask & rec.holemask);
+      merged.free &= old.free;
+      s = ag->inobt->Update(merged);
+      rec = merged;
+    } else if (existing.error().code == XfsError::kNotFound) {
+      s = ag->inobt->Insert(rec);
+    } else {
+      return existing.error();
+    }
+  } else {
+    s = ag->inobt->Insert(rec);
+  }
   if (!s.ok()) return s;
 
-  ag->count += 64;
-  ag->freecount += 64;
-  ag->newino = startino;
-  icount_delta_ += 64;
-  ifree_delta_ += 64;
+  // finobt semantics differ from the inobt: a sparse record always reflects
+  // the fully merged inobt record, replacing any existing finobt record
+  // (xfs_finobt_insert_sprec). Full chunks insert a new record in both.
+  if (geo_->features.finobt) {
+    auto fin = ag->finobt->Find(rec.startino);
+    if (fin.ok()) {
+      s = ag->finobt->Update(rec);
+    } else if (fin.error().code == XfsError::kNotFound) {
+      s = ag->finobt->Insert(rec);
+    } else {
+      return fin.error();
+    }
+    if (!s.ok()) return s;
+  }
+
+  ag->count += newlen;
+  ag->freecount += newlen;
+  ag->newino = rec.startino;
+  icount_delta_ += newlen;
+  ifree_delta_ += newlen;
   ag->dirty = true;
   *rec_out = rec;
   return OkStatus();
@@ -1206,18 +1498,12 @@ Status AllocImpl::AllocateNewChunk(AgiState* ag, InobtRecord* rec_out,
   InobtRecord rec;
   Status s = CreateChunk(ag, &rec);
   if (!s.ok()) return s;
-  // Hand out the first inode of the new chunk (lowest free bit).
-  const uint32_t offset = 0;
-  InobtRecord updated = rec;
-  updated.free &= ~(1ULL << offset);
-  updated.freecount--;
-  s = ag->inobt->Update(updated);
+  auto offset = FirstFreeOffset(rec, geo_->features.spinodes);
+  if (!offset.ok()) return offset.error();
+  s = AllocateFromRecord(ag, rec, offset.value());
   if (!s.ok()) return s;
-  ag->freecount--;
-  --ifree_delta_;
-  ag->dirty = true;
-  *rec_out = updated;
-  *offset_out = offset;
+  *rec_out = rec;
+  *offset_out = offset.value();
   return OkStatus();
 }
 
@@ -1286,6 +1572,14 @@ Status AllocImpl::FreeInode(uint64_t ino) {
         .Actual(rec.startino);
   }
   const uint32_t offset = agino - rec.startino;
+  if (geo_->features.spinodes &&
+      !((InobtAllocMask(rec.holemask) >> offset) & 1ULL)) {
+    return XFS_ERR(XfsError::kCorruptInode,
+                   "freeing an inode in a sparse hole")
+        .Ino(ino)
+        .Metadata("inobt")
+        .Actual(agino);
+  }
   if ((rec.free >> offset) & 1ULL) {
     return XFS_ERR(XfsError::kCorruptInode, "freeing an already free inode")
         .Ino(ino)
@@ -1295,16 +1589,30 @@ Status AllocImpl::FreeInode(uint64_t ino) {
 
   if (new_free == ~0ULL && geo_->inopblock <= ondisk::kInodesPerChunk) {
     // Whole chunk free: remove it and release its blocks, like
-    // xfs_difree_inobt + xfs_difree_inode_chunk.
+    // xfs_difree_inobt + xfs_difree_inode_chunk. The inode count of a sparse
+    // chunk is its backed count, not always 64.
+    const uint32_t chunk_count = geo_->features.spinodes ? rec.count
+                                                         : ondisk::kInodesPerChunk;
     s = ag->inobt->Remove(rec.startino);
     if (!s.ok()) return s;
-    ag->count -= 64;
-    ag->freecount -= 63;
-    icount_delta_ -= 64;
-    ifree_delta_ -= 63;
+    if (geo_->features.finobt) {
+      auto fin = ag->finobt->Find(rec.startino);
+      if (!fin.ok()) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "finobt is missing a chunk being freed")
+            .Ag(agno)
+            .Metadata("finobt")
+            .Actual(rec.startino);
+      }
+      s = ag->finobt->Remove(rec.startino);
+      if (!s.ok()) return s;
+    }
+    ag->count -= chunk_count;
+    ag->freecount -= chunk_count - 1;
+    icount_delta_ -= chunk_count;
+    ifree_delta_ -= static_cast<int64_t>(chunk_count) - 1;
     ag->dirty = true;
-    const uint64_t chunk_fsb = geo_->AgFsb(agno, rec.startino >> geo_->inopblog);
-    return alloc_->Free(chunk_fsb, igeo_.ialloc_blks);
+    return FreeChunkBlocks(ag, rec);
   }
 
   InobtRecord updated = rec;
@@ -1312,9 +1620,93 @@ Status AllocImpl::FreeInode(uint64_t ino) {
   updated.freecount++;
   s = ag->inobt->Update(updated);
   if (!s.ok()) return s;
+  s = UpdateFinobtOnFree(ag, updated, offset);
+  if (!s.ok()) return s;
   ag->freecount++;
   ag->dirty = true;
   ++ifree_delta_;
+  return OkStatus();
+}
+
+Status AllocImpl::UpdateFinobtOnFree(AgiState* ag, const InobtRecord& rec,
+                                     uint32_t offset) {
+  if (!geo_->features.finobt) return OkStatus();
+  auto found = ag->finobt->Find(rec.startino);
+  if (!found.ok()) {
+    // The chunk was fully allocated before this free, so the finobt had no
+    // record for it (xfs_difree_finobt).
+    if (rec.freecount != 1) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "finobt is missing a chunk that was not fully allocated")
+          .Ag(ag->agno)
+          .Metadata("finobt")
+          .Actual(rec.startino);
+    }
+    return ag->finobt->Insert(rec);
+  }
+  // Apply the same transition independently and require the result to match
+  // the inobt record; this catches silent divergence between the trees.
+  InobtRecord f = found.value();
+  f.free |= 1ULL << offset;
+  f.freecount++;
+  if (f.free != rec.free || f.freecount != rec.freecount) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "finobt and inobt disagree while freeing an inode")
+        .Ag(ag->agno)
+        .Metadata("finobt")
+        .Actual(rec.startino);
+  }
+  if (rec.free == ~0ULL && geo_->inopblock <= ondisk::kInodesPerChunk) {
+    return ag->finobt->Remove(rec.startino);
+  }
+  return ag->finobt->Update(f);
+}
+
+Status AllocImpl::FreeChunkBlocks(AgiState* ag, const InobtRecord& rec) {
+  const uint32_t sagbno = rec.startino >> geo_->inopblog;
+  if (!geo_->features.spinodes || rec.holemask == 0) {
+    const uint64_t chunk_fsb = geo_->AgFsb(ag->agno, sagbno);
+    return alloc_->Free(chunk_fsb, igeo_.ialloc_blks);
+  }
+  // Only the backed holemask ranges are owned by the chunk. Walk runs of
+  // zero bits (allocated) and free each contiguous range; holes were never
+  // allocated to inodes and must never enter the free-space tree twice.
+  uint32_t bit = 0;
+  while (bit < bt::kInobtHolemaskBits) {
+    if ((rec.holemask >> bit) & 1u) {
+      ++bit;
+      continue;
+    }
+    const uint32_t start = bit;
+    while (bit < bt::kInobtHolemaskBits &&
+           ((rec.holemask >> bit) & 1u) == 0) {
+      ++bit;
+    }
+    const uint32_t end = bit;  // exclusive
+    const uint32_t inode_offset =
+        start * ondisk::kInodesPerHolemaskBit;
+    const uint32_t inode_count =
+        (end - start) * ondisk::kInodesPerHolemaskBit;
+    if (inode_offset % geo_->inopblock != 0 ||
+        inode_count % geo_->inopblock != 0) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "sparse inode backing is not block aligned")
+          .Ag(ag->agno)
+          .Metadata("inobt")
+          .Actual(rec.startino);
+    }
+    const uint32_t agbno = sagbno + inode_offset / geo_->inopblock;
+    const uint32_t blocks = inode_count / geo_->inopblock;
+    if (blocks == 0 || agbno + blocks > geo_->AgBlocksFor(ag->agno)) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "sparse inode backing is out of range")
+          .Ag(ag->agno)
+          .Metadata("inobt")
+          .Actual(rec.startino);
+    }
+    Status s = alloc_->Free(geo_->AgFsb(ag->agno, agbno), blocks);
+    if (!s.ok()) return s;
+  }
   return OkStatus();
 }
 
@@ -1370,6 +1762,20 @@ Status AllocImpl::AddAgiBuffer(AgiState* ag) {
   PutBE32(b, agi::kNewino, ag->newino);
   PutBE32(b, agi::kRoot, ag->inobt->root());
   PutBE32(b, agi::kLevel, ag->inobt->level());
+  if (geo_->features.finobt) {
+    PutBE32(b, agi::kFreeRoot, ag->finobt->root());
+    PutBE32(b, agi::kFreeLevel, ag->finobt->level());
+  }
+  if (geo_->features.inobtcnt) {
+    // xfs_inobt_mod_blockcount / scrub's xfs_btree_count_blocks: the counters
+    // are the number of reachable blocks including each tree's root.
+    PutBE32(b, agi::kIblocks,
+            static_cast<uint32_t>(ag->inobt->blocks().size()));
+    PutBE32(b, agi::kFblocks,
+            geo_->features.finobt
+                ? static_cast<uint32_t>(ag->finobt->blocks().size())
+                : 0);
+  }
   const uint64_t offset = geo_->AgByteOffset(ag->agno) + AgiByteOffset(*geo_);
   return txn_->AddMetadataBuffer(offset, ag->agi_buf, lf::kBlftAgi, agi::kLsn,
                                  agi::kCrc, "AGI");
@@ -1415,15 +1821,20 @@ Status AllocImpl::Commit() {
       Status s = AddAgiBuffer(ag);
       if (!s.ok()) return s;
     }
-    for (uint32_t agbno : ag->inobt->dirty_blocks()) {
-      const auto& blocks = ag->inobt->blocks();
-      auto block_it = blocks.find(agbno);
-      if (block_it == blocks.end()) continue;
-      const uint64_t offset = geo_->FsbToByte(geo_->AgFsb(ag->agno, agbno));
-      Status s = txn_->AddMetadataBuffer(offset, block_it->second,
-                                         lf::kBlftBtree, bt::kSLsn, bt::kSCrc,
-                                         "inobt");
-      if (!s.ok()) return s;
+    InobtTree* trees[] = {ag->inobt.get(),
+                          ag->finobt ? ag->finobt.get() : nullptr};
+    for (InobtTree* tree : trees) {
+      if (tree == nullptr) continue;
+      for (uint32_t agbno : tree->dirty_blocks()) {
+        const auto& blocks = tree->blocks();
+        auto block_it = blocks.find(agbno);
+        if (block_it == blocks.end()) continue;
+        const uint64_t offset = geo_->FsbToByte(geo_->AgFsb(ag->agno, agbno));
+        Status s = txn_->AddMetadataBuffer(
+            offset, block_it->second, lf::kBlftBtree, bt::kSLsn, bt::kSCrc,
+            tree == ag->finobt.get() ? "finobt" : "inobt");
+        if (!s.ok()) return s;
+      }
     }
   }
   Status s = ApplySuperblockDeltas();
@@ -1445,6 +1856,11 @@ XfsInodeGeometry MakeInodeGeometry(const XfsSuperblock& sb,
   g.inodes_per_block = geo.inopblock;
   g.ialloc_inos = std::max<uint32_t>(ondisk::kInodesPerChunk, geo.inopblock);
   g.ialloc_blks = g.ialloc_inos >> geo.inopblog;
+  g.spino_align = sb.spino_align ? sb.spino_align : 0;
+  g.ialloc_min_blks =
+      (sb.features.spinodes && g.spino_align)
+          ? g.spino_align
+          : g.ialloc_blks;
 
   // Inode cluster size: xfs_ialloc_setup_geometry.
   constexpr uint64_t kBigClusterSize = 8192;

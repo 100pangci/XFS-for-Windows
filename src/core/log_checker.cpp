@@ -144,8 +144,11 @@ Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
           .Metadata("log")
           .Offset(log_start + off);
     }
+    // h_lsn and record positions count 512-byte basic blocks; sb_logblocks
+    // counts filesystem blocks. Do not discard headers in the later log area.
     if (!ScanChunk(buf.data(), to_read, log_start + off, log_start,
-                   static_cast<uint32_t>(sb.logblocks), sb.uuid, &state)) {
+                   static_cast<uint32_t>(log_bytes / kSectorSize), sb.uuid,
+                   &state)) {
       return XFS_ERR(XfsError::kIoError, "log scan failed")
           .Metadata("log");
     }

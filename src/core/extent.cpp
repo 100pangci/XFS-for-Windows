@@ -68,15 +68,11 @@ Status ValidateExtentList(const XfsGeometry& geo, const XfsInode& inode,
           .Metadata("extent")
           .Actual(e.startblock);
     }
-    if (e.startblock >= geo.dblocks ||
-        e.blockcount > geo.dblocks - e.startblock) {
-      return XFS_ERR(XfsError::kCorruptExtent,
-                     "extent points outside the filesystem")
-          .Ino(inode.ino)
-          .Metadata("extent")
-          .Actual(e.startblock);
-    }
-    if (!geo.FsbRangeValid(e.startblock, e.blockcount)) {
+    // startblock encodes (AG number, AG-relative block), not a linear block
+    // index. It can exceed sb_dblocks when agblocks is not a power of two.
+    // Validate the decoded range, including the shorter final AG.
+    if ((e.startblock >> geo.agblklog) >= geo.agcount ||
+        !geo.FsbRangeValid(e.startblock, e.blockcount)) {
       return XFS_ERR(XfsError::kCorruptExtent,
                      "extent crosses an allocation group boundary or points "
                      "outside the filesystem")

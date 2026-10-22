@@ -61,6 +61,13 @@ inline uint32_t LoadLE32(const void* p) {
          (static_cast<uint32_t>(b[1]) << 8) | static_cast<uint32_t>(b[0]);
 }
 
+inline uint64_t LoadLE64(const void* p) {
+  return static_cast<uint64_t>(LoadLE32(p)) |
+         (static_cast<uint64_t>(LoadLE32(
+              static_cast<const uint8_t*>(p) + 4))
+          << 32);
+}
+
 inline void StoreBE16(void* p, uint16_t v) {
   auto* b = static_cast<uint8_t*>(p);
   b[0] = static_cast<uint8_t>(v >> 8);
@@ -99,6 +106,12 @@ inline void StoreLE32(void* p, uint32_t v) {
   b[1] = static_cast<uint8_t>(v >> 8);
   b[2] = static_cast<uint8_t>(v >> 16);
   b[3] = static_cast<uint8_t>(v >> 24);
+}
+
+inline void StoreLE64(void* p, uint64_t v) {
+  auto* b = static_cast<uint8_t*>(p);
+  StoreLE32(b, static_cast<uint32_t>(v));
+  StoreLE32(b + 4, static_cast<uint32_t>(v >> 32));
 }
 
 // Offset-based reads over a base pointer: GetBE32(base, 0x20). The one-argument

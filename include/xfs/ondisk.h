@@ -343,10 +343,18 @@ constexpr size_t kAllocRecSize = 8;   // leaf record == key size
 constexpr size_t kInobtKeySize = 4;   // startino be32
 constexpr size_t kInobtPtrSize = 4;   // be32
 constexpr size_t kInobtRecSize = 16;  // xfs_inobt_rec
-// xfs_inobt_rec fields without sparse inodes:
+// xfs_inobt_rec fields. The 4-byte word at offset 4 is a union:
+//   full chunks   : ir_freecount be32
+//   sparse chunks : ir_holemask be16, ir_count u8, ir_freecount u8
 constexpr size_t kInobtRecStartino = 0;   // be32
-constexpr size_t kInobtRecFreecount = 4;  // be32 (sparse layout: holemask+count)
+constexpr size_t kInobtRecFreecount = 4;  // be32 (full layout)
+constexpr size_t kInobtRecHolemask = 4;   // be16 (sparse layout)
+constexpr size_t kInobtRecCount = 6;      // u8   (sparse layout)
+constexpr size_t kInobtRecSparseFreecount = 7;  // u8 (sparse layout)
 constexpr size_t kInobtRecFree = 8;       // be64
+constexpr uint32_t kInobtHolemaskBits = 16;
+constexpr uint32_t kInodesPerHolemaskBit = 4;
+constexpr uint16_t kInobtHolemaskFull = 0;
 constexpr size_t kBmbtKeySize = 8;    // startoff be64
 constexpr size_t kBmbtPtrSize = 8;    // be64
 constexpr size_t kBmbtRecSize = 16;   // xfs_bmbt_rec
