@@ -349,6 +349,8 @@ def verify_inode(img, geo, ino, free_bit):
     mode = u16(raw, 2)
     if free_bit and mode != 0:
         fail("inode %d: free inode has mode %o" % (ino, mode))
+    if not free_bit and mode == 0:
+        fail("inode %d: allocated inode has mode zero" % ino)
     return {
         "ino": ino,
         "mode": mode,

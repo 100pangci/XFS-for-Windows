@@ -164,23 +164,14 @@ int MakeRw6SparseFixture(const std::string& path_string) {
     }
   };
 
-  // Fill the formatter chunk so the next chunk must be a sparse allocation.
-  {
-    auto txn = fs.BeginTransaction();
-    if (!txn.ok()) return fail("sparse transaction", txn.error());
-    BlockAllocator alloc(&txn.value(), image.get(), &geo);
-    InodeAllocator inodes(&txn.value(), &alloc, image.get(), &sb, &geo);
-    for (uint32_t i = 0; i < 61; ++i) {
-      uint64_t ino = 0;
-      Status s = inodes.AllocateInode(0, 0, &ino);
-      if (!s.ok()) return fail("sparse fill allocation", s);
-    }
-    Status s = alloc.Commit();
-    if (!s.ok()) return fail("sparse fill block commit", s);
-    s = inodes.Commit();
-    if (!s.ok()) return fail("sparse fill inode commit", s);
-    s = fs.CommitTransaction(txn.value());
-    if (!s.ok()) return fail("sparse fill transaction commit", s);
+  // Fill the formatter chunk with real, initialized file inodes (not just
+  // allocated bits), so an allocated inode cannot have mode zero when
+  // xfs_repair scans the fixture.
+  for (uint32_t i = 0; i < 61; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "fill%02u.bin", i);
+    auto created = fs.CreateRegularFile(fs.RootInode(), name, 0644, 0, 0);
+    if (!created.ok()) return fail("sparse fill create", created.error());
   }
 
   // Read the AG0 free extents. The helper walks the bnobt from disk, so this
