@@ -424,7 +424,10 @@ unexplained ownership. Do not rebuild rmapbt to mask writer bugs.
 Pending acceptance evidence (none implied by this research note):
 
 - [x] typed reader, key/record validation, lookup directions, CLI dump
-- [x] independent Python forward-derived ownership oracle
+- [x] independent Python forward-derived ownership oracle on a real
+      Linux-created, multi-level rmapbt fixture
+- [x] Windows-formatted rmapbt=1,reflink=0 image accepted by Linux
+      `xfs_repair -n`, mount and a writable Linux pass
 - [x] RmapEditor logical and physical writer (unit matrix, real height 3)
 - [x] owner-aware writer at every audited allocation/free/conversion site
 - [x] RUI/RUD parser, shared-operation refusal, ordered lifetime, atomic RUD
@@ -457,9 +460,19 @@ AG 0: 1351/1351, AG 1: 87/87, AG 2: 5163/5163, AG 3: 4186/4186
 missing 0, unexpected 0, overlap 0, owner errors 0
 ```
 
-This proves the reader/oracle against a Linux-created multi-level overlapping
-tree. It does **not** yet prove Windows mutation, crash recovery, or reverse
-interoperability; those remain unchecked below.
+Windows subsequently read the same image:
+`xfswin check` traversed every AG's typed tree cleanly, `xfswin rmap --ag=0`
+dumped the records, `rw6b_rmap_probe.py` again reported exact counts, and the
+reader differential matched sample file hashes and namespace entries.
+
+The Windows-formatted `rmapbt=1,reflink=0` image also passed the independent
+oracle, then `xfs_repair -n`, a read-only mount, and a writable Linux pass
+(including `xfs_repair -n` on the resulting image).
+
+This proves the reader/oracle and formatter writes against a Linux-created
+multi-level overlapping tree. It does **not** yet prove Windows mutation of a
+Linux fixture, writer crash recovery, genuine surviving RUI recovery, or
+repeated reverse interoperability; those remain unchecked below.
 
 Only after these gates may `CheckWritableProfile` allow rmapbt. Reflink,
 refcountbt, CoW, realtime, external log, quota/xattr/parent mutation, metadir
