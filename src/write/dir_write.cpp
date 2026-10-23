@@ -1219,7 +1219,9 @@ Result<uint32_t> DirectoryEditor::PickDataBlock(uint32_t hash, size_t need) {
 
 Result<uint64_t> DirectoryEditor::AllocDirBlock(uint64_t file_block) {
   Allocation allocation;
-  Status s = alloc_->Allocate(geo_->InoAgno(ino_), 1, &allocation);
+  Status s = alloc_->AllocateOwned(
+      geo_->InoAgno(ino_), 1, RmapOwner::Data(ino_, file_block, false),
+      &allocation);
   if (!s.ok()) return s.error();
   XfsExtent extent;
   extent.startoff = file_block;

@@ -253,8 +253,9 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         Allocation allocation;
         Status allocated;
         while (true) {
-          allocated = alloc.Allocate(preferred, static_cast<uint32_t>(want),
-                                     &allocation);
+          allocated = alloc.AllocateOwned(
+              preferred, static_cast<uint32_t>(want),
+              RmapOwner::Data(ino, cursor, true), &allocation);
           if (allocated.ok()) break;
           if (allocated.error().code != XfsError::kNoSpace || want == 1) {
             return allocated.error();
@@ -387,6 +388,10 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
                                                plan.last_block + 1);
       if (first >= last) continue;
       const uint64_t fsb = e.startblock + (first - e.startoff);
+      s = alloc.ConvertOwned(
+          fsb, static_cast<uint32_t>(last - first),
+          RmapOwner::Data(ino, first, true), /*old_unwritten=*/true);
+      if (!s.ok()) return s.error();
       s = editor.RemoveRange(first, last);
       if (!s.ok()) return s.error();
       XfsExtent converted;

@@ -40,6 +40,7 @@
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/rmap_intent.h"
 #include "xfs/transaction.h"
 
 namespace xfs {
@@ -87,7 +88,7 @@ Result<XfsFilesystem::RecoverySummary> XfsFilesystem::AnalyzeJournal() const {
     // Unresolved intents the completion pass cannot finish are a refusal too:
     // the scan only proves the replay half can be done.
     for (const PendingIntent& intent : CollectPendingIntents(log)) {
-      if (intent.type == lf::kItemEfi) continue;
+      if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui) continue;
       summary.unsupported_items.push_back(
           "unresolved intent " + IntentContext(intent) +
           " requires deferred completion this build does not implement");
@@ -167,7 +168,7 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
   }
   const std::vector<PendingIntent> intents = CollectPendingIntents(scan);
   for (const PendingIntent& intent : intents) {
-    if (intent.type != lf::kItemEfi) {
+    if (intent.type != lf::kItemEfi && intent.type != lf::kItemRui) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "cannot recover dirty log: unresolved intent " +
                          IntentContext(intent) +
@@ -289,6 +290,60 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
 // transaction and log the matching EFD so a later crash does not redo the
 // work (the done item releases the intent during recovery).
 Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
+  if (intent.type == lf::kItemRui) {
+    if (intent.regions.empty()) {
+      return XFS_ERR(XfsError::kCorruptBtree, "RUI item has no format region")
+          .Metadata("log");
+    }
+    auto parsed = ParseRui(intent.regions[0], geometry_);
+    if (!parsed.ok()) return parsed.error();
+    const RmapIntent rui = std::move(parsed.value());
+    return RunTransaction([&](XfsTransaction& txn) -> Status {
+      BlockAllocator blocks(&txn, device_.get(), &geometry_);
+      for (const RmapIntentExtent& e : rui.extents) {
+        RmapOwner owner;
+        owner.owner = e.owner;
+        owner.offset = e.startoff;
+        owner.flags = 0;
+        if (e.flags & lf::kRmapExtentAttrFork) owner.flags |= kRmapAttrFork;
+        if (e.flags & lf::kRmapExtentBmbtBlock) owner.flags |= kRmapBmbtBlock;
+        if (e.flags & lf::kRmapExtentUnwritten) owner.flags |= kRmapUnwritten;
+        const uint32_t op = e.flags & lf::kRmapExtentTypeMask;
+        Status s = OkStatus();
+        switch (op) {
+          case lf::kRmapExtentMap:
+          case lf::kRmapExtentAlloc:
+            s = blocks.RmapMap(e.startblock, e.len, owner);
+            break;
+          case lf::kRmapExtentUnmap:
+          case lf::kRmapExtentFree:
+            s = blocks.RmapUnmap(e.startblock, e.len, owner);
+            break;
+          case lf::kRmapExtentConvert:
+            // The intent records the new state; xfs_rmap_finish_one passes
+            // !unwritten as the *old* state to xfs_rmap_convert.
+            s = blocks.RmapConvert(e.startblock, e.len, owner,
+                                   (e.flags & lf::kRmapExtentUnwritten) == 0);
+            break;
+          default:
+            return XFS_ERR(XfsError::kUnsupportedFeature,
+                           "unsupported RUI operation")
+                .Actual(op)
+                .Metadata("RUI");
+        }
+        if (!s.ok()) return s;
+      }
+      // RUD must be in the same committed transaction as the rmap buffers;
+      // add it before the allocator's budget check so an oversized completion
+      // is refused before the first metadata write.
+      std::vector<uint8_t> rud(lf::kRudFormatSize, 0);
+      StoreLE16(rud.data(), lf::kItemRud);
+      StoreLE16(rud.data() + 2, 1);
+      StoreLE64(rud.data() + lf::kIntentIdOffset, rui.id);
+      txn.AddLogOp(std::move(rud));
+      return blocks.Commit();
+    });
+  }
   if (intent.type != lf::kItemEfi) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "cannot complete intent " + IntentContext(intent))
@@ -329,17 +384,20 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
   return RunTransaction([&](XfsTransaction& txn) -> Status {
     BlockAllocator blocks(&txn, device_.get(), &geometry_);
     for (const LoggedExtent& extent : extents) {
-      Status freed = blocks.Free(extent.start, extent.len);
+      // EFI has no owner: with rmapbt this is the OWN_UNKNOWN wildcard path
+      // (fully covering record or no overlap; partial coverage is corruption).
+      Status freed = geometry_.features.rmapbt
+                         ? blocks.FreeUnknown(extent.start, extent.len)
+                         : blocks.Free(extent.start, extent.len);
       if (!freed.ok()) return freed;
     }
-    Status committed = blocks.Commit();
-    if (!committed.ok()) return committed;
     // The done item: the same extent array with the EFD type. Replaying the
-    // log again finds the EFD and drops the intent instead of redoing it.
+    // log again finds the EFD and drops the intent instead of redoing it.  Add
+    // it before the allocator's final log-budget check.
     std::vector<uint8_t> efd = format;
     StoreLE16(efd.data(), lf::kItemEfd);
     txn.AddLogOp(std::move(efd));
-    return OkStatus();
+    return blocks.Commit();
   });
 }
 

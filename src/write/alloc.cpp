@@ -218,21 +218,31 @@ struct AgState {
   uint32_t freeblks = 0;
   uint32_t longest = 0;
   uint32_t orig_freeblks = 0, orig_flcount = 0, orig_btreeblks = 0;
+  uint32_t rmap_root = 0, rmap_level = 0, rmap_blocks = 0;
 
   std::vector<FreeRec> recs;  // sorted by start, disjoint
   std::unique_ptr<AllocTree> bno, cnt;
 
   bool refilling = false;
   bool counted = false;
+  bool rmap_loaded = false;
 
   Status Load(Allocator* allocator, uint32_t agno_in);
   Status InsertRec(const FreeRec& rec);
   Status RemoveRec(const FreeRec& rec);
   Status GetTreeBlock(uint32_t* agbno);
   Status PutTreeBlock(uint32_t agbno);
-  Status RefillAgfl(uint32_t want);
-  Status AllocateBestFit(uint32_t want, Allocation* out);
-  Status AllocateAligned(uint32_t want, uint32_t align, Allocation* out,
+  // Removes free extents and pushes their blocks onto the AGFL without any
+  // ownership change.  The caller maps the added ranges OWN_AG afterwards;
+  // doing it in this order is what keeps the rmap tree's own split from
+  // recursing into an empty freelist.
+  Status RefillAgflRaw(uint32_t want, std::vector<FreeRec>* added);
+  // Moves AGFL entries back to ordinary free space, removing OWN_AG first.
+  Status DrainAgfl(uint32_t count);
+  Status AllocateBestFit(uint32_t want, const RmapOwner* owner,
+                         Allocation* out);
+  Status AllocateAligned(uint32_t want, uint32_t align,
+                         const RmapOwner* owner, Allocation* out,
                          uint32_t min_agbno = 0,
                          uint32_t max_agbno = 0xffffffffu);
   void RecomputeLongest();
@@ -244,8 +254,7 @@ struct AgState {
 // ---------------------------------------------------------------------------
 class Allocator {
  public:
-  Allocator(XfsTransaction* txn, BlockDevice* device, const XfsGeometry* geo)
-      : txn_(txn), device_(device), geo_(geo) {}
+  Allocator(XfsTransaction* txn, BlockDevice* device, const XfsGeometry* geo);
 
   XfsTransaction* txn() { return txn_; }
   BlockDevice* device() { return device_; }
@@ -259,6 +268,26 @@ class Allocator {
                    size_t lsn_offset, size_t crc_offset, const char* what);
   Status Commit();
   int64_t fdblocks_delta() const { return fdblocks_delta_; }
+
+  bool rmap_enabled() const { return geo_->features.rmapbt; }
+  bool rmap_editing() const { return rmap_editing_; }
+  uint32_t RmapBlocks(uint32_t agno) const;
+  Status MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
+                  const RmapOwner& owner);
+  Status UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
+                    const RmapOwner& owner, bool unknown_owner);
+  Status ConvertOwnedRmap(uint32_t agno, uint32_t agbno, uint32_t len,
+                          const RmapOwner& owner, bool old_unwritten);
+  Status MapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
+                     uint64_t owner);
+  Status UnmapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
+                       uint64_t owner);
+  Status AllocateRmapBlock(uint32_t agno, uint32_t* agbno);
+  Status FreeRmapBlock(uint32_t agno, uint32_t agbno);
+  Status ReserveForRmap(uint32_t agno);
+  Status EnsureAgflInternal(uint32_t agno, uint32_t want);
+  Status FreeBlocksInternal(uint64_t fsb, uint32_t len, const RmapOwner* owner,
+                            bool unknown_owner);
 
  private:
   struct OutBuffer {
@@ -274,8 +303,31 @@ class Allocator {
   const XfsGeometry* geo_;
   std::map<uint32_t, std::unique_ptr<AgState>> ags_;
   std::map<uint64_t, OutBuffer> buffers_;
+  std::unique_ptr<RmapEditor> rmap_;
+  bool rmap_editing_ = false;
   int64_t fdblocks_delta_ = 0;
 };
+
+Allocator::Allocator(XfsTransaction* txn, BlockDevice* device,
+                     const XfsGeometry* geo)
+    : txn_(txn), device_(device), geo_(geo) {
+  if (!geo_->features.rmapbt) return;
+  RmapEditor::Hooks hooks;
+  hooks.alloc_block = [this](uint32_t agno, uint32_t* agbno) {
+    return AllocateRmapBlock(agno, agbno);
+  };
+  hooks.free_block = [this](uint32_t agno, uint32_t agbno) {
+    return FreeRmapBlock(agno, agbno);
+  };
+  hooks.publish_block = [this](uint32_t agno, uint32_t agbno,
+                               const uint8_t* data, size_t len) {
+    std::vector<uint8_t> buffer(data, data + len);
+    const uint64_t offset = FsbToByte(geo_->AgFsb(agno, agbno));
+    return txn_->AddMetadataBuffer(offset, std::move(buffer), lf::kBlftBtree,
+                                   bt::kSLsn, bt::kSCrc, "rmapbt");
+  };
+  rmap_ = std::make_unique<RmapEditor>(device_, geo_, std::move(hooks));
+}
 
 // ---------------------------------------------------------------------------
 // AllocTree
@@ -936,9 +988,12 @@ Status AllocTree::Remove(const FreeRec& rec) {
 // ---------------------------------------------------------------------------
 
 uint32_t AgState::Contribution() const {
-  const uint32_t btreeblks =
-      static_cast<uint32_t>(bno->block_count() - 1) +
-      static_cast<uint32_t>(cnt->block_count() - 1);
+  uint32_t btreeblks = static_cast<uint32_t>(bno->block_count() - 1) +
+                       static_cast<uint32_t>(cnt->block_count() - 1);
+  if (owner->rmap_enabled()) {
+    const uint32_t blocks = owner->RmapBlocks(agno);
+    if (blocks > 0) btreeblks += blocks - 1;
+  }
   return freeblks + flcount + btreeblks;
 }
 
@@ -1004,6 +1059,20 @@ Status AgState::Load(Allocator* allocator, uint32_t agno_in) {
   orig_freeblks = freeblks;
   orig_flcount = flcount;
   orig_btreeblks = GetBE32(af, agf::kBtreeblks);
+  rmap_root = GetBE32(af, agf::kRmapRoot);
+  rmap_level = GetBE32(af, agf::kRmapLevel);
+  rmap_blocks = GetBE32(af, agf::kRmapBlocks);
+  if (geo->features.rmapbt) {
+    if (rmap_root == kNullAgBlock || !geo->AgbnoValid(agno, rmap_root) ||
+        rmap_level < 1 || rmap_level > bt::kMaxTraversalLevels ||
+        rmap_blocks == 0 || rmap_blocks > length) {
+      return XFS_ERR(XfsError::kCorruptAgHeader,
+                     "AGF rmap root/level/blocks is invalid")
+          .Ag(agno)
+          .Actual(rmap_root)
+          .Metadata("AGF");
+    }
+  }
 
   bno = std::make_unique<AllocTree>(owner, agno, TreeKind::kBno, "bnobt");
   cnt = std::make_unique<AllocTree>(owner, agno, TreeKind::kCnt, "cntbt");
@@ -1132,7 +1201,15 @@ Status AgState::RemoveRec(const FreeRec& rec) {
 
 Status AgState::GetTreeBlock(uint32_t* agbno) {
   if (flcount == 0) {
-    Status s = RefillAgfl(1);
+    if (owner->rmap_editing()) {
+      // The reservation failed earlier; never recurse into rmap mapping while
+      // the rmap tree is already being edited.
+      return XFS_ERR(XfsError::kNoSpace,
+                     "AGFL reservation exhausted during an rmap edit")
+          .Ag(agno)
+          .Metadata("AGFL");
+    }
+    Status s = owner->EnsureAgflInternal(agno, 1);
     if (!s.ok()) return s;
   }
   if (flcount == 0) {
@@ -1141,26 +1218,36 @@ Status AgState::GetTreeBlock(uint32_t* agbno) {
         .Ag(agno)
         .Metadata("AGFL");
   }
-  const uint32_t bno = GetBE32(agfl_buf.data(), kAgflHeaderSize + flfirst * 4);
-  if (bno >= length) {
+  const uint32_t agb = GetBE32(agfl_buf.data(), kAgflHeaderSize + flfirst * 4);
+  if (agb >= length) {
     return XFS_ERR(XfsError::kCorruptAgHeader, "AGFL entry out of range")
         .Ag(agno)
         .Metadata("AGFL")
-        .Actual(bno);
+        .Actual(agb);
   }
   flfirst = (flfirst + 1) % agfl_size;
   flcount--;
   agfl_dirty = true;
   agf_dirty = true;
-  *agbno = bno;
+  *agbno = agb;
   return OkStatus();
 }
 
 Status AgState::PutTreeBlock(uint32_t agbno) {
   if (flcount >= agfl_size) {
-    return XFS_ERR(XfsError::kUnsupportedFeature, "AGFL is full")
-        .Ag(agno)
-        .Metadata("AGFL");
+    if (owner->rmap_editing()) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "AGFL is full during an rmap edit")
+          .Ag(agno)
+          .Metadata("AGFL");
+    }
+    Status s = DrainAgfl(1);
+    if (!s.ok()) return s;
+    if (flcount >= agfl_size) {
+      return XFS_ERR(XfsError::kUnsupportedFeature, "AGFL is full")
+          .Ag(agno)
+          .Metadata("AGFL");
+    }
   }
   if (agbno >= length) {
     return XFS_ERR(XfsError::kInternal, "freeing an out of range AGFL block")
@@ -1176,10 +1263,16 @@ Status AgState::PutTreeBlock(uint32_t agbno) {
   return OkStatus();
 }
 
-Status AgState::RefillAgfl(uint32_t want) {
+Status AgState::RefillAgflRaw(uint32_t want, std::vector<FreeRec>* added) {
   if (refilling) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "AGFL refill would recurse into itself")
+        .Ag(agno)
+        .Metadata("AGFL");
+  }
+  if (want > agfl_size) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "AGFL refill target exceeds the ring size")
         .Ag(agno)
         .Metadata("AGFL");
   }
@@ -1199,6 +1292,13 @@ Status AgState::RefillAgfl(uint32_t want) {
     }
     const FreeRec old = *best;
     const uint32_t take = std::min<uint32_t>(want - flcount, old.len);
+    if (take > agfl_size - flcount) {
+      result = XFS_ERR(XfsError::kUnsupportedFeature,
+                       "AGFL refill would overflow the ring")
+                   .Ag(agno)
+                   .Metadata("AGFL");
+      break;
+    }
     result = RemoveRec(old);
     if (!result.ok()) break;
     if (old.len > take) {
@@ -1211,12 +1311,78 @@ Status AgState::RefillAgfl(uint32_t want) {
       if (!result.ok()) break;
     }
     if (!result.ok()) break;
+    if (added != nullptr) added->push_back(FreeRec{old.start, take});
   }
   refilling = false;
   return result;
 }
 
-Status AgState::AllocateBestFit(uint32_t want, Allocation* out) {
+Status AgState::DrainAgfl(uint32_t count) {
+  while (count > 0 && flcount > 0) {
+    const uint32_t agb =
+        GetBE32(agfl_buf.data(), kAgflHeaderSize + flfirst * 4);
+    if (agb >= length) {
+      return XFS_ERR(XfsError::kCorruptAgHeader, "AGFL entry out of range")
+          .Ag(agno)
+          .Actual(agb)
+          .Metadata("AGFL");
+    }
+    if (owner->rmap_enabled()) {
+      Status s = owner->UnmapMetadata(agno, agb, 1, kRmapOwnerAg);
+      if (!s.ok()) return s;
+    }
+    flfirst = (flfirst + 1) % agfl_size;
+    flcount--;
+    agfl_dirty = true;
+    agf_dirty = true;
+
+    // Return the block to ordinary free space, merging both neighbours.
+    FreeRec left;
+    bool have_left = false;
+    FreeRec right;
+    bool have_right = false;
+    for (const FreeRec& r : recs) {
+      if (r.start + r.len == agb) {
+        left = r;
+        have_left = true;
+      }
+      if (r.start == agb + 1) {
+        right = r;
+        have_right = true;
+      }
+    }
+    Status s = OkStatus();
+    if (have_left && have_right) {
+      s = RemoveRec(left);
+      if (s.ok()) s = RemoveRec(right);
+      if (s.ok()) {
+        s = InsertRec(FreeRec{left.start, left.len + 1 + right.len});
+      }
+    } else if (have_left) {
+      s = RemoveRec(left);
+      if (s.ok()) s = InsertRec(FreeRec{left.start, left.len + 1});
+    } else if (have_right) {
+      s = RemoveRec(right);
+      if (s.ok()) s = InsertRec(FreeRec{agb, 1 + right.len});
+    } else {
+      s = InsertRec(FreeRec{agb, 1});
+    }
+    if (!s.ok()) return s;
+    ++freeblks;
+    --count;
+  }
+  RecomputeLongest();
+  return OkStatus();
+}
+
+Status AgState::AllocateBestFit(uint32_t want, const RmapOwner* rmap_owner,
+                                Allocation* out) {
+  if (this->owner->rmap_enabled() && rmap_owner == nullptr) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt allocation requires an owner")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
   const FreeRec* best = nullptr;
   for (const FreeRec& r : recs) {
     if (r.len < want) continue;
@@ -1241,15 +1407,26 @@ Status AgState::AllocateBestFit(uint32_t want, Allocation* out) {
   freeblks -= want;
   RecomputeLongest();
   agf_dirty = true;
-  out->fsb = owner->geo()->AgFsb(agno, old.start);
+  if (rmap_owner != nullptr) {
+    Status s = this->owner->MapOwned(agno, old.start, want, *rmap_owner);
+    if (!s.ok()) return s;
+  }
+  out->fsb = this->owner->geo()->AgFsb(agno, old.start);
   out->len = want;
   return OkStatus();
 }
 
-Status AgState::AllocateAligned(uint32_t want, uint32_t align, Allocation* out,
+Status AgState::AllocateAligned(uint32_t want, uint32_t align,
+                                const RmapOwner* rmap_owner, Allocation* out,
                                 uint32_t min_agbno, uint32_t max_agbno) {
+  if (this->owner->rmap_enabled() && rmap_owner == nullptr) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt allocation requires an owner")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
   if (align <= 1 && min_agbno == 0 && max_agbno >= length) {
-    return AllocateBestFit(want, out);
+    return AllocateBestFit(want, rmap_owner, out);
   }
   if (align <= 1) align = 1;
   // Best fit among the free extents that contain an aligned run of `want`
@@ -1303,7 +1480,11 @@ Status AgState::AllocateAligned(uint32_t want, uint32_t align, Allocation* out,
   freeblks -= want;
   RecomputeLongest();
   agf_dirty = true;
-  out->fsb = owner->geo()->AgFsb(agno, best_off);
+  if (rmap_owner != nullptr) {
+    Status mapped = this->owner->MapOwned(agno, best_off, want, *rmap_owner);
+    if (!mapped.ok()) return mapped;
+  }
+  out->fsb = this->owner->geo()->AgFsb(agno, best_off);
   out->len = want;
   return OkStatus();
 }
@@ -1324,6 +1505,256 @@ Status Allocator::LoadAg(uint32_t agno, AgState** out) {
   AgState* raw = state.get();
   ags_.emplace(agno, std::move(state));
   *out = raw;
+  if (rmap_enabled() && !raw->rmap_loaded) {
+    s = rmap_->Load(agno, raw->rmap_root, raw->rmap_level, raw->rmap_blocks);
+    if (!s.ok()) {
+      ags_.erase(agno);
+      return s;
+    }
+    raw->rmap_loaded = true;
+  }
+  return OkStatus();
+}
+
+uint32_t Allocator::RmapBlocks(uint32_t agno) const {
+  if (!rmap_) return 0;
+  return rmap_->Blocks(agno);
+}
+
+Status Allocator::MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
+                           const RmapOwner& owner) {
+  if (!rmap_enabled()) return OkStatus();
+  if (rmap_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive rmap ownership update")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  rmap_editing_ = true;
+  Status s = rmap_->AllocateExtent(agno, agbno, len, owner);
+  rmap_editing_ = false;
+  if (s.ok()) {
+    auto it = ags_.find(agno);
+    if (it != ags_.end()) it->second->agf_dirty = true;
+  }
+  return s;
+}
+
+Status Allocator::UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
+                             const RmapOwner& owner, bool unknown_owner) {
+  if (!rmap_enabled()) return OkStatus();
+  if (rmap_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive rmap ownership update")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  rmap_editing_ = true;
+  Status s = rmap_->FreeExtent(agno, agbno, len, owner, unknown_owner);
+  rmap_editing_ = false;
+  if (s.ok()) {
+    auto it = ags_.find(agno);
+    if (it != ags_.end()) it->second->agf_dirty = true;
+  }
+  return s;
+}
+
+Status Allocator::ConvertOwnedRmap(uint32_t agno, uint32_t agbno,
+                                   uint32_t len, const RmapOwner& owner,
+                                   bool old_unwritten) {
+  if (!rmap_enabled()) return OkStatus();
+  if (rmap_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive rmap ownership update")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  rmap_editing_ = true;
+  Status s = rmap_->Convert(agno, agbno, len, owner, old_unwritten);
+  rmap_editing_ = false;
+  if (s.ok()) {
+    auto it = ags_.find(agno);
+    if (it != ags_.end()) it->second->agf_dirty = true;
+  }
+  return s;
+}
+
+Status Allocator::MapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
+                              uint64_t owner) {
+  if (!rmap_enabled()) return OkStatus();
+  if (rmap_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive metadata ownership update")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  rmap_editing_ = true;
+  Status s = rmap_->AllocateMetadata(agno, agbno, len, owner);
+  rmap_editing_ = false;
+  if (s.ok()) {
+    auto it = ags_.find(agno);
+    if (it != ags_.end()) it->second->agf_dirty = true;
+  }
+  return s;
+}
+
+Status Allocator::UnmapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
+                                uint64_t owner) {
+  if (!rmap_enabled()) return OkStatus();
+  if (rmap_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive metadata ownership update")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  rmap_editing_ = true;
+  Status s = rmap_->FreeMetadata(agno, agbno, len, owner);
+  rmap_editing_ = false;
+  if (s.ok()) {
+    auto it = ags_.find(agno);
+    if (it != ags_.end()) it->second->agf_dirty = true;
+  }
+  return s;
+}
+
+Status Allocator::AllocateRmapBlock(uint32_t agno, uint32_t* agbno) {
+  auto it = ags_.find(agno);
+  if (it == ags_.end()) {
+    return XFS_ERR(XfsError::kInternal,
+                   "rmap tree block allocation before the AG is loaded")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  return it->second->GetTreeBlock(agbno);
+}
+
+Status Allocator::FreeRmapBlock(uint32_t agno, uint32_t agbno) {
+  auto it = ags_.find(agno);
+  if (it == ags_.end()) {
+    return XFS_ERR(XfsError::kInternal,
+                   "rmap tree block free before the AG is loaded")
+        .Ag(agno)
+        .Metadata("rmapbt");
+  }
+  return it->second->PutTreeBlock(agbno);
+}
+
+Status Allocator::EnsureAgflInternal(uint32_t agno, uint32_t want) {
+  AgState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  if (!rmap_enabled()) {
+    return ag->RefillAgflRaw(want, nullptr);
+  }
+  // Reserve for the current rmap height plus the caller's request.  Mapping
+  // the newly-added ranges can itself split the rmap tree; those splits take
+  // blocks from the AGFL, so the refill target must already include the
+  // worst-case reserve.  The loop handles blocks consumed by that split.
+  for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+    const uint32_t reserve =
+        std::max<uint32_t>(rmap_->ReserveBlocks(agno) + 2, want);
+    if (ag->flcount >= reserve) return OkStatus();
+    std::vector<FreeRec> added;
+    s = ag->RefillAgflRaw(reserve, &added);
+    if (!s.ok()) return s;
+    for (const FreeRec& rec : added) {
+      s = MapMetadata(agno, rec.start, rec.len, kRmapOwnerAg);
+      if (!s.ok()) return s;
+    }
+    if (ag->flcount >= reserve) return OkStatus();
+  }
+  return XFS_ERR(XfsError::kNoSpace,
+                 "could not establish the rmap AGFL reservation")
+      .Ag(agno)
+      .Metadata("AGFL");
+}
+
+Status Allocator::ReserveForRmap(uint32_t agno) {
+  if (!rmap_enabled()) return OkStatus();
+  return EnsureAgflInternal(agno, rmap_->ReserveBlocks(agno) + 2);
+}
+
+Status Allocator::FreeBlocksInternal(uint64_t fsb, uint32_t len,
+                                     const RmapOwner* owner,
+                                     bool unknown_owner) {
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot free zero blocks")
+        .Metadata("allocator");
+  }
+  if (!geo_->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "free range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("allocator");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo_->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo_->agblklog) - 1));
+  AgState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  if (rmap_enabled()) {
+    s = ReserveForRmap(agno);
+    if (!s.ok()) return s;
+    if (unknown_owner) {
+      s = UnmapOwned(agno, agbno, len, RmapOwner{}, true);
+    } else if (owner != nullptr) {
+      s = UnmapOwned(agno, agbno, len, *owner, false);
+    } else {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "rmapbt free requires an owner")
+          .Ag(agno)
+          .Actual(agbno)
+          .Metadata("allocator");
+    }
+    if (!s.ok()) return s;
+  }
+
+  for (const FreeRec& r : ag->recs) {
+    if (agbno < r.start + r.len && r.start < agbno + len) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "freeing blocks that are already free")
+          .Ag(agno)
+          .Actual(agbno)
+          .Metadata("free space");
+    }
+  }
+  FreeRec left;
+  bool have_left = false;
+  FreeRec right;
+  bool have_right = false;
+  for (const FreeRec& r : ag->recs) {
+    if (r.start + r.len == agbno) {
+      left = r;
+      have_left = true;
+    }
+    if (r.start == agbno + len) {
+      right = r;
+      have_right = true;
+    }
+  }
+  if (have_left && have_right) {
+    s = ag->RemoveRec(left);
+    if (!s.ok()) return s;
+    s = ag->RemoveRec(right);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{left.start, left.len + len + right.len});
+  } else if (have_left) {
+    s = ag->RemoveRec(left);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{left.start, left.len + len});
+  } else if (have_right) {
+    s = ag->RemoveRec(right);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{agbno, len + right.len});
+  } else {
+    s = ag->InsertRec(FreeRec{agbno, len});
+  }
+  if (!s.ok()) return s;
+  ag->freeblks += len;
+  ag->RecomputeLongest();
+  ag->agf_dirty = true;
   return OkStatus();
 }
 
@@ -1347,6 +1778,13 @@ Status Allocator::AddBuffer(uint64_t offset, std::vector<uint8_t> data,
 }
 
 Status Allocator::Commit() {
+  if (rmap_) {
+    // Publish rmap tree blocks before the AGF that points at their new root.
+    // Both are part of the same buffer-logging transaction; publication order
+    // only affects the record layout, not durability.
+    Status s = rmap_->Commit();
+    if (!s.ok()) return s;
+  }
   for (auto& entry : ags_) {
     AgState& ag = *entry.second;
 
@@ -1366,9 +1804,16 @@ Status Allocator::Commit() {
       PutBE32(af, agf::kFlfirst, ag.flfirst);
       PutBE32(af, agf::kFllast, ag.fllast);
       PutBE32(af, agf::kFlcount, ag.flcount);
-      PutBE32(af, agf::kBtreeblks,
-              static_cast<uint32_t>(ag.bno->block_count() - 1) +
-                  static_cast<uint32_t>(ag.cnt->block_count() - 1));
+      uint32_t btreeblks = static_cast<uint32_t>(ag.bno->block_count() - 1) +
+                           static_cast<uint32_t>(ag.cnt->block_count() - 1);
+      if (rmap_enabled()) {
+        const uint32_t blocks = rmap_->Blocks(ag.agno);
+        if (blocks > 0) btreeblks += blocks - 1;
+        PutBE32(af, agf::kRmapRoot, rmap_->Root(ag.agno));
+        PutBE32(af, agf::kRmapLevel, rmap_->Level(ag.agno));
+        PutBE32(af, agf::kRmapBlocks, blocks);
+      }
+      PutBE32(af, agf::kBtreeblks, btreeblks);
       PutBE32(af, agf::kBnoRoot, ag.bno->root());
       PutBE32(af, agf::kCntRoot, ag.cnt->root());
       PutBE32(af, agf::kBnoLevel, ag.bno->level());
@@ -1463,6 +1908,11 @@ BlockAllocator::~BlockAllocator() = default;
 
 Status BlockAllocator::Allocate(uint32_t preferred_agno, uint32_t len,
                                 Allocation* out) {
+  if (impl_->alloc->rmap_enabled()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt allocation requires an owner")
+        .Metadata("allocator");
+  }
   if (len == 0) {
     return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
         .Metadata("allocator");
@@ -1474,7 +1924,34 @@ Status BlockAllocator::Allocate(uint32_t preferred_agno, uint32_t len,
     AgState* ag = nullptr;
     Status s = impl_->alloc->LoadAg(agno, &ag);
     if (!s.ok()) return s;
-    s = ag->AllocateBestFit(len, out);
+    s = ag->AllocateBestFit(len, nullptr, out);
+    if (s.ok()) return s;
+    if (s.error().code != XfsError::kNoSpace) return s;
+  }
+  return XFS_ERR(XfsError::kNoSpace, "no AG has a free extent that large")
+      .Metadata("allocator")
+      .Actual(len);
+}
+
+Status BlockAllocator::AllocateOwned(uint32_t preferred_agno, uint32_t len,
+                                     const RmapOwner& owner, Allocation* out) {
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
+        .Metadata("allocator");
+  }
+  if (preferred_agno >= impl_->alloc->geo()->agcount) preferred_agno = 0;
+  const uint32_t agcount = impl_->alloc->geo()->agcount;
+  for (uint32_t i = 0; i < agcount; ++i) {
+    const uint32_t agno = (preferred_agno + i) % agcount;
+    Status s = impl_->alloc->ReserveForRmap(agno);
+    if (!s.ok()) {
+      if (s.error().code == XfsError::kNoSpace) continue;
+      return s;
+    }
+    AgState* ag = nullptr;
+    s = impl_->alloc->LoadAg(agno, &ag);
+    if (!s.ok()) return s;
+    s = ag->AllocateBestFit(len, &owner, out);
     if (s.ok()) return s;
     if (s.error().code != XfsError::kNoSpace) return s;
   }
@@ -1502,10 +1979,45 @@ Status BlockAllocator::AllocateFromAg(uint32_t agno, uint32_t len,
         .Metadata("allocator")
         .Actual(align);
   }
+  if (impl_->alloc->rmap_enabled()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt allocation requires an owner")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
   AgState* ag = nullptr;
   Status s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
-  return ag->AllocateAligned(len, align, out);
+  return ag->AllocateAligned(len, align, nullptr, out);
+}
+
+Status BlockAllocator::AllocateFromAgOwned(uint32_t agno, uint32_t len,
+                                           uint32_t align,
+                                           const RmapOwner& owner,
+                                           Allocation* out) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (agno >= geo->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
+        .Metadata("allocator");
+  }
+  if (align <= 1) align = 1;
+  if ((align & (align - 1)) != 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "alignment must be a power of two")
+        .Metadata("allocator")
+        .Actual(align);
+  }
+  Status s = impl_->alloc->ReserveForRmap(agno);
+  if (!s.ok()) return s;
+  AgState* ag = nullptr;
+  s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  return ag->AllocateAligned(len, align, &owner, out);
 }
 
 Status BlockAllocator::AllocateFromAgRange(uint32_t agno, uint32_t len,
@@ -1519,8 +2031,7 @@ Status BlockAllocator::AllocateFromAgRange(uint32_t agno, uint32_t len,
         .Metadata("allocator");
   }
   if (len == 0 || min_agbno >= max_agbno) {
-    return XFS_ERR(XfsError::kInvalidArgument,
-                   "invalid allocation range")
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid allocation range")
         .Metadata("allocator");
   }
   if (align <= 1) align = 1;
@@ -1530,21 +2041,79 @@ Status BlockAllocator::AllocateFromAgRange(uint32_t agno, uint32_t len,
         .Metadata("allocator")
         .Actual(align);
   }
+  if (impl_->alloc->rmap_enabled()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt allocation requires an owner")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
   AgState* ag = nullptr;
   Status s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
-  return ag->AllocateAligned(len, align, out, min_agbno, max_agbno);
+  return ag->AllocateAligned(len, align, nullptr, out, min_agbno, max_agbno);
+}
+
+Status BlockAllocator::AllocateFromAgRangeOwned(
+    uint32_t agno, uint32_t len, uint32_t align, uint32_t min_agbno,
+    uint32_t max_agbno, const RmapOwner& owner, Allocation* out) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (agno >= geo->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  if (len == 0 || min_agbno >= max_agbno) {
+    return XFS_ERR(XfsError::kInvalidArgument, "invalid allocation range")
+        .Metadata("allocator");
+  }
+  if (align <= 1) align = 1;
+  if ((align & (align - 1)) != 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "alignment must be a power of two")
+        .Metadata("allocator")
+        .Actual(align);
+  }
+  Status s = impl_->alloc->ReserveForRmap(agno);
+  if (!s.ok()) return s;
+  AgState* ag = nullptr;
+  s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  return ag->AllocateAligned(len, align, &owner, out, min_agbno, max_agbno);
 }
 
 Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {
-  if (len == 0) {
-    return XFS_ERR(XfsError::kInvalidArgument, "cannot free zero blocks")
+  if (impl_->alloc->rmap_enabled()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmapbt free requires an owner")
+        .Fsb(fsb)
         .Metadata("allocator");
   }
+  return impl_->alloc->FreeBlocksInternal(fsb, len, nullptr, false);
+}
+
+Status BlockAllocator::FreeOwned(uint64_t fsb, uint32_t len,
+                                 const RmapOwner& owner) {
+  return impl_->alloc->FreeBlocksInternal(fsb, len, &owner, false);
+}
+
+Status BlockAllocator::FreeUnknown(uint64_t fsb, uint32_t len) {
+  if (!impl_->alloc->rmap_enabled()) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "OWN_UNKNOWN free requires rmapbt")
+        .Fsb(fsb)
+        .Metadata("allocator");
+  }
+  return impl_->alloc->FreeBlocksInternal(fsb, len, nullptr, true);
+}
+
+Status BlockAllocator::ConvertOwned(uint64_t fsb, uint32_t len,
+                                    const RmapOwner& owner,
+                                    bool old_unwritten) {
+  if (!impl_->alloc->rmap_enabled()) return OkStatus();
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->FsbRangeValid(fsb, len)) {
     return XFS_ERR(XfsError::kInvalidArgument,
-                   "free range is not inside one AG")
+                   "convert range is not inside one AG")
         .Fsb(fsb)
         .Actual(len)
         .Metadata("allocator");
@@ -1552,55 +2121,95 @@ Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {
   const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
   const uint32_t agbno =
       static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->ReserveForRmap(agno);
+  if (!s.ok()) return s;
   AgState* ag = nullptr;
-  Status s = impl_->alloc->LoadAg(agno, &ag);
+  s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
+  (void)ag;
+  return impl_->alloc->ConvertOwnedRmap(agno, agbno, len, owner,
+                                        old_unwritten);
+}
 
-  for (const FreeRec& r : ag->recs) {
-    if (agbno < r.start + r.len && r.start < agbno + len) {
-      return XFS_ERR(XfsError::kCorruptBtree,
-                     "freeing blocks that are already free")
-          .Ag(agno)
-          .Actual(agbno)
-          .Metadata("free space");
-    }
+Status BlockAllocator::RmapMap(uint64_t fsb, uint32_t len,
+                               const RmapOwner& owner) {
+  if (!impl_->alloc->rmap_enabled()) return OkStatus();
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmap map range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("rmapbt");
   }
-  FreeRec left;
-  bool have_left = false;
-  FreeRec right;
-  bool have_right = false;
-  for (const FreeRec& r : ag->recs) {
-    if (r.start + r.len == agbno) {
-      left = r;
-      have_left = true;
-    }
-    if (r.start == agbno + len) {
-      right = r;
-      have_right = true;
-    }
-  }
-  if (have_left && have_right) {
-    s = ag->RemoveRec(left);
-    if (!s.ok()) return s;
-    s = ag->RemoveRec(right);
-    if (!s.ok()) return s;
-    s = ag->InsertRec(FreeRec{left.start, left.len + len + right.len});
-  } else if (have_left) {
-    s = ag->RemoveRec(left);
-    if (!s.ok()) return s;
-    s = ag->InsertRec(FreeRec{left.start, left.len + len});
-  } else if (have_right) {
-    s = ag->RemoveRec(right);
-    if (!s.ok()) return s;
-    s = ag->InsertRec(FreeRec{agbno, len + right.len});
-  } else {
-    s = ag->InsertRec(FreeRec{agbno, len});
-  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->ReserveForRmap(agno);
   if (!s.ok()) return s;
-  ag->freeblks += len;
-  ag->RecomputeLongest();
-  ag->agf_dirty = true;
-  return OkStatus();
+  AgState* ag = nullptr;
+  s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  (void)ag;
+  return impl_->alloc->MapOwned(agno, agbno, len, owner);
+}
+
+Status BlockAllocator::RmapUnmap(uint64_t fsb, uint32_t len,
+                                 const RmapOwner& owner) {
+  if (!impl_->alloc->rmap_enabled()) return OkStatus();
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmap unmap range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("rmapbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->ReserveForRmap(agno);
+  if (!s.ok()) return s;
+  AgState* ag = nullptr;
+  s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  (void)ag;
+  return impl_->alloc->UnmapOwned(agno, agbno, len, owner, false);
+}
+
+Status BlockAllocator::RmapConvert(uint64_t fsb, uint32_t len,
+                                   const RmapOwner& owner,
+                                   bool old_unwritten) {
+  if (!impl_->alloc->rmap_enabled()) return OkStatus();
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "rmap convert range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("rmapbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->ReserveForRmap(agno);
+  if (!s.ok()) return s;
+  AgState* ag = nullptr;
+  s = impl_->alloc->LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  (void)ag;
+  return impl_->alloc->ConvertOwnedRmap(agno, agbno, len, owner,
+                                        old_unwritten);
+}
+
+Status BlockAllocator::EnsureAgfl(uint32_t agno, uint32_t blocks) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (agno >= geo->agcount) {
+    return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  return impl_->alloc->EnsureAgflInternal(agno, blocks);
 }
 
 Status BlockAllocator::Commit() { return impl_->alloc->Commit(); }

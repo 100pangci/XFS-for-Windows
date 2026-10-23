@@ -79,6 +79,22 @@ jobs:
           python tests/tools/rw6_inode_probe.py out/modern.img
           if ($LASTEXITCODE -ne 0) { throw "RW-6A oracle rejected the image" }
 
+      - name: RW-6B Windows-formatted rmapbt image (oracle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe mkimage out\rw6b-rmap.img 300M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
+          & $exe format out\rw6b-rmap.img --yes-i-really-mean-it --rmapbt
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt format failed" }
+          & $exe check out\rw6b-rmap.img --verbose
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt check failed" }
+          & $exe recover out\rw6b-rmap.img --yes-i-really-mean-it
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt recovery preflight failed" }
+          python tests/tools/rw6b_rmap_probe.py out/rw6b-rmap.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B oracle rejected the formatted image" }
+
       - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
         shell: pwsh
         run: |
@@ -300,6 +316,13 @@ jobs:
           path: out/rw6-sparse.img
           if-no-files-found: error
 
+      - name: Upload the RW-6B Windows-formatted rmapbt image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-windows-rmap
+          path: out/rw6b-rmap.img
+          if-no-files-found: error
+
   # ===========================================================================
   # RW-6A: modern inode feature profile
   # (finobt + inobtcount + sparse inodes + bigtime + NREXT64)
@@ -386,6 +409,93 @@ jobs:
           sudo bash tests/scripts/verify_windows_image_linux.sh \
             rw6-sparse/rw6-sparse.img
           python3 tests/tools/rw6_inode_probe.py rw6-sparse/rw6-sparse.img
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: the Windows formatter's rmapbt=1,reflink=0 profile must be accepted
+  # by real xfs_repair, mount and a writable Linux pass (which itself updates
+  # the reverse mappings).  This is also the reverse-interoperability check for
+  # the formatter's ownership records.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6b-formatted:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-rmap
+          path: rw6b-formatted
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-formatted rmapbt image with Linux
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6b-formatted/rw6b-rmap.img
+          python3 tests/tools/rw6b_rmap_probe.py rw6b-formatted/rw6b-rmap.img
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: Linux creates and populates a real rmapbt=1,reflink=0 image with
+  # every forward structure the Windows reader/writer must handle.  The fixture
+  # is required to have an rmapbt at level >= 2.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6b-rmap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Create and populate the rmapbt fixture
+        run: |
+          mkfs.xfs -V
+          sudo env SIZE_MB=2048 bash tests/scripts/make_rw6b_rmap_linux.sh rw6b
+          sudo chown -R "$USER" rw6b
+          cat rw6b/rmap.layout.txt
+          python3 tests/tools/rw6b_rmap_probe.py rw6b/rmap.img
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows reads the Linux-created rmapbt image: typed traversal, CLI dump,
+  # independent ownership oracle, reader differential.
+  # ---------------------------------------------------------------------------
+  windows-read-rw6b-rmap:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+
+      - name: Read and validate the Linux rmapbt image
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_read_windows.ps1 `
+            -Exe "bin\xfswin.exe" -Image "rw6b\rmap.img"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B Windows read validation failed" }
 
   # ---------------------------------------------------------------------------
   # Windows mutates the Linux-created image (create/write/truncate/rename/

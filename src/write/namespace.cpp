@@ -1416,7 +1416,9 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
             .Ino(child_ino);
       }
       Allocation alloc;
-      s = blocks.Allocate(geometry_.InoAgno(parent_ino), need, &alloc);
+      s = blocks.AllocateOwned(
+          geometry_.InoAgno(parent_ino), need,
+          RmapOwner::Data(child_ino, 0, false), &alloc);
       if (!s.ok()) return s;
       ondisk::BmbtRec rec;
       rec.startoff = 0;

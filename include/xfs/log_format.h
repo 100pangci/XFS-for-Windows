@@ -117,6 +117,34 @@ constexpr size_t kExtentSize = 16;           // xfs_extent: start u64, len u32
 constexpr size_t kExtentStartOffset = 0;     // u64
 constexpr size_t kExtentLenOffset = 8;       // u32
 
+// xfs_rui_log_format: type u16, size u16, nextents u32, rui_id u64, then
+// xfs_map_extent[] (all host order).  RUD is a fixed 16-byte item.
+constexpr size_t kRuiFormatSize = 16;
+constexpr size_t kRuiExtentSize = 32;
+constexpr size_t kRuiOwnerOffset = 0;       // u64
+constexpr size_t kRuiStartblockOffset = 8;  // u64 (encoded fsblock)
+constexpr size_t kRuiStartoffOffset = 16;   // u64
+constexpr size_t kRuiLenOffset = 24;        // u32
+constexpr size_t kRuiFlagsOffset = 28;      // u32
+constexpr size_t kRudFormatSize = 16;
+
+// xfs_map_extent.me_flags: low byte is the operation, upper bits are flags.
+constexpr uint32_t kRmapExtentTypeMask = 0xff;
+constexpr uint32_t kRmapExtentMap = 1;
+constexpr uint32_t kRmapExtentMapShared = 2;
+constexpr uint32_t kRmapExtentUnmap = 3;
+constexpr uint32_t kRmapExtentUnmapShared = 4;
+constexpr uint32_t kRmapExtentConvert = 5;
+constexpr uint32_t kRmapExtentConvertShared = 6;
+constexpr uint32_t kRmapExtentAlloc = 7;
+constexpr uint32_t kRmapExtentFree = 8;
+constexpr uint32_t kRmapExtentAttrFork = 1u << 31;
+constexpr uint32_t kRmapExtentBmbtBlock = 1u << 30;
+constexpr uint32_t kRmapExtentUnwritten = 1u << 29;
+constexpr uint32_t kRmapExtentFlags =
+    kRmapExtentTypeMask | kRmapExtentAttrFork | kRmapExtentBmbtBlock |
+    kRmapExtentUnwritten;
+
 // xfs_icreate_log, 28 bytes, host endian type/size then big-endian fields.
 // Replay calls xfs_ialloc_inode_init, which rebuilds the whole inode cluster
 // from scratch: exactly what a newly allocated chunk needs.

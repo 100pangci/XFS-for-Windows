@@ -53,6 +53,12 @@ struct MountOptions {
   // Finish a mount-time recovery with a clean-unmount record (the standalone
   // `xfswin recover` shape). Read-write mounts keep the log writable instead.
   bool clean_log_after_recovery = false;
+  // Internal recovery-only path: allow the profile check to accept the
+  // rmapbt=1,reflink=0 feature set so a dirty rmapbt log can be recovered
+  // before the general writable gate is opened.  It does not make ordinary
+  // read-write mounts legal; `xfswin recover` is the only caller and closes
+  // the filesystem immediately after the completion pass.
+  bool recovery_only = false;
 };
 
 struct XfsFileInfo {

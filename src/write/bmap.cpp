@@ -379,7 +379,8 @@ uint32_t DataForkEditor::preferred_agno() const {
 
 Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
   Allocation alloc;
-  Status s = alloc_->Allocate(preferred_agno(), 1, &alloc);
+  Status s = alloc_->AllocateOwned(preferred_agno(), 1,
+                                   RmapOwner::Bmbt(ino_), &alloc);
   if (!s.ok()) return s;
   nblocks_delta_ += 1;  // bmbt blocks are counted by di_nblocks
   *fsb = alloc.fsb;
@@ -387,7 +388,7 @@ Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
 }
 
 Status DataForkEditor::FreeBmbtBlock(uint64_t fsb) {
-  Status s = alloc_->Free(fsb, 1);
+  Status s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_));
   if (!s.ok()) return s;
   nblocks_delta_ -= 1;
   return OkStatus();
@@ -588,12 +589,16 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
     const uint64_t overlap_start = std::max(old.startoff, first_block);
     const uint64_t overlap_end = std::min(old.EndBlock(), end_block);
     if (free_removed_ && overlap_start < overlap_end) {
-      // Release the data blocks that leave the file (truncate).
+      // Release the data blocks that leave the file (truncate).  The rmap
+      // record is removed with the exact logical offset and state of this
+      // physical range; in-memory merges/splits never cause extra mapping.
       const uint64_t fsb = old.startblock + (overlap_start - old.startoff);
-      Status s = alloc_->Free(fsb, static_cast<uint32_t>(overlap_end -
-                                                        overlap_start));
+      const uint32_t count =
+          static_cast<uint32_t>(overlap_end - overlap_start);
+      Status s = alloc_->FreeOwned(
+          fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
       if (!s.ok()) return s;
-      nblocks_delta_ -= static_cast<int64_t>(overlap_end - overlap_start);
+      nblocks_delta_ -= static_cast<int64_t>(count);
     }
     if (overlap_start == old.startoff && overlap_end == old.EndBlock()) {
       Status s = ApplyRemove(old);

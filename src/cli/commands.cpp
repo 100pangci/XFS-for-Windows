@@ -89,6 +89,7 @@ void PrintUsage() {
       "                                inodes + bigtime + NREXT64\n"
       "      [--finobt] [--inobtcount] [--sparse-inodes] [--bigtime]\n"
       "      [--nrext64]               select individual RW-6A features\n"
+      "      [--rmapbt]                format with rmapbt=1 (reflink stays off)\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
       "                                created, overwritten, extended, truncated,\n"
@@ -999,6 +1000,7 @@ int CommandFormat(const std::string& target, const Options& options) {
   format_options.sparse_inodes = options.sparse_inodes;
   format_options.bigtime = options.bigtime;
   format_options.nrext64 = options.nrext64;
+  format_options.rmapbt = options.rmapbt;
   auto report = mkfs::Format(*dev, format_options);
   if (!report.ok()) {
     PrintError(report.error());
@@ -1430,6 +1432,9 @@ int CommandRecover(const std::string& target, const Options& options) {
   // The standalone shape ends with a clean unmount record so every later
   // mount (Linux or this build) starts from a recovered, clean log.
   mount_options.clean_log_after_recovery = true;
+  // Recovery may need to finish rmapbt/RUI work before the ordinary writable
+  // gate is opened; it is still never a general read-write mount.
+  mount_options.recovery_only = true;
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1716,6 +1721,8 @@ int Run(const std::vector<std::string>& args) {
       options.bigtime = true;
     } else if (arg == "--nrext64") {
       options.nrext64 = true;
+    } else if (arg == "--rmapbt") {
+      options.rmapbt = true;
     } else if (arg == "--modern-inode-profile") {
       options.finobt = true;
       options.inobtcount = true;

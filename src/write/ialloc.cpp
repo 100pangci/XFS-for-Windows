@@ -283,7 +283,8 @@ Status InobtTree::AllocTreeBlock(uint32_t* agbno) {
   Allocation a;
   // Inobt blocks are regular blocks of this AG (xfs_btree_alloc_block); they
   // come from the block allocator, not from the AGFL.
-  Status s = alloc_->AllocateFromAg(agno_, 1, 1, &a);
+  Status s = alloc_->AllocateFromAgOwned(
+      agno_, 1, 1, RmapOwner::Metadata(kRmapOwnerInobt), &a);
   if (!s.ok()) return s;
   const uint32_t agb = static_cast<uint32_t>(a.fsb & ((1ULL << geo_->agblklog) - 1));
   blocks_.emplace(agb, std::vector<uint8_t>(geo_->block_size, 0));
@@ -293,7 +294,8 @@ Status InobtTree::AllocTreeBlock(uint32_t* agbno) {
 
 Status InobtTree::FreeTreeBlock(uint32_t agbno) {
   const uint64_t fsb = geo_->AgFsb(agno_, agbno);
-  Status s = alloc_->Free(fsb, 1);
+  Status s = alloc_->FreeOwned(fsb, 1,
+                               RmapOwner::Metadata(kRmapOwnerInobt));
   if (!s.ok()) return s;
   blocks_.erase(agbno);
   dirty_.erase(agbno);
@@ -1294,8 +1296,9 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
   // the valid sparse window.
   Allocation alloc;
   bool sparse = false;
-  Status s = alloc_->AllocateFromAg(ag->agno, igeo_.ialloc_blks,
-                                    igeo_.cluster_align, &alloc);
+  Status s = alloc_->AllocateFromAgOwned(
+      ag->agno, igeo_.ialloc_blks, igeo_.cluster_align,
+      RmapOwner::Metadata(kRmapOwnerInodes), &alloc);
   if (!s.ok()) {
     if (!geo_->features.spinodes ||
         igeo_.ialloc_min_blks >= igeo_.ialloc_blks) {
@@ -1306,9 +1309,10 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
         igeo_.cluster_align > 1
             ? (aglen / igeo_.cluster_align) * igeo_.cluster_align
             : aglen;
-    s = alloc_->AllocateFromAgRange(ag->agno, igeo_.ialloc_min_blks,
-                                    igeo_.spino_align, igeo_.cluster_align,
-                                    max_agbno, &alloc);
+    s = alloc_->AllocateFromAgRangeOwned(
+        ag->agno, igeo_.ialloc_min_blks, igeo_.spino_align,
+        igeo_.cluster_align, max_agbno,
+        RmapOwner::Metadata(kRmapOwnerInodes), &alloc);
     if (!s.ok()) return s;
     sparse = true;
   }
@@ -1666,7 +1670,9 @@ Status AllocImpl::FreeChunkBlocks(AgiState* ag, const InobtRecord& rec) {
   const uint32_t sagbno = rec.startino >> geo_->inopblog;
   if (!geo_->features.spinodes || rec.holemask == 0) {
     const uint64_t chunk_fsb = geo_->AgFsb(ag->agno, sagbno);
-    return alloc_->Free(chunk_fsb, igeo_.ialloc_blks);
+    return alloc_->FreeOwned(
+        chunk_fsb, igeo_.ialloc_blks,
+        RmapOwner::Metadata(kRmapOwnerInodes));
   }
   // Only the backed holemask ranges are owned by the chunk. Walk runs of
   // zero bits (allocated) and free each contiguous range; holes were never
@@ -1704,7 +1710,9 @@ Status AllocImpl::FreeChunkBlocks(AgiState* ag, const InobtRecord& rec) {
           .Metadata("inobt")
           .Actual(rec.startino);
     }
-    Status s = alloc_->Free(geo_->AgFsb(ag->agno, agbno), blocks);
+    Status s = alloc_->FreeOwned(
+        geo_->AgFsb(ag->agno, agbno), blocks,
+        RmapOwner::Metadata(kRmapOwnerInodes));
     if (!s.ok()) return s;
   }
   return OkStatus();

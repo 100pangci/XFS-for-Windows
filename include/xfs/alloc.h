@@ -39,6 +39,7 @@
 
 #include "xfs/block_device.h"
 #include "xfs/error.h"
+#include "xfs/rmap_editor.h"
 #include "xfs/superblock.h"
 #include "xfs/transaction.h"
 
@@ -64,7 +65,14 @@ class BlockAllocator {
   // kNoSpace when no AG has a free extent that large, and with
   // kUnsupportedFeature when the allocation would require a tree mutation this
   // build does not implement (the AGFL cannot provide a block).
+  //
+  // On an rmapbt filesystem this unowned form is refused: every allocation has
+  // exactly one owner and the rmap record must be created in the same
+  // transaction as the free-space change.  Use Allocate*Owned instead.
   Status Allocate(uint32_t preferred_agno, uint32_t len, Allocation* out);
+
+  Status AllocateOwned(uint32_t preferred_agno, uint32_t len,
+                       const RmapOwner& owner, Allocation* out);
 
   // Allocates `len` contiguous blocks from *one* AG (never another), with the
   // run's start block aligned to `align` blocks (a power of two, 1 = no
@@ -73,6 +81,8 @@ class BlockAllocator {
   // has no free extent that fits an aligned run.
   Status AllocateFromAg(uint32_t agno, uint32_t len, uint32_t align,
                         Allocation* out);
+  Status AllocateFromAgOwned(uint32_t agno, uint32_t len, uint32_t align,
+                             const RmapOwner& owner, Allocation* out);
 
   // Like AllocateFromAg, but the run must start at or after `min_agbno` and
   // end at or before `max_agbno` (both AG-relative blocks, max exclusive).
@@ -81,10 +91,38 @@ class BlockAllocator {
   Status AllocateFromAgRange(uint32_t agno, uint32_t len, uint32_t align,
                              uint32_t min_agbno, uint32_t max_agbno,
                              Allocation* out);
+  Status AllocateFromAgRangeOwned(uint32_t agno, uint32_t len, uint32_t align,
+                                  uint32_t min_agbno, uint32_t max_agbno,
+                                  const RmapOwner& owner, Allocation* out);
 
   // Frees [fsb, fsb+len), which must lie inside one AG and be currently
   // allocated. Contiguous free neighbours are merged.
+  //
+  // The unowned form is refused on rmapbt filesystems.  FreeOwned validates
+  // the reverse mapping (owner, offset, flags) before the free-space tree is
+  // changed.  FreeUnknown implements the EFI OWN_UNKNOWN wildcard: a fully
+  // covering record is removed, no overlap is accepted as an idempotent replay,
+  // and partial overlap is refused.
   Status Free(uint64_t fsb, uint32_t len);
+  Status FreeOwned(uint64_t fsb, uint32_t len, const RmapOwner& owner);
+  Status FreeUnknown(uint64_t fsb, uint32_t len);
+
+  // Written <-> unwritten state conversion for an inode data extent.  This is
+  // the rmap half of the bmap conversion; it never changes free space.
+  Status ConvertOwned(uint64_t fsb, uint32_t len, const RmapOwner& owner,
+                      bool old_unwritten);
+
+  // RUI completion: apply the rmap half of a recovered intent without
+  // touching the free-space trees (the original transaction already did).
+  Status RmapMap(uint64_t fsb, uint32_t len, const RmapOwner& owner);
+  Status RmapUnmap(uint64_t fsb, uint32_t len, const RmapOwner& owner);
+  Status RmapConvert(uint64_t fsb, uint32_t len, const RmapOwner& owner,
+                     bool old_unwritten);
+
+  // Ensures the AGFL holds at least `blocks` entries, refilling from free
+  // space (and recording OWN_AG ownership) before a structural rmap edit.
+  // This is the reservation that prevents AllocateRmapBlock recursion.
+  Status EnsureAgfl(uint32_t agno, uint32_t blocks);
 
   // Adds every dirty metadata buffer to the transaction (LSN + CRC, buffer log
   // items, write-back) and applies the superblock free block delta. Must be

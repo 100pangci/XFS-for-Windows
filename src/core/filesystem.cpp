@@ -270,7 +270,9 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         if (can_recover) {
           // Never recover a filesystem this build would then refuse to
           // modify: check the profile first.
-          Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+          Status profile = CheckWritableProfile(fs->superblock_,
+                                                fs->geometry_,
+                                                options.recovery_only);
           if (!profile.ok()) {
             auto error = profile.error();
             error.message +=
@@ -341,7 +343,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
-    Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+    Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_,
+                                          options.recovery_only);
     if (!profile.ok()) {
       auto error = profile.error();
       error.message +=
@@ -363,6 +366,11 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         XFS_SB_INFO("unlinked inode recovery: freed="
                     << processed.value() << " cleared_buckets=" << cleared);
       }
+    }
+    if (options.recovery_only) {
+      // Recovery already completed (or the log was clean).  Do not leave a
+      // recovery-only mount usable as a general writable filesystem.
+      fs->writable_ = false;
     }
   }
 

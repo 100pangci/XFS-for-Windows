@@ -29,6 +29,7 @@
 #include "xfs/endian.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
+#include "xfs/rmap_intent.h"
 
 namespace xfs {
 namespace {
@@ -1520,8 +1521,8 @@ constexpr ItemTypeEntry kItemTypes[] = {
     {lf::kItemIunlink, "XFS_LI_IUNLINK", RecoveryItemClass::kIntent},
     {lf::kItemDquot, "XFS_LI_DQUOT", RecoveryItemClass::kRefused},
     {lf::kItemQuotaoff, "XFS_LI_QUOTAOFF", RecoveryItemClass::kRefused},
-    {lf::kItemRui, "XFS_LI_RUI", RecoveryItemClass::kRefused},
-    {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kRefused},
+    {lf::kItemRui, "XFS_LI_RUI", RecoveryItemClass::kIntent},
+    {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kIntentDone},
     {lf::kItemCui, "XFS_LI_CUI", RecoveryItemClass::kRefused},
     {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kRefused},
     {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kRefused},
@@ -1673,12 +1674,41 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   scan.transactions = reconstruction.transactions();
   scan.unsupported_items = reconstruction.unsupported();
 
+  // Inventory and validate every RUI/RUD before replay.  This includes
+  // operations that are already paired (a matching RUD later in the log):
+  // shared/reflink intent must refuse even if it would not need completion.
+  for (const RecoveredTransaction& trans : scan.transactions) {
+    for (const RecoveredItem& item : trans.items) {
+      if (item.type == lf::kItemRui) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("RUI item has no format region");
+          continue;
+        }
+        auto parsed = ParseRui(item.regions[0], geo);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("RUI preflight: ") + parsed.error().Format());
+        }
+      } else if (item.type == lf::kItemRud) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("RUD item has no format region");
+          continue;
+        }
+        auto parsed = ParseRud(item.regions[0]);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("RUD preflight: ") + parsed.error().Format());
+        }
+      }
+    }
+  }
+
   // An unresolved intent this build cannot finish is a refusal too: replaying
   // its metadata would be safe, but the deferred operation could not be
-  // completed (xlog_recover_process_intents). EFI (extent free) is the only
-  // intent type with a completion pass today.
+  // completed (xlog_recover_process_intents). EFI and RUI have completion
+  // passes; every other intent type refuses before the first write.
   for (const PendingIntent& intent : CollectPendingIntents(scan)) {
-    if (intent.type == lf::kItemEfi) continue;
+    if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui) continue;
     scan.unsupported_items.push_back(
         "unresolved intent " +
         std::string(LogItemTypeName(intent.type) ? LogItemTypeName(intent.type)
@@ -1718,8 +1748,12 @@ std::vector<PendingIntent> CollectPendingIntents(const LogScan& scan) {
         }
         const uint64_t id =
             LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
-        const uint16_t want_type =
-            item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
+        uint16_t want_type = lf::kItemBui;
+        if (item.type == lf::kItemEfd) {
+          want_type = lf::kItemEfi;
+        } else if (item.type == lf::kItemRud) {
+          want_type = lf::kItemRui;
+        }
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           if (it->type != want_type || it->regions.empty() ||
               it->regions[0].size() < lf::kIntentLogFormatSize) {

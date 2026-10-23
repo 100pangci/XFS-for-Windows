@@ -15,6 +15,8 @@ add_library(xfs_core STATIC
   core/ag.cpp
   core/btree.cpp
   core/rmap.cpp
+  core/rmap_editor.cpp
+  core/rmap_intent.cpp
   core/inode.cpp
   core/extent.cpp
   core/directory.cpp

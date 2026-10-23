@@ -499,6 +499,13 @@ class TreeChecker {
 
 }  // namespace
 
+Status ValidateRmapRecord(const RmapRecord& rec, const XfsGeometry& geo,
+                          uint32_t agno) {
+  return ValidateRecord(rec, geo, agno);
+}
+
+RmapKey RmapRecordHighKey(const RmapRecord& rec) { return HighKey(rec); }
+
 int RmapKey::Compare(const RmapKey& other) const {
   if (startblock != other.startblock) return startblock < other.startblock ? -1 : 1;
   if (owner != other.owner) return owner < other.owner ? -1 : 1;

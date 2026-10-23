@@ -92,6 +92,17 @@ struct RmapTree {
   Result<RmapRecord> Successor(const RmapKey& key) const;
 };
 
+// Validates one record's physical range, owner encoding and flags against the
+// filesystem geometry.  This is the same check the reader applies; the writer
+// uses it before every logical mutation so a refused edit cannot be published.
+Status ValidateRmapRecord(const RmapRecord& rec, const XfsGeometry& geo,
+                          uint32_t agno);
+
+// xfs_rmapbt_init_high_key_from_rec: start+len-1, plus the logical offset for
+// inode data/attr extents (never for metadata or bmbt records).  The unwritten
+// attribute is not part of a key.
+RmapKey RmapRecordHighKey(const RmapRecord& rec);
+
 // Reads and completely verifies AG `agno`'s rmapbt: block magic/CRC/UUID/
 // blkno/header owner/level/numrecs, sibling links, both low and high child
 // keys, key ordering, every record's bounds/owner/flags, cycles, root level

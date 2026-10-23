@@ -338,7 +338,7 @@ staged replay view and completion feasibility before writes.
 
 ## 9. Current implementation status (not RW-6B completion)
 
-Implemented on `rw-6b`, with the writable gate still closed:
+Implemented on `rw-6b`, with the ordinary writable gate still closed:
 
 * `include/xfs/rmap.h` / `src/core/rmap.cpp`: typed `RmapKey`/`RmapRecord`/
   `RmapTree`; exact/LE/GE/predecessor/successor lookups; traversal with CRC,
@@ -346,24 +346,64 @@ Implemented on `rw-6b`, with the writable gate still closed:
   both child keys, cycle and AGF `rmap_blocks` checks; record bounds, inode
   ownership, flags/offset packing and static-owner checks. Cross-AG inode
   owners are accepted, as Linux does.
-* `xfswin check` now uses this typed reader instead of the short-key generic
-  btree walker; `xfswin rmap <image> [--ag N]` prints the verified records.
-* `tests/unit/rw6b_tests.cpp` builds a synthetic two-level tree (including
-  interleaved high keys and siblings) and checks normal traversal, all lookup
-  directions, and refusal of zero length, ordering, high-key and counter
-  corruption. The synthetic tree is **not** evidence of writer or Linux
-  interoperability.
-* `tests/tools/rw6b_rmap_probe.py` independently parses SB/AGF/AGI/AGFL,
-  free-space and inode trees, every allocated inode's data/attr fork including
-  bmap btrees, and derives expected ownership from those forward structures.
-  It canonicalizes merges and reports missing/unexpected/overlap/owner/free
-  conflicts. It has only had local smoke tests on non-rmap images so far.
+* `include/xfs/rmap_editor.h` / `src/core/rmap_editor.cpp`: independent writer
+  abstraction. Logical `MapExtent`/`UnmapExtent`/`ConvertExtent` implement the
+  merge, exact/prefix/suffix/middle and OWN_UNKNOWN rules; every record edit
+  goes through `InsertExact`/`DeleteExact`/`UpdateExact`. The physical tree
+  implements leaf/node split, merge and borrow, sibling maintenance, root
+  growth, root collapse (Linux `xfs_btree_kill_root` semantics: the child
+  becomes the AGF root and the old root block returns to the AGFL), overlapping
+  low/high-key propagation, and publishes only after a full in-memory
+  structural verification.
+* `src/write/alloc.cpp`: owner-aware allocation/free/convert (`AllocateOwned`,
+  `AllocateFromAgOwned`, `AllocateFromAgRangeOwned`, `FreeOwned`,
+  `FreeUnknown`, `ConvertOwned`, `RmapMap/Unmap/Convert` for intent
+  completion). AGFL refill records OWN_AG after the blocks are on the ring, so
+  an rmap split cannot recurse into an empty freelist; drain removes OWN_AG
+  only when a block actually returns to free space. `agf_btreeblks` now
+  includes rmap non-root blocks and the AGF rmap root/level/blocks fields are
+  maintained in the same transaction. `sb_fdblocks` uses the full
+  freeblks+flcount+btreeblks identity.
+* All audited ownership sites are wired: file data (written/unwritten/convert),
+  bmbt blocks (data/attr flag model), inode chunks (`OWN_INODES`, sparse holes
+  excluded), inobt/finobt (`OWN_INOBT`), directories, remote symlinks, AGFL
+  and the free-space/rmap trees (`OWN_AG`), EFI `OWN_UNKNOWN` completion.
+* `mkfs::FormatOptions::rmapbt` and `xfswin format --rmapbt` create a
+  consistent rmapbt=1,reflink=0 image (single root leaf with canonical
+  FS/LOG/AG/INOBT/INODES records). This exists so unit/CI fixtures do not need
+  hand-built ownership; it is not the primary milestone.
+* RUI/RUD: `include/xfs/rmap_intent.h` validates counts, sizes, encoded
+  fsblocks, AG bounds, owners, offsets, flags and overflow. Shared
+  MAP/UNMAP/CONVERT are refused before replay. RUI is an intent and RUD a done
+  item in the ordered `(type,id)` lifetime table. Surviving RUI completion runs
+  the rmap update and logs the RUD in **one** transaction. CONVERT uses the
+  source-confirmed rule that the intent describes the *new* state and
+  `xfs_rmap_convert` receives the old state.
+* `RMB3` is classified for physical buffer replay; metadata LSN/UUID/CRC
+  stamping uses the short-btree layout. The recovery-only mount path permits
+  the rmapbt=1,reflink=0 profile for `xfswin recover` while ordinary
+  read-write mounts remain refused.
+* Pinned-tail wrap: a completion transaction that would wrap is refused when
+  the pinned recovery window reaches block 0/reserved space, instead of
+  overwriting unrecovered records.
+* `xfswin check` uses the typed reader; `xfswin rmap <image> [--ag N]` prints
+  verified records. `tests/unit/rw6b_tests.cpp` covers the merge/unmap/convert
+  matrices, RUI/RUD preflight and lifetime, allocator ownership round trips,
+  and a real in-memory tree that reaches level 3 (before=1, peak=3,
+  after-delete=2) through split/grow/merge/collapse.
+* `tests/tools/rw6b_rmap_probe.py` independently derives ownership from the
+  forward structures and checks the AGF btreeblks identity. It now runs on
+  Windows-formatted rmap images and is wired as a CI gate; a Linux-created
+  fixture job is also present.
 
-Not implemented yet: the RmapEditor/B+tree writer, owner-aware allocator and
-all mutation integration, RMB3 recovery recognition and RUI/RUD preflight or
-completion, crash matrices, Linux rmap fixtures, and Linux acceptance evidence.
-`CheckWritableProfile` still refuses rmapbt. This note must not be read as a
-claim that RW-6B is complete.
+Still required before the gate may open: genuine Linux-created rmap fixtures
+with Linux-originated mutations, surviving-RUI capture and completion evidence,
+the writer and recovery crash matrices, ENOSPC/log-reservation stress,
+reverse interoperability across repeated Linux/Windows passes, and real
+`xfs_repair -n`/`xfs_db`/`xfs_logprint` acceptance. The current unit tree is
+real but synthetic; it is not a substitute for those gates.
+`CheckWritableProfile` still refuses rmapbt for ordinary read-write mounts.
+This note must not be read as a claim that RW-6B is complete.
 
 ## 10. Independent ownership proof and acceptance gates
 
@@ -378,17 +418,22 @@ unexplained ownership. Do not rebuild rmapbt to mask writer bugs.
 Pending acceptance evidence (none implied by this research note):
 
 - [x] typed reader, key/record validation, lookup directions, CLI dump
-- [x] independent Python forward-derived ownership oracle (local smoke only)
-- [ ] owner-aware writer at every audited allocation/free/conversion site
-- [ ] real leaf/internal split, merge, borrow, root growth/collapse, height >1
+- [x] independent Python forward-derived ownership oracle
+- [x] RmapEditor logical and physical writer (unit matrix, real height 3)
+- [x] owner-aware writer at every audited allocation/free/conversion site
+- [x] RUI/RUD parser, shared-operation refusal, ordered lifetime, atomic RUD
+- [x] RMB3 buffer replay classification and recovery-only rmap profile
+- [x] pinned-tail wrap refusal when the recovery window reaches block 0
+- [ ] real leaf/internal split, merge, borrow, root growth/collapse on a
+      Linux-created fixture (the unit tree is not acceptance evidence)
 - [ ] Linux-created `rmapbt=1,reflink=0` + modern inode profile round trip
 - [ ] Linux -> Windows -> Linux -> Windows mutations and byte/namespace checks
 - [ ] genuine Linux dirty logs with committed surviving RUI (not synthetic-only)
-- [ ] MAP/UNMAP/CONVERT/ALLOC/FREE recovery completion, atomic RUD
+- [ ] MAP/UNMAP/CONVERT/ALLOC/FREE completion against the Linux fixture
 - [ ] writer crash matrix, both Linux and Windows replay oracles
-- [ ] recovery crash/restart matrix, no double-map/unmap, pinned-tail wrap
+- [ ] recovery crash/restart matrix, no double-map/unmap
 - [ ] shared-intent refusal with full-image before/after hashes
-- [ ] malformed tree/record/ownership matrix, no writes on refusal
+- [ ] malformed tree/record/ownership matrix on real fixtures, no writes
 - [ ] Linux mount + `xfs_repair -n` + xfs_db/logprint evidence and all regressions
 
 Only after these gates may `CheckWritableProfile` allow rmapbt. Reflink,

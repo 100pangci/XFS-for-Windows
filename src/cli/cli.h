@@ -26,6 +26,8 @@ struct Options {
   bool sparse_inodes = false;
   bool bigtime = false;
   bool nrext64 = false;
+  // RW-6B formatter/test profile: rmapbt=1, reflink=0.
+  bool rmapbt = false;
 };
 
 // Runs the CLI. argv excludes the program name.

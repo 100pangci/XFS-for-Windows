@@ -9,6 +9,7 @@
 // independent of the writer's positioning logic: the synthetic logs are built
 // from the on-disk format constants, so a bug shared with the writer cannot
 // hide behind them.
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -21,13 +22,16 @@
 #include "xfs/endian.h"
 #include "xfs/error.h"
 #include "xfs/filesystem.h"
+#include "xfs/formatter.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
 #include "xfs/log_format.h"
 #include "xfs/log_record.h"
 #include "xfs/ondisk.h"
 #include "xfs/recovery.h"
+#include "xfs/rmap.h"
 #include "xfs/superblock.h"
+#include "xfs/transaction.h"
 
 namespace {
 
@@ -355,13 +359,13 @@ TEST(recovery_scan_unsupported_item_refuses) {
   FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
   FillCycle(&log, 2, xfs::MakeLsn(2, 2), &next_tid);
 
-  // A committed RUI item (rmap update intent): known type, refused by this
-  // build's writable profile.
-  std::vector<uint8_t> rui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(rui.data(), 0, lf::kItemRui);
-  PutLE16At(rui.data(), 2, 1);  // one region
+  // A committed CUI item (refcount update intent) is still an unsupported
+  // semantic in this build.
+  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
+  PutLE16At(cui.data(), 0, lf::kItemCui);
+  PutLE16At(cui.data(), 2, 1);  // one region
   const uint32_t tid = next_tid;
-  auto ops = CommitOps(tid, {rui});
+  auto ops = CommitOps(tid, {cui});
   log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops);
 
   auto scan = log.Scan();
@@ -370,7 +374,7 @@ TEST(recovery_scan_unsupported_item_refuses) {
   CHECK(!scan.value().Recoverable());
   CHECK_EQ(scan.value().unsupported_items.size(), 1u);
   if (!scan.value().unsupported_items.empty()) {
-    CHECK(scan.value().unsupported_items[0].find("XFS_LI_RUI") !=
+    CHECK(scan.value().unsupported_items[0].find("XFS_LI_CUI") !=
           std::string::npos);
   }
 }
@@ -722,10 +726,10 @@ TEST(recovery_replay_cancel_table) {
 
 TEST(recovery_replay_refuses_unsupported_items) {
   SyntheticLog log;
-  std::vector<uint8_t> rui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(rui.data(), 0, lf::kItemRui);
-  PutLE16At(rui.data(), 2, 1);
-  auto ops = CommitOps(31, {rui});
+  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
+  PutLE16At(cui.data(), 0, lf::kItemCui);
+  PutLE16At(cui.data(), 2, 1);
+  auto ops = CommitOps(31, {cui});
   log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, ops);
 
   auto scan = log.Scan();
@@ -734,7 +738,7 @@ TEST(recovery_replay_refuses_unsupported_items) {
   auto replay = log.Replay(scan.value(), nullptr);
   CHECK(!replay.ok());
   if (!replay.ok()) {
-    CHECK(replay.error().message.find("XFS_LI_RUI") != std::string::npos);
+    CHECK(replay.error().message.find("XFS_LI_CUI") != std::string::npos);
   }
 }
 
@@ -971,6 +975,190 @@ TEST(recovery_of_a_clean_log_is_a_noop) {
   }
   fs.value().reset();
   fixture.Reset();
+}
+
+TEST(recovery_refuses_shared_or_malformed_rui_before_writes) {
+  for (int variant = 0; variant < 2; ++variant) {
+    xfstest::MemoryBlockDevice device(300ull << 20);
+    xfs::mkfs::FormatOptions options;
+    options.block_size = 4096;
+    options.inode_size = 512;
+    options.rmapbt = true;
+    options.quiet = true;
+    CHECK(xfs::mkfs::Format(device, options).ok());
+    auto sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(sb.ok());
+    if (!sb.ok()) return;
+    const xfs::XfsGeometry geo = xfs::MakeGeometry(sb.value());
+
+    auto position = xfs::ReadLogPosition(device, geo, sb.value());
+    CHECK(position.ok());
+    if (!position.ok()) return;
+    std::vector<uint8_t> rui(lf::kRuiFormatSize + lf::kRuiExtentSize, 0);
+    PutLE16At(rui.data(), 0, lf::kItemRui);
+    PutLE16At(rui.data(), 2, 1);
+    PutLE32At(rui.data(), lf::kIntentNextentsOffset, 1);
+    PutLE64At(rui.data(), lf::kIntentIdOffset, 0x5b6c + variant);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiOwnerOffset, 0,
+              sb.value().rootino);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartblockOffset, 0,
+              geo.AgFsb(0, 100));
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartoffOffset, 0, 0);
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiLenOffset, 0, 1);
+    uint32_t flags = lf::kRmapExtentMapShared;
+    if (variant == 1) {
+      flags = lf::kRmapExtentMap | (1u << 8);  // reserved flag bit
+    }
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiFlagsOffset, 0, flags);
+
+    xfs::LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x5b6c + variant;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = xfs::MakeLsn(position.value().cycle,
+                                   position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = xfs::BuildLogRecord(
+        params, CommitOps(0x5b6c + variant, {rui}));
+    CHECK(record.ok());
+    if (!record.ok()) return;
+    CHECK(device.Write(geo.FsbToByte(sb.value().logstart) +
+                           static_cast<uint64_t>(params.block) * 512,
+                       record.value().data(), record.value().size()));
+    CHECK(device.Flush());
+
+    const std::vector<uint8_t> pristine = device.bytes();
+    xfs::MountOptions mount_options;
+    mount_options.read_write = true;
+    mount_options.recovery_only = true;
+    mount_options.clean_log_after_recovery = true;
+    auto fs = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+        mount_options);
+    CHECK(!fs.ok());
+    if (!fs.ok()) {
+      CHECK(fs.error().message.find("RUI") != std::string::npos ||
+            fs.error().message.find("reflink") != std::string::npos ||
+            fs.error().message.find("reserved") != std::string::npos);
+    }
+    CHECK(device.bytes() == pristine);
+  }
+}
+
+TEST(recovery_mount_completes_surviving_rui_convert) {
+  // A Linux RUI that survives without a matching RUD must be completed by a
+  // normal transaction that logs the rmap buffers and the RUD together.
+  xfstest::MemoryBlockDevice device(300ull << 20);
+  xfs::mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.rmapbt = true;
+  options.quiet = true;
+  CHECK(xfs::mkfs::Format(device, options).ok());
+
+  auto sb0 = xfs::ReadSuperblock(device, 0, true);
+  CHECK(sb0.ok());
+  if (!sb0.ok()) return;
+  const xfs::XfsGeometry geo = xfs::MakeGeometry(sb0.value());
+  xfs::Allocation alloc;
+  {
+    // Allocate an unwritten extent and map it exactly as the writer does.
+    xfs::XfsTransaction txn;
+    xfs::BlockAllocator blocks(&txn, &device, &geo);
+    CHECK(blocks
+              .AllocateOwned(0, 4,
+                             xfs::RmapOwner::Data(sb0.value().rootino, 0x123,
+                                                  true),
+                             &alloc)
+              .ok());
+    CHECK(blocks.Commit().ok());
+    for (const xfs::TransactionWrite& write : txn.writes()) {
+      CHECK(device.Write(write.offset, write.data.data(),
+                         write.data.size()));
+    }
+    CHECK(device.Flush());
+  }
+
+  // Append a committed RUI/CONVERT (new state written) at the next log block.
+  {
+    auto position = xfs::ReadLogPosition(device, geo, sb0.value());
+    CHECK(position.ok());
+    if (!position.ok()) return;
+    std::vector<uint8_t> rui(lf::kRuiFormatSize + lf::kRuiExtentSize, 0);
+    PutLE16At(rui.data(), 0, lf::kItemRui);
+    PutLE16At(rui.data(), 2, 1);
+    PutLE32At(rui.data(), lf::kIntentNextentsOffset, 1);
+    PutLE64At(rui.data(), lf::kIntentIdOffset, 0x5b6b);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiOwnerOffset, 0,
+              sb0.value().rootino);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartblockOffset, 0,
+              alloc.fsb);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartoffOffset, 0,
+              0x123);
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiLenOffset, 0,
+              alloc.len);
+    // The intent describes the *new* state: converting the unwritten extent
+    // to written, so the UNWRITTEN bit is clear.
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiFlagsOffset, 0,
+              lf::kRmapExtentConvert);
+
+    xfs::LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x5b6b;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = xfs::MakeLsn(position.value().cycle,
+                                   position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = xfs::BuildLogRecord(params, CommitOps(0x5b6b, {rui}));
+    CHECK(record.ok());
+    if (!record.ok()) return;
+    CHECK(device.Write(geo.FsbToByte(sb0.value().logstart) +
+                           static_cast<uint64_t>(params.block) * 512,
+                       record.value().data(), record.value().size()));
+    CHECK(device.Flush());
+  }
+
+  xfs::MountOptions mount_options;
+  mount_options.read_write = true;
+  mount_options.recovery_only = true;
+  mount_options.clean_log_after_recovery = true;
+  auto fs = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&device), mount_options);
+  if (!fs.ok()) {
+    std::fprintf(stderr, "rui mount failed: %s\n", fs.error().Format().c_str());
+  }
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    CHECK_EQ(fs.value()->recovery_report()->replay.intents_pending, 1u);
+    CHECK_EQ(fs.value()->recovery_report()->intents_completed, 1u);
+  }
+  fs.value().reset();
+
+  auto sb = xfs::ReadSuperblock(device, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  const xfs::XfsGeometry after = xfs::MakeGeometry(sb.value());
+  const uint32_t agno = static_cast<uint32_t>(alloc.fsb >> after.agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(alloc.fsb & ((1ULL << after.agblklog) - 1));
+  auto tree = xfs::LoadRmapTree(device, after, agno, sb.value().lsn);
+  CHECK(tree.ok());
+  if (!tree.ok()) return;
+  auto rec = tree.value().LookupEq(
+      xfs::RmapKey{agbno, sb.value().rootino, 0x123, 0});
+  CHECK(rec.ok());
+  if (rec.ok()) {
+    CHECK_EQ(rec.value().blockcount, alloc.len);
+    CHECK(!rec.value().unwritten());
+  }
 }
 
 TEST(recovery_mount_finishes_extent_free_intents) {

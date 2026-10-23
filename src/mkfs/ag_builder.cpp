@@ -9,6 +9,7 @@
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/ondisk.h"
+#include "xfs/rmap.h"
 
 namespace xfs::mkfs::internal {
 namespace {
@@ -79,6 +80,11 @@ void BuildAgfImage(const FormatGeometry& geo, const FormatGeometry::AgState& ag,
   // xfs_repair counts free-space btree blocks except the roots; a fresh
   // filesystem has only roots, so this counter is zero.
   PutBE32(p, agf::kBtreeblks, 0);
+  if (geo.rmapbt) {
+    PutBE32(p, agf::kRmapRoot, geo.rmap_block);
+    PutBE32(p, agf::kRmapLevel, 1);
+    PutBE32(p, agf::kRmapBlocks, 1);
+  }
   std::memcpy(p + agf::kUuid, geo.meta_uuid.data(), 16);
   PutBE64(p, agf::kLsn, 0);
   UpdateXfsChecksum(p, geo.sector_size, agf::kCrc);
@@ -194,6 +200,89 @@ void BuildInobtRoot(const FormatGeometry& geo,
       PutBE32(rec, bt::kInobtRecFreecount, 61);
     }
     PutBE64(rec, 8, ~7ULL);          // ir_free: bits 0-2 used
+  }
+  FinishBtreeCrc(geo, buf);
+}
+
+void BuildRmapRoot(const FormatGeometry& geo,
+                   const FormatGeometry::AgState& ag,
+                   std::vector<uint8_t>* buf) {
+  struct Obs {
+    uint32_t start;
+    uint32_t len;
+    uint64_t owner;
+  };
+  std::vector<Obs> records;
+  const uint32_t static_len = geo.agfl_block + 1;
+  records.push_back({0, static_len, kRmapOwnerFs});
+  records.push_back({geo.bno_block, 1, kRmapOwnerAg});
+  records.push_back({geo.cnt_block, 1, kRmapOwnerAg});
+  records.push_back({geo.ibt_block, 1, kRmapOwnerInobt});
+  if (geo.finobt) records.push_back({geo.fibt_block, 1, kRmapOwnerInobt});
+  if (geo.rmapbt) records.push_back({geo.rmap_block, 1, kRmapOwnerAg});
+
+  // Active AGFL entries are owned by OWN_AG.  The formatter fills them from
+  // the start of free space, so they are contiguous; group anyway.
+  if (!ag.agfl.empty()) {
+    std::vector<uint32_t> entries = ag.agfl;
+    std::sort(entries.begin(), entries.end());
+    size_t i = 0;
+    while (i < entries.size()) {
+      const uint32_t start = entries[i];
+      size_t j = i + 1;
+      while (j < entries.size() && entries[j] == entries[j - 1] + 1) ++j;
+      records.push_back({start, static_cast<uint32_t>(j - i), kRmapOwnerAg});
+      i = j;
+    }
+  }
+  if (ag.has_inodes) {
+    records.push_back({ag.chunk_agbno, ag.chunk_blocks, kRmapOwnerInodes});
+  }
+  if (ag.agno == geo.log_agno) {
+    const uint32_t mask = (1u << geo.agblklog) - 1u;
+    records.push_back({static_cast<uint32_t>(geo.logstart) & mask,
+                       geo.logblocks, kRmapOwnerLog});
+  }
+  std::sort(records.begin(), records.end(), [](const Obs& a, const Obs& b) {
+    if (a.start != b.start) return a.start < b.start;
+    return a.owner < b.owner;
+  });
+  // mkfs emits canonical records: adjacent special-owner ranges belong to the
+  // same owner and are merged (all special owners have offset/flags zero).
+  std::vector<Obs> merged;
+  for (const Obs& r : records) {
+    if (!merged.empty() && merged.back().owner == r.owner &&
+        RmapNonInodeOwner(r.owner) &&
+        static_cast<uint64_t>(merged.back().start) +
+                merged.back().len ==
+            r.start) {
+      merged.back().len += r.len;
+      continue;
+    }
+    merged.push_back(r);
+  }
+  records = std::move(merged);
+
+  const uint32_t max_leaf =
+      static_cast<uint32_t>((geo.block_size - bt::kSHeaderLenV5) /
+                            bt::kRmapRecSize);
+  buf->assign(geo.block_size, 0);
+  InitBtreeHeader(geo, buf, ondisk::kRmapCrcMagic,
+                  static_cast<uint16_t>(records.size()), ag.agno,
+                  geo.rmap_block);
+  uint8_t* rec = buf->data() + bt::kSHeaderLenV5;
+  for (const Obs& r : records) {
+    PutBE32(rec, 0, r.start);
+    PutBE32(rec, 4, r.len);
+    PutBE64(rec, 8, r.owner);
+    PutBE64(rec, 16, 0);  // offset + flags: all formatter owners are special
+    rec += bt::kRmapRecSize;
+  }
+  if (records.size() > max_leaf) {
+    // The formatter profile only emits a single root leaf.  Refusing here is
+    // safer than writing an invalid tree; the tested geometries are far below
+    // this limit.
+    buf->assign(geo.block_size, 0);
   }
   FinishBtreeCrc(geo, buf);
 }

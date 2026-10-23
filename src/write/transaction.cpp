@@ -307,12 +307,35 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
   // record link stays valid (it points near the end of the log).
   if (static_cast<uint64_t>(log_position_.next_block) + kReservedRecordBlocks >
       log_position_.log_blocks) {
+    if (recovery_tail_pin_.has_value()) {
+      // The replayed window is still authoritative and must not be
+      // overwritten.  Wrapping to block 0 is only safe when the pinned tail
+      // starts after the reserved record space in the current cycle.  If the
+      // active window already crosses block 0, the completion transaction
+      // cannot be written until the intents are resolved; refusing is the
+      // only crash-safe answer.
+      const uint32_t pin_cycle =
+          static_cast<uint32_t>(*recovery_tail_pin_ >> 32);
+      const uint32_t pin_block = static_cast<uint32_t>(*recovery_tail_pin_);
+      if (pin_cycle != log_position_.cycle ||
+          pin_block < kReservedRecordBlocks) {
+        return XFS_ERR(XfsError::kNoSpace,
+                       "recovery tail is pinned inside the log wrap window; "
+                       "cannot append a completion transaction without "
+                       "overwriting unrecovered records")
+            .Expected(log_position_.cycle)
+            .Actual(pin_cycle)
+            .Metadata("log");
+      }
+    }
     XFS_DEBUG("log: wrapping to block 0 (cycle "
               << log_position_.cycle << " -> " << log_position_.cycle + 1
               << ")");
     ++log_position_.cycle;
     log_position_.next_block = 0;
-    log_position_.tail_lsn = MakeLsn(log_position_.cycle, 0);
+    if (!recovery_tail_pin_.has_value()) {
+      log_position_.tail_lsn = MakeLsn(log_position_.cycle, 0);
+    }
   }
 
   XfsTransaction txn;

@@ -114,6 +114,9 @@ bool ClassifyMetadata(const uint8_t* buf, size_t len, MetaType* out) {
     case ondisk::kBmapCrcMagic:
       *out = {"bmbt", ondisk::btree::kLLsn, ondisk::btree::kLCrc, true};
       return true;
+    case ondisk::kRmapCrcMagic:
+      *out = {"rmapbt", ondisk::btree::kSLsn, ondisk::btree::kSCrc, true};
+      return true;
     case ondisk::kDir3BlockMagic:
     case ondisk::kDir3DataMagic:
     case ondisk::kDir3FreeMagic:
@@ -189,6 +192,8 @@ int64_t OnDiskMetadataLsn(const uint8_t* buf, size_t len, const Uuid& meta_uuid,
         return ondisk::btree::kSUuid;
       case ondisk::kBmapCrcMagic:
         return ondisk::btree::kLUuid;
+      case ondisk::kRmapCrcMagic:
+        return ondisk::btree::kSUuid;
       case ondisk::kDir3BlockMagic:
       case ondisk::kDir3DataMagic:
       case ondisk::kDir3FreeMagic:
@@ -1126,8 +1131,12 @@ void Replayer::ReleaseIntent(const RecoveredItem& item) {
   // Host byte order, like every log item format.
   const uint64_t id =
       LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
-  const uint16_t want =
-      item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
+  uint16_t want = lf::kItemBui;
+  if (item.type == lf::kItemEfd) {
+    want = lf::kItemEfi;
+  } else if (item.type == lf::kItemRud) {
+    want = lf::kItemRui;
+  }
   for (auto it = intents_.begin(); it != intents_.end(); ++it) {
     if (it->type != want) continue;
     if (it->regions.empty() ||
