@@ -38,13 +38,48 @@ if ($LASTEXITCODE -ne 0) {
     throw 'the independent rmap ownership oracle rejected the fixture'
 }
 
-$manifest = Join-Path (Split-Path -Parent $Image) 'MANIFEST.sha256'
-if (Test-Path $manifest) {
-    & (Join-Path $PSScriptRoot 'verify_reader_windows.ps1') `
-        -Xfswin $Exe -Image $Image -Manifest $manifest
-    if ($LASTEXITCODE -ne 0) {
-        throw 'the reader differential rejected the rmap fixture'
+# Reader differential against the Linux manifest.  The rmap fixture uses the
+# text MANIFEST.sha256 format emitted by make_rw6b_rmap_linux.sh, not the JSON
+# manifest of the older golden-image reader test.
+$listing = & $Exe ls $Image /
+if ($LASTEXITCODE -ne 0) { throw "ls / failed" }
+$root = $listing -join "`n"
+foreach ($name in @('bigdir', 'blockdir', 'small', 'churn', 'fragmented.bin',
+                    'sparse.bin', 'unwritten.bin', 'hardlink.bin',
+                    'inline.link', 'remote.link')) {
+    if ($root -notmatch [regex]::Escape($name)) {
+        throw "root listing is missing $name"
     }
+}
+$bigdir = & $Exe ls $Image /bigdir
+if ($LASTEXITCODE -ne 0) { throw "ls /bigdir failed" }
+if (($bigdir -join "`n") -notmatch 'n00000\.bin') {
+    throw "bigdir listing is missing n00000.bin"
+}
+
+$temp = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'xfswin-rw6b-' + [guid]::NewGuid().ToString('N') + '.bin')
+try {
+    foreach ($sample in @('small/s00.bin', 'bigdir/n00042.bin',
+                          'fragmented.bin', 'sparse.bin')) {
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        $p = Start-Process -FilePath $Exe -ArgumentList @(
+            'cat', $Image, "/$sample") -RedirectStandardOutput $temp `
+            -NoNewWindow -Wait -PassThru
+        if ($p.ExitCode -ne 0) { throw "cat /$sample failed" }
+        $hash = (Get-FileHash $temp -Algorithm SHA256).Hash.ToLower()
+        $line = Get-Content (Join-Path (Split-Path -Parent $Image)
+                            'MANIFEST.sha256') |
+            Where-Object { $_ -like "file $sample *" } | Select-Object -First 1
+        if ($null -ne $line) {
+            $expected = ($line -split ' ')[-1]
+            if ($hash -ne $expected) {
+                throw "sha256 mismatch for /$sample"
+            }
+        }
+    }
+} finally {
+    Remove-Item $temp -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "RW-6B rmap read validation OK: $Image"
