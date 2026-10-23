@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <vector>
 
 #include "support/fixture_device.h"
@@ -980,6 +981,139 @@ TEST(rw6b_allocator_enospc_reservation_and_release) {
     CHECK(!tree.value()
                .LookupEq(RmapKey{agbno, image.rootino, run.offset, 0})
                .ok());
+  }
+}
+
+TEST(rw6b_allocator_random_churn_stays_consistent) {
+  WritableRmap image;
+  image.device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
+  mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.rmapbt = true;
+  options.quiet = true;
+  CHECK(mkfs::Format(*image.device, options).ok());
+  auto sb0 = ReadSuperblock(*image.device, 0, true);
+  CHECK(sb0.ok());
+  if (!sb0.ok()) return;
+  image.geo = MakeGeometry(sb0.value());
+  image.rootino = sb0.value().rootino;
+
+  struct Model {
+    Allocation allocation;
+    uint64_t owner;
+    uint64_t offset;
+    bool unwritten;
+  };
+  std::vector<Model> live;
+  uint64_t next_offset = 0;
+  std::mt19937 random_state(0x6b6b2026);
+  auto validate_models = [&]() {
+    for (uint32_t agno = 0; agno < image.geo.agcount; ++agno) {
+      auto tree = LoadRmapTree(*image.device, image.geo, agno);
+      CHECK(tree.ok());
+      if (!tree.ok()) return;
+    }
+    for (const Model& m : live) {
+      const uint32_t agno =
+          static_cast<uint32_t>(m.allocation.fsb >> image.geo.agblklog);
+      const uint32_t agbno =
+          static_cast<uint32_t>(m.allocation.fsb &
+                                ((1ULL << image.geo.agblklog) - 1));
+      auto tree = LoadRmapTree(*image.device, image.geo, agno);
+      if (!tree.ok()) {
+        CHECK(false);
+        return;
+      }
+      auto rec = tree.value().LookupEq(
+          RmapKey{agbno, m.owner, m.offset, 0});
+      CHECK(rec.ok());
+      if (rec.ok()) {
+        CHECK(rec.value().blockcount >= m.allocation.len);
+        CHECK_EQ(rec.value().unwritten(), m.unwritten);
+      }
+    }
+  };
+
+  for (uint32_t step = 0; step < 500; ++step) {
+    const uint32_t action = random_state() % 100;
+    if (live.empty() || (live.size() < 300 && action < 55)) {
+      const uint32_t index = static_cast<uint32_t>(random_state() % 4);
+      const uint64_t owner = image.rootino + index;
+      const uint64_t offset = next_offset;
+      next_offset += 64;
+      const bool unwritten = (random_state() & 1) != 0;
+      XfsTransaction txn;
+      BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+      Allocation a;
+      Status s = alloc.AllocateOwned(
+          0, 32, RmapOwner::Data(owner, offset, unwritten), &a);
+      if (!s.ok()) {
+        CHECK(s.error().code == XfsError::kNoSpace);
+        continue;
+      }
+      s = alloc.Commit();
+      CHECK(s.ok());
+      if (!s.ok()) break;
+      FlushTestTransaction(&image, &txn);
+      live.push_back(Model{a, owner, offset, unwritten});
+    } else if (action < 85) {
+      const size_t which = random_state() % live.size();
+      const Model m = live[which];
+      XfsTransaction txn;
+      BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+      Status s = alloc.FreeOwned(
+          m.allocation.fsb, m.allocation.len,
+          RmapOwner::Data(m.owner, m.offset, m.unwritten));
+      CHECK(s.ok());
+      if (!s.ok()) break;
+      s = alloc.Commit();
+      CHECK(s.ok());
+      if (!s.ok()) break;
+      FlushTestTransaction(&image, &txn);
+      live.erase(live.begin() + static_cast<ptrdiff_t>(which));
+    } else {
+      size_t which = static_cast<size_t>(random_state());
+      which %= live.size();
+      Model& m = live[which];
+      XfsTransaction txn;
+      BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+      Status s = alloc.ConvertOwned(
+          m.allocation.fsb, m.allocation.len,
+          RmapOwner::Data(m.owner, m.offset, m.unwritten), m.unwritten);
+      if (s.ok()) s = alloc.Commit();
+      CHECK(s.ok());
+      if (!s.ok()) break;
+      FlushTestTransaction(&image, &txn);
+      m.unwritten = !m.unwritten;
+    }
+    if ((step % 100) == 0) validate_models();
+  }
+  validate_models();
+
+  for (const Model& m : live) {
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    Status s = alloc.FreeOwned(
+        m.allocation.fsb, m.allocation.len,
+        RmapOwner::Data(m.owner, m.offset, m.unwritten));
+    CHECK(s.ok());
+    if (!s.ok()) break;
+    s = alloc.Commit();
+    CHECK(s.ok());
+    if (!s.ok()) break;
+    FlushTestTransaction(&image, &txn);
+  }
+  auto final_sb = ReadSuperblock(*image.device, 0, true);
+  CHECK(final_sb.ok());
+  if (!final_sb.ok()) return;
+  CHECK_EQ(final_sb.value().fdblocks, sb0.value().fdblocks);
+  for (uint32_t agno = 0; agno < image.geo.agcount; ++agno) {
+    auto agf = ReadAgf(*image.device, image.geo, agno);
+    CHECK(agf.ok());
+    if (!agf.ok()) continue;
+    auto tree = LoadRmapTree(*image.device, image.geo, agno);
+    CHECK(tree.ok());
   }
 }
 
