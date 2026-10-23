@@ -99,9 +99,11 @@ sync_dir(bigdir)
 # File with an unwritten extent and a later written extent.
 unwritten = os.path.join(root, "unwritten.bin")
 write(unwritten, b"")
-if os.system("xfs_io -f -c 'fallocate -u 0 1048576' '%s' >/dev/null" %
+# XFS fallocate (mode 0) creates unwritten extents.  Writing the tail below
+# leaves the first MiB unwritten.
+if os.system("xfs_io -f -c 'falloc 0 1048576' '%s' >/dev/null" %
              unwritten) != 0:
-    raise SystemExit("xfs_io fallocate -u failed")
+    raise SystemExit("xfs_io falloc failed")
 with open(unwritten, "r+b") as f:
     f.seek(2 * 1024 * 1024)
     f.write(b"written tail")
@@ -181,18 +183,18 @@ fi
 # would not exercise the writer's node paths.
 {
     echo "== AG0 AGF =="
-    xfs_db -r -c 'agf 0' -c 'p rmap_root rmap_level rmap_blocks btreeblks' "$IMG"
+    xfs_db -r -c 'agf 0' -c 'p rmaproot rmaplevel rmapblocks btreeblks' "$IMG"
     echo "== AG0 rmap root =="
-    xfs_db -r -c 'agf 0' -c 'addr rmap_root' -c 'p' "$IMG"
+    xfs_db -r -c 'agf 0' -c 'addr rmaproot' -c 'p' "$IMG"
     for ag in 0 1 2 3; do
         echo "== AG$ag rmap level/blocks =="
-        xfs_db -r -c "agf $ag" -c 'p rmap_root rmap_level rmap_blocks' "$IMG"
+        xfs_db -r -c "agf $ag" -c 'p rmaproot rmaplevel rmapblocks' "$IMG"
     done
 } > "$OUT/rmap.layout.txt"
 cat "$OUT/rmap.layout.txt"
 
-level=$(xfs_db -r -c 'agf 0' -c 'p rmap_level' "$IMG" |
-        sed -n 's/.*rmap_level = \([0-9][0-9]*\).*/\1/p')
+level=$(xfs_db -r -c 'agf 0' -c 'p rmaplevel' "$IMG" |
+        sed -n 's/.*rmaplevel = \([0-9][0-9]*\).*/\1/p')
 if [ -z "$level" ] || [ "$level" -lt 2 ]; then
     echo "fixture rmapbt did not reach level 2 (got '${level}')" >&2
     exit 1
