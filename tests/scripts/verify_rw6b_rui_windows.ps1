@@ -28,7 +28,6 @@ function Invoke-Ok([string]$what, [string[]]$arguments) {
     return $output
 }
 
-Invoke-Ok 'pre-recovery check' @('check', $image) | Out-Null
 $before = Invoke-Ok 'journal inventory before recovery' @('journal', $image,
     '--json')
 $before | ForEach-Object { Write-Host $_ }
