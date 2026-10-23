@@ -744,12 +744,14 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
     // those blocks (and their reverse mappings); refuse instead of corrupting
     // the ownership ledger.  Local attr data lives inside the inode chunk and
     // needs no separate free.
-    if (inode.value().HasAttrFork() &&
-        inode.value().aformat != di::kFormatLocal) {
+    if (inode.value().HasAttrFork() && inode.value().anextents != 0) {
+      // A nonzero di_forkoff with zero attr extents is a legal, empty attr
+      // fork (Linux creates it that way); only a fork with blocks needs the
+      // attr bmap/rmap free this milestone does not implement.
       return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "cannot free an inode with a non-local attribute fork")
+                     "cannot free an inode with allocated attribute extents")
           .Ino(ino)
-          .Actual(inode.value().aformat)
+          .Actual(inode.value().anextents)
           .Metadata("ifree");
     }
     // A symlink whose target lives in remote blocks is freed like Linux

@@ -59,6 +59,7 @@ if (($bigdir -join "`n") -notmatch 'n00000\.bin') {
 
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) (
     'xfswin-rw6b-' + [guid]::NewGuid().ToString('N') + '.bin')
+$manifestFile = Join-Path (Split-Path -Parent $Image) 'MANIFEST.sha256'
 try {
     foreach ($sample in @('small/s00.bin', 'bigdir/n00042.bin',
                           'fragmented.bin', 'sparse.bin')) {
@@ -68,8 +69,7 @@ try {
             -NoNewWindow -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "cat /$sample failed" }
         $hash = (Get-FileHash $temp -Algorithm SHA256).Hash.ToLower()
-        $line = Get-Content (Join-Path (Split-Path -Parent $Image)
-                            'MANIFEST.sha256') |
+        $line = Get-Content $manifestFile |
             Where-Object { $_ -like "file $sample *" } | Select-Object -First 1
         if ($null -ne $line) {
             $expected = ($line -split ' ')[-1]

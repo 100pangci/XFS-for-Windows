@@ -240,7 +240,13 @@ Windows may log forward map, free trees/counters and rmap buffers in **one**
 transaction rather than emulate Linux's deferred lock ordering. No metadata
 write occurs during build. Commit is log+commit -> durable flush -> metadata
 writeback -> flush. If the 32 KiB log budget cannot hold it, fail before
-writing; do not split an atomic namespace change.
+writing; do not split an atomic namespace change.  RUI completion adds the RUD
+before the allocator's final budget check, so an oversized completion is
+refused rather than half-written.  A Linux RUI may legally carry up to 16
+extents; if the resulting dirty rmap buffers exceed one 32 KiB record, recovery
+currently refuses after replay with the original tail pinned.  Supporting
+larger completion records (log extension headers, `XLOG_MAX_RECORD_BSIZE`)
+remains an acceptance item and must be proven on a genuine Linux RUI.
 
 Linux directly updates metadata allocation owners in allocator context via
 `xfs_rmap_alloc/free`. File fork map/unmap/convert and selected metadata work
