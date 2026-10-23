@@ -1681,6 +1681,11 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   for (const RecoveredTransaction& trans : scan.transactions) {
     for (const RecoveredItem& item : trans.items) {
       if (item.type == lf::kItemRui) {
+        if (!geo.features.rmapbt) {
+          scan.unsupported_items.push_back(
+              "RUI item present on a filesystem without rmapbt");
+          continue;
+        }
         if (item.regions.empty()) {
           scan.unsupported_items.push_back("RUI item has no format region");
           continue;
