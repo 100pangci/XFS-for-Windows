@@ -973,6 +973,8 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   uint64_t total_free = 0;
   uint64_t total_icount = 0;
   uint64_t total_ifree = 0;
+  bool rmap_seen = false;
+  bool rmap_clean = true;
   if (options.allocation_groups) {
     for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
       auto headers = ReadAgHeaders(dev, geo, agno);
@@ -1148,6 +1150,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         uint32_t rmap_blocks = 0;
         bool rmap_ok = true;
         if (live_sb.features.rmapbt) {
+          rmap_seen = true;
           // The generic WalkBtree cannot decode the overlapping tree's
           // interleaved low/high key pairs. The typed reader also validates
           // both child keys, record ownership and the AGF block counter.
@@ -1156,6 +1159,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
             report.Add("AG" + std::to_string(agno) + " rmapbt",
                        CheckStatus::kCorrupt, tree.error().Format());
             rmap_ok = false;
+            rmap_clean = false;
           } else {
             rmap_blocks = tree.value().blocks;
             report.Add("AG" + std::to_string(agno) + " rmapbt",
@@ -1492,6 +1496,13 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         }
       }
     }
+  }
+
+  if (rmap_seen) {
+    report.Add("rmapbt", rmap_clean ? CheckStatus::kOk : CheckStatus::kCorrupt,
+               rmap_clean
+                   ? "all AG reverse-mapping trees structurally clean"
+                   : "one or more AG reverse-mapping trees failed");
   }
 
   if (options.allocation_groups) {
