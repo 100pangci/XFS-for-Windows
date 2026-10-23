@@ -99,7 +99,9 @@ sync_dir(bigdir)
 # File with an unwritten extent and a later written extent.
 unwritten = os.path.join(root, "unwritten.bin")
 write(unwritten, b"")
-os.system("xfs_io -f -c 'fallocate -u 0 1048576' '%s' >/dev/null" % unwritten)
+if os.system("xfs_io -f -c 'fallocate -u 0 1048576' '%s' >/dev/null" %
+             unwritten) != 0:
+    raise SystemExit("xfs_io fallocate -u failed")
 with open(unwritten, "r+b") as f:
     f.seek(2 * 1024 * 1024)
     f.write(b"written tail")

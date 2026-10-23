@@ -379,6 +379,28 @@ TEST(recovery_scan_unsupported_item_refuses) {
   }
 }
 
+TEST(recovery_scan_orphan_rud_refuses) {
+  SyntheticLog log;
+  uint32_t next_tid = 1;
+  FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
+  std::vector<uint8_t> rud(lf::kRudFormatSize, 0);
+  PutLE16At(rud.data(), 0, lf::kItemRud);
+  PutLE16At(rud.data(), 2, 1);
+  PutLE64At(rud.data(), lf::kIntentIdOffset, 0xabc);
+  auto ops = CommitOps(next_tid, {rud});
+  log.WriteRecord(1, 62, 60, xfs::MakeLsn(1, 2), next_tid, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(!scan.value().Recoverable());
+  bool found = false;
+  for (const std::string& reason : scan.value().unsupported_items) {
+    if (reason.find("orphan RUD") != std::string::npos) found = true;
+  }
+  CHECK(found);
+}
+
 TEST(recovery_scan_keeps_every_item_of_a_transaction) {
   // Regression: a transaction with several items must keep all of them (the
   // kernel keeps a list of items on the recover transaction; closing one item
@@ -1124,6 +1146,7 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
     CHECK(device.Flush());
   }
 
+  const std::vector<uint8_t> dirty = device.bytes();
   xfs::MountOptions mount_options;
   mount_options.read_write = true;
   mount_options.recovery_only = true;
@@ -1141,6 +1164,99 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
     CHECK_EQ(fs.value()->recovery_report()->intents_completed, 1u);
   }
   fs.value().reset();
+
+  // Crash at every recovery write and restart: the existing RUI must not run
+  // twice, and the committed RUD must be replayed instead.
+  class LimitedDevice final : public xfs::BlockDevice {
+   public:
+    explicit LimitedDevice(xfs::BlockDevice* backing) : backing_(backing) {}
+    void FailAfter(uint64_t writes) { fail_after_ = writes; }
+    bool Read(uint64_t offset, void* buffer, size_t size) override {
+      return backing_->Read(offset, buffer, size);
+    }
+    bool Write(uint64_t offset, const void* buffer, size_t size) override {
+      if (writes_ >= fail_after_) {
+        last_error_ = "injected crash";
+        return false;
+      }
+      ++writes_;
+      return backing_->Write(offset, buffer, size);
+    }
+    bool Flush() override {
+      if (writes_ >= fail_after_) {
+        last_error_ = "injected crash";
+        return false;
+      }
+      return backing_->Flush();
+    }
+    uint64_t Size() const override { return backing_->Size(); }
+    uint32_t SectorSize() const override { return backing_->SectorSize(); }
+    const xfs::DeviceInfo& Info() const override { return backing_->Info(); }
+    void Close() override {}
+
+   private:
+    xfs::BlockDevice* backing_;
+    uint64_t fail_after_ = ~0ull;
+    uint64_t writes_ = 0;
+  };
+
+  uint64_t verified_cuts = 0;
+  for (uint64_t cut = 0; cut < 64; ++cut) {
+    device.bytes() = dirty;
+    bool crashed_early = false;
+    {
+      auto limited = std::make_unique<LimitedDevice>(&device);
+      limited->FailAfter(cut);
+      auto crashed = xfs::XfsFilesystem::Mount(std::move(limited),
+                                               mount_options);
+      crashed_early = !crashed.ok();
+    }
+    if (!crashed_early) break;
+    auto retry = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+        mount_options);
+    if (!retry.ok()) {
+      std::fprintf(stderr, "RUI restart after cut %llu failed: %s\n",
+                   static_cast<unsigned long long>(cut),
+                   retry.error().Format().c_str());
+      CHECK(retry.ok());
+      return;
+    }
+    // The final log position after a torn completion record can legitimately
+    // differ from the clean reference (stale blocks were trimmed first), so
+    // the crash oracle compares semantics: no pending RUI, the converted rmap
+    // record is present exactly once, and the log ends clean.
+    auto final_sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(final_sb.ok());
+    if (!final_sb.ok()) return;
+    auto final_scan =
+        xfs::ScanLog(device, final_sb.value(),
+                     xfs::MakeGeometry(final_sb.value()));
+    CHECK(final_scan.ok());
+    if (!final_scan.ok()) return;
+    CHECK(final_scan.value().Recoverable());
+    CHECK_EQ(xfs::CollectPendingIntents(final_scan.value()).size(), 0u);
+    CHECK(final_scan.value().state == xfs::LogState::kClean ||
+          final_scan.value().state == xfs::LogState::kEmpty);
+    auto final_geo = xfs::MakeGeometry(final_sb.value());
+    auto final_tree =
+        xfs::LoadRmapTree(device, final_geo,
+                          static_cast<uint32_t>(alloc.fsb >> final_geo.agblklog),
+                          final_sb.value().lsn);
+    CHECK(final_tree.ok());
+    if (!final_tree.ok()) return;
+    auto converted = final_tree.value().LookupEq(xfs::RmapKey{
+        static_cast<uint32_t>(alloc.fsb &
+                              ((1ULL << final_geo.agblklog) - 1)),
+        final_sb.value().rootino, 0x123, 0});
+    CHECK(converted.ok());
+    if (converted.ok()) {
+      CHECK_EQ(converted.value().blockcount, alloc.len);
+      CHECK(!converted.value().unwritten());
+    }
+    ++verified_cuts;
+  }
+  CHECK(verified_cuts >= 3);
 
   auto sb = xfs::ReadSuperblock(device, 0, true);
   CHECK(sb.ok());

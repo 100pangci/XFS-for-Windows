@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1698,6 +1699,41 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
         if (!parsed.ok()) {
           scan.unsupported_items.push_back(
               std::string("RUD preflight: ") + parsed.error().Format());
+        }
+      }
+    }
+  }
+
+  // Ordered RUI/RUD lifetime.  The requested RW-6B policy is stricter than
+  // Linux here: an orphan RUD (no earlier active RUI with the same id) refuses
+  // the recovery instead of being silently cancelled.  IDs can be reused after
+  // a matching RUD, so this is a set of currently active intents, not a global
+  // set of every id ever seen.
+  {
+    std::set<std::pair<uint16_t, uint64_t>> active;
+    for (const RecoveredTransaction& trans : scan.transactions) {
+      for (const RecoveredItem& item : trans.items) {
+        if (item.type != lf::kItemRui && item.type != lf::kItemRud) continue;
+        if (item.regions.empty() ||
+            item.regions[0].size() < lf::kIntentLogFormatSize) {
+          continue;  // already reported by the parser preflight
+        }
+        const uint64_t id = static_cast<uint64_t>(
+            LoadLE32(item.regions[0].data() + lf::kIntentIdOffset)) |
+            (static_cast<uint64_t>(LoadLE32(
+                 item.regions[0].data() + lf::kIntentIdOffset + 4))
+             << 32);
+        if (item.type == lf::kItemRui) {
+          active.insert({item.type, id});
+        } else {
+          auto it = active.find({lf::kItemRui, id});
+          if (it == active.end()) {
+            scan.unsupported_items.push_back(
+                "orphan RUD id=" + std::to_string(id) +
+                " has no earlier active RUI");
+          } else {
+            active.erase(it);
+          }
         }
       }
     }

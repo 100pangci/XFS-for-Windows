@@ -739,6 +739,19 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           .Ino(ino)
           .Metadata("ifree");
     }
+    // Attribute-fork mutation is outside RW-6B, but a Linux-created inode can
+    // carry attr extents/bmbt blocks.  Freeing only the data fork would leak
+    // those blocks (and their reverse mappings); refuse instead of corrupting
+    // the ownership ledger.  Local attr data lives inside the inode chunk and
+    // needs no separate free.
+    if (inode.value().HasAttrFork() &&
+        inode.value().aformat != di::kFormatLocal) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "cannot free an inode with a non-local attribute fork")
+          .Ino(ino)
+          .Actual(inode.value().aformat)
+          .Metadata("ifree");
+    }
     // A symlink whose target lives in remote blocks is freed like Linux
     // xfs_inactive_symlink_rmt: the inode is turned into a regular file (a
     // zero-length symlink must never be visible on disk) in the same

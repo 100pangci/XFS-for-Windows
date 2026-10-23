@@ -1294,7 +1294,11 @@ class RmapEditor::Impl {
       if (left != kNullAgBlock &&
           NumRecs(NodeAt(ag, left)) > minr) {
         BorrowLast(ag, left, frame.child);
-        ++stats_->borrow_leaf;
+        if (cur_level == 0) {
+          ++stats_->borrow_leaf;
+        } else {
+          ++stats_->borrow_node;
+        }
         if (frame.index > 0) RefreshEntry(ag, frame.parent, frame.index - 1);
         RefreshEntry(ag, frame.parent, frame.index);
         path.pop_back();
@@ -1304,7 +1308,11 @@ class RmapEditor::Impl {
       if (right != kNullAgBlock &&
           NumRecs(NodeAt(ag, right)) > minr) {
         BorrowFirst(ag, right, frame.child);
-        ++stats_->borrow_leaf;
+        if (cur_level == 0) {
+          ++stats_->borrow_leaf;
+        } else {
+          ++stats_->borrow_node;
+        }
         RefreshEntry(ag, frame.parent, frame.index);
         RefreshEntry(ag, frame.parent, frame.index + 1);
         path.pop_back();

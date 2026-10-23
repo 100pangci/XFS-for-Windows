@@ -50,8 +50,11 @@ struct RoCompatReason {
 };
 
 constexpr RoCompatReason kRoCompatReasons[] = {
-    // RW-6A maintains finobt and the AGI btree block counters. rmapbt and
-    // reflink still require metadata this writer does not maintain.
+    // RW-6A maintains finobt and the AGI btree block counters.  RW-6B has the
+    // rmapbt writer, but the ordinary read-write gate stays closed until the
+    // Linux/crash acceptance matrix is complete; only the recovery-only path
+    // (`allow_rmapbt_recovery`) may touch such an image.  Reflink remains
+    // entirely unsupported.
     {ondisk::kRoCompatRmapbt, "rmapbt",
      "the reverse mapping btree must track every allocation"},
     {ondisk::kRoCompatReflink, "reflink",

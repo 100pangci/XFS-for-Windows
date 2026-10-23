@@ -48,6 +48,13 @@ Result<RmapIntent> ParseRui(const std::vector<uint8_t>& format,
         .Actual(format.size())
         .Metadata("RUI");
   }
+  if (LoadLE16(format.data()) != lf::kItemRui ||
+      LoadLE16(format.data() + 2) != 1) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "RUI type or region count is invalid")
+        .Actual(LoadLE16(format.data() + 2))
+        .Metadata("RUI");
+  }
   const uint32_t nextents = LoadLE32At(format, lf::kIntentNextentsOffset);
   if (nextents == 0) {
     return XFS_ERR(XfsError::kCorruptBtree, "RUI has no extents")
@@ -177,6 +184,13 @@ Result<uint64_t> ParseRud(const std::vector<uint8_t>& format) {
     return XFS_ERR(XfsError::kCorruptBtree, "RUD item has the wrong size")
         .Expected(lf::kRudFormatSize)
         .Actual(format.size())
+        .Metadata("RUD");
+  }
+  if (LoadLE16(format.data()) != lf::kItemRud ||
+      LoadLE16(format.data() + 2) != 1) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "RUD type or region count is invalid")
+        .Actual(LoadLE16(format.data() + 2))
         .Metadata("RUD");
   }
   const uint32_t pad = LoadLE32At(format, 4);

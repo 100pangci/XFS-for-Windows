@@ -505,6 +505,14 @@ TEST(rw6b_rmap_editor_map_merge_matrix) {
   CHECK_EQ(both.value().blockcount, 30u);
   CHECK(!editor->LookupEq(0, RmapKey{310, ino, 310, 0}).ok());
 
+  // Metadata ownership helpers use the same editor and never accept an
+  // inode-shaped special owner.
+  CHECK(editor->AllocateMetadata(0, 5000, 4, kRmapOwnerInobt).ok());
+  CHECK(editor->LookupEq(0, RmapKey{5000, kRmapOwnerInobt, 0, 0}).ok());
+  CHECK(editor->FreeMetadata(0, 5000, 4, kRmapOwnerInobt).ok());
+  CHECK(!editor->LookupEq(0, RmapKey{5000, kRmapOwnerInobt, 0, 0}).ok());
+  CHECK(!editor->AllocateMetadata(0, 5100, 1, ino).ok());
+
   Republish(&image, editor.get());
   auto tree = LoadRmapTree(*image.device, image.geo, 0);
   CHECK(tree.ok());
