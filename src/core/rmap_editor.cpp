@@ -1342,6 +1342,9 @@ class RmapEditor::Impl {
         Status s = FreeTreeBlock(ag, frame.child);
         if (!s.ok()) return s;
         RemoveParentEntry(parent, frame.index);
+        // The left sibling absorbed the removed block's entries, so its own
+        // parent entry (low/high) must be refreshed before walking upward.
+        RefreshEntry(ag, frame.parent, frame.index - 1);
         path.pop_back();
         if (path.empty()) {
           // Parent is the root; check for collapse below.
@@ -1382,6 +1385,8 @@ class RmapEditor::Impl {
         Status s = FreeTreeBlock(ag, right);
         if (!s.ok()) return s;
         RemoveParentEntry(parent, frame.index + 1);
+        // The current block absorbed the right sibling's entries.
+        RefreshEntry(ag, frame.parent, frame.index);
         path.pop_back();
         if (path.empty()) {
           if (NumRecs(parent) == 1 && ag.level > 1) {

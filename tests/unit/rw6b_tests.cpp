@@ -868,6 +868,121 @@ TEST(rw6b_allocator_owned_rmap_roundtrip) {
   }
 }
 
+TEST(rw6b_allocator_enospc_reservation_and_release) {
+  WritableRmap image;
+  image.device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
+  mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.rmapbt = true;
+  options.quiet = true;
+  CHECK(mkfs::Format(*image.device, options).ok());
+  auto sb0 = ReadSuperblock(*image.device, 0, true);
+  CHECK(sb0.ok());
+  if (!sb0.ok()) return;
+  image.geo = MakeGeometry(sb0.value());
+  image.rootino = sb0.value().rootino;
+
+  uint64_t initial_contribution = 0;
+  for (uint32_t agno = 0; agno < image.geo.agcount; ++agno) {
+    auto agf = ReadAgf(*image.device, image.geo, agno);
+    CHECK(agf.ok());
+    if (!agf.ok()) return;
+    initial_contribution += static_cast<uint64_t>(agf.value().freeblks) +
+                            agf.value().flcount + agf.value().btreeblks;
+  }
+  const uint64_t initial_fdblocks = sb0.value().fdblocks;
+  CHECK_EQ(initial_contribution, initial_fdblocks);
+
+  struct OwnedRun {
+    Allocation allocation;
+    uint64_t offset;
+  };
+  std::vector<OwnedRun> runs;
+  bool hit_enospc = false;
+  for (uint32_t i = 0; i < 4000; ++i) {
+    const uint64_t offset = static_cast<uint64_t>(i) * 128;
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    Allocation a;
+    Status s = alloc.AllocateOwned(
+        0, 64, RmapOwner::Data(image.rootino, offset, false), &a);
+    if (!s.ok()) {
+      CHECK(s.error().code == XfsError::kNoSpace);
+      hit_enospc = true;
+      break;
+    }
+    s = alloc.Commit();
+    CHECK(s.ok());
+    if (!s.ok()) break;
+    FlushTestTransaction(&image, &txn);
+    runs.push_back(OwnedRun{a, offset});
+  }
+  CHECK(hit_enospc);
+  CHECK(runs.size() > 200);
+
+  // The failed transaction must not have written a half allocation.  Every
+  // committed rmap tree is still structurally valid.
+  for (uint32_t agno = 0; agno < image.geo.agcount; ++agno) {
+    auto tree = LoadRmapTree(*image.device, image.geo, agno);
+    CHECK(tree.ok());
+  }
+
+  for (const OwnedRun& run : runs) {
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    Status s = alloc.FreeOwned(
+        run.allocation.fsb, run.allocation.len,
+        RmapOwner::Data(image.rootino, run.offset, false));
+    if (!s.ok()) {
+      std::fprintf(stderr, "free run fsb=%llu len=%u off=%llu failed: %s\n",
+                   static_cast<unsigned long long>(run.allocation.fsb),
+                   run.allocation.len,
+                   static_cast<unsigned long long>(run.offset),
+                   s.error().Format().c_str());
+    }
+    CHECK(s.ok());
+    s = alloc.Commit();
+    if (!s.ok()) {
+      std::fprintf(stderr, "commit free run fsb=%llu len=%u off=%llu: %s\n",
+                   static_cast<unsigned long long>(run.allocation.fsb),
+                   run.allocation.len,
+                   static_cast<unsigned long long>(run.offset),
+                   s.error().Format().c_str());
+    }
+    CHECK(s.ok());
+    if (!s.ok()) break;
+    FlushTestTransaction(&image, &txn);
+  }
+
+  auto final_sb = ReadSuperblock(*image.device, 0, true);
+  CHECK(final_sb.ok());
+  if (!final_sb.ok()) return;
+  uint64_t final_contribution = 0;
+  for (uint32_t agno = 0; agno < image.geo.agcount; ++agno) {
+    auto agf = ReadAgf(*image.device, image.geo, agno);
+    CHECK(agf.ok());
+    if (!agf.ok()) return;
+    final_contribution += static_cast<uint64_t>(agf.value().freeblks) +
+                          agf.value().flcount + agf.value().btreeblks;
+  }
+  CHECK_EQ(final_contribution, initial_contribution);
+  CHECK_EQ(final_sb.value().fdblocks, initial_fdblocks);
+  for (const OwnedRun& run : runs) {
+    const uint32_t agno =
+        static_cast<uint32_t>(run.allocation.fsb >> image.geo.agblklog);
+    const uint32_t agbno =
+        static_cast<uint32_t>(run.allocation.fsb &
+                              ((1ULL << image.geo.agblklog) - 1));
+    auto tree = LoadRmapTree(*image.device, image.geo, agno);
+    CHECK(tree.ok());
+    if (!tree.ok()) continue;
+    CHECK(!tree.value()
+               .LookupEq(RmapKey{agbno, image.rootino, run.offset, 0})
+               .ok());
+  }
+}
+
 TEST(rw6b_rmap_editor_tree_split_grow_merge_collapse) {
   WritableRmap image = BuildWritableRmap();
   auto editor = LoadEditor(&image);
@@ -913,8 +1028,20 @@ TEST(rw6b_rmap_editor_tree_split_grow_merge_collapse) {
   const uint32_t after_level = editor->Level(0);
   std::printf("rw6b rmapbt levels: peak=%u after-delete=%u, blocks after=%u\n",
               peak_level, after_level, editor->Blocks(0));
+  std::printf("rw6b rmapbt edits: split_leaf=%llu split_node=%llu "
+              "merge_leaf=%llu merge_node=%llu borrow_leaf=%llu "
+              "borrow_node=%llu grow=%llu collapse=%llu\n",
+              static_cast<unsigned long long>(editor->stats().split_leaf),
+              static_cast<unsigned long long>(editor->stats().split_node),
+              static_cast<unsigned long long>(editor->stats().merge_leaf),
+              static_cast<unsigned long long>(editor->stats().merge_node),
+              static_cast<unsigned long long>(editor->stats().borrow_leaf),
+              static_cast<unsigned long long>(editor->stats().borrow_node),
+              static_cast<unsigned long long>(editor->stats().root_grow),
+              static_cast<unsigned long long>(editor->stats().root_collapse));
   CHECK(editor->stats().merge_leaf > 0);
   CHECK(editor->stats().merge_node > 0);
+  CHECK(editor->stats().borrow_leaf > 0 || editor->stats().borrow_node > 0);
   CHECK(editor->stats().root_collapse > 0);
   CHECK(after_level < peak_level);
 
