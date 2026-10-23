@@ -436,6 +436,25 @@ Pending acceptance evidence (none implied by this research note):
 - [ ] malformed tree/record/ownership matrix on real fixtures, no writes
 - [ ] Linux mount + `xfs_repair -n` + xfs_db/logprint evidence and all regressions
 
+### Current external evidence (not yet a completed gate)
+
+The `linux-generate-rw6b-rmap` CI job created a real 2 GiB
+`rmapbt=1,reflink=0` filesystem with the modern inode profile and populated it
+with written/unwritten/fragmented/sparse files, bmbt-format inodes,
+short/block/leaf/node directories, hard links, inline/remote symlinks, inode
+churn and sparse chunks. `xfs_repair -n` accepted it. Its rmapbt reached height
+2 (AG0 11 blocks, AG1 1, AG2 32, AG3 39; AG0 `agf_btreeblks = 10`). The
+independent forward-derived oracle then matched every record:
+
+```
+AG 0: 1351/1351, AG 1: 87/87, AG 2: 5163/5163, AG 3: 4186/4186
+missing 0, unexpected 0, overlap 0, owner errors 0
+```
+
+This proves the reader/oracle against a Linux-created multi-level overlapping
+tree. It does **not** yet prove Windows mutation, crash recovery, or reverse
+interoperability; those remain unchecked below.
+
 Only after these gates may `CheckWritableProfile` allow rmapbt. Reflink,
 refcountbt, CoW, realtime, external log, quota/xattr/parent mutation, metadir
 and zoned XFS remain outside this milestone. Formatter support is lower
