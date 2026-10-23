@@ -54,7 +54,7 @@ void PrintUsage() {
       "  list                          list physical disks (with safety info)\n"
       "  info <device|image>           show superblock and geometry\n"
       "  check <device|image>          read-only consistency validation\n"
-      "  rmap <device|image> [--ag N]  human-readable reverse mappings\n"
+      "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
       "  recover <image>               replay the journal (RW-5)\n"
       "      --yes-i-really-mean-it    required: recovery writes metadata\n"
       "  journal <device|image>        dump the internal log structure\n"
@@ -1808,7 +1808,7 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "rmap") {
     if (positional.size() != 2) {
-      std::cerr << "usage: xfswin rmap <device|image> [--ag N]\n";
+      std::cerr << "usage: xfswin rmap <device|image> [--ag=N]\n";
       return 1;
     }
     return CommandRmap(positional[1], rmap_ag);

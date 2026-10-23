@@ -166,6 +166,8 @@ with open(manifest, "w", encoding="utf-8") as out:
 PY
 
 sync
+# Keep a host-side copy for the Windows reader differential.
+cp "$MOUNT/MANIFEST.sha256" "$OUT/MANIFEST.sha256"
 umount "$MOUNT"
 losetup -d "$LOOP"
 LOOP=""

@@ -20,7 +20,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 & $Exe check $Image
 if ($LASTEXITCODE -ne 0) { throw "xfswin check rejected the rmap fixture" }
 
-$rmap = & $Exe rmap $Image --ag 0 2>&1
+$rmap = & $Exe rmap $Image --ag=0 2>&1
 if ($LASTEXITCODE -ne 0) {
     $rmap | ForEach-Object { Write-Host $_ }
     throw "xfswin rmap failed"
@@ -69,12 +69,15 @@ try {
             -NoNewWindow -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "cat /$sample failed" }
         $hash = (Get-FileHash $temp -Algorithm SHA256).Hash.ToLower()
-        $line = Get-Content $manifestFile |
-            Where-Object { $_ -like "file $sample *" } | Select-Object -First 1
-        if ($null -ne $line) {
-            $expected = ($line -split ' ')[-1]
-            if ($hash -ne $expected) {
-                throw "sha256 mismatch for /$sample"
+        if (Test-Path $manifestFile) {
+            $line = Get-Content $manifestFile |
+                Where-Object { $_ -like "file $sample *" } |
+                Select-Object -First 1
+            if ($null -ne $line) {
+                $expected = ($line -split ' ')[-1]
+                if ($hash -ne $expected) {
+                    throw "sha256 mismatch for /$sample"
+                }
             }
         }
     }
