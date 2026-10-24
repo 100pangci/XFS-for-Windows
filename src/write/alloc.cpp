@@ -215,6 +215,9 @@ struct AgState {
   bool agfl_dirty = false;
 
   uint32_t flfirst = 0, fllast = 0, flcount = 0;
+  // Tree shrink can return more blocks than fit in the active AGFL. Keep
+  // overflow transaction-local until ownership edits can safely drain it.
+  std::vector<uint32_t> deferred_tree_blocks;
   uint32_t freeblks = 0;
   uint32_t longest = 0;
   uint32_t orig_freeblks = 0, orig_flcount = 0, orig_btreeblks = 0;
@@ -239,6 +242,7 @@ struct AgState {
   Status RefillAgflRaw(uint32_t want, std::vector<FreeRec>* added);
   // Moves AGFL entries back to ordinary free space, removing OWN_AG first.
   Status DrainAgfl(uint32_t count);
+  Status DrainDeferredTreeBlocks();
   Status AllocateBestFit(uint32_t want, const RmapOwner* owner,
                          Allocation* out);
   Status AllocateAligned(uint32_t want, uint32_t align,
@@ -1234,32 +1238,42 @@ Status AgState::GetTreeBlock(uint32_t* agbno) {
 }
 
 Status AgState::PutTreeBlock(uint32_t agbno) {
-  if (flcount >= agfl_size) {
-    if (owner->rmap_editing()) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "AGFL is full during an rmap edit")
-          .Ag(agno)
-          .Metadata("AGFL");
-    }
-    Status s = DrainAgfl(1);
-    if (!s.ok()) return s;
-    if (flcount >= agfl_size) {
-      return XFS_ERR(XfsError::kUnsupportedFeature, "AGFL is full")
-          .Ag(agno)
-          .Metadata("AGFL");
-    }
-  }
   if (agbno >= length) {
     return XFS_ERR(XfsError::kInternal, "freeing an out of range AGFL block")
         .Ag(agno)
         .Metadata("AGFL")
         .Actual(agbno);
   }
+  if (flcount >= agfl_size) {
+    // Never recurse into OWN_AG unmap while the rmap editor is rebalancing.
+    // Ownership stays OWN_AG until Commit drains the overflow, before any
+    // tree/header publication or free-space counter calculation.
+    deferred_tree_blocks.push_back(agbno);
+    agf_dirty = true;
+    return OkStatus();
+  }
   fllast = (fllast + 1) % agfl_size;
   PutBE32(agfl_buf.data(), kAgflHeaderSize + fllast * 4, agbno);
   flcount++;
   agfl_dirty = true;
   agf_dirty = true;
+  return OkStatus();
+}
+
+Status AgState::DrainDeferredTreeBlocks() {
+  while (!deferred_tree_blocks.empty()) {
+    if (flcount >= agfl_size) {
+      Status s = DrainAgfl(1);
+      if (!s.ok()) return s;
+      // Unmapping the drained block can itself shrink rmap and return more
+      // tree blocks. Iterate to a fixed point rather than recurse.
+      continue;
+    }
+    const uint32_t agbno = deferred_tree_blocks.back();
+    deferred_tree_blocks.pop_back();
+    Status s = PutTreeBlock(agbno);
+    if (!s.ok()) return s;
+  }
   return OkStatus();
 }
 
@@ -1331,14 +1345,17 @@ Status AgState::DrainAgfl(uint32_t count) {
           .Actual(agb)
           .Metadata("AGFL");
     }
-    if (owner->rmap_enabled()) {
-      Status s = owner->UnmapMetadata(agno, agb, 1, kRmapOwnerAg);
-      if (!s.ok()) return s;
-    }
+    // Remove it from the active ring before editing OWN_AG: an unmap can
+    // split rmap and allocate a tree block, which must not pop this same block
+    // while it is being returned to ordinary free space.
     flfirst = (flfirst + 1) % agfl_size;
     flcount--;
     agfl_dirty = true;
     agf_dirty = true;
+    if (owner->rmap_enabled()) {
+      Status s = owner->UnmapMetadata(agno, agb, 1, kRmapOwnerAg);
+      if (!s.ok()) return s;
+    }
 
     // Return the block to ordinary free space, merging both neighbours.
     FreeRec left;
@@ -1782,6 +1799,13 @@ Status Allocator::AddBuffer(uint64_t offset, std::vector<uint8_t> data,
 }
 
 Status Allocator::Commit() {
+  // Settle every transaction-local tree return before rmap buffers are
+  // published. Draining can edit the free trees and rmap, including further
+  // merges/returns, but never rebuilds either tree.
+  for (auto& entry : ags_) {
+    Status s = entry.second->DrainDeferredTreeBlocks();
+    if (!s.ok()) return s;
+  }
   if (rmap_) {
     // Publish rmap tree blocks before the AGF that points at their new root.
     // Both are part of the same buffer-logging transaction; publication order

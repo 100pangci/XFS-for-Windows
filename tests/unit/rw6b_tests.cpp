@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "support/fixture_device.h"
@@ -925,6 +926,93 @@ TEST(rw6b_allocator_agfl_refill_updates_longest_without_data_allocation) {
     CHECK_EQ(after.value().longest, longest);
     if (rmapbt) CHECK(LoadRmapTree(*image.device, image.geo, 0).ok());
   }
+}
+
+TEST(rw6b_allocator_large_rmap_shrink_drains_agfl_overflow) {
+  WritableRmap image;
+  image.device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
+  mkfs::FormatOptions options;
+  options.block_size = 1024;
+  options.inode_size = 512;
+  options.rmapbt = true;
+  options.quiet = true;
+  CHECK(mkfs::Format(*image.device, options).ok());
+  auto original = ReadSuperblock(*image.device, 0, true);
+  CHECK(original.ok());
+  image.geo = MakeGeometry(original.value());
+  image.rootino = original.value().rootino;
+  std::vector<Allocation> runs;
+  {
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    for (uint32_t i = 0; i < 3000; ++i) {
+      Allocation run;
+      CHECK(alloc.AllocateFromAgOwned(0, 1, 1,
+          RmapOwner::Data(image.rootino, i * 2), &run).ok());
+      runs.push_back(run);
+    }
+    CHECK(alloc.Commit().ok());
+    FlushTestTransaction(&image, &txn);
+  }
+  auto peak = LoadRmapTree(*image.device, image.geo, 0);
+  CHECK(peak.ok());
+  CHECK(peak.value().blocks > AgflSize(image.geo));
+  {
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    for (uint32_t i = 0; i < runs.size(); ++i) {
+      Status freed = alloc.FreeOwned(runs[i].fsb, 1,
+          RmapOwner::Data(image.rootino, i * 2));
+      if (!freed.ok()) ::xfstest::Fail(__FILE__, __LINE__, freed.error().Format());
+    }
+    Status committed = alloc.Commit();
+    if (!committed.ok()) ::xfstest::Fail(__FILE__, __LINE__, committed.error().Format());
+    FlushTestTransaction(&image, &txn);
+  }
+  auto final = ReadSuperblock(*image.device, 0, true);
+  CHECK(final.ok());
+  CHECK_EQ(final.value().fdblocks, original.value().fdblocks);
+  auto tree = LoadRmapTree(*image.device, image.geo, 0);
+  CHECK(tree.ok());
+  CHECK(tree.value().blocks < peak.value().blocks);
+  auto ag = ReadAgf(*image.device, image.geo, 0);
+  CHECK(ag.ok());
+  CHECK(ag.value().flcount <= AgflSize(image.geo));
+  auto ring = ReadAgfl(*image.device, image.geo, 0, AgflSize(image.geo));
+  CHECK(ring.ok());
+  // No overflow block may remain unexplained after Commit. Derive OWN_AG
+  // from reachable forward tree blocks and active AGFL slots, not records.
+  std::set<uint32_t> expected;
+  std::vector<uint32_t> stack = {ag.value().bno_root, ag.value().cnt_root,
+                                  ag.value().rmap_root};
+  while (!stack.empty()) {
+    const uint32_t block = stack.back();
+    stack.pop_back();
+    CHECK(expected.insert(block).second);
+    std::vector<uint8_t> data(image.geo.block_size);
+    CHECK(image.device->Read(image.geo.FsbToByte(image.geo.AgFsb(0, block)),
+                             data.data(), data.size()));
+    if (!GetBE16(data.data(), bt::kLevel)) continue;
+    const bool rmap = GetBE32(data.data()) == ondisk::kRmapCrcMagic;
+    const uint32_t maxrecs = (image.geo.block_size - bt::kSHeaderLenV5) /
+                            (rmap ? 44 : 12);
+    const size_t ptrs = bt::kSHeaderLenV5 + maxrecs * (rmap ? 40 : 8);
+    for (uint16_t i = 0; i < GetBE16(data.data(), bt::kNumrecs); ++i) {
+      stack.push_back(GetBE32(data.data(), ptrs + i * 4));
+    }
+  }
+  for (uint32_t i = 0; i < ag.value().flcount; ++i) {
+    const uint32_t slot = (ag.value().flfirst + i) % AgflSize(image.geo);
+    CHECK(expected.insert(ring.value().entries[slot]).second);
+  }
+  std::set<uint32_t> actual;
+  for (const RmapRecord& record : tree.value().records) {
+    if (record.key.owner != kRmapOwnerAg) continue;
+    for (uint32_t i = 0; i < record.blockcount; ++i) {
+      CHECK(actual.insert(record.key.startblock + i).second);
+    }
+  }
+  CHECK(actual == expected);
 }
 
 TEST(rw6b_allocator_enospc_reservation_and_release) {

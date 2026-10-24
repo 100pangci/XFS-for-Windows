@@ -655,3 +655,25 @@ was disabled. The regression accepts the connected multi-child bmbt and
 rejects broken forward/backward links, a nonterminating edge and repeated
 root pointers. The original failing image then passes `check` without any
 image modification; the full structural and Linux pass must still be rerun.
+
+### Large shrink and a full AGFL
+
+The 10,000-record pass subsequently completed growth and removal of the
+alternating-owner B file, but the final A unlink returned `AGFL is full during
+an rmap edit`. Shrink can return more tree blocks than the AGFL ring holds;
+recursively draining OWN_AG inside a running rmap edit is not safe.
+
+Overflow tree returns now stay transaction-local with unchanged OWN_AG
+ownership. Before Commit publishes any rmap/header buffer or computes the
+counter delta, it drains active AGFL entries to ordinary free space and puts
+the overflow blocks onto the ring, iterating through any further rmap merges
+until there are no deferred blocks. Both free trees and rmap are edited
+incrementally. The drained entry is popped **before** its ownership unmap so
+an unmap-induced split cannot allocate the very block being drained.
+
+The regression grows more rmap blocks than the ring capacity, frees 3000
+nonmergeable allocations, and checks exact fdblocks conservation and exact
+OWN_AG coverage derived from reachable bno/cnt/rmap tree blocks plus active
+AGFL slots. The original failed unlink image also recovers its one unlinked
+inode, then passes check and the independent forward oracle with this fix.
+The fresh structural pass and full Linux/crash CI still must confirm it.
