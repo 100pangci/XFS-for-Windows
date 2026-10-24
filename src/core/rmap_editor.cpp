@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "xfs/endian.h"
+#include "xfs/log.h"
 #include "xfs/ondisk.h"
 
 namespace xfs {
@@ -1727,7 +1728,23 @@ const std::vector<RmapRecord>& RmapEditor::Records(uint32_t agno) const {
 uint32_t RmapEditor::ReserveBlocks(uint32_t agno) const {
   return impl_->ReserveBlocks(agno);
 }
-Status RmapEditor::Commit() { return impl_->Commit(); }
+Status RmapEditor::Commit() {
+  Status status = impl_->Commit();
+  if (status.ok() && (stats_.split_leaf || stats_.split_node ||
+                     stats_.merge_leaf || stats_.merge_node ||
+                     stats_.borrow_leaf || stats_.borrow_node ||
+                     stats_.root_grow || stats_.root_collapse)) {
+    XFS_INFO("rmap edits: split_leaf=" << stats_.split_leaf
+             << " split_node=" << stats_.split_node
+             << " merge_leaf=" << stats_.merge_leaf
+             << " merge_node=" << stats_.merge_node
+             << " borrow_leaf=" << stats_.borrow_leaf
+             << " borrow_node=" << stats_.borrow_node
+             << " root_grow=" << stats_.root_grow
+             << " root_collapse=" << stats_.root_collapse);
+  }
+  return status;
+}
 Status RmapEditor::Verify(uint32_t agno) const { return impl_->Verify(agno); }
 
 }  // namespace xfs

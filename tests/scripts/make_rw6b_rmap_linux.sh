@@ -203,3 +203,14 @@ if [ -z "$level" ] || [ "$level" -lt 2 ]; then
 fi
 
 echo "wrote $IMG"
+
+# A second genuine Linux fixture makes internal rmap splits affordable to
+# exercise: 1 KiB blocks give max_leaf=40, max_node=22. This does not replace
+# the populated 2 GiB/4 KiB fixture above.
+tree_img="$OUT/rmap-tree.img"
+truncate -s 512M "$tree_img"
+mkfs.xfs -f -b size=1024 -n size=1024 \
+    -m crc=1,rmapbt=1,reflink=0,finobt=1,inobtcount=1,bigtime=1 \
+    -i sparse=1,nrext64=1 "$tree_img"
+xfs_repair -n "$tree_img" > "$OUT/rmap-tree.repair.txt" 2>&1
+python3 "$(cd "$(dirname "$0")/../.." && pwd)/tests/tools/rw6b_rmap_probe.py" "$tree_img"

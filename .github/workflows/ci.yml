@@ -497,6 +497,64 @@ jobs:
             -Exe "bin\xfswin.exe" -Image "rw6b\rmap.img"
           if ($LASTEXITCODE -ne 0) { throw "RW-6B Windows read validation failed" }
 
+      - name: Refuse malformed Linux rmap metadata without writes
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_refusal_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b\rmap.img" --kind metadata --work-dir rw6b-refusals
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B metadata refusal matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-metadata-refusals
+          path: rw6b-refusals/refusals.json
+          if-no-files-found: error
+
+  windows-rw6b-tree:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+      - name: Exercise actual rmap internal splits and collapse
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_tree_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b\rmap-tree.img" --work-dir rw6b-tree
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B real-image tree matrix failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-tree
+          path: rw6b-tree/
+          if-no-files-found: error
+
+  linux-verify-rw6b-tree:
+    needs: windows-rw6b-tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-tree
+          path: rw6b-tree
+      - run: sudo apt-get update && sudo apt-get install -y xfsprogs
+      - name: Verify the grown and collapsed Linux-origin tree
+        run: |
+          for image in rw6b-tree/*.img; do
+            sudo bash tests/scripts/verify_windows_image_linux.sh "$image"
+            python3 tests/tools/rw6b_rmap_probe.py "$image"
+          done
+          cat rw6b-tree/tree.json
+
   # ---------------------------------------------------------------------------
   # RW-6B: Windows mutates the Linux-created rmapbt image through the ordinary
   # writer API (hidden qualification flag; the public gate stays closed).  The
@@ -858,6 +916,14 @@ jobs:
             -Exe "bin\xfswin.exe" -SourceImage "rw6b-rui\rui.img" `
             -WorkDir "rw6b-recovered"
           if ($LASTEXITCODE -ne 0) { throw "RW-6B surviving-RUI recovery failed" }
+
+      - name: Refuse shared RUI operations without writes
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_refusal_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b-rui\rui.img" --kind shared-rui `
+            --work-dir rw6b-recovered/shared-refusals
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B shared-RUI refusal matrix failed" }
 
       - uses: actions/upload-artifact@v4
         with:
