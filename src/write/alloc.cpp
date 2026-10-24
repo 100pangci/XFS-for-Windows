@@ -1314,6 +1314,10 @@ Status AgState::RefillAgflRaw(uint32_t want, std::vector<FreeRec>* added) {
     if (added != nullptr) added->push_back(FreeRec{old.start, take});
   }
   refilling = false;
+  // Refill removes blocks from the free trees even when no data allocation
+  // follows (e.g. RUI completion). Keep the AGF maximum in sync with recs;
+  // callers must not have to perform a later Allocate/Free to refresh it.
+  RecomputeLongest();
   return result;
 }
 

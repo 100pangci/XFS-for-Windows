@@ -869,6 +869,61 @@ TEST(rw6b_allocator_owned_rmap_roundtrip) {
   }
 }
 
+TEST(rw6b_allocator_agfl_refill_updates_longest_without_data_allocation) {
+  for (bool rmapbt : {false, true}) {
+    WritableRmap image;
+    image.device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
+    mkfs::FormatOptions options;
+    options.block_size = 4096;
+    options.inode_size = 512;
+    options.rmapbt = rmapbt;
+    options.quiet = true;
+    CHECK(mkfs::Format(*image.device, options).ok());
+    auto super = ReadSuperblock(*image.device, 0, true);
+    CHECK(super.ok());
+    image.geo = MakeGeometry(super.value());
+    auto before = ReadAgf(*image.device, image.geo, 0);
+    CHECK(before.ok());
+
+    // A recovery intent can replenish the AGFL without allocating file data.
+    // No later Allocate/Free call will recompute longest on its behalf.
+    XfsTransaction txn;
+    BlockAllocator alloc(&txn, image.device.get(), &image.geo);
+    CHECK(alloc.EnsureAgfl(0, before.value().flcount + 1).ok());
+    CHECK(alloc.Commit().ok());
+    FlushTestTransaction(&image, &txn);
+
+    auto after = ReadAgf(*image.device, image.geo, 0);
+    CHECK(after.ok());
+    CHECK(after.value().freeblks < before.value().freeblks);
+    CHECK(after.value().longest < before.value().longest);
+    CHECK_EQ(after.value().freeblks + after.value().flcount +
+                 after.value().btreeblks,
+             before.value().freeblks + before.value().flcount +
+                 before.value().btreeblks);
+    CHECK_EQ(alloc.fdblocks_delta(), 0);
+
+    // Derive the counters from the actual forward free-space leaf, not rmap.
+    CHECK_EQ(after.value().bno_level, 1u);
+    std::vector<uint8_t> leaf(image.geo.block_size, 0);
+    CHECK(image.device->Read(
+        image.geo.FsbToByte(image.geo.AgFsb(0, after.value().bno_root)),
+        leaf.data(), leaf.size()));
+    uint32_t sum = 0;
+    uint32_t longest = 0;
+    const uint16_t count = GetBE16(leaf.data(), bt::kNumrecs);
+    for (uint16_t i = 0; i < count; ++i) {
+      const uint32_t len =
+          GetBE32(leaf.data(), bt::kSHeaderLenV5 + i * 8 + 4);
+      sum += len;
+      longest = std::max(longest, len);
+    }
+    CHECK_EQ(after.value().freeblks, sum);
+    CHECK_EQ(after.value().longest, longest);
+    if (rmapbt) CHECK(LoadRmapTree(*image.device, image.geo, 0).ok());
+  }
+}
+
 TEST(rw6b_allocator_enospc_reservation_and_release) {
   WritableRmap image;
   image.device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
