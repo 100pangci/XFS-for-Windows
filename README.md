@@ -171,6 +171,10 @@ from forward metadata. Qualification includes Linux repair/mount, repeated
 Linux/Windows mutations, ENOSPC, 330 writer crash cases, and genuine Linux
 surviving-RUI recovery with 11 recovery crash points. See the evidence and
 coverage limits in [docs/RMAPBT.md](docs/RMAPBT.md).
+The ordinary-gate code revision `5a41fca` passed all 65 jobs in
+[qualification run 40107607956](https://github.com/100pangci/XFS-for-Windows/actions/runs/40107607956),
+including grown/collapsed Linux-origin rmap trees and full-image no-write
+refusal checks. Support remains experimental and image-file-only.
 
 **Reflink/refcount/CoW and xattr modification remain unsupported and refused.**
 
