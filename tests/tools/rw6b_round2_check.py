@@ -193,7 +193,7 @@ def expected_entries():
         {"path": "/win2/link", "type": "symlink", "target": "round2.bin"},
     ]
     for i in range(400, 500):
-        entries.append({"path": "/win2/grow/%04d.bin" % i, "type": "file",
+        entries.append({"path": "/win2/grow/n%04d.bin" % i, "type": "file",
                         "content": b"n%04d" % i})
     for i in range(1, 2000, 2):
         entries.append({"path": "/linux-after/i%04d.bin" % i,

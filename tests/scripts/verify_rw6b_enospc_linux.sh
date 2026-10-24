@@ -92,6 +92,36 @@ succeeded="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["suc
 failed_index="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["failed_index"])' "$manifest")"
 failed_path="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["failed_path"])' "$manifest")"
 
+# Compare like-for-like disk counters before mounting. Linux statfs excludes
+# the allocator set-aside and non-root bnobt/cntbt blocks; Windows info reports
+# sb_fdblocks. These are different quantities, not a permissible error margin.
+ag_count="$(xfs_db -r -c 'sb 0' -c 'p agcount' "$img" | awk '$1 == "agcount" {print $3}')"
+disk_free="$(xfs_db -r -c 'sb 0' -c 'p fdblocks' "$img" | awk '$1 == "fdblocks" {print $3}')"
+ag_free=0
+allocbt_blocks=0
+for ((ag = 0; ag < ag_count; ag++)); do
+    read -r contribution allocbt < <(
+        xfs_db -r -c "agf $ag" \
+            -c 'p freeblks flcount btreeblks rmapblocks' "$img" |
+        awk '/ = / {v[$1] = $3}
+             END {print v["freeblks"] + v["flcount"] + v["btreeblks"],
+                        v["btreeblks"] - (v["rmapblocks"] - 1)}')
+    if [ "$allocbt" -lt 0 ]; then
+        echo "FAILED: AG$ag free-space btree block count is negative" >&2
+        exit 1
+    fi
+    ag_free=$((ag_free + contribution))
+    allocbt_blocks=$((allocbt_blocks + allocbt))
+done
+if [ "$disk_free" -ne "$free_after" ] || [ "$ag_free" -ne "$free_after" ]; then
+    echo "FAILED: disk free blocks SB=$disk_free AGs=$ag_free != manifest $free_after" >&2
+    exit 1
+fi
+# xfs_alloc_set_aside = agcount * (XFS_ALLOCBT_AGFL_RESERVE + 4), reserve=4.
+# xfs_fs_statfs subtracts this plus m_allocbt_blks on a read-only mount.
+statfs_free=$((free_after - 8 * ag_count - allocbt_blocks))
+if [ "$statfs_free" -lt 0 ]; then statfs_free=0; fi
+
 echo "== read-only mount: accepted tree =="
 mnt="$(mktemp -d)"
 cleanup() {
@@ -143,8 +173,9 @@ if [ "$fs_bsize" -ne "$block_size" ]; then
     echo "FAILED: mounted block size $fs_bsize != $block_size" >&2
     exit 1
 fi
-if [ "$free_now" -ne "$free_after" ]; then
-    echo "FAILED: mounted free blocks $free_now != Windows manifest $free_after" >&2
+if [ "$free_now" -ne "$statfs_free" ]; then
+    echo "FAILED: mounted free blocks $free_now != expected $statfs_free " \
+         "(disk $free_after, AG set-aside $((8 * ag_count)), allocbt $allocbt_blocks)" >&2
     exit 1
 fi
 if [ "$free_after" -ge "$free_before" ]; then
