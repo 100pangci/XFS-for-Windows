@@ -71,7 +71,7 @@ if [ "$(id -u)" != "0" ]; then
     echo "must run as root (loop device/dm-snapshot/mount)" >&2
     exit 1
 fi
-for tool in mkfs.xfs xfs_repair xfs_logprint losetup dmsetup python3 dd; do
+for tool in mkfs.xfs xfs_repair xfs_logprint xfs_db losetup dmsetup python3 dd; do
     command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
 if ! dmsetup targets 2>/dev/null | grep -q '^snapshot '; then
@@ -353,7 +353,12 @@ fi
 # for the Windows recovery test.
 cp --sparse=always "$OUT/rui.img" "$WORK/sanity.img"
 mkdir -p "$WORK/sanity-mnt"
-mount -o loop "$WORK/sanity.img" "$WORK/sanity-mnt"
+if ! mount -o loop,nouuid "$WORK/sanity.img" "$WORK/sanity-mnt"; then
+    echo "kernel replay of the captured RUI image failed" >&2
+    dmesg | tail -40 >&2 || true
+    xfs_db -r -c 'sb 0' -c 'p' "$OUT/rui.img" 2>&1 | head -20 >&2 || true
+    exit 1
+fi
 umount "$WORK/sanity-mnt"
 xfs_repair -n "$WORK/sanity.img" > "$OUT/rui.repair.txt" 2>&1
 if grep -Eiq 'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
