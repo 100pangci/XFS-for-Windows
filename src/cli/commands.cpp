@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 
 #include "xfs/block_device.h"
@@ -60,11 +61,16 @@ void PrintUsage() {
       "  journal <device|image>        dump the internal log structure\n"
       "      --json                    machine-readable (recovery differential)\n"
       "  mkimage <file> <size>         create a sparse test image (e.g. 300M)\n"
-      "  ls <device|image> <path>      list a directory\n"
+      "  ls <device|image> <path>      list a directory [--json]\n"
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
       "  stat <device|image> <path>    show inode information\n"
       "  pwrite <image> <path> <off>   write bytes at an offset (may extend the\n"
       "      --rw-experimental [--text=<s> | --from=<file>]\n"
+      "  fallocate <image> <path> <off> <len>  allocate unwritten extents\n"
+      "      --rw-experimental\n"
+      "  convert-unwritten <image> <path> <off> <len>  mark them written\n"
+      "      --rw-experimental\n"
+      "  bmap <image> <path>          dump the physical data extents [--json]\n"
       "  extend <image> <path> <size>  grow a file to <size> bytes by writing a\n"
       "      --rw-experimental [--fill=0xNN]\n"
       "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
@@ -737,7 +743,8 @@ int CommandMkImage(const std::string& path_string, const std::string& size) {
   return 0;
 }
 
-int CommandLs(const std::string& target, const std::string& path) {
+int CommandLs(const std::string& target, const std::string& path,
+              const Options& options) {
   std::string error;
   auto dev = OpenTarget(target, false, false, &error);
   if (!dev) {
@@ -763,12 +770,23 @@ int CommandLs(const std::string& target, const std::string& path) {
             [](const XfsDirEntry& a, const XfsDirEntry& b) {
               return a.name < b.name;
             });
+  bool first_json = true;
+  if (options.json) std::cout << "[";
   for (const auto& entry : entries.value()) {
     if (entry.name == "." || entry.name == "..") continue;
     auto child = fs.value()->OpenInode(entry.ino);
     if (!child.ok()) {
-      std::cout << "?---------   ? ?         ? " << entry.name
-                << "   [unreadable: " << child.error().message << "]\n";
+      if (options.json) {
+        if (!first_json) std::cout << ",";
+        first_json = false;
+        std::cout << "{\"name\":";
+        PrintJsonString(entry.name);
+        std::cout << ",\"inode\":" << entry.ino
+                  << ",\"unreadable\":true}";
+      } else {
+        std::cout << "?---------   ? ?         ? " << entry.name
+                  << "   [unreadable: " << child.error().message << "]\n";
+      }
       continue;
     }
     const XfsInode& ino = child.value();
@@ -778,17 +796,37 @@ int CommandLs(const std::string& target, const std::string& path) {
       name += "  (win: " + Utf16ToUtf8(win.name).value_or("?") + ")";
     }
     uint64_t size = ino.IsDir() ? 0 : ino.size;
+    std::optional<std::string> link_target;
+    if (ino.IsSymlink()) {
+      auto link = fs.value()->ReadSymlink(ino.ino);
+      if (link.ok()) link_target = link.value();
+    }
+    if (options.json) {
+      if (!first_json) std::cout << ",";
+      first_json = false;
+      std::cout << "{\"name\":";
+      PrintJsonString(entry.name);
+      std::cout << ",\"inode\":" << ino.ino << ",\"mode\":" << ino.mode
+                << ",\"nlink\":" << ino.nlink << ",\"size\":" << size
+                << ",\"ftype\":" << static_cast<unsigned>(entry.ftype)
+                << ",\"dir\":" << (ino.IsDir() ? "true" : "false")
+                << ",\"symlink\":" << (ino.IsSymlink() ? "true" : "false")
+                << ",\"target\":";
+      if (link_target.has_value()) {
+        PrintJsonString(*link_target);
+      } else {
+        std::cout << "null";
+      }
+      std::cout << "}";
+      continue;
+    }
     std::printf("%s %3u %6u %6u %12llu %s %s\n", ModeString(ino.mode).c_str(),
                 ino.nlink, ino.uid, ino.gid,
                 static_cast<unsigned long long>(size),
                 FormatTime(ino.mtime).c_str(), name.c_str());
-    if (ino.IsSymlink()) {
-      auto link = fs.value()->ReadSymlink(ino.ino);
-      if (link.ok()) {
-        std::cout << "    -> " << link.value() << "\n";
-      }
-    }
+    if (link_target.has_value()) std::cout << "    -> " << *link_target << "\n";
   }
+  if (options.json) std::cout << "]\n";
   return 0;
 }
 
@@ -1033,7 +1071,8 @@ int CommandMount(const std::string& target, const std::string& drive,
 #ifdef XFSWIN_HAS_WINFSP
   return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
                               options.verbose || options.debug,
-                              options.rw_experimental);
+                              options.rw_experimental,
+                              options.rmapbt_qualification);
 #else
   (void)target;
   (void)drive;
@@ -1072,6 +1111,17 @@ bool ParseU64(const std::string& text, uint64_t* out) {
   }
   *out = std::strtoull(begin, &end, base);
   return end != nullptr && *end == '\0' && end != begin;
+}
+
+// Every ordinary mutation opens a writable mount through this helper.  The
+// hidden qualification bit is the only way to bypass the rmapbt gate; the
+// public --rw-experimental flag alone must keep refusing rmapbt images.
+MountOptions WritableMountOptions(const Options& options) {
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  mount_options.allow_rmapbt_qualification =
+      options.rmapbt_qualification;
+  return mount_options;
 }
 
 }  // namespace
@@ -1145,8 +1195,7 @@ int CommandPwrite(const std::string& target, const std::string& path,
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  MountOptions mount_options;
-  mount_options.read_write = true;
+  MountOptions mount_options = WritableMountOptions(options);
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1211,8 +1260,7 @@ int CommandExtend(const std::string& target, const std::string& path,
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  MountOptions mount_options;
-  mount_options.read_write = true;
+  MountOptions mount_options = WritableMountOptions(options);
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1283,8 +1331,7 @@ int CommandTruncate(const std::string& target, const std::string& path,
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  MountOptions mount_options;
-  mount_options.read_write = true;
+  MountOptions mount_options = WritableMountOptions(options);
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1311,6 +1358,181 @@ int CommandTruncate(const std::string& target, const std::string& path,
   }
   std::cout << "resized " << path << " (inode " << inode.value().ino << ") to "
             << info.value().size << " bytes\n";
+  return 0;
+}
+
+namespace {
+
+// Shared front matter for fallocate/convert-unwritten: byte range arguments,
+// opt-in flag, image only, exclusive writable mount.
+int ParseRangeArguments(const std::string& target, const std::string& path,
+                        const std::string& offset_text,
+                        const std::string& length_text, const Options& options,
+                        uint64_t* offset, uint64_t* length) {
+  if (!options.rw_experimental) {
+    std::cerr << "error: this command modifies the image; pass "
+                 "--rw-experimental\n";
+    return 3;
+  }
+  if (IsRawDevicePath(target)) {
+    std::cerr << "error: this command is restricted to image files in this "
+                 "version\n";
+    return 3;
+  }
+  if (!ParseU64(offset_text, offset) || !ParseU64(length_text, length)) {
+    std::cerr << "error: <offset> and <length> must be decimal or 0x-prefixed "
+                 "byte counts\n";
+    return 1;
+  }
+  if (*length == 0) {
+    std::cerr << "error: <length> must be nonzero\n";
+    return 1;
+  }
+  (void)path;
+  return 0;
+}
+
+}  // namespace
+
+int CommandFallocate(const std::string& target, const std::string& path,
+                     const std::string& offset_text,
+                     const std::string& length_text, const Options& options) {
+  uint64_t offset = 0, length = 0;
+  int parsed = ParseRangeArguments(target, path, offset_text, length_text,
+                                   options, &offset, &length);
+  if (parsed != 0) return parsed;
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options = WritableMountOptions(options);
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto info = fs.value()->AllocateUnwritten(inode.value().ino, offset, length);
+  if (!info.ok()) {
+    PrintError(info.error());
+    return 1;
+  }
+  Status closed = fs.value()->WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return 1;
+  }
+  if (!fs.value()->Flush().ok()) {
+    std::cerr << "error: flush failed\n";
+    return 1;
+  }
+  std::cout << "preallocated " << length << " unwritten bytes at " << offset
+            << " in " << path << " (inode " << inode.value().ino
+            << ", size " << info.value().size << ")\n";
+  return 0;
+}
+
+int CommandConvertUnwritten(const std::string& target,
+                            const std::string& path,
+                            const std::string& offset_text,
+                            const std::string& length_text,
+                            const Options& options) {
+  uint64_t offset = 0, length = 0;
+  int parsed = ParseRangeArguments(target, path, offset_text, length_text,
+                                   options, &offset, &length);
+  if (parsed != 0) return parsed;
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options = WritableMountOptions(options);
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto info = fs.value()->ConvertUnwritten(inode.value().ino, offset, length);
+  if (!info.ok()) {
+    PrintError(info.error());
+    return 1;
+  }
+  Status closed = fs.value()->WriteCleanUnmountRecord();
+  if (!closed.ok()) {
+    PrintError(closed.error());
+    return 1;
+  }
+  if (!fs.value()->Flush().ok()) {
+    std::cerr << "error: flush failed\n";
+    return 1;
+  }
+  std::cout << "converted unwritten range [" << offset << ", "
+            << (offset + length) << ") in " << path << " (inode "
+            << inode.value().ino << ", size " << info.value().size << ")\n";
+  return 0;
+}
+
+// bmap: print the physical data-fork extents. The free-block-reuse and
+// structure-transition matrices use this to prove that a freed block was
+// actually reused by a different owner.
+int CommandBmap(const std::string& target, const std::string& path,
+                const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto fs = XfsFilesystem::Mount(std::move(dev), MountOptions{});
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto extents = fs.value()->GetDataExtents(inode.value().ino);
+  if (!extents.ok()) {
+    PrintError(extents.error());
+    return 1;
+  }
+  if (options.json) {
+    std::cout << "{\"inode\":" << inode.value().ino << ",\"size\":"
+              << inode.value().size << ",\"extents\":[";
+    for (size_t i = 0; i < extents.value().size(); ++i) {
+      const XfsExtent& e = extents.value()[i];
+      if (i != 0) std::cout << ",";
+      std::cout << "{\"startoff\":" << e.startoff
+                << ",\"startblock\":" << e.startblock
+                << ",\"blockcount\":" << e.blockcount
+                << ",\"unwritten\":" << (e.unwritten ? "true" : "false")
+                << "}";
+    }
+    std::cout << "]}\n";
+    return 0;
+  }
+  std::cout << "inode " << inode.value().ino << ", size "
+            << inode.value().size << ", " << extents.value().size()
+            << " extents\n";
+  for (const XfsExtent& e : extents.value()) {
+    std::cout << "  logical " << e.startoff << " physical " << e.startblock
+              << " blocks " << e.blockcount
+              << (e.unwritten ? " unwritten\n" : " written\n");
+  }
   return 0;
 }
 
@@ -1380,8 +1602,7 @@ int OpenWritable(const std::string& target, const Options& options,
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  MountOptions mount_options;
-  mount_options.read_write = true;
+  MountOptions mount_options = WritableMountOptions(options);
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
@@ -1723,6 +1944,10 @@ int Run(const std::vector<std::string>& args) {
       options.nrext64 = true;
     } else if (arg == "--rmapbt") {
       options.rmapbt = true;
+    } else if (arg == "--rw-rmapbt-qualification") {
+      // Hidden RW-6B acceptance switch. It only has an effect together with
+      // --rw-experimental; ordinary mounts still refuse rmapbt.
+      options.rmapbt_qualification = true;
     } else if (arg == "--modern-inode-profile") {
       options.finobt = true;
       options.inobtcount = true;
@@ -1837,10 +2062,10 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "ls") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin ls <device|image> <path>\n";
+      std::cerr << "usage: xfswin ls <device|image> <path> [--json]\n";
       return 1;
     }
-    return CommandLs(positional[1], positional[2]);
+    return CommandLs(positional[1], positional[2], options);
   }
   if (command == "cat") {
     if (positional.size() != 3) {
@@ -1864,6 +2089,31 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandPwrite(positional[1], positional[2], positional[3],
                          pwrite_text, pwrite_from, options);
+  }
+  if (command == "fallocate") {
+    if (positional.size() != 5) {
+      std::cerr << "usage: xfswin fallocate <image> <path> <offset> <length> "
+                   "--rw-experimental\n";
+      return 1;
+    }
+    return CommandFallocate(positional[1], positional[2], positional[3],
+                            positional[4], options);
+  }
+  if (command == "convert-unwritten") {
+    if (positional.size() != 5) {
+      std::cerr << "usage: xfswin convert-unwritten <image> <path> <offset> "
+                   "<length> --rw-experimental\n";
+      return 1;
+    }
+    return CommandConvertUnwritten(positional[1], positional[2],
+                                   positional[3], positional[4], options);
+  }
+  if (command == "bmap") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin bmap <image> <path> [--json]\n";
+      return 1;
+    }
+    return CommandBmap(positional[1], positional[2], options);
   }
   if (command == "extend") {
     if (positional.size() != 4) {
@@ -1984,6 +2234,8 @@ int Run(const std::vector<std::string>& args) {
       }
       MountOptions mount_options;
       mount_options.read_write = options.rw_experimental;
+      mount_options.allow_rmapbt_qualification =
+          options.rmapbt_qualification;
       auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
       if (!fs.ok()) {
         PrintError(fs.error());

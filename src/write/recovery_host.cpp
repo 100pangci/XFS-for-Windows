@@ -341,7 +341,18 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
       StoreLE16(rud.data() + 2, 1);
       StoreLE64(rud.data() + lf::kIntentIdOffset, rui.id);
       txn.AddLogOp(std::move(rud));
-      return blocks.Commit();
+      Status committed = blocks.Commit();
+      if (committed.ok()) {
+        XFS_INFO("RUI completion: id="
+                 << rui.id << " extents=" << rui.extents.size()
+                 << " log_bytes=" << txn.log_bytes()
+                 << " serialized_log_bytes=" << txn.serialized_log_bytes()
+                 << " fits_256k="
+                 << (txn.serialized_log_bytes() <= lf::kMaxRecordBytes
+                         ? "yes"
+                         : "no"));
+      }
+      return committed;
     });
   }
   if (intent.type != lf::kItemEfi) {

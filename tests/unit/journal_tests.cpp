@@ -17,6 +17,7 @@
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
+#include "xfs/formatter.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
 #include "xfs/log_format.h"
@@ -187,11 +188,113 @@ TEST(log_record_layout_matches_the_kernel_format) {
   CHECK_EQ(len, 0u);
 }
 
-TEST(log_record_rejects_bad_parameters) {
-  // Record larger than a single header block's worth of cycle data.
+TEST(log_record_larger_than_32k_uses_extension_headers) {
+  // A legal Linux record whose data area needs an iclog larger than 32 KiB.
+  // The writer must choose h_size (64 KiB here), place the extra cycle words
+  // in xlog_rec_ext_header blocks and produce a CRC that covers them.
+  std::vector<std::vector<uint8_t>> items;
+  for (uint32_t i = 0; i < 24; ++i) {
+    items.emplace_back(2500, static_cast<uint8_t>(i * 7 + 1));
+  }
   LogRecordParams params = BaseParams();
+  params.log_blocks = 2048;  // 1 MiB log
+  auto record = xfs::BuildLogRecord(params, FrameOps(7, std::move(items)));
+  CHECK(record.ok());
+  const std::vector<uint8_t>& r = record.value();
+  CHECK(GetBE32(r.data(), lf::kRecSize) == 64 * 1024);
+  CHECK(GetBE32(r.data(), lf::kRecLen) > lf::kHeaderCycleBytes);
+  CHECK(GetBE32(r.data(), lf::kRecLen) <= 64 * 1024);
+  CHECK(r.size() > lf::kHeaderCycleBytes);  // header blocks + data blocks
+  CHECK(r.size() <= lf::kMaxRecordBytes);
+
+  // Extension header: its cycle word and the first saved data cycle word.
+  const uint8_t* ext = r.data() + lf::kRecordHeaderSize;
+  CHECK(GetBE32(ext, lf::kRecExtCycle) == 3);
+  const uint32_t data_blocks = GetBE32(r.data(), lf::kRecLen) / 512;
+  CHECK(data_blocks > lf::kRecCycleDataCount);
+  // Data block 0 starts with the START op's transaction id, which is saved in
+  // the header while the on-disk word is the record cycle.
+  CHECK(GetBE32(r.data(), lf::kRecCycleData) == params.tid);
+  CHECK(GetBE32(r.data() + 2 * lf::kRecordHeaderSize, 0) == 3);
+
+  // Independent CRC over fixed header + extension header + data.
+  std::vector<uint8_t> fixed(r.begin(), r.begin() + lf::kRecCrcCovered);
+  xfs::PutLE32(fixed.data(), lf::kRecCrc, 0);
+  uint32_t crc = xfs::Crc32cUpdate(0xFFFFFFFFu, fixed.data(), fixed.size());
+  crc = xfs::Crc32cUpdate(crc, ext, lf::kRecExtSize);
+  crc = xfs::Crc32cUpdate(crc, r.data() + 2 * lf::kRecordHeaderSize,
+                          GetBE32(r.data(), lf::kRecLen));
+  CHECK(~crc == GetLE32(r.data(), lf::kRecCrc));
+}
+
+TEST(transaction_larger_than_one_record_is_split_and_recovers) {
+  // A transaction whose item stream exceeds one 32 KiB record must be split
+  // into multiple records with a single COMMIT. Reading it back through the
+  // independent scanner proves the CONTINUE/WAS_CONT framing and the one
+  // transaction id survive the split.
+  xfstest::MemoryBlockDevice device(300ull << 20);
+  xfs::mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.quiet = true;
+  CHECK(xfs::mkfs::Format(device, options).ok());
+  auto mounted = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+      [] {
+        xfs::MountOptions m;
+        m.read_write = true;
+        return m;
+      }());
+  CHECK(mounted.ok());
+  if (!mounted.ok()) return;
+  auto txn = mounted.value()->BeginTransaction();
+  CHECK(txn.ok());
+  if (!txn.ok()) return;
+  constexpr uint32_t kItems = 24;
+  std::vector<uint8_t> item(2000, 0);
+  xfs::StoreLE16(item.data(), lf::kItemBuf);
+  xfs::StoreLE16(item.data() + 2, 1);
+  for (uint32_t i = 0; i < kItems; ++i) {
+    xfs::StoreLE32(item.data() + 8, i);
+    txn.value().AddLogOp(item);
+  }
+  // One region larger than a whole record forces a payload split with
+  // CONTINUE/WAS_CONT, not just an op-boundary split.
+  std::vector<uint8_t> huge(70000, 0x5a);
+  xfs::StoreLE16(huge.data(), lf::kItemBuf);
+  xfs::StoreLE16(huge.data() + 2, 1);
+  txn.value().AddLogOp(std::move(huge));
+  CHECK(txn.value().serialized_log_bytes() > lf::kHeaderCycleBytes);
+  CHECK(txn.value().record_fits());
+  CHECK(mounted.value()->CommitTransaction(txn.value()).ok());
+  mounted.value().reset();
+
+  auto sb = xfs::ReadSuperblock(device, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  auto scan =
+      xfs::ScanLog(device, sb.value(), xfs::MakeGeometry(sb.value()));
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().state == xfs::LogState::kDirty);
+  CHECK(scan.value().records.size() >= 2);
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (!scan.value().transactions.empty()) {
+    CHECK_EQ(scan.value().transactions[0].items.size(), kItems + 1);
+    const auto& items = scan.value().transactions[0].items;
+    if (items.size() == kItems + 1 && !items.back().regions.empty()) {
+      CHECK_EQ(items.back().regions[0].size(), 70000u);
+    }
+  }
+}
+
+TEST(log_record_rejects_bad_parameters) {
+  // Larger than XLOG_MAX_RECORD_BSIZE (256 KiB): the caller must split the
+  // metadata across transactions instead of emitting an illegal record.
+  LogRecordParams params = BaseParams();
+  params.log_blocks = 4096;
   std::vector<LogOp> huge =
-      FrameOps(0x11223344, {std::vector<uint8_t>(40 * 1024, 0x33)});
+      FrameOps(0x11223344, {std::vector<uint8_t>(300 * 1024, 0x33)});
   auto built = xfs::BuildLogRecord(params, huge);
   CHECK(!built.ok());
   if (!built.ok()) CHECK(built.error().code == xfs::XfsError::kUnsupportedFeature);

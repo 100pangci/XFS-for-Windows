@@ -50,6 +50,16 @@ constexpr uint32_t kDefaultRecordSize = 32 * 1024;  // h_size (one header block)
 // header, records larger than 32 KiB use xlog_rec_ext_header blocks.
 constexpr uint32_t kCycleBlockSize = 512;
 constexpr uint32_t kHeaderCycleBytes = kRecCycleDataCount * kCycleBlockSize;
+// xlog_rec_ext_header: cycle word plus 64 saved data-block words. Only these
+// 260 bytes are covered by the record CRC (not the 252 reserved bytes).
+constexpr size_t kRecExtCycle = 0;    // be32
+constexpr size_t kRecExtData = 4;     // be32[64]
+constexpr size_t kRecExtSize = kRecExtData + kRecCycleDataCount * 4;  // 260
+// Linux XLOG_MAX_RECORD_BSIZE. A transaction this build emits is a single
+// legal Linux log record; larger metadata sets are split by the caller before
+// commit rather than emitted as an unsupported record.
+constexpr uint32_t kMaxRecordBytes = 256 * 1024;
+constexpr uint32_t kMaxIclogBytes = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Log operation header (xlog_op_header), 12 bytes, big-endian fields

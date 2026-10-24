@@ -99,8 +99,13 @@ class XfsTransaction {
   // deltas to the same superblock buffer without losing each other's changes.
   const std::vector<uint8_t>* QueuedBuffer(uint64_t offset) const;
   size_t log_bytes() const;
-  // Total size of the framed log record (header block + rounded data).
+  // Total size of the framed log record (header block + rounded data). For a
+  // transaction split into several records this is the one-record summary;
+  // serialized_log_bytes() is the sum over the actual split records.
   size_t record_bytes() const;
+  // Physical log bytes (headers + data) of the records this transaction will
+  // emit, including CONTINUE/WAS_CONT splits.
+  size_t serialized_log_bytes() const;
   // False when the item list would produce a record larger than this writer
   // can emit (32 KiB of data; bigger records need extension headers).
   bool record_fits() const;

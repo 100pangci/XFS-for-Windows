@@ -43,7 +43,8 @@ namespace xfs {
 // cannot update it consistently, and a best-effort update would corrupt the
 // filesystem; those are refused.
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
-                            bool allow_rmapbt_recovery = false);
+                            bool allow_rmapbt_recovery = false,
+                            bool allow_rmapbt_qualification = false);
 
 // Human readable one-line profile description for logs/diagnostics.
 std::string WritableProfileSummary(const XfsSuperblock& sb);

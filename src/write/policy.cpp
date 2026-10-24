@@ -64,7 +64,8 @@ constexpr RoCompatReason kRoCompatReasons[] = {
 }  // namespace
 
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
-                            bool allow_rmapbt_recovery) {
+                            bool allow_rmapbt_recovery,
+                            bool allow_rmapbt_qualification) {
   if (sb.features.incompat_unknown) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "unknown incompatible features " +
@@ -94,7 +95,8 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
   }
   for (const auto& reason : kRoCompatReasons) {
     if (sb.features_ro_compat & reason.bit) {
-      if (reason.bit == ondisk::kRoCompatRmapbt && allow_rmapbt_recovery &&
+      if (reason.bit == ondisk::kRoCompatRmapbt &&
+          (allow_rmapbt_recovery || allow_rmapbt_qualification) &&
           !sb.features.reflink) {
         continue;
       }

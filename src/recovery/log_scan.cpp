@@ -351,28 +351,36 @@ bool HeaderCheckMount(const uint8_t* bytes, const XfsSuperblock& sb,
 // xlog_cksum(): the CRC covers the fixed header (up to XLOG_REC_SIZE, with the
 // CRC field zeroed) plus the record data exactly as written, i.e. with the
 // cycle words stamped in. A zero stored CRC is accepted (mkfs history).
-uint32_t ComputeRecordCrc(const uint8_t* header_bytes, size_t header_covered,
-                          const uint8_t* data, size_t data_len) {
-  std::vector<uint8_t> header(header_bytes, header_bytes + header_covered);
-  PutLE32(header.data(), lf::kRecCrc, 0);
-  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, header.data(), header.size());
+uint32_t ComputeRecordCrc(const uint8_t* header_bytes, size_t header_size,
+                          size_t header_covered, const uint8_t* data,
+                          size_t data_len) {
+  std::vector<uint8_t> fixed(header_bytes, header_bytes + header_covered);
+  PutLE32(fixed.data(), lf::kRecCrc, 0);
+  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, fixed.data(), fixed.size());
+  // xlog_cksum() streams each extension header's 260 covered bytes; the 252
+  // reserved bytes are not part of the checksum.
+  for (size_t off = lf::kRecordHeaderSize;
+       off + lf::kRecExtSize <= header_size; off += lf::kRecordHeaderSize) {
+    crc = Crc32cUpdate(crc, header_bytes + off, lf::kRecExtSize);
+  }
   if (data_len) crc = Crc32cUpdate(crc, data, data_len);
   return ~crc;
 }
 
 // Verifies a record's CRC. Returns false when the stored CRC is set and does
-// not match either historical coverage size.
+// not match either historical fixed-header coverage size.
 bool VerifyRecordCrc(const std::vector<uint8_t>& header_bytes,
                      const uint8_t* data, size_t data_len, uint32_t* computed) {
   const uint32_t stored = GetLE32(header_bytes.data(), lf::kRecCrc);
   // XLOG_REC_SIZE (328, the non-i386 layout) and XLOG_REC_SIZE_OTHER (324).
-  uint32_t crc = ComputeRecordCrc(header_bytes.data(), lf::kRecCrcCovered, data,
-                                  data_len);
+  uint32_t crc = ComputeRecordCrc(header_bytes.data(), header_bytes.size(),
+                                  lf::kRecCrcCovered, data, data_len);
   if (stored == 0 || crc == stored) {
     if (computed) *computed = crc;
     return true;
   }
-  uint32_t other = ComputeRecordCrc(header_bytes.data(), 324, data, data_len);
+  uint32_t other = ComputeRecordCrc(header_bytes.data(), header_bytes.size(),
+                                    324, data, data_len);
   if (computed) *computed = other;
   return other == stored;
 }

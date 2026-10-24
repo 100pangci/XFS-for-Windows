@@ -32,10 +32,106 @@ namespace {
 namespace lf = logfmt;
 
 // Room reserved at BeginTransaction so the record never has to be split across
-// the physical end of the log: header block + the largest record we can build
-// (32 KiB of data, the limit before extended headers would be needed) + slack.
-// The actual size is checked again at commit.
-constexpr uint32_t kReservedRecordBlocks = 70;  // ~35 KiB of log space
+// the physical end of the log.  XLOG_MAX_RECORD_BSIZE is 256 KiB; with the 8
+// possible header blocks (main + 7 extension headers) the worst case is 520
+// basic blocks.  The actual size is checked again at commit.
+constexpr uint32_t kReservedRecordBlocks =
+    (lf::kMaxRecordBytes + lf::kCycleBlockSize - 1) / lf::kCycleBlockSize;
+
+// Data capacity of one 32 KiB log record (one 512-byte header block). The
+// kernel writes all records with the mount's fixed iclog size; this writer
+// keeps 32 KiB for compatibility with Linux-created logs and splits a large
+// transaction across records instead of changing h_size mid-log.
+constexpr size_t kMaxRecordData =
+    lf::kHeaderCycleBytes - lf::kRecordHeaderSize;  // 32256
+
+size_t OpWireSize(const LogOp& op) {
+  return RoundUp64(lf::kOpHeaderSize + op.payload.size(), 4);
+}
+
+// Splits one transaction's item operations into a sequence of complete log
+// records. The first record carries START + transaction header, the last one
+// COMMIT. A split item payload uses CONTINUE on its first fragment and
+// WAS_CONT on every later fragment, exactly the state machine the kernel and
+// the recovery scanner implement.
+std::vector<std::vector<LogOp>> FrameTransactionRecords(
+    const std::vector<LogOp>& items, uint32_t tid) {
+  std::vector<std::vector<LogOp>> records;
+  std::vector<LogOp> current;
+  size_t used = 0;
+
+  auto flush = [&]() {
+    if (!current.empty()) {
+      records.push_back(std::move(current));
+      current.clear();
+      used = 0;
+    }
+  };
+  auto append = [&](LogOp op) {
+    used += OpWireSize(op);
+    current.push_back(std::move(op));
+  };
+  auto max_fragment = [](size_t space) -> size_t {
+    if (space <= lf::kOpHeaderSize) return 0;
+    size_t take = space - lf::kOpHeaderSize;
+    while (take > 0 &&
+           RoundUp64(lf::kOpHeaderSize + take, 4) > space) {
+      --take;
+    }
+    return take;
+  };
+
+  current.push_back(LogOp(lf::kFlagStartTrans, {}));
+  used = OpWireSize(current.back());
+  std::vector<uint8_t> trans_header;
+  trans_header.reserve(lf::kTransHeaderSize);
+  AppendTransHeader(&trans_header, tid, static_cast<uint32_t>(items.size()));
+  append(LogOp(0, std::move(trans_header)));
+
+  for (const LogOp& item : items) {
+    const size_t wire = OpWireSize(item);
+    if (used + wire <= kMaxRecordData) {
+      append(item);
+      continue;
+    }
+    if (item.payload.empty()) {
+      flush();
+      append(item);
+      continue;
+    }
+    // Try to split the payload into the remaining space.
+    size_t offset = 0;
+    bool first_fragment = true;
+    while (offset < item.payload.size()) {
+      const size_t space =
+          used < kMaxRecordData ? kMaxRecordData - used : 0;
+      const size_t take =
+          std::min(max_fragment(space), item.payload.size() - offset);
+      if (take == 0) {
+        flush();
+        continue;
+      }
+      LogOp fragment;
+      fragment.flags =
+          item.flags |
+          (first_fragment ? lf::kFlagContinueTrans : lf::kFlagWasContTrans);
+      fragment.payload.assign(
+          item.payload.begin() + static_cast<ptrdiff_t>(offset),
+          item.payload.begin() +
+              static_cast<ptrdiff_t>(offset + take));
+      offset += take;
+      first_fragment = false;
+      append(std::move(fragment));
+      if (offset < item.payload.size()) flush();
+    }
+  }
+
+  LogOp commit(lf::kFlagCommitTrans, {});
+  if (used + OpWireSize(commit) > kMaxRecordData) flush();
+  append(std::move(commit));
+  flush();
+  return records;
+}
 
 std::string TxnText(const XfsTransaction& txn, const char* what) {
   return std::string(what) + " tid=" + std::to_string(txn.tid()) +
@@ -77,8 +173,21 @@ size_t XfsTransaction::record_bytes() const {
   return lf::kRecordHeaderSize + RoundUp64(log_bytes(), lf::kCycleBlockSize);
 }
 
+size_t XfsTransaction::serialized_log_bytes() const {
+  const auto records = FrameTransactionRecords(ops_, tid_);
+  size_t total = 0;
+  for (const auto& ops : records) {
+    size_t data = 0;
+    for (const LogOp& op : ops) data += OpWireSize(op);
+    total += lf::kRecordHeaderSize + RoundUp64(data, lf::kCycleBlockSize);
+  }
+  return total;
+}
+
 bool XfsTransaction::record_fits() const {
-  return RoundUp64(log_bytes(), lf::kCycleBlockSize) <= lf::kHeaderCycleBytes;
+  // The budget is the sum of the actual split records, including each
+  // record's header block, capped at XLOG_MAX_RECORD_BSIZE.
+  return serialized_log_bytes() <= lf::kMaxRecordBytes;
 }
 
 Status XfsTransaction::AddOrderedBuffer(uint64_t offset,
@@ -363,72 +472,118 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         .Metadata("transaction");
   }
 
-  // Frame the item operations: start op, transaction header, items, commit op.
-  std::vector<LogOp> ops;
-  ops.reserve(txn.ops_.size() + 3);
-  ops.push_back(LogOp(lf::kFlagStartTrans, {}));
-  std::vector<uint8_t> trans_header;
-  trans_header.reserve(lf::kTransHeaderSize);
-  AppendTransHeader(&trans_header, txn.tid_,
-                    static_cast<uint32_t>(txn.ops_.size()));
-  ops.push_back(LogOp(0, std::move(trans_header)));
-  for (const LogOp& op : txn.ops_) ops.push_back(op);
-  ops.push_back(LogOp(lf::kFlagCommitTrans, {}));
-
-  LogRecordParams params;
-  params.cycle = txn.cycle_;
-  params.block = txn.block_;
-  params.tid = txn.tid_;
-  params.prev_block = log_position_.prev_block;
-  params.tail_lsn = log_position_.tail_lsn;
-  params.log_blocks = log_position_.log_blocks;
-  params.record_size = log_position_.record_size;
-  params.uuid = geometry_.meta_uuid;
-  auto record = BuildLogRecord(params, ops);
-  if (!record.ok()) return record.error();
-
-  const size_t record_bytes = record.value().size();
-  const uint32_t record_blocks =
-      static_cast<uint32_t>(record_bytes / lf::kCycleBlockSize);
-  if (static_cast<uint64_t>(txn.block_) + record_blocks >
-      log_position_.log_blocks) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "transaction does not fit in the reserved log space")
-        .Metadata("transaction")
-        .Expected(kReservedRecordBlocks)
-        .Actual(record_blocks);
+  // Frame the item operations into one or more 32 KiB log records. The first
+  // record carries START + the transaction header; the last one COMMIT. A
+  // transaction larger than one record is split at op boundaries or inside a
+  // payload (CONTINUE/WAS_CONT), never by changing h_size mid-log.
+  const std::vector<std::vector<LogOp>> framed =
+      FrameTransactionRecords(txn.ops_, txn.tid_);
+  if (framed.empty()) {
+    return XFS_ERR(XfsError::kInternal, "transaction produced no log records")
+        .Metadata("transaction");
   }
-  const uint64_t record_offset =
-      geometry_.FsbToByte(superblock_.logstart) +
-      static_cast<uint64_t>(txn.block_) * lf::kCycleBlockSize;
 
-  MaybeCrash(CrashPoint::kBeforeLogWrite, TxnText(txn, "commit"));
-  if (!device_->Write(record_offset, record.value().data(),
-                      lf::kRecordHeaderSize)) {
-    return XFS_ERR(XfsError::kIoError,
-                   "failed to write log record header: " +
-                       device_->LastError())
-        .Offset(record_offset)
-        .Metadata("log");
-  }
-  // A torn record (header without data, or a partial data area) fails the
-  // record CRC and is trimmed by recovery.
-  MaybeCrash(CrashPoint::kMidLogRecord, TxnText(txn, "record-header"));
-  if (record_bytes > lf::kRecordHeaderSize) {
-    if (!device_->Write(record_offset + lf::kRecordHeaderSize,
-                        record.value().data() + lf::kRecordHeaderSize,
-                        record_bytes - lf::kRecordHeaderSize)) {
-      return XFS_ERR(XfsError::kIoError,
-                     "failed to write log record data: " +
-                         device_->LastError())
-          .Offset(record_offset + lf::kRecordHeaderSize)
-          .Metadata("log");
+  struct BuiltRecord {
+    LogRecordParams params;
+    std::vector<uint8_t> bytes;
+  };
+  std::vector<BuiltRecord> records;
+  records.reserve(framed.size());
+  uint32_t cycle = txn.cycle_;
+  uint32_t block = txn.block_;
+  uint32_t prev_block = log_position_.prev_block;
+  uint32_t total_blocks = 0;
+  for (size_t i = 0; i < framed.size(); ++i) {
+    LogRecordParams params;
+    params.cycle = cycle;
+    params.block = block;
+    params.tid = txn.tid_;
+    params.prev_block = prev_block;
+    // Every piece points at the oldest record still needed. During intent
+    // completion that is the pinned original recovery window, not the first
+    // completion piece: a crash before COMMIT must re-replay the RUI too.
+    params.tail_lsn = recovery_tail_pin_.has_value()
+                          ? *recovery_tail_pin_
+                          : txn.lsn_;
+    params.log_blocks = log_position_.log_blocks;
+    params.record_size = lf::kDefaultRecordSize;
+    params.uuid = geometry_.meta_uuid;
+    auto built = BuildLogRecord(params, framed[i]);
+    if (!built.ok()) return built.error();
+    const uint32_t blocks =
+        static_cast<uint32_t>(built.value().size() / lf::kCycleBlockSize);
+    if (static_cast<uint64_t>(block) + blocks >
+        log_position_.log_blocks) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "transaction does not fit in the reserved log space")
+          .Metadata("transaction")
+          .Expected(kReservedRecordBlocks)
+          .Actual(total_blocks + blocks);
+    }
+    total_blocks += blocks;
+    records.push_back(BuiltRecord{params, std::move(built.value())});
+    prev_block = block;
+    block += blocks;
+    if (block == log_position_.log_blocks) {
+      block = 0;
+      ++cycle;
+    } else if (block > log_position_.log_blocks) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "transaction log record crosses the log end")
+          .Metadata("transaction");
     }
   }
+  if (total_blocks > kReservedRecordBlocks) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "transaction exceeds the reserved log space")
+        .Metadata("transaction")
+        .Expected(kReservedRecordBlocks)
+        .Actual(total_blocks);
+  }
+
+  MaybeCrash(CrashPoint::kBeforeLogWrite, TxnText(txn, "commit"));
+  for (size_t i = 0; i < records.size(); ++i) {
+    const BuiltRecord& record = records[i];
+    const uint64_t record_offset =
+        geometry_.FsbToByte(superblock_.logstart) +
+        static_cast<uint64_t>(record.params.block) * lf::kCycleBlockSize;
+    if (!device_->Write(record_offset, record.bytes.data(),
+                        lf::kRecordHeaderSize)) {
+      return XFS_ERR(XfsError::kIoError,
+                     "failed to write log record header: " +
+                         device_->LastError())
+          .Offset(record_offset)
+          .Metadata("log");
+    }
+    // A torn record (header without data, or a partial data area) fails the
+    // record CRC and is trimmed by recovery. If an earlier piece was durable
+    // but the COMMIT piece was not, the transaction is still uncommitted.
+    // Keep this injection point per transaction (the harness uses hit counts
+    // to select transactions), not per split record.
+    if (i == 0) {
+      MaybeCrash(CrashPoint::kMidLogRecord,
+                 TxnText(txn, "record-header") + " records=" +
+                     std::to_string(records.size()));
+    }
+    if (record.bytes.size() > lf::kRecordHeaderSize) {
+      if (!device_->Write(record_offset + lf::kRecordHeaderSize,
+                          record.bytes.data() + lf::kRecordHeaderSize,
+                          record.bytes.size() - lf::kRecordHeaderSize)) {
+        return XFS_ERR(XfsError::kIoError,
+                       "failed to write log record data: " +
+                           device_->LastError())
+            .Offset(record_offset + lf::kRecordHeaderSize)
+            .Metadata("log");
+      }
+    }
+  }
+  const uint64_t first_record_offset =
+      geometry_.FsbToByte(superblock_.logstart) +
+      static_cast<uint64_t>(txn.block_) * lf::kCycleBlockSize;
   if (!device_->Flush()) {
     return XFS_ERR(XfsError::kIoError,
                    "failed to flush log record: " + device_->LastError())
-        .Offset(record_offset)
+        .Offset(first_record_offset)
         .Metadata("log");
   }
   MaybeCrash(CrashPoint::kAfterLogCommit, TxnText(txn, "committed"));
@@ -465,12 +620,13 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
   // unless a recovered intent is still unresolved: then the tail stays pinned
   // to the replayed window so a crash here re-replays it (and the done item
   // this transaction logged releases the intent).
-  log_position_.next_block += record_blocks;
+  log_position_.next_block = block;
+  log_position_.cycle = cycle;
   if (log_position_.next_block >= log_position_.log_blocks) {
     log_position_.next_block = 0;
     ++log_position_.cycle;
   }
-  log_position_.prev_block = txn.block_;
+  log_position_.prev_block = records.back().params.block;
   log_position_.tail_lsn = recovery_tail_pin_.has_value()
                                ? *recovery_tail_pin_
                                : MakeLsn(log_position_.cycle,

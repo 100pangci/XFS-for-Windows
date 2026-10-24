@@ -495,6 +495,8 @@ std::vector<uint8_t> BuildExtendedRecord(uint32_t cycle, uint32_t block,
   std::vector<uint8_t> header(record.begin(), record.begin() + lf::kRecCrcCovered);
   xfs::PutLE32(header.data(), lf::kRecCrc, 0);
   uint32_t crc = xfs::Crc32cUpdate(0xFFFFFFFFu, header.data(), header.size());
+  // xlog_cksum() also covers each extension header's 260 bytes.
+  crc = xfs::Crc32cUpdate(crc, ext, lf::kRecExtSize);
   crc = xfs::Crc32cUpdate(crc, record.data() + 2 * lf::kRecordHeaderSize,
                           data.size());
   xfs::PutLE32(record.data(), lf::kRecCrc, ~crc);
@@ -543,6 +545,53 @@ TEST(recovery_scan_large_record_with_extension_header) {
     // Every data block's cycle stamp was restored from the header or the
     // extension header: the logged region must be byte-identical.
     CHECK(items[0].regions[1] == payload);
+  }
+}
+
+TEST(recovery_scan_writer_large_record_with_extension_header) {
+  // Same shape as the synthetic scanner test, but produced by the production
+  // log-record writer: the writer must choose h_size > 32 KiB, fill the
+  // extension header, and the scanner must verify its CRC and unpack every
+  // cycle word back into the 32 KiB logged buffer region.
+  SyntheticLog log(96);
+  std::vector<uint8_t> payload(32 * 1024, 0);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
+  }
+  auto regions = BufItemRegions(8192, 64, lf::kBlftAgf, 0, payload);
+  auto ops = CommitOps(9, regions);
+  xfs::LogRecordParams params;
+  params.cycle = 1;
+  params.block = 0;
+  params.tid = 9;
+  params.prev_block = 0xffffffffu;
+  params.tail_lsn = xfs::MakeLsn(1, 0);
+  params.log_blocks = log.log_blocks();
+  params.uuid = log.sb().uuid;
+  auto record = xfs::BuildLogRecord(params, ops);
+  CHECK(record.ok());
+  if (!record.ok()) return;
+  CHECK(GetBE32(record.value().data(), lf::kRecSize) == 64 * 1024);
+  CHECK(GetBE32(record.value().data(), lf::kRecLen) > lf::kHeaderCycleBytes);
+  log.WriteRaw(log.log_byte(), record.value().data(), record.value().size());
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().state == xfs::LogState::kDirty);
+  CHECK_EQ(scan.value().records.size(), 1u);
+  if (!scan.value().records.empty()) {
+    CHECK_EQ(scan.value().records[0].header_blocks, 2u);
+  }
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (scan.value().transactions.empty()) return;
+  const auto& items = scan.value().transactions[0].items;
+  CHECK_EQ(items.size(), 1u);
+  if (items.size() == 1 && items[0].regions.size() == 2) {
+    CHECK(items[0].type == lf::kItemBuf);
+    CHECK(items[0].regions[1] == payload);
+  } else {
+    CHECK(false);
   }
 }
 
@@ -1150,7 +1199,9 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
   xfs::MountOptions mount_options;
   mount_options.read_write = true;
   mount_options.recovery_only = true;
-  mount_options.clean_log_after_recovery = true;
+  // Keep the completion transaction in the log for the structural assertion
+  // below; the crash loop uses a copy that closes with an unmount record.
+  mount_options.clean_log_after_recovery = false;
   auto fs = xfs::XfsFilesystem::Mount(
       std::make_unique<xfstest::BorrowedBlockDevice>(&device), mount_options);
   if (!fs.ok()) {
@@ -1164,6 +1215,35 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
     CHECK_EQ(fs.value()->recovery_report()->intents_completed, 1u);
   }
   fs.value().reset();
+
+  // Atomicity assertion independent of the final filesystem state: scan the
+  // still-dirty log and require one committed transaction carrying both the
+  // RUD and at least one metadata buffer item.
+  {
+    auto after_sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(after_sb.ok());
+    if (!after_sb.ok()) return;
+    auto after_scan =
+        xfs::ScanLog(device, after_sb.value(),
+                     xfs::MakeGeometry(after_sb.value()));
+    CHECK(after_scan.ok());
+    if (!after_scan.ok()) return;
+    bool saw = false;
+    for (const auto& trans : after_scan.value().transactions) {
+      bool rud = false;
+      size_t buffers = 0;
+      for (const auto& item : trans.items) {
+        if (item.type == lf::kItemRud) rud = true;
+        if (item.type == lf::kItemBuf) ++buffers;
+      }
+      if (rud) {
+        CHECK(buffers > 0);
+        saw = true;
+      }
+    }
+    CHECK(saw);
+    CHECK_EQ(xfs::CollectPendingIntents(after_scan.value()).size(), 0u);
+  }
 
   // Crash at every recovery write and restart: the existing RUI must not run
   // twice, and the committed RUD must be replayed instead.
@@ -1200,6 +1280,8 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
     uint64_t writes_ = 0;
   };
 
+  xfs::MountOptions crash_mount_options = mount_options;
+  crash_mount_options.clean_log_after_recovery = true;
   uint64_t verified_cuts = 0;
   for (uint64_t cut = 0; cut < 64; ++cut) {
     device.bytes() = dirty;
@@ -1208,13 +1290,13 @@ TEST(recovery_mount_completes_surviving_rui_convert) {
       auto limited = std::make_unique<LimitedDevice>(&device);
       limited->FailAfter(cut);
       auto crashed = xfs::XfsFilesystem::Mount(std::move(limited),
-                                               mount_options);
+                                               crash_mount_options);
       crashed_early = !crashed.ok();
     }
     if (!crashed_early) break;
     auto retry = xfs::XfsFilesystem::Mount(
         std::make_unique<xfstest::BorrowedBlockDevice>(&device),
-        mount_options);
+        crash_mount_options);
     if (!retry.ok()) {
       std::fprintf(stderr, "RUI restart after cut %llu failed: %s\n",
                    static_cast<unsigned long long>(cut),

@@ -226,11 +226,13 @@ Scope of this milestone:
   invalidation path with a per-inode write generation, so a concurrent read can
   never resurrect stale bytes.
 - **Limits.** A single truncate is split over multiple transactions (like
-  Linux's rolling truncate) when it would remove more than ~48 extents; a
-  transaction that would produce more than 32 KiB of log data is refused before
-  anything is written. There is no rmapbt/reflink support yet; multi-level
-  inobt/finobt roots are fully edited, while the free-space trees are only
-  collapsed one leaf at a time.
+  Linux's rolling truncate) when it would remove more than ~48 extents. A
+  transaction whose item stream exceeds one 32 KiB log record is split across
+  several records with `CONTINUE`/`WAS_CONT` fragments and one `COMMIT`, up to
+  Linux's `XLOG_MAX_RECORD_BSIZE` (256 KiB); a transaction that would exceed
+  that is refused before anything is written. There is no reflink/refcount support
+  yet; multi-level inobt/finobt roots are fully edited, while the free-space
+  trees are only collapsed one leaf at a time.
 - **Flush is real.** `FlushFileBuffers` failure is an error
   (`STATUS_IO_DEVICE_ERROR`), never success; unmount flushes before the mount
   point disappears.
@@ -335,11 +337,12 @@ Scope of this milestone:
 
 ### If it does not fit
 
-A rename that would exceed the 32 KiB log-record budget (two large
+A rename that would exceed the 256 KiB legal transaction limit (two large
 directories, structural conversions, allocator metadata) is refused **before
-any write**: the transaction is built in memory and `BuildLogRecord` rejects
-it, so the filesystem is unchanged. This is preferable to splitting an atomic
-rename into two transactions.
+any write**: the transaction is built in memory and the record splitter
+rejects it, so the filesystem is unchanged. Records between 32 and 256 KiB are
+split into multiple 32 KiB records within the same transaction. This is
+preferable to splitting an atomic rename into two transactions.
 
 ## Requirements
 

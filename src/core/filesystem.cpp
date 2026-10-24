@@ -270,9 +270,9 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         if (can_recover) {
           // Never recover a filesystem this build would then refuse to
           // modify: check the profile first.
-          Status profile = CheckWritableProfile(fs->superblock_,
-                                                fs->geometry_,
-                                                options.recovery_only);
+          Status profile = CheckWritableProfile(
+              fs->superblock_, fs->geometry_, options.recovery_only,
+              options.allow_rmapbt_qualification);
           if (!profile.ok()) {
             auto error = profile.error();
             error.message +=
@@ -343,8 +343,9 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
-    Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_,
-                                          options.recovery_only);
+    Status profile = CheckWritableProfile(
+        fs->superblock_, fs->geometry_, options.recovery_only,
+        options.allow_rmapbt_qualification);
     if (!profile.ok()) {
       auto error = profile.error();
       error.message +=

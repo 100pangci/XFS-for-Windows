@@ -22,11 +22,18 @@ void AppendZeroes(std::vector<uint8_t>* data, size_t count) {
   data->insert(data->end(), count, 0);
 }
 
-// CRC of the record: header (with the CRC field zeroed) + data area. Matches
-// xlog_cksum(): seed ~0, streamed over header then payload, final inversion.
-uint32_t RecordChecksum(const uint8_t* header, const uint8_t* data,
-                        size_t data_len) {
-  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, header, lf::kRecCrcCovered);
+// CRC of the record: the fixed header (with the CRC field zeroed), any
+// xlog_rec_ext_header blocks, then the data area. Matches xlog_cksum(): each
+// extension header contributes its 260 covered bytes, not the reserved tail.
+uint32_t RecordChecksum(const uint8_t* header, size_t header_bytes,
+                        const uint8_t* data, size_t data_len) {
+  std::vector<uint8_t> fixed(header, header + lf::kRecCrcCovered);
+  PutLE32(fixed.data(), lf::kRecCrc, 0);
+  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, fixed.data(), fixed.size());
+  for (size_t off = lf::kRecordHeaderSize; off + lf::kRecExtSize <= header_bytes;
+       off += lf::kRecordHeaderSize) {
+    crc = Crc32cUpdate(crc, header + off, lf::kRecExtSize);
+  }
   if (data_len) crc = Crc32cUpdate(crc, data, data_len);
   return ~crc;
 }
@@ -128,13 +135,39 @@ Result<std::vector<uint8_t>> BuildLogRecord(const LogRecordParams& params,
   // the log sector size (512 in this profile); recovery computes the number of
   // data blocks as BTOBB(h_len), so it must be exact.
   const size_t rounded = RoundUp64(data.size(), lf::kCycleBlockSize);
+  // h_size is the iclog size. Records up to 32 KiB keep the historical
+  // one-header-block shape; larger ones choose the smallest legal iclog size
+  // (64/128/256 KiB) and carry xlog_rec_ext_header blocks for the extra cycle
+  // words.  XLOG_MAX_RECORD_BSIZE bounds the whole record, not just the data.
+  size_t hsize = lf::kDefaultRecordSize;
+  size_t header_blocks = 1;
   if (rounded > lf::kHeaderCycleBytes) {
+    while (true) {
+      hsize *= 2;
+      header_blocks = hsize / lf::kHeaderCycleBytes;
+      if (hsize > lf::kMaxIclogBytes) {
+        return XFS_ERR(XfsError::kUnsupportedFeature,
+                       "log record exceeds XLOG_MAX_RECORD_BSIZE")
+            .Metadata("log record")
+            .Expected(lf::kMaxRecordBytes)
+            .Actual(header_blocks * lf::kRecordHeaderSize + rounded);
+      }
+      if (header_blocks * lf::kRecordHeaderSize + rounded <= hsize) break;
+    }
+  }
+  const size_t header_bytes = header_blocks * lf::kRecordHeaderSize;
+  if (header_bytes + rounded > lf::kMaxRecordBytes) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "log record larger than 32 KiB would need extension "
-                   "headers")
+                   "log record exceeds XLOG_MAX_RECORD_BSIZE")
         .Metadata("log record")
-        .Expected(lf::kHeaderCycleBytes)
-        .Actual(rounded);
+        .Expected(lf::kMaxRecordBytes)
+        .Actual(header_bytes + rounded);
+  }
+  if (rounded / lf::kCycleBlockSize > header_blocks * lf::kRecCycleDataCount) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "log record needs more cycle-data slots than its headers")
+        .Metadata("log record")
+        .Actual(rounded / lf::kCycleBlockSize);
   }
   AppendZeroes(&data, rounded - data.size());
 
@@ -159,9 +192,10 @@ Result<std::vector<uint8_t>> BuildLogRecord(const LogRecordParams& params,
     PutBE32(block, 0, params.cycle);
   }
 
-  // Header block.
-  std::vector<uint8_t> record(lf::kRecordHeaderSize + rounded, 0);
-  uint8_t* h = record.data();
+  // Header blocks: the fixed xlog_rec_header followed by one
+  // xlog_rec_ext_header per additional 32 KiB of cycle-data words.
+  std::vector<uint8_t> header(header_bytes, 0);
+  uint8_t* h = header.data();
   PutBE32(h, lf::kRecMagic, lf::kRecordMagic);
   PutBE32(h, lf::kRecCycle, params.cycle);
   PutBE32(h, lf::kRecVersion, lf::kVersion2);
@@ -171,18 +205,28 @@ Result<std::vector<uint8_t>> BuildLogRecord(const LogRecordParams& params,
   PutLE32(h, lf::kRecCrc, 0);
   PutBE32(h, lf::kRecPrevBlock, params.prev_block);
   PutBE32(h, lf::kRecNumLogOps, num_ops);
-  for (size_t i = 0; i < saved_words.size(); ++i) {
-    PutBE32(h, lf::kRecCycleData + i * 4, saved_words[i]);
-  }
   PutBE32(h, lf::kRecFmt, lf::kFmtLinuxLe);
   std::memcpy(h + lf::kRecUuid, params.uuid.data(), 16);
-  PutBE32(h, lf::kRecSize,
-          params.record_size ? params.record_size : lf::kDefaultRecordSize);
+  PutBE32(h, lf::kRecSize, static_cast<uint32_t>(hsize));
   PutBE32(h, lf::kRecPad0, 0);
-  std::memcpy(record.data() + lf::kRecordHeaderSize, data.data(), data.size());
+  for (size_t i = 0; i < saved_words.size(); ++i) {
+    if (i < lf::kRecCycleDataCount) {
+      PutBE32(h, lf::kRecCycleData + i * 4, saved_words[i]);
+    } else {
+      const size_t ext = i / lf::kRecCycleDataCount;  // 1-based ext index
+      const size_t slot = i % lf::kRecCycleDataCount;
+      uint8_t* xh = header.data() + ext * lf::kRecordHeaderSize;
+      if (slot == 0) PutBE32(xh, lf::kRecExtCycle, params.cycle);
+      PutBE32(xh, lf::kRecExtData + slot * 4, saved_words[i]);
+    }
+  }
 
-  // CRC over the header (CRC field zero) plus the data area.
-  uint32_t crc = RecordChecksum(record.data(), record.data() + lf::kRecordHeaderSize,
+  std::vector<uint8_t> record(header.size() + rounded, 0);
+  std::memcpy(record.data(), header.data(), header.size());
+  std::memcpy(record.data() + header.size(), data.data(), data.size());
+
+  // CRC over the fixed header (CRC field zero), extension headers and data.
+  uint32_t crc = RecordChecksum(record.data(), header.size(), data.data(),
                                 data.size());
   PutLE32(record.data(), lf::kRecCrc, crc);
   return record;

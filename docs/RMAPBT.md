@@ -239,14 +239,20 @@ Duplicate ownership is not legitimate sharing.
 Windows may log forward map, free trees/counters and rmap buffers in **one**
 transaction rather than emulate Linux's deferred lock ordering. No metadata
 write occurs during build. Commit is log+commit -> durable flush -> metadata
-writeback -> flush. If the 32 KiB log budget cannot hold it, fail before
-writing; do not split an atomic namespace change.  RUI completion adds the RUD
-before the allocator's final budget check, so an oversized completion is
-refused rather than half-written.  A Linux RUI may legally carry up to 16
-extents; if the resulting dirty rmap buffers exceed one 32 KiB record, recovery
-currently refuses after replay with the original tail pinned.  Supporting
-larger completion records (log extension headers, `XLOG_MAX_RECORD_BSIZE`)
-remains an acceptance item and must be proven on a genuine Linux RUI.
+writeback -> flush. The writer keeps the kernel's fixed 32 KiB record size and
+splits a larger transaction into multiple records with `CONTINUE`/`WAS_CONT`
+item fragments and one `COMMIT`, exactly the kernel's rolling-transaction
+mechanism. It does not change `h_size` in the middle of a Linux-created log.
+The total transaction budget remains `XLOG_MAX_RECORD_BSIZE` (256 KiB); a
+transaction that would exceed it is refused before writing, and an atomic
+namespace change is never split across transactions. The typed reader and
+both Python probes also accept genuine Linux records with
+`xlog_rec_ext_header` blocks (up to 256 KiB). RUI completion adds the RUD before the
+allocator's final budget check, so an oversized completion is refused rather
+than half-written. The completion log size for genuine Linux RUIs with
+different `rui_nextents` is still to be measured in CI (the writer logs the
+serialized size of every completion transaction there); until that evidence
+exists this section is an implementation statement, not an acceptance result.
 
 Linux directly updates metadata allocation owners in allocator context via
 `xfs_rmap_alloc/free`. File fork map/unmap/convert and selected metadata work

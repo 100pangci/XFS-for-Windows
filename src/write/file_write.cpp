@@ -429,6 +429,271 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
   return length;
 }
 
+Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
+                                                   uint64_t offset,
+                                                   uint64_t length) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume,
+                   "filesystem is mounted read-only")
+        .Ino(ino)
+        .Metadata("fallocate");
+  }
+  if (length == 0) return GetFileInfo(ino);
+  if (length > kMaxWriteBytes || offset > (1ull << 54) ||
+      length > (1ull << 54) - offset) {
+    return XFS_ERR(XfsError::kOutOfRange, "fallocate range out of range")
+        .Ino(ino)
+        .Actual(length)
+        .Metadata("fallocate");
+  }
+
+  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  auto inode = OpenInode(ino);
+  if (!inode.ok()) return inode.error();
+  if (!inode.value().IsRegular()) {
+    return XFS_ERR(XfsError::kNotRegularFile,
+                   "only regular files can be preallocated")
+        .Ino(ino);
+  }
+  if (inode.value().format != di::kFormatExtents &&
+      inode.value().format != di::kFormatBtree) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "inode has no writable data fork")
+        .Ino(ino)
+        .Actual(inode.value().format);
+  }
+  if ((inode.value().flags & di::kDiFlagImmutable) != 0) {
+    return XFS_ERR(XfsError::kPermissionDenied, "inode is immutable").Ino(ino);
+  }
+
+  const uint64_t end = offset + length;
+  const uint64_t first_block = offset >> geometry_.block_log;
+  const uint64_t last_block = (end - 1) >> geometry_.block_log;
+  const uint64_t old_size = inode.value().size;
+  const uint64_t new_size = std::max(old_size, end);
+
+  auto txn = BeginTransaction();
+  if (!txn.ok()) return txn.error();
+  BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
+  DataForkEditor editor(&txn.value(), &alloc, device_.get(), &geometry_);
+  Status s = editor.Load(inode.value());
+  if (!s.ok()) return s.error();
+
+  const uint32_t preferred = geometry_.InoAgno(ino);
+  uint64_t block = first_block;
+  bool changed = false;
+  while (block <= last_block) {
+    const XfsExtent* cover = nullptr;
+    if (FindExtentForBlock(editor.extents(), block, &cover)) {
+      ++block;
+      continue;
+    }
+    uint64_t run_end = block;
+    while (run_end <= last_block &&
+           !FindExtentForBlock(editor.extents(), run_end, &cover)) {
+      ++run_end;
+    }
+    uint64_t remaining = run_end - block;
+    uint64_t cursor = block;
+    while (remaining > 0) {
+      uint64_t want = remaining;
+      Allocation allocation;
+      Status allocated;
+      while (true) {
+        allocated = alloc.AllocateOwned(
+            preferred, static_cast<uint32_t>(want),
+            RmapOwner::Data(ino, cursor, true), &allocation);
+        if (allocated.ok()) break;
+        if (allocated.error().code != XfsError::kNoSpace || want == 1) {
+          return allocated.error();
+        }
+        want = std::max<uint64_t>(1, want / 2);
+      }
+      XfsExtent extent;
+      extent.startoff = cursor;
+      extent.startblock = allocation.fsb;
+      extent.blockcount = allocation.len;
+      extent.unwritten = true;
+      s = editor.InsertExtent(extent);
+      if (!s.ok()) return s.error();
+      editor.AddNblocks(static_cast<int64_t>(allocation.len));
+      cursor += allocation.len;
+      remaining -= allocation.len;
+      changed = true;
+    }
+    block = run_end;
+  }
+
+  if (!changed && new_size == old_size) return GetFileInfo(ino);
+
+  auto raw = ReadRawInode(ino);
+  if (!raw.ok()) return raw.error();
+  std::vector<uint8_t> raw_inode = std::move(raw.value());
+  uint32_t ilog_fields = 0;
+  std::vector<uint8_t> fork_region;
+  s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
+  if (!s.ok()) return s.error();
+  if (new_size != old_size) {
+    PutBE64(raw_inode.data(), di::kSize, new_size);
+  }
+  const XfsTimestamp now = CurrentTimestamp();
+  s = StoreModifiedTimes(raw_inode.data(), now);
+  if (!s.ok()) return s.error();
+  s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
+                       fork_region);
+  if (!s.ok()) return s.error();
+  s = alloc.Commit();
+  if (!s.ok()) return s.error();
+  s = CommitTransaction(txn.value());
+  if (!s.ok()) return s.error();
+
+  InvalidateCaches(CacheInvalidation::Extents(ino));
+  XFS_EXT_DEBUG("preallocated " << length << " bytes at " << offset
+                                << " in inode " << ino << " (size " << old_size
+                                << " -> " << new_size << ")");
+  return GetFileInfo(ino);
+}
+
+Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
+                                                   uint64_t offset,
+                                                   uint64_t length) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume,
+                   "filesystem is mounted read-only")
+        .Ino(ino)
+        .Metadata("convert-unwritten");
+  }
+  if (length == 0) return GetFileInfo(ino);
+  if (length > kMaxWriteBytes || offset > (1ull << 54) ||
+      length > (1ull << 54) - offset) {
+    return XFS_ERR(XfsError::kOutOfRange,
+                   "convert-unwritten range out of range")
+        .Ino(ino)
+        .Actual(length)
+        .Metadata("convert-unwritten");
+  }
+
+  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  auto inode = OpenInode(ino);
+  if (!inode.ok()) return inode.error();
+  if (!inode.value().IsRegular()) {
+    return XFS_ERR(XfsError::kNotRegularFile,
+                   "only regular files can be converted")
+        .Ino(ino);
+  }
+
+  const uint64_t first_block = offset >> geometry_.block_log;
+  const uint64_t last_block =
+      ((offset + length - 1) >> geometry_.block_log) + 1;
+
+  // The conversion transaction only changes the rmap and bmap state; it does
+  // not write file data.  Converting an unwritten range that the caller has
+  // not written would expose stale disk bytes, so fill it with zeros and make
+  // that durable *before* the state change becomes visible.  (A crash before
+  // the conversion still reads zeros because the extent is unwritten.)
+  auto extents = LoadExtentsCached(inode.value());
+  if (!extents.ok()) return extents.error();
+  std::vector<uint8_t> zeros(static_cast<size_t>(geometry_.block_size), 0);
+  bool zeroed = false;
+  for (const XfsExtent& e : *extents.value()) {
+    if (!e.unwritten) continue;
+    const uint64_t first = std::max<uint64_t>(e.startoff, first_block);
+    const uint64_t last = std::min<uint64_t>(e.EndBlock(), last_block);
+    if (first >= last) continue;
+    uint64_t remaining = (last - first) << geometry_.block_log;
+    uint64_t device_offset =
+        geometry_.FsbToByte(e.startblock + (first - e.startoff));
+    while (remaining > 0) {
+      const size_t chunk = static_cast<size_t>(
+          std::min<uint64_t>(remaining, zeros.size()));
+      if (!device_->Write(device_offset, zeros.data(), chunk)) {
+        return XFS_ERR(XfsError::kIoError,
+                       "failed to zero an unwritten range: " +
+                           device_->LastError())
+            .Ino(ino)
+            .Offset(device_offset)
+            .Metadata("device");
+      }
+      device_offset += chunk;
+      remaining -= chunk;
+    }
+    zeroed = true;
+  }
+  if (zeroed && !device_->Flush()) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to flush zeroed unwritten data: " +
+                       device_->LastError())
+        .Ino(ino)
+        .Metadata("device");
+  }
+  if (zeroed) {
+    InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
+  }
+
+  auto txn = BeginTransaction();
+  if (!txn.ok()) return txn.error();
+  BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
+  DataForkEditor editor(&txn.value(), &alloc, device_.get(), &geometry_);
+  Status s = editor.Load(inode.value());
+  if (!s.ok()) return s.error();
+  bool changed = false;
+  const std::vector<XfsExtent> current = editor.extents();
+  for (const XfsExtent& e : current) {
+    if (!e.unwritten) continue;
+    const uint64_t first = std::max<uint64_t>(e.startoff, first_block);
+    const uint64_t last = std::min<uint64_t>(e.EndBlock(), last_block);
+    if (first >= last) continue;
+    const uint64_t fsb = e.startblock + (first - e.startoff);
+    s = alloc.ConvertOwned(fsb, static_cast<uint32_t>(last - first),
+                           RmapOwner::Data(ino, first, true),
+                           /*old_unwritten=*/true);
+    if (!s.ok()) return s.error();
+    s = editor.RemoveRange(first, last);
+    if (!s.ok()) return s.error();
+    XfsExtent converted;
+    converted.startoff = first;
+    converted.startblock = fsb;
+    converted.blockcount = last - first;
+    converted.unwritten = false;
+    s = editor.InsertExtent(converted);
+    if (!s.ok()) return s.error();
+    changed = true;
+  }
+  if (!changed) return GetFileInfo(ino);
+
+  auto raw = ReadRawInode(ino);
+  if (!raw.ok()) return raw.error();
+  std::vector<uint8_t> raw_inode = std::move(raw.value());
+  uint32_t ilog_fields = 0;
+  std::vector<uint8_t> fork_region;
+  s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
+  if (!s.ok()) return s.error();
+  const XfsTimestamp now = CurrentTimestamp();
+  s = StoreModifiedTimes(raw_inode.data(), now);
+  if (!s.ok()) return s.error();
+  s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
+                       fork_region);
+  if (!s.ok()) return s.error();
+  s = alloc.Commit();
+  if (!s.ok()) return s.error();
+  s = CommitTransaction(txn.value());
+  if (!s.ok()) return s.error();
+
+  InvalidateCaches(CacheInvalidation::Extents(ino));
+  XFS_EXT_DEBUG("converted " << length << " unwritten bytes at " << offset
+                             << " in inode " << ino);
+  return GetFileInfo(ino);
+}
+
+Result<std::vector<XfsExtent>> XfsFilesystem::GetDataExtents(
+    uint64_t ino) const {
+  auto inode = OpenInode(ino);
+  if (!inode.ok()) return inode.error();
+  auto extents = LoadExtentsCached(inode.value());
+  if (!extents.ok()) return extents.error();
+  return *extents.value();
+}
+
 Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
