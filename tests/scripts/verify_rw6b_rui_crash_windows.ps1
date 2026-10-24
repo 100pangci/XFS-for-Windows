@@ -32,6 +32,13 @@ $points = @(
     'recovery_before_log_clean',
     'recovery_after_log_clean'
 )
+$manifestPath = Join-Path (Split-Path -Parent $SourceImage) 'rui.manifest.json'
+if (-not (Test-Path $manifestPath)) {
+    throw "missing RUI manifest: $manifestPath"
+}
+$manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+$expectedRuds = @($manifest.surviving_rui).Count
+if ($expectedRuds -lt 1) { throw 'the RUI manifest has no surviving intents' }
 $crashExit = 0x58435348
 $failed = @()
 $crashes = 0
@@ -71,8 +78,9 @@ foreach ($point in $points) {
             if ($item.type -eq 'XFS_LI_RUD') { $ruds += $item }
         }
     }
-    if ($ruds.Count -ne 1) {
-        $failed += "$point produced $($ruds.Count) committed RUD items (expected 1)"
+    if ($ruds.Count -ne $expectedRuds) {
+        $failed += "$point produced $($ruds.Count) committed RUD items " +
+            "(expected $expectedRuds)"
         continue
     }
     if ($journal.state -ne 'clean') {
