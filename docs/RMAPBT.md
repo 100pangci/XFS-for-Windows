@@ -503,8 +503,9 @@ was relaxed, and no rmap tree was rebuilt.
 | Original RUI, Windows recovery after `f82c969` | local `check`, clean journal and forward oracle pass; 5 intents completed |
 | Original RUI, recovery crash/restart after `f82c969` | local 11 injected crashes, 0 failures; Linux CI verification pending |
 | New RUI from `40084457645` | unmatched RUD exposed the legal replay-tail boundary described in section 7; after correction, local recovery completes 15 intents and passes check/oracle; Linux verification pending |
+| CI-captured RUI from `40087979448` | Windows recovery and all 11 recovery restarts pass; both Linux RUI verification jobs pass |
 | ENOSPC | ordinary-gate Windows rerun passes: 255 x 1 MiB, next allocation refused empty, 238 disk free blocks; `40084457645` Linux repair/oracle/coverage pass, mounted accounting corrected below; writable Linux continuation pending |
-| Reverse interoperability | ordinary-gate Windows rerun and `40084457645` Windows reverse pass after `1a6e251`; final Linux repair/oracle pass, expected-path typo corrected below; final Linux continuation pending |
+| Reverse interoperability | ordinary-gate Windows local rerun passes; complete Windows reverse and Linux final continuation pass in `40087979448` |
 
 ### AGF longest: completion, not BUF replay
 
@@ -566,3 +567,23 @@ required for the resulting, legitimately different tree layout.
   Windows state checks already agree on these names. Correcting the generated
   paths preserves every size/hash/nlink check; all 100 corrected expectations
   were matched individually against the original reverse image locally.
+
+### Full run `40087979448`
+
+62 of 63 jobs passed. In particular both Windows RUI jobs and both Linux RUI
+verification jobs pass, including all 11 restarted images. Mutation, 330-case
+writer crash (both replay implementations), reverse/final, WinFsp mount, raw
+device and RW-0..RW-6A regressions also pass. This is not yet permission to
+open the ordinary writable gate: the remaining job is Linux ENOSPC continuation.
+
+That job now passes repair, ownership oracle, exact allocated coverage,
+SB/AGF accounting, read-only mount and exact statfs accounting. Its writable
+copy freed 32 MiB, but the following 16 MiB `dd` still hit ENOSPC. Linux
+`xfs_default_resblks` reserves up to 8192 filesystem blocks (32 MiB at 4 KiB),
+in addition to per-AG reservations; freeing a fixed 32 MiB does not establish
+that 16 MiB is available to file data. The continuation now frees already
+verified 1 MiB allocation files in batches until kernel statfs reports 32 MiB
+available, logs each batch, and still requires the full 16 MiB write, namespace
+operations, final repair and oracle. It neither disables kernel reserves nor
+reduces the write size. Failure to make enough space after releasing every
+successful allocation remains a failure. Linux confirmation is pending.

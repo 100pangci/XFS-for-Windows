@@ -197,11 +197,31 @@ cp --sparse=always "$img" "$copy"
 rmdir "$mnt"
 mnt="$(mktemp -d)"
 mount -o loop "$copy" "$mnt"
-for ((i = 0; i < 32; i++)); do
-    rm -f "$(printf '%s/a%04d.bin' "$mnt$fill" "$i")"
+# The default kernel emergency pool alone can hold 8192 filesystem blocks
+# (32 MiB here); per-AG reservations are additional. Freeing a fixed 32 files
+# can merely refill those pools without making 16 MiB allocatable to data.
+# Preserve the full write test: release verified 1 MiB files until statfs
+# reports 32 MiB available (16 MiB data plus metadata/preallocation headroom).
+released=0
+available="$(stat -f -c %a "$mnt")"
+while [ "$released" -lt 32 ] || [ $((available * block_size)) -lt 33554432 ]; do
+    if [ "$released" -ge "$succeeded" ]; then
+        echo "FAILED: freeing all $succeeded allocation files left only $available available blocks" >&2
+        exit 1
+    fi
+    rm "$(printf '%s/a%04d.bin' "$mnt$fill" "$released")"
+    released=$((released + 1))
+    if [ $((released % 32)) -eq 0 ] || [ "$released" -eq "$succeeded" ]; then
+        sync
+        available="$(stat -f -c %a "$mnt")"
+        echo "Linux release: $released MiB freed, $available blocks available after kernel reservations"
+    fi
 done
-sync
 dd if=/dev/urandom of="$mnt$fill/linux-write.bin" bs=1M count=16 status=none
+if [ "$(stat -c %s "$mnt$fill/linux-write.bin")" -ne 16777216 ]; then
+    echo "FAILED: Linux continuation did not write the full 16 MiB" >&2
+    exit 1
+fi
 mkdir -p "$mnt$fill/linux-dir/sub"
 ln -s /enospc "$mnt$fill/linux-link"
 ln "$mnt$fill/linux-write.bin" "$mnt$fill/linux-hard"
