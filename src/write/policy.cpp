@@ -51,10 +51,9 @@ struct RoCompatReason {
 
 constexpr RoCompatReason kRoCompatReasons[] = {
     // RW-6A maintains finobt and the AGI btree block counters.  RW-6B has the
-    // rmapbt writer, but the ordinary read-write gate stays closed until the
-    // Linux/crash acceptance matrix is complete; only the recovery-only path
-    // (`allow_rmapbt_recovery`) may touch such an image.  Reflink remains
-    // entirely unsupported.
+    // rmapbt writer; rmapbt=1,reflink=0 is writable through the ordinary
+    // read-write gate.  Reflink remains entirely unsupported: the refcount
+    // btree and shared extents are outside this milestone.
     {ondisk::kRoCompatRmapbt, "rmapbt",
      "the reverse mapping btree must track every allocation"},
     {ondisk::kRoCompatReflink, "reflink",
@@ -66,6 +65,8 @@ constexpr RoCompatReason kRoCompatReasons[] = {
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_recovery,
                             bool allow_rmapbt_qualification) {
+  (void)allow_rmapbt_recovery;
+  (void)allow_rmapbt_qualification;
   if (sb.features.incompat_unknown) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "unknown incompatible features " +
@@ -95,9 +96,8 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
   }
   for (const auto& reason : kRoCompatReasons) {
     if (sb.features_ro_compat & reason.bit) {
-      if (reason.bit == ondisk::kRoCompatRmapbt &&
-          (allow_rmapbt_recovery || allow_rmapbt_qualification) &&
-          !sb.features.reflink) {
+      // RW-6B: a reverse-mapping filesystem without reflink is writable.
+      if (reason.bit == ondisk::kRoCompatRmapbt && !sb.features.reflink) {
         continue;
       }
       return XFS_ERR(XfsError::kUnsupportedFeature,

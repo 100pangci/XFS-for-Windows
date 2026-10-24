@@ -1,9 +1,11 @@
 # Reverse mapping ledger (RW-6B)
 
-Status: **in progress, not writable support**. The rmapbt/reflink writable
-gates remain closed. This document separates source-verified format/semantics
-from implementation and interoperability evidence. A reader or a structurally
-valid tree is not proof that the writer maintains ownership.
+Status: **ordinary experimental rmapbt qualification** (`rmapbt=1,reflink=0`
+only). Baseline run `40091917917` passed all 63 jobs; the gate-opening revision
+must additionally pass the same suite using ordinary `--rw-experimental` and
+the real-image structural/refusal gates below. Reflink/refcount/CoW and xattr
+modification remain refused. Format/semantics, unit coverage and genuine-kernel
+evidence are distinguished here; a valid tree alone is not ownership proof.
 
 ## 1. Baseline and sources
 
@@ -409,14 +411,11 @@ Implemented on `rw-6b`, with the ordinary writable gate still closed:
   Windows-formatted rmap images and is wired as a CI gate; a Linux-created
   fixture job is also present.
 
-Still required before the gate may open: genuine Linux-created rmap fixtures
-with Linux-originated mutations, surviving-RUI capture and completion evidence,
-the writer and recovery crash matrices, ENOSPC/log-reservation stress,
-reverse interoperability across repeated Linux/Windows passes, and real
-`xfs_repair -n`/`xfs_db`/`xfs_logprint` acceptance. The current unit tree is
-real but synthetic; it is not a substitute for those gates.
-`CheckWritableProfile` still refuses rmapbt for ordinary read-write mounts.
-This note must not be read as a claim that RW-6B is complete.
+The early implementation snapshot above did not authorize writable rmapbt.
+The subsequent Linux-created fixture, mutation, genuine surviving-RUI,
+crash, ENOSPC and repeated interoperability evidence is recorded below.
+The ordinary gate now selects only `rmapbt=1,reflink=0`; its revision must
+pass CI using ordinary opt-in, not the former qualification switch.
 
 ## 10. Independent ownership proof and acceptance gates
 
@@ -428,7 +427,7 @@ observations using the owner/flags/logical rules, then compare coverage and
 records. Also reject expected duplicates, free-space conflicts, missing and
 unexplained ownership. Do not rebuild rmapbt to mask writer bugs.
 
-Pending acceptance evidence (none implied by this research note):
+Acceptance evidence (unchecked rows are not claimed as completed):
 
 - [x] typed reader, key/record validation, lookup directions, CLI dump
 - [x] independent Python forward-derived ownership oracle on a real
@@ -441,20 +440,33 @@ Pending acceptance evidence (none implied by this research note):
 - [x] RMB3 buffer replay classification and recovery-only rmap profile
 - [x] pinned-tail wrap refusal when the recovery window reaches block 0
 - [ ] real leaf/internal split, merge, borrow, root growth/collapse on a
-       Linux-created fixture (the unit tree is not acceptance evidence)
-- [ ] Linux-created `rmapbt=1,reflink=0` + modern inode profile round trip
-- [ ] Linux -> Windows -> Linux -> Windows mutations and byte/namespace checks
-- [ ] genuine Linux dirty logs with committed surviving RUI (not synthetic-only)
-- [ ] MAP/UNMAP/CONVERT/ALLOC/FREE completion against the Linux fixture
+       Linux-created fixture (`windows-rw6b-tree` / `linux-verify-rw6b-tree`;
+       a local Windows-formatted structural test is not acceptance evidence)
+- [x] Linux-created `rmapbt=1,reflink=0` + modern inode profile round trip
+- [x] Linux -> Windows -> Linux -> Windows mutations and byte/namespace checks
+- [x] genuine Linux dirty logs with committed surviving RUI (not synthetic-only)
 - [x] writer crash matrix, both Linux and Windows replay oracles
-      (330 cases, run `40079819711`; ordinary-gate local Windows rerun passes,
-      current Linux rerun still pending)
-- [ ] recovery crash/restart matrix, no double-map/unmap
-- [ ] shared-intent refusal with full-image before/after hashes
-- [ ] malformed tree/record/ownership matrix on real fixtures, no writes
-- [ ] Linux mount + `xfs_repair -n` + xfs_db/logprint evidence and all regressions
+      (330 cases, run `40091917917`; ordinary-gate local Windows rerun passes)
+- [x] recovery crash/restart matrix, no double-map/unmap
+- [x] shared-intent refusal with full-image before/after hashes
+      (three shared operations injected into a genuine kernel log; local pass,
+      required again in the ordinary-gate CI revision)
+- [x] malformed tree/record/ownership matrix on real fixtures, no writes
+      (seven CRC-correct/CRC fault cases on a Linux-created image; local pass,
+      required again in the ordinary-gate CI revision)
+- [x] Linux mount + `xfs_repair -n` + xfs_db/logprint evidence and all regressions
+      (baseline `40091917917`; ordinary-gate revision must repeat the suite)
 
-### Current external evidence (not yet a completed gate)
+Kernel-log sampling limit: the genuine samples establish UNMAP and CONVERT,
+not every possible RUI producer. The MAP/UNMAP/CONVERT/ALLOC/FREE parser/editor
+matrix is unit coverage, **not** five-family kernel-log acceptance. Additional
+genuine MAP samples and online-repair ALLOC/FREE samples remain unclaimed.
+In the consulted kernel, ALLOC/FREE intent producers are online repair and CoW;
+CoW/refcount owners remain refused, and online repair is not an advertised
+ordinary writer operation. This qualification does not claim online repair or
+reflink/CoW interoperability.
+
+### Initial external evidence
 
 The `linux-generate-rw6b-rmap` CI job created a real 2 GiB
 `rmapbt=1,reflink=0` filesystem with the modern inode profile and populated it
@@ -478,10 +490,9 @@ The Windows-formatted `rmapbt=1,reflink=0` image also passed the independent
 oracle, then `xfs_repair -n`, a read-only mount, and a writable Linux pass
 (including `xfs_repair -n` on the resulting image).
 
-This proves the reader/oracle and formatter writes against a Linux-created
-multi-level overlapping tree. It does **not** yet prove Windows mutation of a
-Linux fixture, writer crash recovery, genuine surviving RUI recovery, or
-repeated reverse interoperability; those remain unchecked below.
+This initial result proved the reader/oracle and formatter writes only.
+Windows mutation, genuine surviving RUI, crash and repeated interoperability
+were subsequently accepted in the runs recorded in section 11.
 
 Only after these gates may `CheckWritableProfile` allow rmapbt. Reflink,
 refcountbt, CoW, realtime, external log, quota/xattr/parent mutation, metadir
@@ -490,10 +501,10 @@ priority than Linux-created correctness and is not a prerequisite.
 
 ## 11. Acceptance follow-up (2026-10-24)
 
-The ordinary writable gate is **not yet accepted**. The local gate-opening
-preparation is kept separate from the fixes below; CI must validate the fixes
-before that preparation is published. No ownership oracle or repair threshold
-was relaxed, and no rmap tree was rebuilt.
+Baseline acceptance completed in `40091917917` (63/63 success), before the
+gate-opening commit. The ordinary-gate revision repeats the full suite and
+adds explicit real-image structural/refusal assertions. No ownership oracle
+or repair threshold was relaxed, and no rmap tree was rebuilt.
 
 | evidence | result / reference |
 |---|---|
@@ -504,7 +515,7 @@ was relaxed, and no rmap tree was rebuilt.
 | Original RUI, recovery crash/restart after `f82c969` | local 11 injected crashes, 0 failures; Linux CI verification pending |
 | New RUI from `40084457645` | unmatched RUD exposed the legal replay-tail boundary described in section 7; after correction, local recovery completes 15 intents and passes check/oracle; Linux verification pending |
 | CI-captured RUI from `40087979448` | Windows recovery and all 11 recovery restarts pass; both Linux RUI verification jobs pass |
-| ENOSPC | ordinary-gate Windows rerun passes: 255 x 1 MiB, next allocation refused empty, 238 disk free blocks; `40084457645` Linux repair/oracle/coverage pass, mounted accounting corrected below; writable Linux continuation pending |
+| ENOSPC | ordinary-gate local Windows pass: 255 x 1 MiB, next allocation refused empty, 238 disk free blocks; full Linux continuation passes in `40091917917` |
 | Reverse interoperability | ordinary-gate Windows local rerun passes; complete Windows reverse and Linux final continuation pass in `40087979448` |
 
 ### AGF longest: completion, not BUF replay
@@ -587,3 +598,36 @@ available, logs each batch, and still requires the full 16 MiB write, namespace
 operations, final repair and oracle. It neither disables kernel reserves nor
 reduces the write size. Failure to make enough space after releasing every
 successful allocation remains a failure. Linux confirmation is pending.
+
+### Baseline completed: `40091917917`
+
+All **63 jobs succeeded**. The Linux ENOSPC continuation freed 32 MiB and
+reported only 75 allocatable blocks; after freeing 64 MiB it reported 8267
+blocks, wrote all 16 MiB, and passed final repair and the forward oracle.
+Both genuine-RUI recovery jobs and both Linux RUI verification jobs passed,
+as did mutation/reverse/final, 330-case writer crash, RW-0..RW-6A, WinFsp and
+raw-device verification. This completed before publishing the ordinary gate.
+
+The gate revision additionally requires:
+
+* seven malformed metadata/ownership refusals on the real Linux fixture:
+  bad CRC, zero length, invalid owner, out-of-AG extent, parent high key,
+  sibling cycle, and a valid-but-wrong owner for a real file. A positive
+  ordinary allocation control prevents mistaking profile refusal for metadata
+  refusal. Every negative operation has equal full-image before/after SHA256;
+* MAP_SHARED/UNMAP_SHARED/CONVERT_SHARED refusal after injecting only the
+  operation into an existing committed kernel RUI and preserving record CRCs
+  and cycle stamps. These are rejection tests, not synthetic-RUI acceptance;
+* a separate Linux-created 512 MiB/1 KiB fixture for actual internal rmap
+  splits and collapse, through ordinary file allocations and unlink. It does
+  not replace the populated 2 GiB/4 KiB fixture. Both the grown and collapsed
+  images go back to Linux for repair/mount/oracle. Tree edit counters are
+  diagnostic only; the forward oracle remains independent.
+
+The local structural harness (Windows-formatted, **not** Linux acceptance)
+measured height `1 -> 3 -> 2`, 64 leaf splits, 4 internal splits, 62 leaf
+merges, 4 internal merges, 474 leaf borrows, 16 internal borrows, 2 root grows
+and 1 collapse. Returning to height 1 is not required: scattered blocks
+returned to the active AGFL still carry OWN_AG and can legitimately need two
+levels. The real-image CI assertions require every operation class and a
+strict height decrease, not an assumed identical physical layout.

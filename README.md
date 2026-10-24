@@ -47,7 +47,7 @@ anything else is refused for read-write and stays readable.
 | Multi-block directories | read |
 | Internal log cleanliness check | yes; dirty logs are classified by the recovery scanner |
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
-| Formatter (mkfs) | yes: standard v5, plus optional finobt/inobtcount/sparse/bigtime/NREXT64 (`--modern-inode-profile`); no rmapbt/reflink |
+| Formatter (mkfs) | yes: standard v5, optional modern inode profile and `--rmapbt`; no reflink |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`), including the recovery inventory of a dirty log |
 | **Journal replay (RW-5)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI intent completion and AGI unlinked processing |
 | **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
@@ -147,7 +147,7 @@ profile are replayed by the RW-5 engine and verified back on Linux; the
 independent `tests/tools/rw6_inode_probe.py` cross-checks every tree, hole
 mask, counter and inode image.
 
-## Writable feature table (RW-6A)
+## Writable feature table (RW-6B)
 
 | Feature | Read | Write | Recovery |
 |---|---|---|---|
@@ -156,13 +156,23 @@ mask, counter and inode image.
 | sparse inode chunks | yes | yes | yes |
 | bigtime | yes | yes | yes |
 | NREXT64 | yes | yes | yes |
-| rmapbt | yes (`check` walks it; the reader does not need it) | **no** | n/a (refused on write) |
+| rmapbt | yes (`check` walks it; the reader does not need it) | experimental, **reflink=0 only** | RMB3 replay and surviving RUI completion |
 | reflink / refcount | yes (extents are read normally) | **no** | n/a (refused on write) |
 | xattr | preserved byte-for-byte | **no mutation** | preserved by inode items |
 
 The writable profile is XFS v5 with an internal log and a single data device.
-A filesystem using rmapbt, reflink, parent pointers, quotas, realtime, an
+A filesystem using reflink, parent pointers, quotas, realtime, an
 external log, metadir or zoned mode is refused before the first write.
+
+RW-6B incrementally maintains ownership on Linux-created `rmapbt=1,reflink=0`
+images through the ordinary `--rw-experimental` opt-in. It never rebuilds the
+rmapbt to repair a mutation. The independent ownership oracle derives owners
+from forward metadata. Qualification includes Linux repair/mount, repeated
+Linux/Windows mutations, ENOSPC, 330 writer crash cases, and genuine Linux
+surviving-RUI recovery with 11 recovery crash points. See the evidence and
+coverage limits in [docs/RMAPBT.md](docs/RMAPBT.md).
+
+**Reflink/refcount/CoW and xattr modification remain unsupported and refused.**
 
 ## Journal recovery (RW-5)
 
@@ -212,7 +222,8 @@ Scope of this milestone:
 - **Allow-list mount policy.** A filesystem may be mounted read-write only if
   this build can maintain every structure it uses. RW-6A added finobt,
   inobtcount, sparse inode chunks, bigtime and NREXT64 to the writable profile.
-  rmapbt, reflink, parent pointers, quotas, realtime devices, external logs,
+  RW-6B additionally maintains rmapbt when reflink is off. Reflink, parent
+  pointers, quotas, realtime devices, external logs,
   metadir, zoned and case-insensitive directories are still refused for
   read-write (they remain readable), with the blocking feature named in the
   error.
@@ -478,7 +489,8 @@ Fixed, conservative profile that Linux mounts natively:
 - optional RW-6A profile (`--modern-inode-profile`, or the individual
   `--finobt`, `--inobtcount`, `--sparse-inodes`, `--bigtime`, `--nrext64`
   switches): finobt, inobtcount, sparse inode chunks, bigtime and NREXT64
-- rmapbt, reflink, parent pointers and metadir remain off
+- optional `--rmapbt` enables reverse mapping with reflink off; reflink,
+  parent pointers and metadir remain off
 
 The formatter refuses devices that are too small for this profile (a 64 MiB
 log must fit inside one AG).

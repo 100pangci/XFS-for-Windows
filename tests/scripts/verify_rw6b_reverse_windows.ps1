@@ -24,7 +24,7 @@ $image = Join-Path $WorkDir 'rmap-windows-round2.img'
 Copy-Item $SourceImage $image -Force
 $checker = Join-Path $repo 'tests/tools/rw6b_round2_check.py'
 $oracle = Join-Path $repo 'tests/tools/rw6b_rmap_probe.py'
-$q = @('--rw-experimental', '--rw-rmapbt-qualification')
+$q = @('--rw-experimental')
 
 function Invoke-Cmd([string]$what, [string[]]$arguments) {
     $output = & $Exe @arguments 2>&1

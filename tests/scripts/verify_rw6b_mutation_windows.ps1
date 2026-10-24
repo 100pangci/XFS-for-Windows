@@ -10,10 +10,9 @@
 #   * the independent forward-derived ownership oracle
 #   * the user-visible namespace/content/size/nlink/symlink state
 #
-# The hidden --rw-rmapbt-qualification flag is deliberately separate from
-# --rw-experimental: ordinary rmapbt read-write stays refused until every
-# acceptance gate has passed.  The final image and expected.json are verified
-# by Linux (xfs_repair -n, mount, xfs_db, oracle).
+# This matrix now uses the ordinary --rw-experimental gate: rmapbt=1 with
+# reflink=0 is a supported writable profile.  The final image and expected.json
+# are verified by Linux (xfs_repair -n, mount, xfs_db, oracle).
 #
 #   pwsh -File tests/scripts/verify_rw6b_mutation_windows.ps1 `
 #       -Exe bin/xfswin.exe -SourceImage rw6b/rmap.img -WorkDir rw6b-mutated
@@ -79,9 +78,8 @@ function Invoke-Q([string]$what, [string[]]$arguments) {
     return Invoke-Cmd $what ($arguments + $q)
 }
 
-# The hidden switch is ignored without --rw-experimental, exactly like every
-# other write command.
-$q = @('--rw-experimental', '--rw-rmapbt-qualification')
+# Exercise the same explicit opt-in as every ordinary write command.
+$q = @('--rw-experimental')
 
 Write-Host "copying Linux-created rmapbt image: $SourceImage"
 Copy-Item $SourceImage $image -Force

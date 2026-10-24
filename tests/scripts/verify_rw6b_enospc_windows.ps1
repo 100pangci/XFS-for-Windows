@@ -22,7 +22,7 @@ $oracle = Join-Path $repo 'tests/tools/rw6b_rmap_probe.py'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $image = Join-Path $WorkDir 'rmap-enospc.img'
 Copy-Item $SourceImage $image -Force
-$q = @('--rw-experimental', '--rw-rmapbt-qualification')
+$q = @('--rw-experimental')
 
 function Invoke-Cmd([string]$what, [string[]]$arguments) {
     $output = & $Exe @arguments 2>&1

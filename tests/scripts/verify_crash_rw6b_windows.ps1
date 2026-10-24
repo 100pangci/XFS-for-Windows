@@ -29,7 +29,7 @@ $python = 'python'
 $checker = Join-Path $repo 'tests/tools/rw6b_crash_check.py'
 $oracle = Join-Path $repo 'tests/tools/rw6b_rmap_probe.py'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$q = @('--rw-rmapbt-qualification', '--rw-experimental')
+$q = @('--rw-experimental')
 $crash_exit_code = 0x58435348
 $remoteTarget = '../' + ('y/' * 120)
 
