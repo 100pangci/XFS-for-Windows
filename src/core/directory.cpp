@@ -807,7 +807,33 @@ Status ListDirectory(BlockDevice& dev, const XfsGeometry& geo,
       if (!leaf.ok()) return leaf.error();
       // Enumerate data blocks 0..bestcount-1 directly for stable order.
       const LeafView& view = leaf.value();
+      // Linux punches empty data blocks out of leaf directories. A null
+      // bests slot describes a hole, never a block referenced by a live entry.
+      for (uint16_t i = 0; i < view.count; ++i) {
+        const uint32_t addr = LoadBE32(&view.ents[i].address);
+        if (addr == kNullDataPtr) continue;
+        const uint32_t db = addr >> (io.DirBlockLog() - 3);
+        if (db >= view.bestcount || GetBE16(view.bests + db * 2) == 0xffffu) {
+          return XFS_ERR(XfsError::kCorruptDirectory,
+                         "live leaf entry references a missing data block")
+              .Ino(inode.ino)
+              .Actual(addr);
+        }
+      }
       for (uint32_t db = 0; db < view.bestcount; ++db) {
+        if (GetBE16(view.bests + db * 2) == 0xffffu) {
+          auto mapping = MapFileOffset(dev, geo, inode,
+                                      static_cast<uint64_t>(db)
+                                          << io.DirBlockLog());
+          if (!mapping.ok()) return mapping.error();
+          if (!mapping.value().is_hole) {
+            return XFS_ERR(XfsError::kCorruptDirectory,
+                           "null leaf bests entry has a mapped data block")
+                .Ino(inode.ino)
+                .DirBlock(db);
+          }
+          continue;
+        }
         auto block = io.ReadDirBlock(static_cast<uint64_t>(db)
                                          << io.DirBlockLog(),
                                      ondisk::kDir3DataMagic, "dir data block");
