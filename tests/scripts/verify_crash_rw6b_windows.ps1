@@ -131,7 +131,8 @@ foreach ($mode in @('create', 'write', 'truncate', 'unlink', 'fallocate',
                     if ($LASTEXITCODE -ne 0) {
                         $script:failed += "$mode/$point/$hit`: ownership oracle failed"
                     } else {
-                        & $python $checker --exe $Exe --image $image --mode $mode
+                        & $python $checker --exe $Exe --image $image `
+                            --mode $mode --base $SourceImage
                         if ($LASTEXITCODE -ne 0) {
                             $script:failed += "$mode/$point/$hit`: state is neither old nor new"
                         }

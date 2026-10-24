@@ -23,7 +23,6 @@ FRAG_SIZE = 128 * 2 * BLOCK - BLOCK
 FRAG_OLD_EXTENTS = 128
 REMOTE_TARGET = "../" + ("y/" * 120)
 
-
 class CheckError(AssertionError):
     pass
 
@@ -81,14 +80,14 @@ def require(condition, message):
         raise CheckError(message)
 
 
-def check_create(cli):
+def check_create(cli, base):
     item = cli.entry("/dirB", "new.bin")
     if item is not None:
         require(item.get("dir") is False, "new.bin is not a regular file")
         require(item.get("size") == 0, "partial new.bin size")
 
 
-def check_write(cli):
+def check_write(cli, base):
     st = cli.stat("/rewrite.bin")
     require(st["size"] in (8192, 8197),
             "rewrite.bin has partial size %d" % st["size"])
@@ -101,9 +100,14 @@ def check_write(cli):
         require(data[8192:] == b"WRITE", "new rewrite.bin tail is wrong")
 
 
-def check_truncate(cli):
+def check_truncate(cli, base):
+    frag_size = FRAG_SIZE
+    frag_extents = FRAG_OLD_EXTENTS
+    if base is not None:
+        frag_size = base.stat("/frag.bin")["size"]
+        frag_extents = base.stat("/frag.bin")["extents"]
     st = cli.stat("/frag.bin")
-    require(st["size"] in (4096, FRAG_SIZE),
+    require(st["size"] in (4096, frag_size),
             "frag.bin has partial size %d" % st["size"])
     if st["size"] == 4096:
         require(st["extents"] == 1,
@@ -111,20 +115,24 @@ def check_truncate(cli):
         require(cli.cat("/frag.bin") == b"F0000000" * (BLOCK // 8),
                 "truncated frag.bin content is wrong")
     else:
-        require(st["extents"] <= FRAG_OLD_EXTENTS,
-                "frag.bin grew to %d extents" % st["extents"])
+        require(st["extents"] <= frag_extents,
+                "frag.bin grew to %d extents (base %d)" %
+                (st["extents"], frag_extents))
 
 
-def check_unlink(cli):
+def check_unlink(cli, base):
     item = cli.entry("/", "frag.bin")
     if item is None:
         return
+    frag_size = FRAG_SIZE
+    if base is not None:
+        frag_size = base.stat("/frag.bin")["size"]
     require(item.get("dir") is False, "frag.bin is not a regular file")
-    require(item.get("size") == FRAG_SIZE,
+    require(item.get("size") == frag_size,
             "surviving frag.bin has partial size %d" % item.get("size"))
 
 
-def check_fallocate(cli):
+def check_fallocate(cli, base):
     st = cli.stat("/falloc.bin")
     require(st["size"] in (0, 1048576),
             "falloc.bin has partial size %d" % st["size"])
@@ -139,7 +147,7 @@ def check_fallocate(cli):
                 "falloc.bin contains written extents")
 
 
-def check_convert(cli):
+def check_convert(cli, base):
     st = cli.stat("/unwritten.bin")
     require(st["size"] == 1048576, "unwritten.bin size changed")
     written = set()
@@ -156,20 +164,20 @@ def check_convert(cli):
             "convert-unwritten changed blocks outside the range")
 
 
-def check_mkdir(cli):
+def check_mkdir(cli, base):
     item = cli.entry("/", "newdir")
     if item is not None:
         require(item.get("dir") is True, "newdir is not a directory")
 
 
-def check_rmdir(cli):
+def check_rmdir(cli, base):
     item = cli.entry("/", "emptydir")
     if item is not None:
         require(item.get("dir") is True, "emptydir is not a directory")
         require(item.get("size") == 0, "emptydir is not empty")
 
 
-def check_symlink(cli):
+def check_symlink(cli, base):
     item = cli.entry("/dirB", "sl")
     if item is not None:
         require(item.get("symlink") is True, "sl is not a symlink")
@@ -195,9 +203,11 @@ def main(argv):
     parser.add_argument("--exe", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--mode", required=True, choices=sorted(CHECKS))
+    parser.add_argument("--base", help="pristine crash fixture image")
     args = parser.parse_args(argv[1:])
     cli = Cli(args.exe, args.image)
-    CHECKS[args.mode](cli)
+    base = Cli(args.exe, args.base) if args.base else None
+    CHECKS[args.mode](cli, base)
     return 0
 
 

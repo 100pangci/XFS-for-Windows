@@ -1171,9 +1171,52 @@ Status DirectoryEditor::DropDataBlockIfEmpty(uint32_t db, bool empty) {
     if (it != data_blocks_.end()) bests_[db] = DataBestFree(it->second);
     return OkStatus();
   }
-  const uint32_t bestcount = static_cast<uint32_t>(data_size_ >> block_log_);
-  if (db + 1 != bestcount) {
-    bests_[db] = static_cast<uint16_t>(dir_block_size_ - d::kData3HeaderSize);
+  uint32_t last = 0;
+  for (const auto& entry : data_blocks_) last = std::max(last, entry.first);
+  if (db != last) {
+    // xfs_dir2_shrink_inode: an empty middle data block is replaced by the
+    // last data block, then the trailing block is removed.  Leaving empty
+    // blocks in place is rejected by xfs_repair ("empty data block ...
+    // would junk block").
+    auto last_it = data_blocks_.find(last);
+    if (last_it == data_blocks_.end()) {
+      return XFS_ERR(XfsError::kInternal, "directory tail block is missing")
+          .Ino(ino_)
+          .Actual(last);
+    }
+    std::vector<uint8_t> image = std::move(last_it->second);
+    data_blocks_.erase(last_it);
+    const uint64_t new_fsb = FsbForFileBlock(db);
+    if (new_fsb == kNullFsb) {
+      return XFS_ERR(XfsError::kInternal, "directory data block is not mapped")
+          .Ino(ino_)
+          .DirBlock(db);
+    }
+    PutBE64(image.data(), kBlkBlkno, geo_->FsbToByte(new_fsb) / 512);
+    data_blocks_[db] = std::move(image);
+    bests_[db] = DataBestFree(data_blocks_[db]);
+    bests_.erase(last);
+    data_dirty_.insert(db);
+    data_dirty_.erase(last);
+    const uint32_t shift = block_log_ - 3;
+    const uint32_t mask = (1u << shift) - 1;
+    for (auto& entry : leaf_blocks_) {
+      bool dirty = false;
+      for (LeafEnt& ent : entry.second.ents) {
+        if (ent.addr == 0 || (ent.addr >> shift) != last) continue;
+        ent.addr = (db << shift) | (ent.addr & mask);
+        dirty = true;
+      }
+      if (dirty) entry.second.dirty = true;
+    }
+    Status s = FreeDirBlock(last);
+    if (!s.ok()) return s;
+    uint32_t new_last = 0;
+    for (const auto& entry : data_blocks_) {
+      new_last = std::max(new_last, entry.first);
+    }
+    data_size_ = static_cast<uint64_t>(new_last + 1) << block_log_;
+    dirty_ = true;
     return OkStatus();
   }
   Status s = FreeDirBlock(db);
@@ -1181,9 +1224,11 @@ Status DirectoryEditor::DropDataBlockIfEmpty(uint32_t db, bool empty) {
   data_blocks_.erase(db);
   bests_.erase(db);
   data_dirty_.erase(db);
-  uint32_t last = 0;
-  for (const auto& entry : data_blocks_) last = std::max(last, entry.first);
-  data_size_ = static_cast<uint64_t>(last + 1) << block_log_;
+  uint32_t new_last = 0;
+  for (const auto& entry : data_blocks_) {
+    new_last = std::max(new_last, entry.first);
+  }
+  data_size_ = static_cast<uint64_t>(new_last + 1) << block_log_;
   dirty_ = true;
   return OkStatus();
 }

@@ -41,12 +41,24 @@ if not any(word in d["failure"].lower()
     raise SystemExit("refusal was not a free-space error: %r" % d["failure"])
 PY
 
-for tool in xfs_db xfs_repair mount umount stat find dd sync; do
+for tool in xfs_db xfs_repair xfs_bmap mount umount stat find dd sync awk; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "missing required tool: $tool" >&2
         exit 1
     }
 done
+
+# Sum the logical block coverage of a file from xfs_bmap.  stat %b also counts
+# bmbt blocks, so it cannot distinguish a fully allocated 1 MiB file from a
+# 1 MiB file with holes plus metadata.
+logical_blocks() {
+    xfs_bmap "$1" | awk -F'[][]' '
+        /\[/ {
+            split($2, range, "\\.\\.");
+            total += range[2] - range[1] + 1;
+        }
+        END { print total + 0 }'
+}
 
 echo "== xfs_db: superblock =="
 db_out="$(xfs_db -r -c 'sb 0' -c 'p' "$img" 2>&1)"
@@ -94,13 +106,13 @@ if [ ! -f "$mnt$fill/fill.bin" ]; then
     exit 1
 fi
 fill_size="$(stat -c %s "$mnt$fill/fill.bin")"
-fill_blocks="$(stat -c %b "$mnt$fill/fill.bin")"
+fill_blocks="$(logical_blocks "$mnt$fill/fill.bin")"
 if [ "$fill_size" -ne "$fill_bytes" ]; then
     echo "FAILED: fill.bin size $fill_size != $fill_bytes" >&2
     exit 1
 fi
-if [ $((fill_blocks * 512)) -ne "$fill_bytes" ]; then
-    echo "FAILED: fill.bin is sparse ($((fill_blocks * 512)) allocated)" >&2
+if [ $((fill_blocks * block_size)) -ne "$fill_bytes" ]; then
+    echo "FAILED: fill.bin covers $fill_blocks blocks, expected $((fill_bytes / block_size))" >&2
     exit 1
 fi
 
@@ -112,15 +124,16 @@ fi
 for ((i = 0; i < succeeded; i++)); do
     path="$(printf '%s/a%04d.bin' "$fill" "$i")"
     size="$(stat -c %s "$mnt$path")"
-    blocks="$(stat -c %b "$mnt$path")"
-    if [ "$size" -ne 1048576 ] || [ $((blocks * 512)) -ne 1048576 ]; then
-        echo "FAILED: $path is not a fully allocated 1 MiB file" >&2
+    blocks="$(logical_blocks "$mnt$path")"
+    if [ "$size" -ne 1048576 ] || [ "$blocks" -ne 256 ]; then
+        echo "FAILED: $path is not a fully allocated 1 MiB file " \
+             "(size $size, $blocks blocks)" >&2
         exit 1
     fi
 done
 failed_file="$(printf '%s/a%04d.bin' "$fill" "$failed_index")"
 if [ "$(stat -c %s "$mnt$failed_file")" -ne 0 ] ||
-   [ "$(stat -c %b "$mnt$failed_file")" -ne 0 ]; then
+   [ "$(logical_blocks "$mnt$failed_file")" -ne 0 ]; then
     echo "FAILED: refused allocation left data in $failed_file" >&2
     exit 1
 fi
