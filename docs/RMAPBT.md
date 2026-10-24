@@ -309,11 +309,12 @@ lifetimes in replay order, keyed by **intent type and id**, not a global set
 of all done IDs (IDs are pointer-derived and can be reused). Matching RUD
 releases an earlier active RUI; an uncommitted RUD releases nothing.
 
-Important source distinction: Linux `xlog_recover_release_intent` does not
-report an unmatched RUD as corruption; it cancels matches if present. The
-RW-6B requested policy is stricter (orphan RUD refuses). Keep that policy
-explicit; do not describe it as Linux's exact rule. Real Linux fixtures must
-establish whether this conservative refusal excludes otherwise legal logs.
+Linux `xlog_recover_release_intent` cancels earlier active matches if present;
+an unmatched RUD is legal when its RUI is outside the replay tail. Genuine
+kernel fixture `40084457645` establishes this boundary (the kernel recovers
+it cleanly). The scanner therefore accepts a structurally valid unmatched
+RUD, without cancelling later reused IDs. Malformed RUDs and unsupported
+shared RUIs still refuse before any replay write.
 
 Surviving RUI completion is `xfs_rmap_recover_work` -> validate every extent
 -> reconstruct operations -> `xlog_recover_finish_intent` ->
@@ -440,12 +441,14 @@ Pending acceptance evidence (none implied by this research note):
 - [x] RMB3 buffer replay classification and recovery-only rmap profile
 - [x] pinned-tail wrap refusal when the recovery window reaches block 0
 - [ ] real leaf/internal split, merge, borrow, root growth/collapse on a
-      Linux-created fixture (the unit tree is not acceptance evidence)
+       Linux-created fixture (the unit tree is not acceptance evidence)
 - [ ] Linux-created `rmapbt=1,reflink=0` + modern inode profile round trip
 - [ ] Linux -> Windows -> Linux -> Windows mutations and byte/namespace checks
 - [ ] genuine Linux dirty logs with committed surviving RUI (not synthetic-only)
 - [ ] MAP/UNMAP/CONVERT/ALLOC/FREE completion against the Linux fixture
-- [ ] writer crash matrix, both Linux and Windows replay oracles
+- [x] writer crash matrix, both Linux and Windows replay oracles
+      (330 cases, run `40079819711`; ordinary-gate local Windows rerun passes,
+      current Linux rerun still pending)
 - [ ] recovery crash/restart matrix, no double-map/unmap
 - [ ] shared-intent refusal with full-image before/after hashes
 - [ ] malformed tree/record/ownership matrix on real fixtures, no writes
@@ -484,3 +487,82 @@ Only after these gates may `CheckWritableProfile` allow rmapbt. Reflink,
 refcountbt, CoW, realtime, external log, quota/xattr/parent mutation, metadir
 and zoned XFS remain outside this milestone. Formatter support is lower
 priority than Linux-created correctness and is not a prerequisite.
+
+## 11. Acceptance follow-up (2026-10-24)
+
+The ordinary writable gate is **not yet accepted**. The local gate-opening
+preparation is kept separate from the fixes below; CI must validate the fixes
+before that preparation is published. No ownership oracle or repair threshold
+was relaxed, and no rmap tree was rebuilt.
+
+| evidence | result / reference |
+|---|---|
+| Linux-created fixture, Windows mutation, Linux repair/mount/oracle | passed in runs `40079819711` and `40081605233`; ordinary-gate Windows mutation rerun also passes locally |
+| Writer crash matrix | 330 Windows cases plus Linux replay/repair/oracle passed in `40079819711` and `40084457645`; all 330 ordinary-gate local Windows cases also pass, archives and `cases.json` retained |
+| Genuine surviving RUI | `40081605233`, artifact `rw6b-linux-rui`; kernel-recovered copy passes the oracle |
+| Original RUI, Windows recovery after `f82c969` | local `check`, clean journal and forward oracle pass; 5 intents completed |
+| Original RUI, recovery crash/restart after `f82c969` | local 11 injected crashes, 0 failures; Linux CI verification pending |
+| New RUI from `40084457645` | unmatched RUD exposed the legal replay-tail boundary described in section 7; after correction, local recovery completes 15 intents and passes check/oracle; Linux verification pending |
+| ENOSPC | ordinary-gate Windows rerun passes: 255 x 1 MiB, next allocation refused empty, 238 disk free blocks; `40084457645` Linux repair/oracle/coverage pass, mounted accounting corrected below; writable Linux continuation pending |
+| Reverse interoperability | ordinary-gate Windows rerun and `40084457645` Windows reverse pass after `1a6e251`; final Linux repair/oracle pass, expected-path typo corrected below; final Linux continuation pending |
+
+### AGF longest: completion, not BUF replay
+
+The original failure was `AG0 bnobt longest 4015 != AGF longest 4016`.
+Stopping at `recovery_after_metadata_flush` isolates physical log replay from
+deferred intent completion. On the original RUI image from `40081605233`:
+
+| AG0 field | after BUF/INODE replay | Linux recovery | Windows completion, fixed |
+|---|---:|---:|---:|
+| freeblks | 8035 | 8035 | 8034 |
+| btreeblks | 103 | 103 | 104 |
+| longest | 4016 | 4016 | 4015 |
+| largest bnobt extent | 45136 + 4016 | 45136 + 4016 | 45137 + 4015 |
+| flcount | 8 | 8 | 8 |
+
+Thus the replayed free-space state already matches the kernel. Completing a
+middle-extent CONVERT can insert two additional records into a full rmap leaf.
+The Windows editor splits where the Linux btree can redistribute to a sibling;
+the physical layouts need not be identical. Windows consumes active AGFL block
+16319 for that split, then reserves block 45136 to replenish the ring. Block
+45136 is an **active AGFL entry**, not a leaked or missed free block. The
+forward oracle accounts independently for the new tree and the active ring.
+AG1 and AG3 likewise consume an AGFL block for a split.
+
+`AgState::RefillAgflRaw` updated the free records and freeblks but left its
+cached longest unchanged. RUI completion can refill without a later file-data
+Allocate/Free call to recompute that maximum. `f82c969` refreshes longest in
+the refill path itself. Its regression test fails before the fix and passes
+after it, both with and without rmapbt; it derives the maximum from bnobt and
+also checks conservation of freeblks+flcount+btreeblks. Replay LSN and buffer
+cancellation rules were not changed. Linux repair/mount acceptance remains
+required for the resulting, legitimately different tree layout.
+
+### Other acceptance blockers uncovered
+
+* `xfs_bmap` reports both offsets and lengths in **512-byte basic blocks**
+  regardless of filesystem block size (`xfs_bmap(8)`). The literal-dot regex
+  correction alone did not fix the 8x discrepancy on 4 KiB images. The ENOSPC
+  verifier now compares allocated coverage in bytes, includes unwritten
+  preallocation with `-p`, and excludes holes/delalloc. The expected allocation
+  sizes and failed-allocation emptiness checks are unchanged.
+* Linux can punch out an empty middle data block while retaining a leaf1
+  directory. Its bests slot is `NULLDATAOFF` (`0xffff`). Enumeration now skips
+  only a slot whose forward mapping is actually a hole, and rejects live leaf
+  pointers to such a slot or a mapped block hidden by a null slot. The unit
+  regression covers both the valid sparse layout and corrupt references. The
+  original Linux `/linux-after/grow` fixture has db0 and db2, with db1 absent;
+  Windows now lists its 100 remaining entries instead of reporting corruption.
+* Disk `sb_fdblocks` and Linux read-only `statfs.f_bfree` are not the same
+  quantity. `xfs_alloc_set_aside` withholds `8 * agcount` blocks;
+  `xfs_freecounter_unavailable` additionally withholds non-root bnobt/cntbt
+  blocks (`agf_btreeblks - (agf_rmap_blocks - 1)`). The ENOSPC verifier now
+  requires exact equality of the manifest, disk SB counter and summed AGF
+  contributions, then independently requires exact mounted accounting with
+  these deductions. In `40084457645`, `238 - 8*4 - 0 = 206`. No tolerance or
+  ignored accounting discrepancy is introduced.
+* The final expectation generator omitted the `n` prefix from the 100 moved
+  `/win2/grow/n0400.bin` through `n0499.bin` paths. The fixture creator and
+  Windows state checks already agree on these names. Correcting the generated
+  paths preserves every size/hash/nlink check; all 100 corrected expectations
+  were matched individually against the original reverse image locally.
