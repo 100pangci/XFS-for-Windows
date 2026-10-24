@@ -618,16 +618,22 @@ The gate revision additionally requires:
 * MAP_SHARED/UNMAP_SHARED/CONVERT_SHARED refusal after injecting only the
   operation into an existing committed kernel RUI and preserving record CRCs
   and cycle stamps. These are rejection tests, not synthetic-RUI acceptance;
-* a separate Linux-created 512 MiB/1 KiB fixture for actual internal rmap
+* a separate Linux-created 512 MiB/4 KiB fixture for actual internal rmap
   splits and collapse, through ordinary file allocations and unlink. It does
   not replace the populated 2 GiB/4 KiB fixture. Both the grown and collapsed
   images go back to Linux for repair/mount/oracle. Tree edit counters are
   diagnostic only; the forward oracle remains independent.
 
 The local structural harness (Windows-formatted, **not** Linux acceptance)
-measured height `1 -> 3 -> 2`, 64 leaf splits, 4 internal splits, 62 leaf
+initially used 1 KiB blocks and measured height `1 -> 3 -> 2`, 64 leaf splits, 4 internal splits, 62 leaf
 merges, 4 internal merges, 474 leaf borrows, 16 internal borrows, 2 root grows
 and 1 collapse. Returning to height 1 is not required: scattered blocks
 returned to the active AGFL still carry OWN_AG and can legitimately need two
 levels. The real-image CI assertions require every operation class and a
 strict height decrease, not an assumed identical physical layout.
+
+Run `40096839943` rejected the first companion fixture at mkfs's minimum
+directory size check (`-n size=1024`); no Windows/Linux structural acceptance
+is claimed from that run. The companion now uses Linux-supported 4 KiB
+blocks/directories and 5000 alternating allocation pairs (10,000 data rmap
+records), retaining internal split/merge/borrow and root transition assertions.

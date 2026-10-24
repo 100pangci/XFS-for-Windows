@@ -49,7 +49,7 @@ def main():
         with image.open("rb") as stream:
             sb = stream.read(512)
             sector = int.from_bytes(sb[102:104], "big")
-            assert int.from_bytes(sb[4:8], "big") == 1024
+            assert int.from_bytes(sb[4:8], "big") == 4096
             stream.seek(sector + 36)
             return int.from_bytes(stream.read(4), "big")
 
@@ -60,10 +60,12 @@ def main():
     cli("create", "/tree-b", write=True)
     # Alternating owners prevent physical adjacency from merging the rmap
     # records. Removing B then removes every other mapping, forcing borrow.
-    for i in range(600):
+    # max_leaf=168, max_node=91 at 4 KiB. 10,000 nonmergeable data records
+    # force internal growth, not just more leaves under an unchanged root.
+    for i in range(5000):
         for name in ("/tree-a", "/tree-b"):
-            cli("fallocate", name, i * 1024, 1024, write=True)
-        if (i + 1) % 100 == 0:
+            cli("fallocate", name, i * 4096, 4096, write=True)
+        if (i + 1) % 500 == 0:
             print("allocated pairs:", i + 1, flush=True)
     verify()
     peak = height()

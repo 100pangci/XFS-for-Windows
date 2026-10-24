@@ -323,26 +323,6 @@ int MakeRw6SparseFixture(const std::string& path_string) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  // Local structural-stress fixture only. CI must use mkfs.xfs's independently
-  // created rmap-tree.img for the interoperability acceptance job.
-  if (argc == 3 && std::strcmp(argv[1], "--make-rw6b-tree") == 0) {
-    std::string error;
-    auto image = xfs::ImageBlockDevice::Create(
-        std::filesystem::path(argv[2]), 512ull << 20, 512, &error);
-    if (!image) return 1;
-    xfs::mkfs::FormatOptions options;
-    options.block_size = 1024;
-    options.inode_size = 512;
-    options.rmapbt = true;
-    options.finobt = true;
-    options.quiet = true;
-    auto formatted = xfs::mkfs::Format(*image, options);
-    if (!formatted.ok()) {
-      std::cerr << formatted.error().Format() << '\n';
-      return 1;
-    }
-    return image->Flush() ? 0 : 1;
-  }
   if (argc == 3 && std::strcmp(argv[1], "--make-fixture") == 0) {
     return MakeFixture(argv[2]);
   }

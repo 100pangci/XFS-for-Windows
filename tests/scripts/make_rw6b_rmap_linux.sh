@@ -204,12 +204,12 @@ fi
 
 echo "wrote $IMG"
 
-# A second genuine Linux fixture makes internal rmap splits affordable to
-# exercise: 1 KiB blocks give max_leaf=40, max_node=22. This does not replace
-# the populated 2 GiB/4 KiB fixture above.
+# A second genuine Linux fixture starts with a single-leaf rmap tree so the
+# Windows pass can prove growth and collapse. Keep mkfs.xfs's supported 4 KiB
+# block/directory profile; this does not replace the populated 2 GiB fixture.
 tree_img="$OUT/rmap-tree.img"
 truncate -s 512M "$tree_img"
-mkfs.xfs -f -b size=1024 -n size=1024 \
+mkfs.xfs -f -b size=4096 -n size=4096 \
     -m crc=1,rmapbt=1,reflink=0,finobt=1,inobtcount=1,bigtime=1 \
     -i sparse=1,nrext64=1 "$tree_img"
 xfs_repair -n "$tree_img" > "$OUT/rmap-tree.repair.txt" 2>&1
