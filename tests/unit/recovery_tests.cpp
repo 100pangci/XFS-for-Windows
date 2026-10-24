@@ -9,6 +9,7 @@
 // independent of the writer's positioning logic: the synthetic logs are built
 // from the on-disk format constants, so a bug shared with the writer cannot
 // hide behind them.
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -21,13 +22,16 @@
 #include "xfs/endian.h"
 #include "xfs/error.h"
 #include "xfs/filesystem.h"
+#include "xfs/formatter.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
 #include "xfs/log_format.h"
 #include "xfs/log_record.h"
 #include "xfs/ondisk.h"
 #include "xfs/recovery.h"
+#include "xfs/rmap.h"
 #include "xfs/superblock.h"
+#include "xfs/transaction.h"
 
 namespace {
 
@@ -355,13 +359,13 @@ TEST(recovery_scan_unsupported_item_refuses) {
   FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
   FillCycle(&log, 2, xfs::MakeLsn(2, 2), &next_tid);
 
-  // A committed RUI item (rmap update intent): known type, refused by this
-  // build's writable profile.
-  std::vector<uint8_t> rui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(rui.data(), 0, lf::kItemRui);
-  PutLE16At(rui.data(), 2, 1);  // one region
+  // A committed CUI item (refcount update intent) is still an unsupported
+  // semantic in this build.
+  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
+  PutLE16At(cui.data(), 0, lf::kItemCui);
+  PutLE16At(cui.data(), 2, 1);  // one region
   const uint32_t tid = next_tid;
-  auto ops = CommitOps(tid, {rui});
+  auto ops = CommitOps(tid, {cui});
   log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops);
 
   auto scan = log.Scan();
@@ -370,9 +374,28 @@ TEST(recovery_scan_unsupported_item_refuses) {
   CHECK(!scan.value().Recoverable());
   CHECK_EQ(scan.value().unsupported_items.size(), 1u);
   if (!scan.value().unsupported_items.empty()) {
-    CHECK(scan.value().unsupported_items[0].find("XFS_LI_RUI") !=
+    CHECK(scan.value().unsupported_items[0].find("XFS_LI_CUI") !=
           std::string::npos);
   }
+}
+
+TEST(recovery_scan_rud_without_intent_in_replay_window_is_legal) {
+  SyntheticLog log;
+  uint32_t next_tid = 1;
+  FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
+  std::vector<uint8_t> rud(lf::kRudFormatSize, 0);
+  PutLE16At(rud.data(), 0, lf::kItemRud);
+  PutLE16At(rud.data(), 2, 1);
+  PutLE64At(rud.data(), lf::kIntentIdOffset, 0xabc);
+  auto ops = CommitOps(next_tid, {rud});
+  log.WriteRecord(1, 62, 60, xfs::MakeLsn(1, 2), next_tid, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().Recoverable());
+  CHECK(scan.value().unsupported_items.empty());
+  CHECK(xfs::CollectPendingIntents(scan.value()).empty());
 }
 
 TEST(recovery_scan_keeps_every_item_of_a_transaction) {
@@ -469,6 +492,8 @@ std::vector<uint8_t> BuildExtendedRecord(uint32_t cycle, uint32_t block,
   std::vector<uint8_t> header(record.begin(), record.begin() + lf::kRecCrcCovered);
   xfs::PutLE32(header.data(), lf::kRecCrc, 0);
   uint32_t crc = xfs::Crc32cUpdate(0xFFFFFFFFu, header.data(), header.size());
+  // xlog_cksum() also covers each extension header's 260 bytes.
+  crc = xfs::Crc32cUpdate(crc, ext, lf::kRecExtSize);
   crc = xfs::Crc32cUpdate(crc, record.data() + 2 * lf::kRecordHeaderSize,
                           data.size());
   xfs::PutLE32(record.data(), lf::kRecCrc, ~crc);
@@ -517,6 +542,53 @@ TEST(recovery_scan_large_record_with_extension_header) {
     // Every data block's cycle stamp was restored from the header or the
     // extension header: the logged region must be byte-identical.
     CHECK(items[0].regions[1] == payload);
+  }
+}
+
+TEST(recovery_scan_writer_large_record_with_extension_header) {
+  // Same shape as the synthetic scanner test, but produced by the production
+  // log-record writer: the writer must choose h_size > 32 KiB, fill the
+  // extension header, and the scanner must verify its CRC and unpack every
+  // cycle word back into the 32 KiB logged buffer region.
+  SyntheticLog log(96);
+  std::vector<uint8_t> payload(32 * 1024, 0);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
+  }
+  auto regions = BufItemRegions(8192, 64, lf::kBlftAgf, 0, payload);
+  auto ops = CommitOps(9, regions);
+  xfs::LogRecordParams params;
+  params.cycle = 1;
+  params.block = 0;
+  params.tid = 9;
+  params.prev_block = 0xffffffffu;
+  params.tail_lsn = xfs::MakeLsn(1, 0);
+  params.log_blocks = log.log_blocks();
+  params.uuid = log.sb().uuid;
+  auto record = xfs::BuildLogRecord(params, ops);
+  CHECK(record.ok());
+  if (!record.ok()) return;
+  CHECK(GetBE32(record.value().data(), lf::kRecSize) == 64 * 1024);
+  CHECK(GetBE32(record.value().data(), lf::kRecLen) > lf::kHeaderCycleBytes);
+  log.WriteRaw(log.log_byte(), record.value().data(), record.value().size());
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().state == xfs::LogState::kDirty);
+  CHECK_EQ(scan.value().records.size(), 1u);
+  if (!scan.value().records.empty()) {
+    CHECK_EQ(scan.value().records[0].header_blocks, 2u);
+  }
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (scan.value().transactions.empty()) return;
+  const auto& items = scan.value().transactions[0].items;
+  CHECK_EQ(items.size(), 1u);
+  if (items.size() == 1 && items[0].regions.size() == 2) {
+    CHECK(items[0].type == lf::kItemBuf);
+    CHECK(items[0].regions[1] == payload);
+  } else {
+    CHECK(false);
   }
 }
 
@@ -722,10 +794,10 @@ TEST(recovery_replay_cancel_table) {
 
 TEST(recovery_replay_refuses_unsupported_items) {
   SyntheticLog log;
-  std::vector<uint8_t> rui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(rui.data(), 0, lf::kItemRui);
-  PutLE16At(rui.data(), 2, 1);
-  auto ops = CommitOps(31, {rui});
+  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
+  PutLE16At(cui.data(), 0, lf::kItemCui);
+  PutLE16At(cui.data(), 2, 1);
+  auto ops = CommitOps(31, {cui});
   log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, ops);
 
   auto scan = log.Scan();
@@ -734,7 +806,7 @@ TEST(recovery_replay_refuses_unsupported_items) {
   auto replay = log.Replay(scan.value(), nullptr);
   CHECK(!replay.ok());
   if (!replay.ok()) {
-    CHECK(replay.error().message.find("XFS_LI_RUI") != std::string::npos);
+    CHECK(replay.error().message.find("XFS_LI_CUI") != std::string::npos);
   }
 }
 
@@ -971,6 +1043,317 @@ TEST(recovery_of_a_clean_log_is_a_noop) {
   }
   fs.value().reset();
   fixture.Reset();
+}
+
+TEST(recovery_refuses_shared_or_malformed_rui_before_writes) {
+  for (int variant = 0; variant < 2; ++variant) {
+    xfstest::MemoryBlockDevice device(300ull << 20);
+    xfs::mkfs::FormatOptions options;
+    options.block_size = 4096;
+    options.inode_size = 512;
+    options.rmapbt = true;
+    options.quiet = true;
+    CHECK(xfs::mkfs::Format(device, options).ok());
+    auto sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(sb.ok());
+    if (!sb.ok()) return;
+    const xfs::XfsGeometry geo = xfs::MakeGeometry(sb.value());
+
+    auto position = xfs::ReadLogPosition(device, geo, sb.value());
+    CHECK(position.ok());
+    if (!position.ok()) return;
+    std::vector<uint8_t> rui(lf::kRuiFormatSize + lf::kRuiExtentSize, 0);
+    PutLE16At(rui.data(), 0, lf::kItemRui);
+    PutLE16At(rui.data(), 2, 1);
+    PutLE32At(rui.data(), lf::kIntentNextentsOffset, 1);
+    PutLE64At(rui.data(), lf::kIntentIdOffset, 0x5b6c + variant);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiOwnerOffset, 0,
+              sb.value().rootino);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartblockOffset, 0,
+              geo.AgFsb(0, 100));
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartoffOffset, 0, 0);
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiLenOffset, 0, 1);
+    uint32_t flags = lf::kRmapExtentMapShared;
+    if (variant == 1) {
+      flags = lf::kRmapExtentMap | (1u << 8);  // reserved flag bit
+    }
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiFlagsOffset, 0, flags);
+
+    xfs::LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x5b6c + variant;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = xfs::MakeLsn(position.value().cycle,
+                                   position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = xfs::BuildLogRecord(
+        params, CommitOps(0x5b6c + variant, {rui}));
+    CHECK(record.ok());
+    if (!record.ok()) return;
+    CHECK(device.Write(geo.FsbToByte(sb.value().logstart) +
+                           static_cast<uint64_t>(params.block) * 512,
+                       record.value().data(), record.value().size()));
+    CHECK(device.Flush());
+
+    const std::vector<uint8_t> pristine = device.bytes();
+    xfs::MountOptions mount_options;
+    mount_options.read_write = true;
+    mount_options.recovery_only = true;
+    mount_options.clean_log_after_recovery = true;
+    auto fs = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+        mount_options);
+    CHECK(!fs.ok());
+    if (!fs.ok()) {
+      CHECK(fs.error().message.find("RUI") != std::string::npos ||
+            fs.error().message.find("reflink") != std::string::npos ||
+            fs.error().message.find("reserved") != std::string::npos);
+    }
+    CHECK(device.bytes() == pristine);
+  }
+}
+
+TEST(recovery_mount_completes_surviving_rui_convert) {
+  // A Linux RUI that survives without a matching RUD must be completed by a
+  // normal transaction that logs the rmap buffers and the RUD together.
+  xfstest::MemoryBlockDevice device(300ull << 20);
+  xfs::mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.rmapbt = true;
+  options.quiet = true;
+  CHECK(xfs::mkfs::Format(device, options).ok());
+
+  auto sb0 = xfs::ReadSuperblock(device, 0, true);
+  CHECK(sb0.ok());
+  if (!sb0.ok()) return;
+  const xfs::XfsGeometry geo = xfs::MakeGeometry(sb0.value());
+  xfs::Allocation alloc;
+  {
+    // Allocate an unwritten extent and map it exactly as the writer does.
+    xfs::XfsTransaction txn;
+    xfs::BlockAllocator blocks(&txn, &device, &geo);
+    CHECK(blocks
+              .AllocateOwned(0, 4,
+                             xfs::RmapOwner::Data(sb0.value().rootino, 0x123,
+                                                  true),
+                             &alloc)
+              .ok());
+    CHECK(blocks.Commit().ok());
+    for (const xfs::TransactionWrite& write : txn.writes()) {
+      CHECK(device.Write(write.offset, write.data.data(),
+                         write.data.size()));
+    }
+    CHECK(device.Flush());
+  }
+
+  // Append a committed RUI/CONVERT (new state written) at the next log block.
+  {
+    auto position = xfs::ReadLogPosition(device, geo, sb0.value());
+    CHECK(position.ok());
+    if (!position.ok()) return;
+    std::vector<uint8_t> rui(lf::kRuiFormatSize + lf::kRuiExtentSize, 0);
+    PutLE16At(rui.data(), 0, lf::kItemRui);
+    PutLE16At(rui.data(), 2, 1);
+    PutLE32At(rui.data(), lf::kIntentNextentsOffset, 1);
+    PutLE64At(rui.data(), lf::kIntentIdOffset, 0x5b6b);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiOwnerOffset, 0,
+              sb0.value().rootino);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartblockOffset, 0,
+              alloc.fsb);
+    PutLE64At(rui.data() + lf::kRuiFormatSize + lf::kRuiStartoffOffset, 0,
+              0x123);
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiLenOffset, 0,
+              alloc.len);
+    // The intent describes the *new* state: converting the unwritten extent
+    // to written, so the UNWRITTEN bit is clear.
+    PutLE32At(rui.data() + lf::kRuiFormatSize + lf::kRuiFlagsOffset, 0,
+              lf::kRmapExtentConvert);
+
+    xfs::LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x5b6b;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = xfs::MakeLsn(position.value().cycle,
+                                   position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = xfs::BuildLogRecord(params, CommitOps(0x5b6b, {rui}));
+    CHECK(record.ok());
+    if (!record.ok()) return;
+    CHECK(device.Write(geo.FsbToByte(sb0.value().logstart) +
+                           static_cast<uint64_t>(params.block) * 512,
+                       record.value().data(), record.value().size()));
+    CHECK(device.Flush());
+  }
+
+  const std::vector<uint8_t> dirty = device.bytes();
+  xfs::MountOptions mount_options;
+  mount_options.read_write = true;
+  mount_options.recovery_only = true;
+  // Keep the completion transaction in the log for the structural assertion
+  // below; the crash loop uses a copy that closes with an unmount record.
+  mount_options.clean_log_after_recovery = false;
+  auto fs = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&device), mount_options);
+  if (!fs.ok()) {
+    std::fprintf(stderr, "rui mount failed: %s\n", fs.error().Format().c_str());
+  }
+  CHECK(fs.ok());
+  if (!fs.ok()) return;
+  CHECK(fs.value()->recovery_report().has_value());
+  if (fs.value()->recovery_report().has_value()) {
+    CHECK_EQ(fs.value()->recovery_report()->replay.intents_pending, 1u);
+    CHECK_EQ(fs.value()->recovery_report()->intents_completed, 1u);
+  }
+  fs.value().reset();
+
+  // Atomicity assertion independent of the final filesystem state: scan the
+  // still-dirty log and require one committed transaction carrying both the
+  // RUD and at least one metadata buffer item.
+  {
+    auto after_sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(after_sb.ok());
+    if (!after_sb.ok()) return;
+    auto after_scan =
+        xfs::ScanLog(device, after_sb.value(),
+                     xfs::MakeGeometry(after_sb.value()));
+    CHECK(after_scan.ok());
+    if (!after_scan.ok()) return;
+    bool saw = false;
+    for (const auto& trans : after_scan.value().transactions) {
+      bool rud = false;
+      size_t buffers = 0;
+      for (const auto& item : trans.items) {
+        if (item.type == lf::kItemRud) rud = true;
+        if (item.type == lf::kItemBuf) ++buffers;
+      }
+      if (rud) {
+        CHECK(buffers > 0);
+        saw = true;
+      }
+    }
+    CHECK(saw);
+    CHECK_EQ(xfs::CollectPendingIntents(after_scan.value()).size(), 0u);
+  }
+
+  // Crash at every recovery write and restart: the existing RUI must not run
+  // twice, and the committed RUD must be replayed instead.
+  class LimitedDevice final : public xfs::BlockDevice {
+   public:
+    explicit LimitedDevice(xfs::BlockDevice* backing) : backing_(backing) {}
+    void FailAfter(uint64_t writes) { fail_after_ = writes; }
+    bool Read(uint64_t offset, void* buffer, size_t size) override {
+      return backing_->Read(offset, buffer, size);
+    }
+    bool Write(uint64_t offset, const void* buffer, size_t size) override {
+      if (writes_ >= fail_after_) {
+        last_error_ = "injected crash";
+        return false;
+      }
+      ++writes_;
+      return backing_->Write(offset, buffer, size);
+    }
+    bool Flush() override {
+      if (writes_ >= fail_after_) {
+        last_error_ = "injected crash";
+        return false;
+      }
+      return backing_->Flush();
+    }
+    uint64_t Size() const override { return backing_->Size(); }
+    uint32_t SectorSize() const override { return backing_->SectorSize(); }
+    const xfs::DeviceInfo& Info() const override { return backing_->Info(); }
+    void Close() override {}
+
+   private:
+    xfs::BlockDevice* backing_;
+    uint64_t fail_after_ = ~0ull;
+    uint64_t writes_ = 0;
+  };
+
+  xfs::MountOptions crash_mount_options = mount_options;
+  crash_mount_options.clean_log_after_recovery = true;
+  uint64_t verified_cuts = 0;
+  for (uint64_t cut = 0; cut < 64; ++cut) {
+    device.bytes() = dirty;
+    bool crashed_early = false;
+    {
+      auto limited = std::make_unique<LimitedDevice>(&device);
+      limited->FailAfter(cut);
+      auto crashed = xfs::XfsFilesystem::Mount(std::move(limited),
+                                               crash_mount_options);
+      crashed_early = !crashed.ok();
+    }
+    if (!crashed_early) break;
+    auto retry = xfs::XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+        crash_mount_options);
+    if (!retry.ok()) {
+      std::fprintf(stderr, "RUI restart after cut %llu failed: %s\n",
+                   static_cast<unsigned long long>(cut),
+                   retry.error().Format().c_str());
+      CHECK(retry.ok());
+      return;
+    }
+    // The final log position after a torn completion record can legitimately
+    // differ from the clean reference (stale blocks were trimmed first), so
+    // the crash oracle compares semantics: no pending RUI, the converted rmap
+    // record is present exactly once, and the log ends clean.
+    auto final_sb = xfs::ReadSuperblock(device, 0, true);
+    CHECK(final_sb.ok());
+    if (!final_sb.ok()) return;
+    auto final_scan =
+        xfs::ScanLog(device, final_sb.value(),
+                     xfs::MakeGeometry(final_sb.value()));
+    CHECK(final_scan.ok());
+    if (!final_scan.ok()) return;
+    CHECK(final_scan.value().Recoverable());
+    CHECK_EQ(xfs::CollectPendingIntents(final_scan.value()).size(), 0u);
+    CHECK(final_scan.value().state == xfs::LogState::kClean ||
+          final_scan.value().state == xfs::LogState::kEmpty);
+    auto final_geo = xfs::MakeGeometry(final_sb.value());
+    auto final_tree =
+        xfs::LoadRmapTree(device, final_geo,
+                          static_cast<uint32_t>(alloc.fsb >> final_geo.agblklog),
+                          final_sb.value().lsn);
+    CHECK(final_tree.ok());
+    if (!final_tree.ok()) return;
+    auto converted = final_tree.value().LookupEq(xfs::RmapKey{
+        static_cast<uint32_t>(alloc.fsb &
+                              ((1ULL << final_geo.agblklog) - 1)),
+        final_sb.value().rootino, 0x123, 0});
+    CHECK(converted.ok());
+    if (converted.ok()) {
+      CHECK_EQ(converted.value().blockcount, alloc.len);
+      CHECK(!converted.value().unwritten());
+    }
+    ++verified_cuts;
+  }
+  CHECK(verified_cuts >= 3);
+
+  auto sb = xfs::ReadSuperblock(device, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  const xfs::XfsGeometry after = xfs::MakeGeometry(sb.value());
+  const uint32_t agno = static_cast<uint32_t>(alloc.fsb >> after.agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(alloc.fsb & ((1ULL << after.agblklog) - 1));
+  auto tree = xfs::LoadRmapTree(device, after, agno, sb.value().lsn);
+  CHECK(tree.ok());
+  if (!tree.ok()) return;
+  auto rec = tree.value().LookupEq(
+      xfs::RmapKey{agbno, sb.value().rootino, 0x123, 0});
+  CHECK(rec.ok());
+  if (rec.ok()) {
+    CHECK_EQ(rec.value().blockcount, alloc.len);
+    CHECK(!rec.value().unwritten());
+  }
 }
 
 TEST(recovery_mount_finishes_extent_free_intents) {

@@ -130,13 +130,23 @@ const uint8_t* BtreeLeafRec(const uint8_t* buf, const BtreeBlockMeta& meta,
 }
 
 Status WalkBtree(const BtreeSpec& spec, uint64_t root,
-                 const BtreeWalkCallbacks& callbacks) {
+                  const BtreeWalkCallbacks& callbacks) {
+  return WalkBtreeForest(spec, {root}, 0xffff, callbacks);
+}
+
+Status WalkBtreeForest(const BtreeSpec& spec, const std::vector<uint64_t>& roots,
+                      uint16_t expected_level,
+                      const BtreeWalkCallbacks& callbacks) {
   if (!callbacks.read_block || !callbacks.visit) {
     return XFS_ERR(XfsError::kInternal, "btree walk missing callbacks")
         .Metadata(spec.name);
   }
   std::unordered_set<uint64_t> visited;
-  std::unordered_map<uint16_t, uint64_t> last_block_at_level;
+  struct Sibling {
+    uint64_t ptr;
+    uint64_t right;
+  };
+  std::unordered_map<uint16_t, Sibling> last_block_at_level;
 
   // Explicit stack with expected child level (0xffff = root, any level).
   constexpr uint16_t kAnyLevel = 0xffff;
@@ -146,7 +156,9 @@ Status WalkBtree(const BtreeSpec& spec, uint64_t root,
     uint16_t expected_level;
   };
   std::vector<Frame> stack;
-  stack.push_back({root, 0, kAnyLevel});
+  for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
+    stack.push_back({*it, 0, expected_level});
+  }
 
   while (!stack.empty()) {
     Frame frame = stack.back();
@@ -212,15 +224,22 @@ Status WalkBtree(const BtreeSpec& spec, uint64_t root,
 
     // Sibling coherence: blocks are visited in in-order; the previous block
     // at this level should be exactly leftsib.
-    if (callbacks.check_siblings && meta.level > 0) {
+    if (callbacks.check_siblings) {
       auto it = last_block_at_level.find(meta.level);
       if (it != last_block_at_level.end()) {
-        if (meta.leftsib != it->second) {
+        if (meta.leftsib != it->second.ptr) {
           return XFS_ERR(XfsError::kCorruptBtree,
                          "left sibling pointer mismatch")
               .Metadata(spec.name)
-              .Expected(it->second)
+              .Expected(it->second.ptr)
               .Actual(meta.leftsib);
+        }
+        if (it->second.right != frame.ptr) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "right sibling pointer mismatch")
+              .Metadata(spec.name)
+              .Expected(frame.ptr)
+              .Actual(it->second.right);
         }
       } else {
         if (meta.leftsib != spec.null_ptr) {
@@ -230,7 +249,7 @@ Status WalkBtree(const BtreeSpec& spec, uint64_t root,
               .Actual(meta.leftsib);
         }
       }
-      last_block_at_level[meta.level] = frame.ptr;
+      last_block_at_level[meta.level] = {frame.ptr, meta.rightsib};
     }
 
     s = callbacks.visit(frame.ptr, meta, buf.data());
@@ -245,6 +264,16 @@ Status WalkBtree(const BtreeSpec& spec, uint64_t root,
       stack.push_back(
           {child, static_cast<uint16_t>(frame.depth + 1),
            static_cast<uint16_t>(meta.level - 1)});
+    }
+  }
+  if (callbacks.check_siblings) {
+    for (const auto& entry : last_block_at_level) {
+      if (entry.second.right != spec.null_ptr) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "last block at level has a right sibling")
+            .Metadata(spec.name)
+            .Actual(entry.second.right);
+      }
     }
   }
   return OkStatus();

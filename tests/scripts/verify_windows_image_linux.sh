@@ -92,6 +92,20 @@ sync
 umount "$mnt"
 trap - EXIT
 rmdir "$mnt"
+
+echo "== xfs_repair -n after the Linux writable pass =="
+if ! xfs_repair -n "$copy" > /tmp/xfswin-repair-after.log 2>&1; then
+    cat /tmp/xfswin-repair-after.log
+    echo "FAILED: xfs_repair -n rejected the Linux-modified copy" >&2
+    rm -f "$copy"
+    exit 1
+fi
+cat /tmp/xfswin-repair-after.log
+if grep -qiE 'corruption|fatal|would fix' /tmp/xfswin-repair-after.log; then
+    echo "FAILED: the Linux writable pass left repairable damage" >&2
+    rm -f "$copy"
+    exit 1
+fi
 rm -f "$copy"
 
 echo "OK: $img is a valid XFS v5 filesystem"

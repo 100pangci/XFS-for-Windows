@@ -162,18 +162,25 @@ class Geometry:
 
 
 class LogImage:
-    def __init__(self, image, geo):
-        self.image = image
+    """Reads the log ring from a buffer that starts at log block zero.
+
+    Only the superblock and the log are loaded, so probing a multi-GiB image
+    does not fault the whole file into memory each time.  The RUI capture
+    script calls this scanner once per device-mapper snapshot.
+    """
+
+    def __init__(self, log_data, geo):
+        self.log_data = log_data
         self.geo = geo
 
     def read_block(self, block):
         block %= self.geo.log_bb
-        off = self.geo.log_byte + block * 512
-        return self.image[off:off + 512]
+        off = block * 512
+        return self.log_data[off:off + 512]
 
     def read_raw(self, block, count):
-        off = self.geo.log_byte + block * 512
-        return self.image[off:off + count * 512]
+        off = block * 512
+        return self.log_data[off:off + count * 512]
 
     def cycle(self, block):
         data = self.read_block(block)
@@ -364,10 +371,15 @@ def seek_logrec_hdr(img, head_blk, tail_blk, count):
     return found, rblk, header, wrapped
 
 
-def record_crc(header_bytes, data):
-    header = bytearray(header_bytes[:328])
+def record_crc(header_bytes, data, fixed=328):
+    header = bytearray(header_bytes[:fixed])
     struct.pack_into("<I", header, 32, 0)
     crc = crc32c(bytes(header))
+    # xlog_cksum(): each xlog_rec_ext_header contributes its 260 covered bytes
+    # (cycle word + 64 saved data-cycle words), not the 252 reserved bytes.
+    for ext in range(1, len(header_bytes) // 512):
+        at = ext * 512
+        crc = crc32c(bytes(header_bytes[at:at + 260]), crc)
     crc = crc32c(data, crc)
     return (~crc) & 0xFFFFFFFF
 
@@ -379,9 +391,7 @@ def verify_crc(header_bytes, data):
     crc = record_crc(header_bytes, data)
     if crc == stored:
         return True, crc
-    header = bytearray(header_bytes[:324])
-    struct.pack_into("<I", header, 32, 0)
-    other = (~crc32c(data, crc32c(bytes(header)))) & 0xFFFFFFFF
+    other = record_crc(header_bytes, data, fixed=324)
     return other == stored, other
 
 
@@ -629,6 +639,24 @@ def item_summary(item):
                     "count": be32(first, 12)})
     elif tid in (0x1236, 0x1237, 0x1244, 0x1245) and len(first) >= 16:
         out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
+    elif tid in (0x1240, 0x1241) and len(first) >= 16:
+        out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
+        if tid == 0x1240:
+            count = le32(first, 4)
+            extents = []
+            for i in range(count):
+                base = 16 + i * 32
+                if base + 32 > len(first):
+                    break
+                extents.append({
+                    "owner": struct.unpack_from("<Q", first, base)[0],
+                    "startblock": struct.unpack_from("<Q", first, base + 8)[0],
+                    "startoff": struct.unpack_from("<Q", first, base + 16)[0],
+                    "len": le32(first, base + 24),
+                    "flags": le32(first, base + 28),
+                    "op": le32(first, base + 28) & 0xFF,
+                })
+            out.update({"nextents": count, "extents": extents})
     return out
 
 
@@ -763,9 +791,17 @@ class Reconstruction:
 
 
 def scan(path):
-    image = open(path, "rb").read()
-    geo = Geometry(image)
-    img = LogImage(image, geo)
+    with open(path, "rb") as stream:
+        sb = stream.read(512)
+        if len(sb) < 512:
+            raise LogError("short superblock read")
+        geo = Geometry(sb)
+        stream.seek(geo.log_byte)
+        log_data = stream.read(geo.log_bb * 512)
+    if len(log_data) != geo.log_bb * 512:
+        raise LogError("short log read (%d of %d bytes)" %
+                       (len(log_data), geo.log_bb * 512))
+    img = LogImage(log_data, geo)
     tail = find_tail(img, geo)
     result = {
         "state": tail["state"],

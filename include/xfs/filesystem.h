@@ -53,6 +53,17 @@ struct MountOptions {
   // Finish a mount-time recovery with a clean-unmount record (the standalone
   // `xfswin recover` shape). Read-write mounts keep the log writable instead.
   bool clean_log_after_recovery = false;
+  // Internal recovery-only path: allow the profile check to accept the
+  // rmapbt=1,reflink=0 feature set so a dirty rmapbt log can be recovered
+  // before the general writable gate is opened.  It does not make ordinary
+  // read-write mounts legal; `xfswin recover` is the only caller and closes
+  // the filesystem immediately after the completion pass.
+  bool recovery_only = false;
+  // Qualification-only override for the RW-6B mutation matrix.  It is
+  // deliberately separate from `read_write` so ordinary `--rw-experimental`
+  // continues to refuse rmapbt until every acceptance gate has passed.  Only
+  // the hidden `--rw-rmapbt-qualification` CLI flag sets it.
+  bool allow_rmapbt_qualification = false;
 };
 
 struct XfsFileInfo {
@@ -198,6 +209,29 @@ class XfsFilesystem {
   //     frees them through the allocator, keeps a partially covered last
   //     block and zeroes the part of it beyond the new size.
   Result<XfsFileInfo> SetFileSize(uint64_t ino, uint64_t new_size);
+
+  // Preallocate [offset, offset + length) as unwritten extents (fallocate
+  // mode 0 semantics for the qualification matrix). Existing extents are
+  // preserved; the range is rounded out to whole filesystem blocks and a file
+  // that grows keeps the new logical size (the bytes read as zeros). The
+  // allocation, extent-map change and inode update commit in one transaction.
+  // This is the state a crash after the write-path's first transaction leaves
+  // behind; `xfswin convert-unwritten` turns it back into written data.
+  Result<XfsFileInfo> AllocateUnwritten(uint64_t ino, uint64_t offset,
+                                        uint64_t length);
+
+  // Converts every unwritten extent overlapping [offset, offset + length) to
+  // written.  Unwritten blocks the caller did not initialize are zero-filled
+  // and flushed before the state change commits, so a converted extent can
+  // never expose stale disk contents.  (The normal write path converts only
+  // after it has written the data; this entry point is the qualification
+  // equivalent of a zero-range plus conversion.)
+  Result<XfsFileInfo> ConvertUnwritten(uint64_t ino, uint64_t offset,
+                                       uint64_t length);
+
+  // Physical data-fork extents (for diagnostics, the free-block-reuse matrix
+  // and crash-image structure transitions).
+  Result<std::vector<XfsExtent>> GetDataExtents(uint64_t ino) const;
 
   // ---- namespace mutation (RW-3, read-write mounts only) ----
   // Creates a regular file (mode must be a regular-file mode; 0 means 0644)

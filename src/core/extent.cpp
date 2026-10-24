@@ -193,29 +193,14 @@ Status LoadBtreeFormat(BlockDevice& dev, const XfsGeometry& geo,
         inode.data_fork.data() + bt::kBmdrSize + node_maxrecs * 8;
     const uint8_t* keys = inode.data_fork.data() + bt::kBmdrSize;
 
-    // Walk each child subtree in order, checking the root keys match the
-    // first key of each child.
+    // All children belong to one embedded-root tree. Walking each separately
+    // resets sibling state and falsely rejects a second internal child whose
+    // left sibling is the first child (bmdr level >= 2).
     uint64_t prev_key = 0;
-    bool first_child = true;
-    auto original_visit = cb.visit;
-    cb.visit = [&](uint64_t fsb, const BtreeBlockMeta& meta,
-                   const uint8_t* buf) -> Status {
-      if (first_child) {
-        first_child = false;
-        if (meta.level + 1 != root_level) {
-          return XFS_ERR(XfsError::kCorruptInode,
-                         "bmbt root level does not match child level")
-              .Ino(inode.ino)
-              .Metadata("bmbt")
-              .Expected(root_level - 1)
-              .Actual(meta.level);
-        }
-      }
-      return original_visit(fsb, meta, buf);
-    };
+    std::vector<uint64_t> children;
     for (uint16_t i = 0; i < root_numrecs; ++i) {
       uint64_t key = GetBE64(keys + i * 8);
-      if (i > 0 && key < prev_key) {
+      if (i > 0 && key <= prev_key) {
         return XFS_ERR(XfsError::kCorruptInode,
                        "bmbt root keys out of order")
             .Ino(inode.ino)
@@ -229,20 +214,32 @@ Status LoadBtreeFormat(BlockDevice& dev, const XfsGeometry& geo,
             .Metadata("bmbt")
             .Actual(i);
       }
-      // Verify the first leaf record of the subtree has startoff >= key
-      // (the key is the smallest record in the subtree), and order is
-      // maintained across subtrees via ValidateExtentList below.
-      Status s = WalkBtree(spec, child, cb);
-      if (!s.ok()) return s;
-      if (!extents.empty() && extents.back().startoff < key) {
-        return XFS_ERR(XfsError::kCorruptBtree,
-                       "bmbt root key exceeds records in its subtree")
-            .Ino(inode.ino)
-            .Metadata("bmbt")
-            .Expected(extents.back().startoff)
-            .Actual(key);
-      }
+      children.push_back(child);
     }
+    auto original_visit = cb.visit;
+    cb.visit = [&](uint64_t fsb, const BtreeBlockMeta& meta,
+                   const uint8_t* buf) -> Status {
+      for (size_t i = 0; i < children.size(); ++i) {
+        if (children[i] != fsb) continue;
+        const uint64_t actual = meta.level == 0
+            ? ToExtent(BtreeLeafRec(buf, meta, spec, 0)).startoff
+            : BtreeKeyValue(buf, meta, spec, 0);
+        const uint64_t expected = GetBE64(keys + i * 8);
+        if (actual != expected) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "bmbt root key does not match its child")
+              .Ino(inode.ino)
+              .Metadata("bmbt")
+              .Expected(expected)
+              .Actual(actual);
+        }
+        break;
+      }
+      return original_visit(fsb, meta, buf);
+    };
+    Status walked = WalkBtreeForest(spec, children,
+                                    static_cast<uint16_t>(root_level - 1), cb);
+    if (!walked.ok()) return walked;
   }
 
   Status s = ValidateExtentList(geo, inode, extents);

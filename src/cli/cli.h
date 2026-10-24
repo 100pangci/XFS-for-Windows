@@ -26,6 +26,12 @@ struct Options {
   bool sparse_inodes = false;
   bool bigtime = false;
   bool nrext64 = false;
+  // RW-6B formatter/test profile: rmapbt=1, reflink=0.
+  bool rmapbt = false;
+  // Hidden qualification override: permits ordinary mutation of a
+  // rmapbt=1,reflink=0 image before the writable gate is opened. Never set by
+  // `--rw-experimental` alone; the RW-6B acceptance jobs use it explicitly.
+  bool rmapbt_qualification = false;
 };
 
 // Runs the CLI. argv excludes the program name.

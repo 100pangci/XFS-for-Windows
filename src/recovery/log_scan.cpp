@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "xfs/endian.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
+#include "xfs/rmap_intent.h"
 
 namespace xfs {
 namespace {
@@ -349,28 +351,36 @@ bool HeaderCheckMount(const uint8_t* bytes, const XfsSuperblock& sb,
 // xlog_cksum(): the CRC covers the fixed header (up to XLOG_REC_SIZE, with the
 // CRC field zeroed) plus the record data exactly as written, i.e. with the
 // cycle words stamped in. A zero stored CRC is accepted (mkfs history).
-uint32_t ComputeRecordCrc(const uint8_t* header_bytes, size_t header_covered,
-                          const uint8_t* data, size_t data_len) {
-  std::vector<uint8_t> header(header_bytes, header_bytes + header_covered);
-  PutLE32(header.data(), lf::kRecCrc, 0);
-  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, header.data(), header.size());
+uint32_t ComputeRecordCrc(const uint8_t* header_bytes, size_t header_size,
+                          size_t header_covered, const uint8_t* data,
+                          size_t data_len) {
+  std::vector<uint8_t> fixed(header_bytes, header_bytes + header_covered);
+  PutLE32(fixed.data(), lf::kRecCrc, 0);
+  uint32_t crc = Crc32cUpdate(0xFFFFFFFFu, fixed.data(), fixed.size());
+  // xlog_cksum() streams each extension header's 260 covered bytes; the 252
+  // reserved bytes are not part of the checksum.
+  for (size_t off = lf::kRecordHeaderSize;
+       off + lf::kRecExtSize <= header_size; off += lf::kRecordHeaderSize) {
+    crc = Crc32cUpdate(crc, header_bytes + off, lf::kRecExtSize);
+  }
   if (data_len) crc = Crc32cUpdate(crc, data, data_len);
   return ~crc;
 }
 
 // Verifies a record's CRC. Returns false when the stored CRC is set and does
-// not match either historical coverage size.
+// not match either historical fixed-header coverage size.
 bool VerifyRecordCrc(const std::vector<uint8_t>& header_bytes,
                      const uint8_t* data, size_t data_len, uint32_t* computed) {
   const uint32_t stored = GetLE32(header_bytes.data(), lf::kRecCrc);
   // XLOG_REC_SIZE (328, the non-i386 layout) and XLOG_REC_SIZE_OTHER (324).
-  uint32_t crc = ComputeRecordCrc(header_bytes.data(), lf::kRecCrcCovered, data,
-                                  data_len);
+  uint32_t crc = ComputeRecordCrc(header_bytes.data(), header_bytes.size(),
+                                  lf::kRecCrcCovered, data, data_len);
   if (stored == 0 || crc == stored) {
     if (computed) *computed = crc;
     return true;
   }
-  uint32_t other = ComputeRecordCrc(header_bytes.data(), 324, data, data_len);
+  uint32_t other = ComputeRecordCrc(header_bytes.data(), header_bytes.size(),
+                                    324, data, data_len);
   if (computed) *computed = other;
   return other == stored;
 }
@@ -1520,8 +1530,8 @@ constexpr ItemTypeEntry kItemTypes[] = {
     {lf::kItemIunlink, "XFS_LI_IUNLINK", RecoveryItemClass::kIntent},
     {lf::kItemDquot, "XFS_LI_DQUOT", RecoveryItemClass::kRefused},
     {lf::kItemQuotaoff, "XFS_LI_QUOTAOFF", RecoveryItemClass::kRefused},
-    {lf::kItemRui, "XFS_LI_RUI", RecoveryItemClass::kRefused},
-    {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kRefused},
+    {lf::kItemRui, "XFS_LI_RUI", RecoveryItemClass::kIntent},
+    {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kIntentDone},
     {lf::kItemCui, "XFS_LI_CUI", RecoveryItemClass::kRefused},
     {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kRefused},
     {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kRefused},
@@ -1673,12 +1683,51 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   scan.transactions = reconstruction.transactions();
   scan.unsupported_items = reconstruction.unsupported();
 
+  // Inventory and validate every RUI/RUD before replay.  This includes
+  // operations that are already paired (a matching RUD later in the log):
+  // shared/reflink intent must refuse even if it would not need completion.
+  for (const RecoveredTransaction& trans : scan.transactions) {
+    for (const RecoveredItem& item : trans.items) {
+      if (item.type == lf::kItemRui) {
+        if (!geo.features.rmapbt) {
+          scan.unsupported_items.push_back(
+              "RUI item present on a filesystem without rmapbt");
+          continue;
+        }
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("RUI item has no format region");
+          continue;
+        }
+        auto parsed = ParseRui(item.regions[0], geo);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("RUI preflight: ") + parsed.error().Format());
+        }
+      } else if (item.type == lf::kItemRud) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("RUD item has no format region");
+          continue;
+        }
+        auto parsed = ParseRud(item.regions[0]);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("RUD preflight: ") + parsed.error().Format());
+        }
+      }
+    }
+  }
+
+  // A done item can outlive its intent in the replay window once the tail
+  // advances. xlog_recover_release_intent cancels only earlier active matches;
+  // an unmatched RUD is legal, not a reason to refuse an otherwise valid log.
+  // CollectPendingIntents preserves this ordering (including reused IDs).
+
   // An unresolved intent this build cannot finish is a refusal too: replaying
   // its metadata would be safe, but the deferred operation could not be
-  // completed (xlog_recover_process_intents). EFI (extent free) is the only
-  // intent type with a completion pass today.
+  // completed (xlog_recover_process_intents). EFI and RUI have completion
+  // passes; every other intent type refuses before the first write.
   for (const PendingIntent& intent : CollectPendingIntents(scan)) {
-    if (intent.type == lf::kItemEfi) continue;
+    if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui) continue;
     scan.unsupported_items.push_back(
         "unresolved intent " +
         std::string(LogItemTypeName(intent.type) ? LogItemTypeName(intent.type)
@@ -1718,8 +1767,12 @@ std::vector<PendingIntent> CollectPendingIntents(const LogScan& scan) {
         }
         const uint64_t id =
             LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
-        const uint16_t want_type =
-            item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
+        uint16_t want_type = lf::kItemBui;
+        if (item.type == lf::kItemEfd) {
+          want_type = lf::kItemEfi;
+        } else if (item.type == lf::kItemRud) {
+          want_type = lf::kItemRui;
+        }
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           if (it->type != want_type || it->regions.empty() ||
               it->regions[0].size() < lf::kIntentLogFormatSize) {

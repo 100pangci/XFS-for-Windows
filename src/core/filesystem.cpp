@@ -16,6 +16,7 @@
 #include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/rmap.h"
 #include "xfs/symlink.h"
 #include "xfs/verifier.h"
 #include "xfs/write.h"
@@ -269,7 +270,9 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         if (can_recover) {
           // Never recover a filesystem this build would then refuse to
           // modify: check the profile first.
-          Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+          Status profile = CheckWritableProfile(
+              fs->superblock_, fs->geometry_, options.recovery_only,
+              options.allow_rmapbt_qualification);
           if (!profile.ok()) {
             auto error = profile.error();
             error.message +=
@@ -340,7 +343,9 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
-    Status profile = CheckWritableProfile(fs->superblock_, fs->geometry_);
+    Status profile = CheckWritableProfile(
+        fs->superblock_, fs->geometry_, options.recovery_only,
+        options.allow_rmapbt_qualification);
     if (!profile.ok()) {
       auto error = profile.error();
       error.message +=
@@ -362,6 +367,11 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         XFS_SB_INFO("unlinked inode recovery: freed="
                     << processed.value() << " cleared_buckets=" << cleared);
       }
+    }
+    if (options.recovery_only) {
+      // Recovery already completed (or the log was clean).  Do not leave a
+      // recovery-only mount usable as a general writable filesystem.
+      fs->writable_ = false;
     }
   }
 
@@ -850,6 +860,10 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
   }
   const uint16_t root_level = GetBE16(inode.data_fork.data(), 0);
   const uint16_t root_numrecs = GetBE16(inode.data_fork.data(), 2);
+  if (root_level == 0) {
+    *out = blocks;
+    return OkStatus();
+  }
   const size_t node_maxrecs =
       (inode.data_fork.size() - bt::kBmdrSize) / (bt::kBmbtKeySize + bt::kBmbtPtrSize);
   BtreeSpec spec;
@@ -884,6 +898,7 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
     ++bmbt_blocks;
     return OkStatus();
   };
+  std::vector<uint64_t> children;
   for (uint16_t i = 0; i < root_numrecs; ++i) {
     const uint64_t ptr = GetBE64(inode.data_fork.data(),
                                  bt::kBmdrSize + node_maxrecs * 8 + i * 8);
@@ -892,10 +907,10 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
           .Ino(inode.ino)
           .Metadata("inode");
     }
-    s = WalkBtree(spec, ptr, cb);
-    if (!s.ok()) return s;
+    children.push_back(ptr);
   }
-  (void)root_level;
+  s = WalkBtreeForest(spec, children, static_cast<uint16_t>(root_level - 1), cb);
+  if (!s.ok()) return s;
   *out = blocks + bmbt_blocks;
   return OkStatus();
 }
@@ -964,6 +979,8 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   uint64_t total_free = 0;
   uint64_t total_icount = 0;
   uint64_t total_ifree = 0;
+  bool rmap_seen = false;
+  bool rmap_clean = true;
   if (options.allocation_groups) {
     for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
       auto headers = ReadAgHeaders(dev, geo, agno);
@@ -1139,42 +1156,24 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         uint32_t rmap_blocks = 0;
         bool rmap_ok = true;
         if (live_sb.features.rmapbt) {
-          BtreeSpec rmap;
-          rmap.name = "rmapbt";
-          // Short block header (56 bytes, CRC at 52) but two 20-byte keys per
-          // node entry and 4-byte pointers (XFS_RMAP_KEY_ADDR etc).
-          rmap.format = BtreeFormat::kShort;
-          rmap.block_size = geo.block_size;
-          rmap.key_size = bt::kRmapKeySize;
-          rmap.ptr_size = bt::kRmapPtrSize;
-          rmap.rec_size = bt::kRmapRecSize;
-          rmap.magic = ondisk::kRmapCrcMagic;
-          rmap.max_depth = bt::kMaxTraversalLevels;
-          rmap.null_ptr = kNullAgBlock;
-          rmap.expected_owner = agno;
-          rmap.owner_size = 4;
-          rmap.uuid = geo.meta_uuid;
-          rmap.sb_lsn = live_sb.lsn;
-          rmap.ptr_to_daddr = bnobt.ptr_to_daddr;
-          BtreeWalkCallbacks rcb;
-          rcb.read_block = read_ag_block;
-          rcb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
-          rcb.visit = [&](uint64_t, const BtreeBlockMeta&,
-                          const uint8_t*) -> Status {
-            ++rmap_blocks;
-            return OkStatus();
-          };
-          const Status rs = WalkBtree(rmap, agf.rmap_root, rcb);
-          if (!rs.ok()) {
+          rmap_seen = true;
+          // The generic WalkBtree cannot decode the overlapping tree's
+          // interleaved low/high key pairs. The typed reader also validates
+          // both child keys, record ownership and the AGF block counter.
+          auto tree = LoadRmapTree(dev, geo, agno, live_sb.lsn);
+          if (!tree.ok()) {
             report.Add("AG" + std::to_string(agno) + " rmapbt",
-                       CheckStatus::kCorrupt, rs.error().Format());
+                       CheckStatus::kCorrupt, tree.error().Format());
             rmap_ok = false;
-          } else if (rmap_blocks != agf.rmap_blocks) {
-            report.Add("AG" + std::to_string(agno) + " rmapbt blocks",
-                       CheckStatus::kCorrupt,
-                       "AGF rmap_blocks " + std::to_string(agf.rmap_blocks) +
-                           " != counted " + std::to_string(rmap_blocks));
-            rmap_ok = false;
+            rmap_clean = false;
+          } else {
+            rmap_blocks = tree.value().blocks;
+            report.Add("AG" + std::to_string(agno) + " rmapbt",
+                       CheckStatus::kOk,
+                       "level " + std::to_string(tree.value().level) + ", " +
+                           std::to_string(rmap_blocks) + " blocks, " +
+                           std::to_string(tree.value().records.size()) +
+                           " records (structurally verified)");
           }
         }
         if (bno_ok && cnt_ok && rmap_ok) {
@@ -1503,6 +1502,13 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
         }
       }
     }
+  }
+
+  if (rmap_seen) {
+    report.Add("rmapbt", rmap_clean ? CheckStatus::kOk : CheckStatus::kCorrupt,
+               rmap_clean
+                   ? "all AG reverse-mapping trees structurally clean"
+                   : "one or more AG reverse-mapping trees failed");
   }
 
   if (options.allocation_groups) {

@@ -114,6 +114,9 @@ bool ClassifyMetadata(const uint8_t* buf, size_t len, MetaType* out) {
     case ondisk::kBmapCrcMagic:
       *out = {"bmbt", ondisk::btree::kLLsn, ondisk::btree::kLCrc, true};
       return true;
+    case ondisk::kRmapCrcMagic:
+      *out = {"rmapbt", ondisk::btree::kSLsn, ondisk::btree::kSCrc, true};
+      return true;
     case ondisk::kDir3BlockMagic:
     case ondisk::kDir3DataMagic:
     case ondisk::kDir3FreeMagic:
@@ -189,6 +192,8 @@ int64_t OnDiskMetadataLsn(const uint8_t* buf, size_t len, const Uuid& meta_uuid,
         return ondisk::btree::kSUuid;
       case ondisk::kBmapCrcMagic:
         return ondisk::btree::kLUuid;
+      case ondisk::kRmapCrcMagic:
+        return ondisk::btree::kSUuid;
       case ondisk::kDir3BlockMagic:
       case ondisk::kDir3DataMagic:
       case ondisk::kDir3FreeMagic:
@@ -651,20 +656,23 @@ void LogDinodeToDisk(const uint8_t* log, size_t log_size, uint8_t* disk,
 }
 
 // xfs_bmbt_to_bmdr(): the logged data-fork btree root is a full btree block;
-// the inode fork stores the short-form header plus short pointers.
+// the inode fork stores the short header followed by fixed max-record key and
+// pointer arrays (the fork is sized for maxrecs, not numrecs).
 void BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
                 size_t dst_len) {
   if (src_len < ondisk::btree::kLHeaderLenV5 || dst_len < 4) return;
   const uint16_t level = GetBE16(src, ondisk::btree::kLevel);
   const uint16_t numrecs = GetBE16(src, ondisk::btree::kNumrecs);
+  const size_t dst_maxrecs = (dst_len - 4) / 16;
+  if (numrecs > dst_maxrecs) return;
   PutBE16(dst, 0, level);
   PutBE16(dst, 2, numrecs);
   const size_t key_base = ondisk::btree::kLHeaderLenV5;
   const size_t ptr_base = key_base + static_cast<size_t>(numrecs) *
                                           ondisk::btree::kBmbtKeySize;
-  const size_t dst_key_base = ondisk::btree::kBmdrSize;
+  const size_t dst_key_base = 4;
   const size_t dst_ptr_base =
-      dst_key_base + static_cast<size_t>(numrecs) * ondisk::btree::kBmbtKeySize;
+      dst_key_base + dst_maxrecs * ondisk::btree::kBmbtKeySize;
   for (uint16_t i = 0; i < numrecs; ++i) {
     const size_t key_off = key_base + static_cast<size_t>(i) * 8;
     const size_t ptr_off = ptr_base + static_cast<size_t>(i) * 8;
@@ -673,14 +681,9 @@ void BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
     if (key_off + 8 > src_len || ptr_off + 8 > src_len) break;
     if (dst_key_off + 8 > dst_len || dst_ptr_off + 8 > dst_len) break;
     std::memcpy(dst + dst_key_off, src + key_off, 8);
-    // Long-form startblock is 52 bits packed into the first 4 bytes of the
-    // pointer plus the top 21 bits of the second; xfs_bmbt_disk_get_startblock
-    // recomposes it into a full be64 pointer.
-    const uint32_t lo = GetBE32(src, ptr_off);
-    const uint32_t hi = GetBE32(src, ptr_off + 4);
-    const uint64_t startblock =
-        (static_cast<uint64_t>(lo & 0x1FFu) << 43) | (hi >> 21);
-    StoreBE64(dst + dst_ptr_off, startblock);
+    // An internal bmbt pointer is a plain big-endian fsblock.  (Only leaf
+    // records use the 128-bit packed startblock/blockcount form.)
+    StoreBE64(dst + dst_ptr_off, GetBE64(src, ptr_off));
   }
 }
 
@@ -969,12 +972,14 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
     }
     const std::vector<uint8_t>& region = item.regions[region_index++];
     if (dpart == lf::kILogDBRoot) {
-      if (region.size() > dfork_size || dfork_size == 0) {
+      if (dfork_size < 4) {
         return XFS_ERR(XfsError::kCorruptInode,
                        "inode btree root does not fit the data fork")
             .Ino(in_f.ino)
             .Metadata("log item");
       }
+      // The logged region is a full in-core root block (header + max keys).
+      // Only the short bmdr that BmbtToBmdr builds has to fit the fork.
       BmbtToBmdr(region.data(), region.size(), dfork, dfork_size);
     } else {
       if (region.size() > dfork_size) {
@@ -996,7 +1001,7 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
     const std::vector<uint8_t>& region = item.regions[region_index++];
     uint8_t* afork = dip + core_size + (static_cast<size_t>(forkoff) << 3);
     if (apart == lf::kILogABRoot) {
-      if (region.size() > afork_size || afork_size < 8) {
+      if (afork_size < 4) {
         return XFS_ERR(XfsError::kCorruptInode,
                        "inode btree root does not fit the attr fork")
             .Ino(in_f.ino)
@@ -1126,8 +1131,12 @@ void Replayer::ReleaseIntent(const RecoveredItem& item) {
   // Host byte order, like every log item format.
   const uint64_t id =
       LoadLE64(item.regions[0].data() + lf::kIntentIdOffset);
-  const uint16_t want =
-      item.type == lf::kItemEfd ? lf::kItemEfi : lf::kItemBui;
+  uint16_t want = lf::kItemBui;
+  if (item.type == lf::kItemEfd) {
+    want = lf::kItemEfi;
+  } else if (item.type == lf::kItemRud) {
+    want = lf::kItemRui;
+  }
   for (auto it = intents_.begin(); it != intents_.end(); ++it) {
     if (it->type != want) continue;
     if (it->regions.empty() ||

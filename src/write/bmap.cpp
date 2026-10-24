@@ -379,7 +379,8 @@ uint32_t DataForkEditor::preferred_agno() const {
 
 Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
   Allocation alloc;
-  Status s = alloc_->Allocate(preferred_agno(), 1, &alloc);
+  Status s = alloc_->AllocateOwned(preferred_agno(), 1,
+                                   RmapOwner::Bmbt(ino_), &alloc);
   if (!s.ok()) return s;
   nblocks_delta_ += 1;  // bmbt blocks are counted by di_nblocks
   *fsb = alloc.fsb;
@@ -387,7 +388,7 @@ Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
 }
 
 Status DataForkEditor::FreeBmbtBlock(uint64_t fsb) {
-  Status s = alloc_->Free(fsb, 1);
+  Status s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_));
   if (!s.ok()) return s;
   nblocks_delta_ -= 1;
   return OkStatus();
@@ -588,12 +589,16 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
     const uint64_t overlap_start = std::max(old.startoff, first_block);
     const uint64_t overlap_end = std::min(old.EndBlock(), end_block);
     if (free_removed_ && overlap_start < overlap_end) {
-      // Release the data blocks that leave the file (truncate).
+      // Release the data blocks that leave the file (truncate).  The rmap
+      // record is removed with the exact logical offset and state of this
+      // physical range; in-memory merges/splits never cause extra mapping.
       const uint64_t fsb = old.startblock + (overlap_start - old.startoff);
-      Status s = alloc_->Free(fsb, static_cast<uint32_t>(overlap_end -
-                                                        overlap_start));
+      const uint32_t count =
+          static_cast<uint32_t>(overlap_end - overlap_start);
+      Status s = alloc_->FreeOwned(
+          fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
       if (!s.ok()) return s;
-      nblocks_delta_ -= static_cast<int64_t>(overlap_end - overlap_start);
+      nblocks_delta_ -= static_cast<int64_t>(count);
     }
     if (overlap_start == old.startoff && overlap_end == old.EndBlock()) {
       Status s = ApplyRemove(old);
@@ -605,17 +610,34 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
       lower.blockcount = first_block - old.startoff;
       Status s = ApplyUpdate(old, lower);
       if (!s.ok()) return s;
+      // The removal can stop before the end of the original extent, in which
+      // case the tail must survive as a second extent.  Convert-unwritten (and
+      // any future hole punch) removes a range strictly inside one extent.
+      if (overlap_end < old.EndBlock()) {
+        XfsExtent upper;
+        upper.startoff = overlap_end;
+        upper.startblock = old.startblock + (overlap_end - old.startoff);
+        upper.blockcount = old.EndBlock() - overlap_end;
+        upper.unwritten = old.unwritten;
+        s = ApplyInsert(upper);
+        if (!s.ok()) return s;
+      }
       ++pos;
       continue;
     }
-    XfsExtent upper;
-    upper.startoff = overlap_end;
-    upper.startblock = old.startblock + (overlap_end - old.startoff);
-    upper.blockcount = old.EndBlock() - overlap_end;
-    upper.unwritten = old.unwritten;
+    if (overlap_end < old.EndBlock()) {
+      XfsExtent upper;
+      upper.startoff = overlap_end;
+      upper.startblock = old.startblock + (overlap_end - old.startoff);
+      upper.blockcount = old.EndBlock() - overlap_end;
+      upper.unwritten = old.unwritten;
+      Status s = ApplyRemove(old);
+      if (!s.ok()) return s;
+      s = ApplyInsert(upper);
+      if (!s.ok()) return s;
+      continue;
+    }
     Status s = ApplyRemove(old);
-    if (!s.ok()) return s;
-    s = ApplyInsert(upper);
     if (!s.ok()) return s;
   }
   return OkStatus();
@@ -1094,11 +1116,9 @@ Status DataForkEditor::KillRootChild() {
 // ---------------------------------------------------------------------------
 
 Status DataForkEditor::ExtentsToBtree() {
-  if (extents_.empty() ||
-      extents_.size() >
-          static_cast<size_t>((geo_->block_size - kLongHeader) / kRecSize)) {
+  if (extents_.empty()) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "conversion to btree format is not supported here")
+                   "cannot convert an empty extent list to a btree")
         .Ino(ino_)
         .Metadata("bmbt");
   }
@@ -1110,13 +1130,21 @@ Status DataForkEditor::ExtentsToBtree() {
   }
   root_.data.assign(fork_bytes_, 0);
   root_.is_root = true;
+
+  // Bulk-convert the first leaf, then let the normal TreeInsert path split
+  // leaves and grow internal levels for any remaining extents. This matters
+  // near ENOSPC: an allocation may legitimately be satisfied as hundreds of
+  // one-block extents, which no longer fit in one btree leaf.
+  const size_t max_leaf =
+      static_cast<size_t>((geo_->block_size - kLongHeader) / kRecSize);
+  const size_t seed = std::min(extents_.size(), max_leaf);
   uint64_t leaf_fsb = 0;
   Status s = AllocBmbtBlock(&leaf_fsb);
   if (!s.ok()) return s;
   Node* leaf = nullptr;
-  s = AllocNode(leaf_fsb, 0, static_cast<uint16_t>(extents_.size()), &leaf);
+  s = AllocNode(leaf_fsb, 0, static_cast<uint16_t>(seed), &leaf);
   if (!s.ok()) return s;
-  for (size_t i = 0; i < extents_.size(); ++i) {
+  for (size_t i = 0; i < seed; ++i) {
     SetNodeLeafRec(*leaf, i, extents_[i]);
   }
   PutBE16(root_.data.data(), 0, 1);
@@ -1125,6 +1153,11 @@ Status DataForkEditor::ExtentsToBtree() {
   SetNodePtr(root_, 0, leaf_fsb);
   root_.dirty = true;
   format_ = di::kFormatBtree;
+
+  for (size_t i = seed; i < extents_.size(); ++i) {
+    s = TreeInsert(extents_[i]);
+    if (!s.ok()) return s;
+  }
   return OkStatus();
 }
 

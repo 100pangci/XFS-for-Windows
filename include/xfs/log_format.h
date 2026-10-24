@@ -50,6 +50,16 @@ constexpr uint32_t kDefaultRecordSize = 32 * 1024;  // h_size (one header block)
 // header, records larger than 32 KiB use xlog_rec_ext_header blocks.
 constexpr uint32_t kCycleBlockSize = 512;
 constexpr uint32_t kHeaderCycleBytes = kRecCycleDataCount * kCycleBlockSize;
+// xlog_rec_ext_header: cycle word plus 64 saved data-block words. Only these
+// 260 bytes are covered by the record CRC (not the 252 reserved bytes).
+constexpr size_t kRecExtCycle = 0;    // be32
+constexpr size_t kRecExtData = 4;     // be32[64]
+constexpr size_t kRecExtSize = kRecExtData + kRecCycleDataCount * 4;  // 260
+// Linux XLOG_MAX_RECORD_BSIZE. A transaction this build emits is a single
+// legal Linux log record; larger metadata sets are split by the caller before
+// commit rather than emitted as an unsupported record.
+constexpr uint32_t kMaxRecordBytes = 256 * 1024;
+constexpr uint32_t kMaxIclogBytes = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Log operation header (xlog_op_header), 12 bytes, big-endian fields
@@ -116,6 +126,34 @@ constexpr size_t kIntentNextentsOffset = 4;  // u32
 constexpr size_t kExtentSize = 16;           // xfs_extent: start u64, len u32
 constexpr size_t kExtentStartOffset = 0;     // u64
 constexpr size_t kExtentLenOffset = 8;       // u32
+
+// xfs_rui_log_format: type u16, size u16, nextents u32, rui_id u64, then
+// xfs_map_extent[] (all host order).  RUD is a fixed 16-byte item.
+constexpr size_t kRuiFormatSize = 16;
+constexpr size_t kRuiExtentSize = 32;
+constexpr size_t kRuiOwnerOffset = 0;       // u64
+constexpr size_t kRuiStartblockOffset = 8;  // u64 (encoded fsblock)
+constexpr size_t kRuiStartoffOffset = 16;   // u64
+constexpr size_t kRuiLenOffset = 24;        // u32
+constexpr size_t kRuiFlagsOffset = 28;      // u32
+constexpr size_t kRudFormatSize = 16;
+
+// xfs_map_extent.me_flags: low byte is the operation, upper bits are flags.
+constexpr uint32_t kRmapExtentTypeMask = 0xff;
+constexpr uint32_t kRmapExtentMap = 1;
+constexpr uint32_t kRmapExtentMapShared = 2;
+constexpr uint32_t kRmapExtentUnmap = 3;
+constexpr uint32_t kRmapExtentUnmapShared = 4;
+constexpr uint32_t kRmapExtentConvert = 5;
+constexpr uint32_t kRmapExtentConvertShared = 6;
+constexpr uint32_t kRmapExtentAlloc = 7;
+constexpr uint32_t kRmapExtentFree = 8;
+constexpr uint32_t kRmapExtentAttrFork = 1u << 31;
+constexpr uint32_t kRmapExtentBmbtBlock = 1u << 30;
+constexpr uint32_t kRmapExtentUnwritten = 1u << 29;
+constexpr uint32_t kRmapExtentFlags =
+    kRmapExtentTypeMask | kRmapExtentAttrFork | kRmapExtentBmbtBlock |
+    kRmapExtentUnwritten;
 
 // xfs_icreate_log, 28 bytes, host endian type/size then big-endian fields.
 // Replay calls xfs_ialloc_inode_init, which rebuilds the whole inode cluster
