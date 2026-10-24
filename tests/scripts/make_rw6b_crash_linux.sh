@@ -132,13 +132,16 @@ grep -q 'reflink=0' "$OUT/rmap-crash.xfs_info.txt" || {
 LOOP=$(losetup --find --show "$IMG")
 mkdir -p "$WORK/check"
 mount -o ro "$LOOP" "$WORK/check"
-frag_extents=$(xfs_bmap "$WORK/check/frag.bin" | grep -c '^ *[0-9]' || true)
-unwritten=$(xfs_bmap -v "$WORK/check/unwritten.bin")
+frag_output=$(xfs_bmap "$WORK/check/frag.bin" 2>&1 || true)
+frag_extents=$(printf '%s\n' "$frag_output" |
+    grep -cE '^[[:space:]]*[0-9]+:' || true)
+unwritten=$(xfs_bmap -v "$WORK/check/unwritten.bin" 2>&1 || true)
 umount "$WORK/check"
 losetup -d "$LOOP"
 LOOP=""
 if [ "$frag_extents" -lt 100 ]; then
     echo "frag.bin has only $frag_extents extents (need >=100)" >&2
+    printf '%s\n' "$frag_output" >&2
     exit 1
 fi
 if ! printf '%s\n' "$unwritten" | grep -q 'unwritten'; then

@@ -35,8 +35,20 @@ WORK=$(mktemp -d)
 LOOP=""
 COW_LOOP=""
 SNAP_NAME="rw6b-rui-snap"
+ORIGIN_NAME="rw6b-rui-origin"
+REAL_NAME="rw6b-rui-real"
 MOUNT="$WORK/mnt"
 mkdir -p "$MOUNT" "$OUT"
+
+resume_origin() {
+    dmsetup resume "$ORIGIN_NAME" >/dev/null 2>&1 || true
+}
+
+remove_snapshot() {
+    dmsetup suspend --nolockfs "$ORIGIN_NAME" >/dev/null 2>&1 || true
+    dmsetup remove --retry "$SNAP_NAME" >/dev/null 2>&1 || true
+    resume_origin
+}
 
 cleanup() {
     set +e
@@ -45,9 +57,11 @@ cleanup() {
         kill "$WRITER_PID" >/dev/null 2>&1
         wait "$WRITER_PID" >/dev/null 2>&1
     fi
-    dmsetup remove --retry "$SNAP_NAME" >/dev/null 2>&1
-    [ -n "$COW_LOOP" ] && losetup -d "$COW_LOOP" >/dev/null 2>&1
+    remove_snapshot
     mountpoint -q "$MOUNT" && umount -l "$MOUNT" >/dev/null 2>&1
+    dmsetup remove --retry "$ORIGIN_NAME" >/dev/null 2>&1
+    dmsetup remove --retry "$REAL_NAME" >/dev/null 2>&1
+    [ -n "$COW_LOOP" ] && losetup -d "$COW_LOOP" >/dev/null 2>&1
     [ -n "$LOOP" ] && losetup -d "$LOOP" >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -80,10 +94,35 @@ COW="$WORK/cow.img"
 rm -f "$LIVE" "$COW"
 truncate -s "${SIZE_MB}M" "$LIVE"
 truncate -s "${COW_MB}M" "$COW"
-LOOP=$(losetup --find --show "$LIVE")
-mkfs.xfs -f -q $MKFS_OPTS $PARENT_OPT "$LOOP"
-mount "$LOOP" "$MOUNT"
 SECTORS=$((SIZE_MB * 1024 * 1024 / 512))
+LOOP=$(losetup --find --show "$LIVE")
+udevadm settle --timeout=5 >/dev/null 2>&1 || true
+# Use the same layout as an LVM online snapshot: a hidden linear device holds
+# the data, the mounted filesystem sits on a snapshot-origin target, and each
+# snapshot is based on the hidden linear device while the origin is suspended.
+if ! dmsetup create "$REAL_NAME" \
+        --table "0 $SECTORS linear $LOOP 0" 2>"$WORK/real.err"; then
+    cat "$WORK/real.err" >&2
+    exit 1
+fi
+if ! dmsetup create "$ORIGIN_NAME" \
+        --table "0 $SECTORS snapshot-origin /dev/mapper/$REAL_NAME" \
+        2>"$WORK/origin.err"; then
+    cat "$WORK/origin.err" >&2
+    exit 1
+fi
+udevadm settle --timeout=5 >/dev/null 2>&1 || true
+ORIGIN="/dev/mapper/$ORIGIN_NAME"
+for _ in $(seq 1 100); do
+    [ -b "$ORIGIN" ] && break
+    sleep 0.01
+done
+if [ ! -b "$ORIGIN" ]; then
+    echo "device-mapper origin node $ORIGIN did not appear" >&2
+    exit 1
+fi
+mkfs.xfs -f -q $MKFS_OPTS $PARENT_OPT "$ORIGIN"
+mount "$ORIGIN" "$MOUNT"
 
 # Pre-create the fragmented files.  Each write leaves a hole between 4 KiB
 # blocks, so every file is a btree of thousands of single-block extents.
@@ -206,19 +245,41 @@ detach_cow() {
     exit 1
 }
 
+create_snapshot() {
+    for _ in $(seq 1 5); do
+        remove_snapshot
+        detach_cow
+        truncate -s 0 "$COW"
+        truncate -s "${COW_MB}M" "$COW"
+        COW_LOOP=$(losetup --find --show "$COW")
+        udevadm settle --timeout=5 >/dev/null 2>&1 || true
+        if ! dmsetup suspend --nolockfs "$ORIGIN_NAME" >/dev/null 2>&1; then
+            echo "could not suspend the snapshot origin (nolockfs)" >&2
+            detach_cow
+            return 1
+        fi
+        if dmsetup create "$SNAP_NAME" \
+                --table "0 $SECTORS snapshot /dev/mapper/$REAL_NAME $COW_LOOP P 8" \
+                2>"$WORK/dm.err"; then
+            resume_origin
+            udevadm settle --timeout=5 >/dev/null 2>&1 || true
+            return 0
+        fi
+        cat "$WORK/dm.err" >&2
+        resume_origin
+        remove_snapshot
+        detach_cow
+        sleep 0.2
+    done
+    return 1
+}
+
 while [ "$attempts" -lt "$MAX_SNAPS" ]; do
     attempts=$((attempts + 1))
-    dmsetup remove --retry "$SNAP_NAME" >/dev/null 2>&1 || true
-    detach_cow
-    truncate -s 0 "$COW"
-    truncate -s "${COW_MB}M" "$COW"
-    COW_LOOP=$(losetup --find --show "$COW")
-    if ! dmsetup create "$SNAP_NAME" \
-            --table "0 $SECTORS snapshot $LOOP $COW_LOOP P 8" 2>"$WORK/dm.err"; then
-        cat "$WORK/dm.err" >&2
+    if ! create_snapshot; then
+        echo "could not create a dm snapshot after 5 attempts" >&2
         exit 1
     fi
-    udevadm settle --timeout=5 >/dev/null 2>&1 || true
     SNAP="/dev/mapper/$SNAP_NAME"
     for _ in $(seq 1 100); do
         [ -b "$SNAP" ] && break
