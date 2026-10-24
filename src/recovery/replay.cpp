@@ -656,20 +656,23 @@ void LogDinodeToDisk(const uint8_t* log, size_t log_size, uint8_t* disk,
 }
 
 // xfs_bmbt_to_bmdr(): the logged data-fork btree root is a full btree block;
-// the inode fork stores the short-form header plus short pointers.
+// the inode fork stores the short header followed by fixed max-record key and
+// pointer arrays (the fork is sized for maxrecs, not numrecs).
 void BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
                 size_t dst_len) {
   if (src_len < ondisk::btree::kLHeaderLenV5 || dst_len < 4) return;
   const uint16_t level = GetBE16(src, ondisk::btree::kLevel);
   const uint16_t numrecs = GetBE16(src, ondisk::btree::kNumrecs);
+  const size_t dst_maxrecs = (dst_len - 4) / 16;
+  if (numrecs > dst_maxrecs) return;
   PutBE16(dst, 0, level);
   PutBE16(dst, 2, numrecs);
   const size_t key_base = ondisk::btree::kLHeaderLenV5;
   const size_t ptr_base = key_base + static_cast<size_t>(numrecs) *
                                           ondisk::btree::kBmbtKeySize;
-  const size_t dst_key_base = ondisk::btree::kBmdrSize;
+  const size_t dst_key_base = 4;
   const size_t dst_ptr_base =
-      dst_key_base + static_cast<size_t>(numrecs) * ondisk::btree::kBmbtKeySize;
+      dst_key_base + dst_maxrecs * ondisk::btree::kBmbtKeySize;
   for (uint16_t i = 0; i < numrecs; ++i) {
     const size_t key_off = key_base + static_cast<size_t>(i) * 8;
     const size_t ptr_off = ptr_base + static_cast<size_t>(i) * 8;
@@ -678,14 +681,9 @@ void BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
     if (key_off + 8 > src_len || ptr_off + 8 > src_len) break;
     if (dst_key_off + 8 > dst_len || dst_ptr_off + 8 > dst_len) break;
     std::memcpy(dst + dst_key_off, src + key_off, 8);
-    // Long-form startblock is 52 bits packed into the first 4 bytes of the
-    // pointer plus the top 21 bits of the second; xfs_bmbt_disk_get_startblock
-    // recomposes it into a full be64 pointer.
-    const uint32_t lo = GetBE32(src, ptr_off);
-    const uint32_t hi = GetBE32(src, ptr_off + 4);
-    const uint64_t startblock =
-        (static_cast<uint64_t>(lo & 0x1FFu) << 43) | (hi >> 21);
-    StoreBE64(dst + dst_ptr_off, startblock);
+    // An internal bmbt pointer is a plain big-endian fsblock.  (Only leaf
+    // records use the 128-bit packed startblock/blockcount form.)
+    StoreBE64(dst + dst_ptr_off, GetBE64(src, ptr_off));
   }
 }
 

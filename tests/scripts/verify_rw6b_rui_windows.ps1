@@ -48,8 +48,16 @@ Invoke-Ok 'post-recovery check' @('check', $image) | Out-Null
 $after = Invoke-Ok 'journal inventory after recovery' @('journal', $image,
     '--json')
 $after | ForEach-Object { Write-Host $_ }
-if (($after -join "`n") -match 'XFS_LI_RUI.*(no .*RUD|surviving)') {
-    throw 'the recovered log still reports a surviving RUI'
+$afterJournal = ($after -join "`n") | ConvertFrom-Json
+if ($afterJournal.state -ne 'clean') {
+    throw "the recovered log is not clean ($($afterJournal.state))"
+}
+foreach ($trans in @($afterJournal.transactions)) {
+    foreach ($item in @($trans.items)) {
+        if ($item.type -eq 'XFS_LI_RUI') {
+            throw 'the recovered log still contains a surviving RUI'
+        }
+    }
 }
 
 & python (Join-Path $repo 'tests/tools/rw6b_rmap_probe.py') $image

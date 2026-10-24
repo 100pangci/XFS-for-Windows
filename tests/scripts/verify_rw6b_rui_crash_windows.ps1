@@ -72,15 +72,14 @@ foreach ($point in $points) {
         continue
     }
     $journal = $journalText | ConvertFrom-Json
-    $ruds = @()
+    $ruis = @()
     foreach ($trans in @($journal.transactions)) {
         foreach ($item in @($trans.items)) {
-            if ($item.type -eq 'XFS_LI_RUD') { $ruds += $item }
+            if ($item.type -eq 'XFS_LI_RUI') { $ruis += $item }
         }
     }
-    if ($ruds.Count -ne $expectedRuds) {
-        $failed += "$point produced $($ruds.Count) committed RUD items " +
-            "(expected $expectedRuds)"
+    if ($ruis.Count -ne 0) {
+        $failed += "$point left $($ruis.Count) surviving RUI item(s)"
         continue
     }
     if ($journal.state -ne 'clean') {

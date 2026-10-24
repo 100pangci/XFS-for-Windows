@@ -367,6 +367,11 @@ if grep -Eiq 'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metad
     cat "$OUT/rui.repair.txt" >&2
     exit 1
 fi
+# Keep the kernel-recovered image: it is the independent semantic oracle for
+# the Windows recovery result.
+cp --sparse=always "$WORK/sanity.img" "$OUT/rui.kernel-recovered.img"
+python3 "$REPO/tests/tools/rw6b_rmap_probe.py" \
+    "$OUT/rui.kernel-recovered.img" --quiet
 
 python3 - "$OUT/rui.journal.json" "$OUT/rui.manifest.json" "$attempts" <<'PY'
 import json
