@@ -637,3 +637,21 @@ directory size check (`-n size=1024`); no Windows/Linux structural acceptance
 is claimed from that run. The companion now uses Linux-supported 4 KiB
 blocks/directories and 5000 alternating allocation pairs (10,000 data rmap
 records), retaining internal split/merge/borrow and root transition assertions.
+
+### Embedded bmbt root traversal
+
+The larger 4 KiB structural pass exposed a reader boundary near 2646 extents:
+after bmdr grows above its leaf children, `LoadDataForkExtents` called
+`WalkBtree` separately for each embedded-root child. Sibling state reset for
+each call, so the second internal child's legitimate left link was reported
+as corruption. The unchanged failing image passed the independent ownership
+oracle; its writer-produced bmbt links were valid.
+
+`WalkBtreeForest` now shares cycle/duplicate detection and per-level sibling
+state across all embedded-root children, in both extent loading and inode
+block accounting. It checks both sibling directions, leaf links and right-edge
+termination, and validates every child's level and root low key. No verifier
+was disabled. The regression accepts the connected multi-child bmbt and
+rejects broken forward/backward links, a nonterminating edge and repeated
+root pointers. The original failing image then passes `check` without any
+image modification; the full structural and Linux pass must still be rerun.

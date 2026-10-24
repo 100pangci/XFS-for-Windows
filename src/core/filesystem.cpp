@@ -860,6 +860,10 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
   }
   const uint16_t root_level = GetBE16(inode.data_fork.data(), 0);
   const uint16_t root_numrecs = GetBE16(inode.data_fork.data(), 2);
+  if (root_level == 0) {
+    *out = blocks;
+    return OkStatus();
+  }
   const size_t node_maxrecs =
       (inode.data_fork.size() - bt::kBmdrSize) / (bt::kBmbtKeySize + bt::kBmbtPtrSize);
   BtreeSpec spec;
@@ -894,6 +898,7 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
     ++bmbt_blocks;
     return OkStatus();
   };
+  std::vector<uint64_t> children;
   for (uint16_t i = 0; i < root_numrecs; ++i) {
     const uint64_t ptr = GetBE64(inode.data_fork.data(),
                                  bt::kBmdrSize + node_maxrecs * 8 + i * 8);
@@ -902,10 +907,10 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
           .Ino(inode.ino)
           .Metadata("inode");
     }
-    s = WalkBtree(spec, ptr, cb);
-    if (!s.ok()) return s;
+    children.push_back(ptr);
   }
-  (void)root_level;
+  s = WalkBtreeForest(spec, children, static_cast<uint16_t>(root_level - 1), cb);
+  if (!s.ok()) return s;
   *out = blocks + bmbt_blocks;
   return OkStatus();
 }
