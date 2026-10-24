@@ -37,6 +37,31 @@ fi
 
 checked=0
 failed=0
+
+# A host scanner can briefly pin a freshly mounted loop filesystem. Retry
+# only EBUSY-style diagnostics, always with a normal synchronous unmount.
+# Persistent busy/error remains fatal; never run repair on a mounted image.
+unmount_replayed_image() {
+    local attempt rc
+    for attempt in 1 2 3; do
+        if LC_ALL=C umount "$MNT" > "$WORK/umount.txt" 2>&1; then
+            return 0
+        else
+            rc=$?
+        fi
+        cat "$WORK/umount.txt" >&2
+        if [ "$attempt" -eq 3 ] || ! grep -qi 'busy' "$WORK/umount.txt"; then
+            return "$rc"
+        fi
+        echo "normal unmount busy (attempt $attempt/3); checking holders before retry" >&2
+        if command -v fuser >/dev/null 2>&1; then
+            fuser -vm "$MNT" >&2 || true
+        fi
+        sync
+        sleep 1
+    done
+}
+
 while IFS= read -r archive; do
     [ -e "$DIR/$archive" ] || { echo "missing archive: $archive" >&2; failed=$((failed + 1)); continue; }
     rm -rf "$WORK/current"
@@ -55,7 +80,7 @@ while IFS= read -r archive; do
         failed=$((failed + 1))
         continue
     fi
-    umount "$MNT"
+    unmount_replayed_image
     if ! xfs_repair -n "$image" > "$WORK/repair.txt" 2>&1; then
         echo "  FAIL: xfs_repair -n failed" >&2
         sed 's/^/    /' "$WORK/repair.txt" | head -40 >&2

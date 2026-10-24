@@ -733,3 +733,18 @@ These results authorize the ordinary **experimental image-file** writable
 profile only for `rmapbt=1,reflink=0`. They do not authorize reflink/refcount,
 CoW, xattr mutation, raw-device writable mount, online repair, or claim genuine
 kernel samples for every RUI operation family (section 10).
+
+### Documentation-only rerun and host unmount contention
+
+Run `40112173153` (documentation revision `5443130`, identical qualified C++)
+passed 64/65 jobs. The remaining Linux writer-crash job stopped at a normal
+`umount` with `target is busy` (exit 32), before that image's offline repair;
+it did not report a repair/oracle failure. This is recorded rather than
+counted as a passing 330-image job.
+
+The crash verifier now logs the busy error and available `fuser` holder
+diagnostics, and retries **only busy unmounts**, at most three times. Every
+attempt is a normal synchronous unmount; persistent busy or other errors
+remain fatal. No successful-case lazy/forced unmount, missing-image skip,
+repair/oracle relaxation, or reduced case count is introduced. The exact
+330/330 post-unmount repair/clean-log/ownership gates remain mandatory.
