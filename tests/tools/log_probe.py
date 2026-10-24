@@ -224,11 +224,14 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
     rec.prev_block = be32(header, 36)
     rec.num_ops = be32(header, 40)
     h_size = be32(header, 320)
-    # Extension headers are needed above 32 KiB records (h_size blocks); this
-    # writer never emits those, but an image from Linux could.
+    # xlog_rec_ext_header blocks carry the cycle words beyond the first 64.
+    # h_size is the iclog size; each 32 KiB needs one 512-byte header block.
     if h_size > 32768:
+        if h_size > 256 * 1024:
+            rec.problems.append(f"h_size {h_size} above XLOG_MAX_RECORD_BSIZE")
         rec.header_blocks = (h_size + 32768 - 1) // 32768
-        rec.problems.append(f"extension headers ({rec.header_blocks})")
+        if h_size < 32768:
+            rec.problems.append(f"h_size {h_size} below one header block")
     if version not in (1, 2):
         rec.problems.append(f"version {version}")
     if rec.cycle == 0:
@@ -245,11 +248,13 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
         rec.problems.append("record does not fit in the log")
         return rec
 
-    data = bytearray(image[rec.offset + rec.header_blocks * SECTOR:end])
-    # The CRC covers the record as it lies on disk, i.e. *with* the cycle words
-    # stamped into the data (recovery verifies it before xlog_unpack_data
-    # restores them).
-    header_zeroed = bytearray(header[:REC_CRC_COVERED])
+    data_offset = rec.offset + rec.header_blocks * SECTOR
+    data = bytearray(image[data_offset:end])
+    header_bytes = image[rec.offset:data_offset]
+    # The CRC covers the fixed header, each extension header's 260 covered
+    # bytes, then the data as it lies on disk (*with* the cycle words stamped
+    # in; recovery verifies it before xlog_unpack_data restores them).
+    header_zeroed = bytearray(header_bytes[:REC_CRC_COVERED])
     struct.pack_into("<I", header_zeroed, 32, 0)
     if stored_crc == 0:
         # mkfs.xfs writes a zero CRC in its clean-unmount record; the kernel
@@ -259,7 +264,12 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
         rec.crc_ok = True
         rec.crc_unset = True
     else:
-        rec.crc_ok = xfs_crc(bytes(header_zeroed), bytes(data)) == stored_crc
+        crc_chunks = [bytes(header_zeroed)]
+        for ext in range(1, rec.header_blocks):
+            crc_chunks.append(
+                bytes(header_bytes[ext * SECTOR:ext * SECTOR + 4 + 64 * 4]))
+        crc_chunks.append(bytes(data))
+        rec.crc_ok = xfs_crc(*crc_chunks) == stored_crc
         if not rec.crc_ok:
             rec.problems.append("record CRC mismatch (torn record)")
 
@@ -274,11 +284,17 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
                 index * SECTOR) != rec.cycle:
             rec.problems.append(f"data block {index} not cycle stamped")
 
-    # Undo the cycle stamping to decode the operation chain.
+    # Undo the cycle stamping to decode the operation chain. The first 64
+    # saved words live in the main header; later ones in extension headers.
     for index in range(len(data) // SECTOR):
-        data[index * SECTOR:index * SECTOR + 4] = header[44 +
-                                                         index * 4:48 +
-                                                         index * 4]
+        if index < 64:
+            saved = header[44 + index * 4:48 + index * 4]
+        else:
+            ext = index // 64
+            slot = index % 64
+            at = ext * SECTOR + 4 + slot * 4
+            saved = header_bytes[at:at + 4]
+        data[index * SECTOR:index * SECTOR + 4] = saved
 
     # Operation chain.
     pos = 0

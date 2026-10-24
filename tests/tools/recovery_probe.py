@@ -364,10 +364,15 @@ def seek_logrec_hdr(img, head_blk, tail_blk, count):
     return found, rblk, header, wrapped
 
 
-def record_crc(header_bytes, data):
-    header = bytearray(header_bytes[:328])
+def record_crc(header_bytes, data, fixed=328):
+    header = bytearray(header_bytes[:fixed])
     struct.pack_into("<I", header, 32, 0)
     crc = crc32c(bytes(header))
+    # xlog_cksum(): each xlog_rec_ext_header contributes its 260 covered bytes
+    # (cycle word + 64 saved data-cycle words), not the 252 reserved bytes.
+    for ext in range(1, len(header_bytes) // 512):
+        at = ext * 512
+        crc = crc32c(bytes(header_bytes[at:at + 260]), crc)
     crc = crc32c(data, crc)
     return (~crc) & 0xFFFFFFFF
 
@@ -379,9 +384,7 @@ def verify_crc(header_bytes, data):
     crc = record_crc(header_bytes, data)
     if crc == stored:
         return True, crc
-    header = bytearray(header_bytes[:324])
-    struct.pack_into("<I", header, 32, 0)
-    other = (~crc32c(data, crc32c(bytes(header)))) & 0xFFFFFFFF
+    other = record_crc(header_bytes, data, fixed=324)
     return other == stored, other
 
 

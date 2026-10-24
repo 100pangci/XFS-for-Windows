@@ -19,9 +19,9 @@ set -euo pipefail
 
 OUT=${1:?usage: make_rw6b_rui_linux.sh <outdir>}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-SIZE_MB=${SIZE_MB:-384}
-ROUNDS=${ROUNDS:-4}
-MAX_SNAPS=${MAX_SNAPS:-96}
+SIZE_MB=${SIZE_MB:-512}
+ROUNDS=${ROUNDS:-20}
+MAX_SNAPS=${MAX_SNAPS:-240}
 WORK=$(mktemp -d)
 LOOP=""
 MOUNT="$WORK/mnt"
@@ -67,7 +67,7 @@ block = 4096
 os.makedirs(os.path.join(root, "base"), exist_ok=True)
 path = os.path.join(root, "base", "fragmented.bin")
 with open(path, "wb") as f:
-    for i in range(4000):
+    for i in range(12000):
         f.seek(i * 2 * block)
         f.write((b"R%07d" % i) * (block // 8))
     f.flush()
@@ -97,7 +97,7 @@ block = 4096
 for r in range(rounds):
     path = os.path.join(root, "frag-%02d.bin" % r)
     with open(path, "wb") as f:
-        for i in range(2500):
+        for i in range(12000):
             f.seek(i * 2 * block)
             f.write((b"X%07d" % i) * (block // 8))
         f.flush()
@@ -172,6 +172,15 @@ cp --sparse=always "$FOUND" "$OUT/rui.img"
 python3 "$REPO/tests/tools/recovery_probe.py" "$OUT/rui.img" \
     --json > "$OUT/rui.journal.json"
 xfs_logprint -t "$OUT/rui.img" > "$OUT/rui.logprint.txt" 2>&1 || true
+
+# Two independent readers must agree that the snapshot contains a RUI.  The
+# recovery_probe inventory below proves the matching RUD is absent; logprint is
+# the second source and is archived with the fixture.
+if ! grep -q 'RUI' "$OUT/rui.logprint.txt"; then
+    echo "xfs_logprint did not report a RUI in the selected snapshot" >&2
+    tail -100 "$OUT/rui.logprint.txt" >&2
+    exit 1
+fi
 
 # The Linux kernel itself must be able to recover the snapshot (otherwise it
 # is not a legal crash image).  Do this on a copy, leaving rui.img untouched
