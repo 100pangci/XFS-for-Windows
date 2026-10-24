@@ -54,8 +54,8 @@ done
 logical_blocks() {
     xfs_bmap "$1" | awk -F'[][]' '
         /\[/ {
-            split($2, range, "\\.\\.");
-            total += range[2] - range[1] + 1;
+            if (split($2, range, /[.][.]/) == 2)
+                total += range[2] - range[1] + 1;
         }
         END { print total + 0 }'
 }
