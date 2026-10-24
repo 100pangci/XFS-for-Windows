@@ -48,16 +48,16 @@ for tool in xfs_db xfs_repair xfs_bmap mount umount stat find dd sync awk; do
     }
 done
 
-# Sum the logical block coverage of a file from xfs_bmap.  stat %b also counts
-# bmbt blocks, so it cannot distinguish a fully allocated 1 MiB file from a
-# 1 MiB file with holes plus metadata.
-logical_blocks() {
-    xfs_bmap "$1" | awk -F'[][]' '
-        /\[/ {
+# Sum allocated data coverage in bytes, including unwritten preallocation.
+# xfs_bmap offsets are always 512-byte basic blocks, NOT filesystem blocks.
+# stat %b also counts bmbt blocks; holes/delalloc are not allocated coverage.
+allocated_bytes() {
+    xfs_bmap -p "$1" | awk -F'[][]' '
+        /\[/ && !/hole|delalloc/ {
             if (split($2, range, /[.][.]/) == 2)
                 total += range[2] - range[1] + 1;
         }
-        END { print total + 0 }'
+        END { printf "%.0f\n", total * 512 }'
 }
 
 echo "== xfs_db: superblock =="
@@ -106,13 +106,13 @@ if [ ! -f "$mnt$fill/fill.bin" ]; then
     exit 1
 fi
 fill_size="$(stat -c %s "$mnt$fill/fill.bin")"
-fill_blocks="$(logical_blocks "$mnt$fill/fill.bin")"
+fill_allocated="$(allocated_bytes "$mnt$fill/fill.bin")"
 if [ "$fill_size" -ne "$fill_bytes" ]; then
     echo "FAILED: fill.bin size $fill_size != $fill_bytes" >&2
     exit 1
 fi
-if [ $((fill_blocks * block_size)) -ne "$fill_bytes" ]; then
-    echo "FAILED: fill.bin covers $fill_blocks blocks, expected $((fill_bytes / block_size))" >&2
+if [ "$fill_allocated" -ne "$fill_bytes" ]; then
+    echo "FAILED: fill.bin covers $fill_allocated bytes, expected $fill_bytes" >&2
     exit 1
 fi
 
@@ -124,16 +124,16 @@ fi
 for ((i = 0; i < succeeded; i++)); do
     path="$(printf '%s/a%04d.bin' "$fill" "$i")"
     size="$(stat -c %s "$mnt$path")"
-    blocks="$(logical_blocks "$mnt$path")"
-    if [ "$size" -ne 1048576 ] || [ "$blocks" -ne 256 ]; then
+    allocated="$(allocated_bytes "$mnt$path")"
+    if [ "$size" -ne 1048576 ] || [ "$allocated" -ne 1048576 ]; then
         echo "FAILED: $path is not a fully allocated 1 MiB file " \
-             "(size $size, $blocks blocks)" >&2
+             "(size $size, $allocated allocated bytes)" >&2
         exit 1
     fi
 done
 failed_file="$(printf '%s/a%04d.bin' "$fill" "$failed_index")"
 if [ "$(stat -c %s "$mnt$failed_file")" -ne 0 ] ||
-   [ "$(logical_blocks "$mnt$failed_file")" -ne 0 ]; then
+   [ "$(allocated_bytes "$mnt$failed_file")" -ne 0 ]; then
     echo "FAILED: refused allocation left data in $failed_file" >&2
     exit 1
 fi
