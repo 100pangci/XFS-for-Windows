@@ -823,6 +823,17 @@ TEST(rw3_directory_node_to_leaf_moves_the_root_leaf) {
       CHECK(unlinked.ok());
       if (!unlinked.ok()) return;
     }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Empty middle data blocks are compacted away and the last node leaf is
+  // converted back to a leaf1 block, so xfs_repair sees no empty data blocks.
+  CHECK_EQ(std::string(DirFormatName(fixture, dir)), std::string("leaf"));
+  CheckConsistent(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
     auto removed = fs.value()->RemoveEmptyDirectory(root, "big", false);
     CHECK(removed.ok());
     CHECK(fs.value()->WriteCleanUnmountRecord().ok());
