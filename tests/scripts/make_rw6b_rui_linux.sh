@@ -107,6 +107,7 @@ PY
 }
 prepare
 sync
+echo "prepared $FILES x $EXTENTS extents; $(df -h "$MOUNT" | tail -1)" >&2
 
 # Workload: repeatedly truncate the whole set concurrently.  Each truncate
 # commits an RUI; the matching RUD is deferred, so bursts keep intents in the

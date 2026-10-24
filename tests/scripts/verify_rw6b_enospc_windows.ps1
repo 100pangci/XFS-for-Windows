@@ -72,6 +72,12 @@ Invoke-Q 'create fill.bin' @('create', $image, '/enospc/fill.bin') | Out-Null
 $offset = 0
 while ($offset -lt $fillBytes) {
     $length = [int64][math]::Min($chunkBytes, $fillBytes - $offset)
+    if ($length -lt $chunkBytes) {
+        # pwrite has no length argument: make the source file exactly the
+        # remaining size so fill.bin ends at fillBytes.
+        $stream = [System.IO.File]::Open($chunkPath, 'Open', 'Write')
+        try { $stream.SetLength($length) } finally { $stream.Dispose() }
+    }
     Invoke-Q ("fill at {0}" -f $offset) @('pwrite', $image,
         '/enospc/fill.bin', [string]$offset, "--from=$chunkPath") | Out-Null
     $offset += $length
