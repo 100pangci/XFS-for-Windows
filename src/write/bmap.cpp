@@ -1099,11 +1099,9 @@ Status DataForkEditor::KillRootChild() {
 // ---------------------------------------------------------------------------
 
 Status DataForkEditor::ExtentsToBtree() {
-  if (extents_.empty() ||
-      extents_.size() >
-          static_cast<size_t>((geo_->block_size - kLongHeader) / kRecSize)) {
+  if (extents_.empty()) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "conversion to btree format is not supported here")
+                   "cannot convert an empty extent list to a btree")
         .Ino(ino_)
         .Metadata("bmbt");
   }
@@ -1115,13 +1113,21 @@ Status DataForkEditor::ExtentsToBtree() {
   }
   root_.data.assign(fork_bytes_, 0);
   root_.is_root = true;
+
+  // Bulk-convert the first leaf, then let the normal TreeInsert path split
+  // leaves and grow internal levels for any remaining extents. This matters
+  // near ENOSPC: an allocation may legitimately be satisfied as hundreds of
+  // one-block extents, which no longer fit in one btree leaf.
+  const size_t max_leaf =
+      static_cast<size_t>((geo_->block_size - kLongHeader) / kRecSize);
+  const size_t seed = std::min(extents_.size(), max_leaf);
   uint64_t leaf_fsb = 0;
   Status s = AllocBmbtBlock(&leaf_fsb);
   if (!s.ok()) return s;
   Node* leaf = nullptr;
-  s = AllocNode(leaf_fsb, 0, static_cast<uint16_t>(extents_.size()), &leaf);
+  s = AllocNode(leaf_fsb, 0, static_cast<uint16_t>(seed), &leaf);
   if (!s.ok()) return s;
-  for (size_t i = 0; i < extents_.size(); ++i) {
+  for (size_t i = 0; i < seed; ++i) {
     SetNodeLeafRec(*leaf, i, extents_[i]);
   }
   PutBE16(root_.data.data(), 0, 1);
@@ -1130,6 +1136,11 @@ Status DataForkEditor::ExtentsToBtree() {
   SetNodePtr(root_, 0, leaf_fsb);
   root_.dirty = true;
   format_ = di::kFormatBtree;
+
+  for (size_t i = seed; i < extents_.size(); ++i) {
+    s = TreeInsert(extents_[i]);
+    if (!s.ok()) return s;
+  }
   return OkStatus();
 }
 
