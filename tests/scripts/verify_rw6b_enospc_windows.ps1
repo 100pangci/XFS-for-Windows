@@ -80,6 +80,10 @@ Assert-Healthy 'fill'
 
 $failed = $false
 $succeeded = 0
+$failedIndex = -1
+$failedPath = ''
+$failedExit = 0
+$failureText = ''
 for ($i = 0; $i -lt 400; $i++) {
     $path = "/enospc/a{0:D4}.bin" -f $i
     Invoke-Q ("create {0}" -f $path) @('create', $image, $path) | Out-Null
@@ -90,11 +94,22 @@ for ($i = 0; $i -lt 400; $i++) {
     if ($code -ne 0) {
         Write-Host "fallocate failed at allocation $i (exit $code)"
         $output | ForEach-Object { Write-Host $_ }
+        $text = $output -join "`n"
+        if ($text -notmatch 'no space|NoSpace|ENOSPC|free space') {
+            throw "allocation failed for a reason other than ENOSPC:`n$text"
+        }
+        $failedIndex = $i
+        $failedPath = $path
+        $failedExit = $code
+        $failureText = $text.Trim()
         $after = Invoke-Cmd 'bmap after' @('bmap', $image, $path, '--json')
         $afterState = ($after -join "`n") | ConvertFrom-Json
         if ($afterState.size -ne $beforeState.size -or
             @($afterState.extents).Count -ne @($beforeState.extents).Count) {
             throw 'failed fallocate left a partial extent'
+        }
+        if ($afterState.size -ne 0 -or @($afterState.extents).Count -ne 0) {
+            throw 'refused allocation changed the target file'
         }
         Assert-Healthy 'failed fallocate'
         $failed = $true
@@ -113,4 +128,22 @@ if ($LASTEXITCODE -ne 0) {
     $output | ForEach-Object { Write-Host $_ }
     throw 'ownership oracle rejected the final ENOSPC image'
 }
+$infoAfter = (Invoke-Cmd 'info after' @('info', $image)) -join "`n"
+if ($infoAfter -notmatch 'free blocks\s*:\s*(\d+)') {
+    throw 'cannot read final free block count from xfswin info'
+}
+$finalFreeBlocks = [int64]$Matches[1]
+$evidence = [ordered]@{
+    block_size = $blockSize
+    fill_bytes = $fillBytes
+    free_blocks_before = $freeBlocks
+    free_blocks_after = $finalFreeBlocks
+    successful_allocations = $succeeded
+    failed_index = $failedIndex
+    failed_path = $failedPath
+    failed_exit = $failedExit
+    failure = $failureText
+}
+$evidence | ConvertTo-Json | Set-Content -Encoding utf8 `
+    -Path (Join-Path $WorkDir 'enospc.json')
 Write-Output ("RW-6B near-ENOSPC qualification OK: {0} allocations before refusal" -f $succeeded)

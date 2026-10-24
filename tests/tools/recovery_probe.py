@@ -162,18 +162,25 @@ class Geometry:
 
 
 class LogImage:
-    def __init__(self, image, geo):
-        self.image = image
+    """Reads the log ring from a buffer that starts at log block zero.
+
+    Only the superblock and the log are loaded, so probing a multi-GiB image
+    does not fault the whole file into memory each time.  The RUI capture
+    script calls this scanner once per device-mapper snapshot.
+    """
+
+    def __init__(self, log_data, geo):
+        self.log_data = log_data
         self.geo = geo
 
     def read_block(self, block):
         block %= self.geo.log_bb
-        off = self.geo.log_byte + block * 512
-        return self.image[off:off + 512]
+        off = block * 512
+        return self.log_data[off:off + 512]
 
     def read_raw(self, block, count):
-        off = self.geo.log_byte + block * 512
-        return self.image[off:off + count * 512]
+        off = block * 512
+        return self.log_data[off:off + count * 512]
 
     def cycle(self, block):
         data = self.read_block(block)
@@ -784,9 +791,17 @@ class Reconstruction:
 
 
 def scan(path):
-    image = open(path, "rb").read()
-    geo = Geometry(image)
-    img = LogImage(image, geo)
+    with open(path, "rb") as stream:
+        sb = stream.read(512)
+        if len(sb) < 512:
+            raise LogError("short superblock read")
+        geo = Geometry(sb)
+        stream.seek(geo.log_byte)
+        log_data = stream.read(geo.log_bb * 512)
+    if len(log_data) != geo.log_bb * 512:
+        raise LogError("short log read (%d of %d bytes)" %
+                       (len(log_data), geo.log_bb * 512))
+    img = LogImage(log_data, geo)
     tail = find_tail(img, geo)
     result = {
         "state": tail["state"],

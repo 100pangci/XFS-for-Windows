@@ -687,7 +687,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rw6b-enospc-image
-          path: rw6b-enospc/rmap-enospc.img
+          path: |
+            rw6b-enospc/rmap-enospc.img
+            rw6b-enospc/enospc.json
           if-no-files-found: error
 
   linux-verify-rw6b-enospc:
@@ -709,9 +711,8 @@ jobs:
 
       - name: Verify the near-ENOSPC image with Linux
         run: |
-          sudo bash tests/scripts/verify_windows_image_linux.sh \
-            rw6b-enospc/rmap-enospc.img
-          python3 tests/tools/rw6b_rmap_probe.py rw6b-enospc/rmap-enospc.img
+          sudo bash tests/scripts/verify_rw6b_enospc_linux.sh \
+            rw6b-enospc/rmap-enospc.img rw6b-enospc/enospc.json
 
   # ---------------------------------------------------------------------------
   # RW-6B: capture a genuine Linux log with a committed RUI that survives
@@ -724,14 +725,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install xfsprogs
+      - name: Install xfsprogs and device-mapper
         run: |
           sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo apt-get install -y xfsprogs dmsetup
 
       - name: Capture a surviving RUI
         run: |
-          sudo env SIZE_MB=512 ROUNDS=20 MAX_SNAPS=240 \
+          sudo env SIZE_MB=512 FILES=6 EXTENTS=12000 ROUNDS=40 \
+            MAX_SNAPS=1200 COW_MB=256 \
             bash tests/scripts/make_rw6b_rui_linux.sh rw6b-rui
           sudo chown -R "$USER" rw6b-rui
           cat rw6b-rui/rui.manifest.json
