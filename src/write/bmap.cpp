@@ -610,17 +610,34 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
       lower.blockcount = first_block - old.startoff;
       Status s = ApplyUpdate(old, lower);
       if (!s.ok()) return s;
+      // The removal can stop before the end of the original extent, in which
+      // case the tail must survive as a second extent.  Convert-unwritten (and
+      // any future hole punch) removes a range strictly inside one extent.
+      if (overlap_end < old.EndBlock()) {
+        XfsExtent upper;
+        upper.startoff = overlap_end;
+        upper.startblock = old.startblock + (overlap_end - old.startoff);
+        upper.blockcount = old.EndBlock() - overlap_end;
+        upper.unwritten = old.unwritten;
+        s = ApplyInsert(upper);
+        if (!s.ok()) return s;
+      }
       ++pos;
       continue;
     }
-    XfsExtent upper;
-    upper.startoff = overlap_end;
-    upper.startblock = old.startblock + (overlap_end - old.startoff);
-    upper.blockcount = old.EndBlock() - overlap_end;
-    upper.unwritten = old.unwritten;
+    if (overlap_end < old.EndBlock()) {
+      XfsExtent upper;
+      upper.startoff = overlap_end;
+      upper.startblock = old.startblock + (overlap_end - old.startoff);
+      upper.blockcount = old.EndBlock() - overlap_end;
+      upper.unwritten = old.unwritten;
+      Status s = ApplyRemove(old);
+      if (!s.ok()) return s;
+      s = ApplyInsert(upper);
+      if (!s.ok()) return s;
+      continue;
+    }
     Status s = ApplyRemove(old);
-    if (!s.ok()) return s;
-    s = ApplyInsert(upper);
     if (!s.ok()) return s;
   }
   return OkStatus();

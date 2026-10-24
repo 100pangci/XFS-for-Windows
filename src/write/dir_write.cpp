@@ -1717,6 +1717,36 @@ Status DirectoryEditor::RebuildNodeTree() {
         .Ino(ino_)
         .Metadata("directory");
   }
+  // A leaf-format directory stores its only leaf at root_dablk_.  When a
+  // second leaf appears, the da node root must occupy root_dablk_, so move the
+  // old root leaf out of the way first.  Without this, LogBlocks() writes the
+  // leaf and the node to the same physical block and the last write (the
+  // node) leaves the leaf magic zeroed.
+  if (node_blocks_.empty() && leaf_blocks_.size() > 1) {
+    auto root_leaf = leaf_blocks_.find(root_dablk_);
+    if (root_leaf != leaf_blocks_.end()) {
+      uint32_t dablk = root_dablk_ + 1;
+      while (leaf_blocks_.count(dablk) || node_blocks_.count(dablk)) ++dablk;
+      auto alloc = AllocDirBlock(dablk);
+      if (!alloc.ok()) return alloc.error();
+      LeafBlock moved = std::move(root_leaf->second);
+      leaf_blocks_.erase(root_leaf);
+      moved.dablk = dablk;
+      moved.dirty = true;
+      for (auto& entry : leaf_blocks_) {
+        if (entry.second.forw == root_dablk_) {
+          entry.second.forw = dablk;
+          entry.second.dirty = true;
+        }
+        if (entry.second.back == root_dablk_) {
+          entry.second.back = dablk;
+          entry.second.dirty = true;
+        }
+      }
+      leaf_blocks_[dablk] = std::move(moved);
+      dirty_ = true;
+    }
+  }
   uint32_t first = 0;
   size_t roots = 0;
   for (const auto& entry : leaf_blocks_) {

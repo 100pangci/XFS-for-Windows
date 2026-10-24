@@ -686,6 +686,19 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
 
   std::vector<LogOp> ops;
   ops.push_back(MakeUnmountOp());
+
+  // Every durability step below is a separate write.  Before the log becomes
+  // clean, make the on-disk superblock cover all metadata LSNs already written
+  // by transactions; otherwise a crash between the unmount record and the
+  // final stamp leaves a clean log whose metadata LSNs are ahead of sb_lsn.
+  // The kernel has the same ordering: it covers the log (logging the
+  // superblock) before writing the unmount record.
+  if (log_dirty_) {
+    Status stamped = StampSuperblockLsn(
+        MakeLsn(log_position_.cycle, log_position_.next_block));
+    if (!stamped.ok()) return stamped;
+  }
+
   LogRecordParams params;
   params.cycle = log_position_.cycle;
   params.block = log_position_.next_block;

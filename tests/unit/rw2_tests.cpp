@@ -187,6 +187,42 @@ TEST(rw2_fallocate_then_convert_is_zero_safe) {
   CheckConsistent(fixture);
 }
 
+TEST(rw2_convert_range_inside_one_extent_keeps_tail) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t ino = fixture.info().file_ino;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    CHECK(fs.value()->SetFileSize(ino, 0).ok());
+    auto prealloc = fs.value()->AllocateUnwritten(ino, 0, 4 * kBlock);
+    CHECK(prealloc.ok());
+    // Removing the converted middle range must leave both the head and the
+    // tail of the original unwritten extent in place.
+    auto converted = fs.value()->ConvertUnwritten(ino, kBlock, 2 * kBlock);
+    CHECK(converted.ok());
+    auto extents = fs.value()->GetDataExtents(ino);
+    CHECK(extents.ok());
+    if (extents.ok()) {
+      CHECK_EQ(extents.value().size(), 3u);
+      if (extents.value().size() == 3) {
+        CHECK(extents.value()[0].unwritten);
+        CHECK_EQ(extents.value()[0].startoff, 0u);
+        CHECK_EQ(extents.value()[0].blockcount, 1u);
+        CHECK(!extents.value()[1].unwritten);
+        CHECK_EQ(extents.value()[1].startoff, 1u);
+        CHECK_EQ(extents.value()[1].blockcount, 2u);
+        CHECK(extents.value()[2].unwritten);
+        CHECK_EQ(extents.value()[2].startoff, 3u);
+        CHECK_EQ(extents.value()[2].blockcount, 1u);
+      }
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+  }
+  CheckConsistent(fixture);
+}
+
 TEST(rw2_append_one_block) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();

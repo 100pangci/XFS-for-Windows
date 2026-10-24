@@ -505,7 +505,8 @@ const char* DirFormatName(xfstest::FixtureImage& fixture, uint64_t ino) {
                                    root.size()));
       const uint16_t m = GetBE16(root.data(), 8);
       if (m == ondisk::kDir3Leaf1Magic) return "leaf";
-      return "node";
+      if (m == ondisk::kDaNode3Magic) return "node";
+      return "?";
     }
   }
   return "?";
@@ -781,6 +782,51 @@ TEST(rw3_directory_grows_through_all_formats) {
       auto found = fs.value()->LookupName(root, FixedName(i));
       CHECK_EQ(found.ok(), (i % 2) == 0 ? false : true);
     }
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_directory_node_to_leaf_moves_the_root_leaf) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  constexpr int kEntries = 1200;
+  uint64_t dir = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    CHECK(fs.value()->Mkdir(root, "big", 0755, 0, 0).ok());
+    auto found = fs.value()->LookupName(root, "big");
+    CHECK(found.ok());
+    if (!found.ok()) return;
+    dir = found.value().ino;
+    for (int i = 0; i < kEntries; ++i) {
+      auto created = fs.value()->CreateRegularFile(dir, FixedName(i), 0644, 0, 0);
+      CHECK(created.ok());
+      if (!created.ok()) return;
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Enough leaves to require a da node root.  The root leaf must have been
+  // moved out of root_dablk_ (and logged) before the node root was written.
+  CHECK_EQ(std::string(DirFormatName(fixture, dir)), std::string("node"));
+  CheckConsistent(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    for (int i = 0; i < kEntries; ++i) {
+      auto unlinked = fs.value()->Unlink(dir, FixedName(i), false);
+      CHECK(unlinked.ok());
+      if (!unlinked.ok()) return;
+    }
+    auto removed = fs.value()->RemoveEmptyDirectory(root, "big", false);
+    CHECK(removed.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
   }
   CheckConsistent(fixture);
   fixture.Reset();
