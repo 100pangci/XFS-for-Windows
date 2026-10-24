@@ -727,6 +727,9 @@ TEST(rw6b_rui_rud_lifetime_is_ordered_and_type_keyed) {
     trans.items.push_back(std::move(item));
     scan.transactions.push_back(std::move(trans));
   };
+  // The earlier RUI can be outside the tail; this RUD must not cancel a
+  // future RUI that reuses the pointer-derived id.
+  add(lf::kItemRud, 1, 0);
   add(lf::kItemRui, 1, 1);
   add(lf::kItemRui, 2, 2);
   add(lf::kItemRud, 1, 3);  // releases RUI 1

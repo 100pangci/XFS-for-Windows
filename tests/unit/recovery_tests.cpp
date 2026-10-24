@@ -379,7 +379,7 @@ TEST(recovery_scan_unsupported_item_refuses) {
   }
 }
 
-TEST(recovery_scan_orphan_rud_refuses) {
+TEST(recovery_scan_rud_without_intent_in_replay_window_is_legal) {
   SyntheticLog log;
   uint32_t next_tid = 1;
   FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
@@ -393,12 +393,9 @@ TEST(recovery_scan_orphan_rud_refuses) {
   auto scan = log.Scan();
   CHECK(scan.ok());
   if (!scan.ok()) return;
-  CHECK(!scan.value().Recoverable());
-  bool found = false;
-  for (const std::string& reason : scan.value().unsupported_items) {
-    if (reason.find("orphan RUD") != std::string::npos) found = true;
-  }
-  CHECK(found);
+  CHECK(scan.value().Recoverable());
+  CHECK(scan.value().unsupported_items.empty());
+  CHECK(xfs::CollectPendingIntents(scan.value()).empty());
 }
 
 TEST(recovery_scan_keeps_every_item_of_a_transaction) {
