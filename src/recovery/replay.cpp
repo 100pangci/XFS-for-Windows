@@ -972,12 +972,14 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
     }
     const std::vector<uint8_t>& region = item.regions[region_index++];
     if (dpart == lf::kILogDBRoot) {
-      if (region.size() > dfork_size || dfork_size == 0) {
+      if (dfork_size < 4) {
         return XFS_ERR(XfsError::kCorruptInode,
                        "inode btree root does not fit the data fork")
             .Ino(in_f.ino)
             .Metadata("log item");
       }
+      // The logged region is a full in-core root block (header + max keys).
+      // Only the short bmdr that BmbtToBmdr builds has to fit the fork.
       BmbtToBmdr(region.data(), region.size(), dfork, dfork_size);
     } else {
       if (region.size() > dfork_size) {
@@ -999,7 +1001,7 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
     const std::vector<uint8_t>& region = item.regions[region_index++];
     uint8_t* afork = dip + core_size + (static_cast<size_t>(forkoff) << 3);
     if (apart == lf::kILogABRoot) {
-      if (region.size() > afork_size || afork_size < 8) {
+      if (afork_size < 4) {
         return XFS_ERR(XfsError::kCorruptInode,
                        "inode btree root does not fit the attr fork")
             .Ino(in_f.ino)
