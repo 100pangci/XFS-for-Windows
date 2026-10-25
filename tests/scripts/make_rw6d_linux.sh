@@ -105,6 +105,11 @@ if "inodes" not in data:
     raise SystemExit("%s oracle failed: %s" % (sys.argv[2], data))
 inodes = data["inodes"]
 formats = {item["format"] for item in inodes}
+for item in inodes:
+    print("%s inode %s: format=%s root_level=%s aformat=%s leaves=%s nodes=%s remote=%s" %
+          (sys.argv[2], item["inode"], item["format"], item["root_level"],
+           item["aformat"], item["leaf_count"], item["node_count"],
+           item["remote_blocks"]))
 if not {"shortform", "leaf", "node"} <= formats:
     raise SystemExit("%s is missing an attribute representation: %s" %
                      (sys.argv[2], sorted(formats)))

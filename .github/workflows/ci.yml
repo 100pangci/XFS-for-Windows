@@ -3229,10 +3229,11 @@ jobs:
           cat rw6d-linux/rw6d.oracle.txt 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: rw6d-linux
           path: rw6d-linux/
-          if-no-files-found: error
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Windows reads every Linux attribute, mutates all representations and
