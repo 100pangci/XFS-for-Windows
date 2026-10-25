@@ -582,12 +582,23 @@ int MakeRw6dFixture(const std::string& path_string) {
   };
 
   uint64_t short_ino = 0;
+  // A minimal valid POSIX access ACL, so xfs_repair's ACL walk accepts the
+  // fixture: version 2 plus USER_OBJ/GROUP_OBJ/OTHER (rwx, rwx, rwx).
+  const std::vector<uint8_t> acl = {
+      0x02, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff,
+      0x04, 0x00, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff,
+      0x20, 0x00, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff,
+  };
   if (!create("short", &short_ino) || !write(short_ino, 0, pattern(4096, 1)) ||
       !set(short_ino, "user.alpha", {'h', 'e', 'l', 'l', 'o'}) ||
       !set(short_ino, "user.beta", pattern(23, 0x0101)) ||
       !set(short_ino, "trusted.owner", {'t', 'r', 'u', 's', 't'}) ||
-      !set(short_ino, "security.selinux", {'s', 0, 'e', 'l'}) ||
-      !set(short_ino, "system.posix_acl_access", {'a', 'c', 'l'})) {
+      !set(short_ino, "security.selinux",
+           {'s', 'y', 's', 't', 'e', 'm', '_', 'u', ':', 'o', 'b', 'j',
+            'e', 'c', 't', '_', 'r', ':', 'u', 'n', 'l', 'a', 'b', 'e',
+            'l', 'e', 'd', '_', 't', ':', 's', '0'}) ||
+      !set(short_ino, "system.posix_acl_access", acl)) {
     return 1;
   }
   track("/short", short_ino);
