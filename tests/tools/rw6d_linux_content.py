@@ -10,6 +10,7 @@ kernel xattr syscalls; it never parses on-disk metadata.
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -52,9 +53,10 @@ def listx(path):
     return os.listxattr(path, follow_symlinks=False)
 
 
-def describe_attributes(path):
+def describe_attributes(path, known_names=None):
+    attr_names = known_names if known_names is not None else listx(path)
     attrs = []
-    for name in sorted(listx(path)):
+    for name in sorted(attr_names):
         value = getx(path, name)
         attrs.append({
             "name": name,
@@ -69,7 +71,8 @@ def is_file(path):
 
 
 def build_manifest(root, paths, deleted=None, include_files=True,
-                   kind="rw6d-linux"):
+                   kind="rw6d-linux", known_names=None):
+    known_names = known_names or {}
     inodes = []
     files = {}
     for path, ino in sorted(paths.items()):
@@ -79,7 +82,8 @@ def build_manifest(root, paths, deleted=None, include_files=True,
         inodes.append({
             "ino": int(ino),
             "path": path,
-            "attributes": describe_attributes(full),
+            "attributes": describe_attributes(full,
+                                             known_names.get(path)),
         })
         if include_files and is_file(full):
             size = os.path.getsize(full)
@@ -211,15 +215,26 @@ def verify(root, manifest_path):
             fail("%s is missing" % item["path"])
         expected = {a["name"]: a for a in item.get("attributes", [])}
         symlink = os.path.islink(path)
-        visible = {name for name in listx(path)
-                   if name.startswith("trusted.") or
-                   (name.startswith("user.") and not symlink)}
-        want_visible = {name for name in expected
-                        if name.startswith("trusted.") or
-                        (name.startswith("user.") and not symlink)}
-        if visible != want_visible:
-            fail("%s attributes %s != %s" %
-                 (item["path"], sorted(visible), sorted(want_visible)))
+        try:
+            listed = listx(path)
+        except OSError as error:
+            if error.errno != errno.E2BIG:
+                raise
+            # A user-space listxattr buffer is capped at XATTR_LIST_MAX
+            # (64 KiB); the deep fixture names exceed that.  The raw oracle
+            # still proves there are no unexpected attributes; here every
+            # expected name is fetched individually.
+            listed = None
+        if listed is not None:
+            visible = {name for name in listed
+                       if name.startswith("trusted.") or
+                       (name.startswith("user.") and not symlink)}
+            want_visible = {name for name in expected
+                            if name.startswith("trusted.") or
+                            (name.startswith("user.") and not symlink)}
+            if visible != want_visible:
+                fail("%s attributes %s != %s" %
+                     (item["path"], sorted(visible), sorted(want_visible)))
         for name, want in expected.items():
             # The kernel owns the security.*/system.* encodings; the
             # independent raw oracle still verifies their stored bytes.
@@ -344,8 +359,17 @@ def reverse(root, manifest_path, out_path):
     paths.pop("/del", None)
     paths["/linux-new"] = os.stat(created).st_ino
     # /linkme2 is a second name of the /linkme inode; one path is enough.
+    known = {}
+    deep_item = next((item for item in manifest.get("inodes", [])
+                      if item.get("path") == "/deep"), None)
+    if deep_item is not None:
+        deep_names = {a["name"] for a in deep_item.get("attributes", [])}
+        deep_names.discard(deep_name(4000))
+        deep_names.add("user.linux-deep")
+        known["/deep"] = deep_names
     final = build_manifest(root, paths, deleted=deleted,
-                           kind="rw6d-linux-reverse")
+                           kind="rw6d-linux-reverse",
+                           known_names=known)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(final, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -372,7 +396,9 @@ def main(argv):
     if args.command == "create":
         create(args.root)
     elif args.command == "create-manifest":
-        manifest = build_manifest(args.root, create_paths(args.root))
+        known = {"/deep": [deep_name(i) for i in range(DEEP_ATTRS)]}
+        manifest = build_manifest(args.root, create_paths(args.root),
+                                  known_names=known)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
             f.write("\n")
