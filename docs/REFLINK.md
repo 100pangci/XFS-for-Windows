@@ -334,7 +334,8 @@ The following was observed on Windows before the Linux qualification run. It
 is recorded to make the implementation state auditable, not to claim any
 Linux gate:
 
-* full unit/integration suite: **167 tests passed**;
+* full unit/integration suite: **168 tests passed**, including a bmbt
+  append test that requires sibling shifting before a leaf split;
 * `--make-rw6c-fixture` produced a Windows-formatted, 1 KiB-block
   `reflink=1,rmapbt=1` image with 100 separated shared extents; the independent
   oracle accepted it (104 shared records / 123 shared blocks, refcount tree

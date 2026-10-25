@@ -161,7 +161,10 @@ build_one() {
     rm -f "$img"
     truncate -s "${SIZE_MB}M" "$img"
     LOOP=$(losetup --find --show "$img")
-    local mkfs_opts="-b size=1024 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
+    # The writable profile requires one filesystem block per directory block
+    # (xfs_win policy); mkfs.xfs would otherwise pick a 4 KiB directory block
+    # for this 1 KiB filesystem.
+    local mkfs_opts="-b size=1024 -n size=1024 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
     mkfs.xfs -f -q $mkfs_opts $PARENT_OPT "$LOOP"
     mount "$LOOP" "$MOUNT"
     xfs_info "$MOUNT" > "$OUT/$name.xfs_info.txt"

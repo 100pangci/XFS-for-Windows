@@ -901,6 +901,43 @@ TEST(rw6c_three_way_clone_and_shared_release) {
   CHECK(fs.WriteCleanUnmountRecord().ok());
 }
 
+TEST(rw6c_bmbt_insert_shifts_before_splitting) {
+  const auto run = [](uint32_t block_size, uint32_t extents) {
+    Image image = MakeImage(true, false, block_size, true);
+    XfsFilesystem& fs = *image.fs;
+    auto file = fs.CreateRegularFile(fs.RootInode(), "shift.bin", 0644, 0, 0);
+    CHECK(file.ok());
+    // Appending one block every other block leaves a hole between mappings, so
+    // every write inserts one single-block extent at the end of the file.
+    // After the first leaf split, the last leaf fills again; the next insert
+    // must move its first record into the left sibling instead of allocating a
+    // third bmbt block (xfs_btree_make_block_unfull: rshift, lshift, split).
+    std::vector<uint8_t> payload = Pattern(block_size, 0x51f7);
+    for (uint32_t i = 0; i < extents; ++i) {
+      const uint64_t offset =
+          static_cast<uint64_t>(i) * 2 * block_size;
+      CHECK(fs.WriteFileData(file.value(), offset, payload.data(),
+                             payload.size())
+                .ok());
+    }
+    auto inode = fs.OpenInode(file.value());
+    CHECK(inode.ok());
+    if (!inode.ok()) return;
+    CHECK_EQ(inode.value().format, di::kFormatBtree);
+    CHECK_EQ(inode.value().nextents, extents);
+    // Data blocks plus exactly two leaf blocks.  A split-on-every-full-leaf
+    // tree would have three leaf blocks here, at both 1 KiB and 4 KiB.
+    CHECK_EQ(inode.value().nblocks,
+             static_cast<uint64_t>(extents) + 2);
+    auto data = fs.GetDataExtents(file.value());
+    CHECK(data.ok());
+    CHECK_EQ(data.value().size(), extents);
+    CHECK(fs.WriteCleanUnmountRecord().ok());
+  };
+  run(1024, 100);
+  run(4096, 380);
+}
+
 TEST(rw6c_many_shared_extents_grow_and_collapse_real_tree) {
   Image image = MakeImage(true, true, 1024, true);
   XfsFilesystem& fs = *image.fs;

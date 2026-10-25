@@ -118,7 +118,8 @@ Result<RmapIntent> ParseRui(const std::vector<uint8_t>& format,
     if (RmapIntentIsShared(e.flags)) {
       if (!geo.features.reflink) {
         return XFS_ERR(XfsError::kUnsupportedFeature,
-                       std::string("RUI shared operation without reflink: ") +
+                       std::string("RUI requires unsupported reflink "
+                                   "semantics: ") +
                            RmapIntentOpName(e.flags))
             .Actual(e.flags)
             .Metadata("RUI");

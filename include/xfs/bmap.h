@@ -138,6 +138,13 @@ class DataForkEditor {
                    uint64_t* right_fsb, XfsExtent* right_key);
   Status SplitNode(Node& node, const std::vector<Entry>& entries,
                    uint64_t* right_fsb, XfsExtent* right_key);
+  // xfs_btree_make_block_unfull(): before splitting a full block, try to move
+  // one entry into the right or left sibling.  The path is the block's
+  // ancestors (the block itself is not included).
+  bool ShiftForInsertRight(const std::vector<Frame>& path, Node* node,
+                           size_t* pos);
+  bool ShiftForInsertLeft(const std::vector<Frame>& path, Node* node,
+                          size_t* pos);
   Status GrowRoot(const std::vector<Entry>& entries,
                   uint16_t child_level);
   void RemoveEntry(Node& node, size_t pos);
