@@ -243,7 +243,9 @@ transaction per intent:
 
 BUI/BUD are the companion deferred data-fork mapping intents.  A reflink clone
 and a CoW remap both log the destination mapping through a BUI, often in the
-same transaction as the CUI.  Recovery accepts a BUI only with exactly one
+same transaction as the CUI.  The parser also accepts the RUI shared variants
+(`MAP_SHARED`, `UNMAP_SHARED`, `CONVERT_SHARED`) on a reflink filesystem; on a
+non-reflink filesystem they remain refused before the first write.  Recovery accepts a BUI only with exactly one
 map or unmap operation, validates it against the inode and AG geometry, and
 completes it in a normal transaction:
 

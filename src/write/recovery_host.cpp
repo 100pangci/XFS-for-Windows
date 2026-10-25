@@ -472,14 +472,17 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
         Status s = OkStatus();
         switch (op) {
           case lf::kRmapExtentMap:
+          case lf::kRmapExtentMapShared:
           case lf::kRmapExtentAlloc:
             s = blocks.RmapMap(e.startblock, e.len, owner);
             break;
           case lf::kRmapExtentUnmap:
+          case lf::kRmapExtentUnmapShared:
           case lf::kRmapExtentFree:
             s = blocks.RmapUnmap(e.startblock, e.len, owner);
             break;
           case lf::kRmapExtentConvert:
+          case lf::kRmapExtentConvertShared:
             // The intent records the new state; xfs_rmap_finish_one passes
             // !unwritten as the *old* state to xfs_rmap_convert.
             s = blocks.RmapConvert(e.startblock, e.len, owner,

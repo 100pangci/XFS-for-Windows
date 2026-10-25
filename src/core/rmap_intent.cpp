@@ -116,11 +116,23 @@ Result<RmapIntent> ParseRui(const std::vector<uint8_t>& format,
           .Metadata("RUI");
     }
     if (RmapIntentIsShared(e.flags)) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     std::string("RUI requires unsupported reflink semantics: ") +
-                         RmapIntentOpName(e.flags))
-          .Actual(e.flags)
-          .Metadata("RUI");
+      if (!geo.features.reflink) {
+        return XFS_ERR(XfsError::kUnsupportedFeature,
+                       std::string("RUI shared operation without reflink: ") +
+                           RmapIntentOpName(e.flags))
+            .Actual(e.flags)
+            .Metadata("RUI");
+      }
+      // Shared operations are ordinary written-data rmap updates.  They may
+      // overlap physically, but never target metadata or an attribute fork.
+      if ((e.flags & (lf::kRmapExtentAttrFork | lf::kRmapExtentBmbtBlock)) !=
+              0 ||
+          RmapNonInodeOwner(e.owner)) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "RUI shared operation targets non-data metadata")
+            .Actual(e.flags)
+            .Metadata("RUI");
+      }
     }
 
     const bool special = RmapNonInodeOwner(e.owner);
