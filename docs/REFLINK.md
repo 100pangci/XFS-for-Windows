@@ -401,5 +401,9 @@ to name the runs/artifacts.
   outside the writable profile.
 * The Windows formatter's refcount tree is a single empty root leaf; tree
   growth is exercised by the writer, not by mkfs.
+* Linux-created qualification fixtures use 4 KiB blocks because `mkfs.xfs`
+  cannot create 1 KiB directory blocks.  A 1 KiB writable profile is still
+  supported when its directory blocks are one filesystem block, as produced by
+  the Windows formatter and checked by the formatter gate.
 * The independent oracle validates metadata and forward sharing, not file
   content; content is checked by the Linux mount scripts.

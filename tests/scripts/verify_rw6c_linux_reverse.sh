@@ -34,7 +34,7 @@ import subprocess
 import sys
 
 root = sys.argv[1]
-block = 1024
+block = 4096
 
 
 def pattern(size, seed):
@@ -71,7 +71,7 @@ clone(source, os.path.join(root, "linux", "source-clone.bin"))
 patch(os.path.join(root, "base", "cow.bin"), 0, pattern(block, 904))
 os.truncate(os.path.join(root, "rw6c", "new-clone.bin"), block)
 os.unlink(os.path.join(root, "rw6c", "three-clone.bin"))
-# A 1 KiB file clone exercises the smallest possible shared extent.
+# A one-block clone exercises the smallest possible shared extent.
 write(os.path.join(root, "linux", "tiny.bin"), pattern(block, 905))
 clone(os.path.join(root, "linux", "tiny.bin"),
       os.path.join(root, "linux", "tiny-clone.bin"))
@@ -116,7 +116,7 @@ import hashlib
 import json
 import sys
 
-block = 1024
+block = 4096
 
 
 def pattern(size, seed):
@@ -153,7 +153,7 @@ expected = {
     "linux/tiny.bin": tiny,
     "linux/tiny-clone.bin": tiny,
 }
-for i in range(100):
+for i in range(600):
     data = pattern(block, 200 + i)
     expected["base/s%03d.bin" % i] = data
     expected["base/d%03d.bin" % i] = data
@@ -164,7 +164,7 @@ manifest = {
     "kind": "rw6c-linux-reverse",
     "deleted": ["base/clone-b.bin", "rw6c/three-clone.bin"],
     "block_size": block,
-    "seeds": {"shared_pairs": 100},
+    "seeds": {"shared_pairs": 600},
     "files": {
         name: {"size": len(data),
                "sha256": hashlib.sha256(data).hexdigest()}

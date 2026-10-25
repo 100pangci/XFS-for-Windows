@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 
-BLOCK = 1024
+BLOCK = 4096
 
 
 def sha(data):

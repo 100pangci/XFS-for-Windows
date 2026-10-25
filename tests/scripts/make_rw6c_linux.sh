@@ -10,7 +10,7 @@
 #   rw6c-normap.img   reflink=1, rmapbt=0
 #
 # Both images contain a deep clone tree (three-way clones, a CoW-modified
-# clone, holes, a partial EOF block and 100 separate shared extents that make
+# clone, holes, a partial EOF block and 600 separate shared extents that make
 # the refcount btree at least two levels deep).  The independent RW-6C oracle
 # must accept each image before it is uploaded.
 #
@@ -56,7 +56,7 @@ import subprocess
 import sys
 
 root, manifest_path = sys.argv[1], sys.argv[2]
-block = 1024
+block = 4096
 
 
 def pattern(size, seed):
@@ -108,9 +108,9 @@ with open(sparse, "wb") as f:
     os.fsync(f.fileno())
 clone(sparse, os.path.join(base, "sparse-clone.bin"))
 
-# 100 shared 1-block extents separated by private gap blocks.  At 1 KiB the
-# refcount leaf holds 80 records, so this forces a non-root refcount block.
-pairs = 100
+# 600 shared 1-block extents separated by private gap blocks.  At 4 KiB the
+# refcount leaf holds 505 records, so this forces a non-root refcount block.
+pairs = 600
 for i in range(pairs):
     src = os.path.join(base, "s%03d.bin" % i)
     gap = os.path.join(base, "g%03d.bin" % i)
@@ -162,9 +162,10 @@ build_one() {
     truncate -s "${SIZE_MB}M" "$img"
     LOOP=$(losetup --find --show "$img")
     # The writable profile requires one filesystem block per directory block
-    # (xfs_win policy); mkfs.xfs would otherwise pick a 4 KiB directory block
-    # for this 1 KiB filesystem.
-    local mkfs_opts="-b size=1024 -n size=1024 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
+    # (xfs_win policy).  Linux mkfs.xfs cannot create 1 KiB directory blocks,
+    # so use 4 KiB blocks and one AG to keep all 600 refcount records in a
+    # single tree.
+    local mkfs_opts="-b size=4096 -d agcount=1 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
     mkfs.xfs -f -q $mkfs_opts $PARENT_OPT "$LOOP"
     mount "$LOOP" "$MOUNT"
     xfs_info "$MOUNT" > "$OUT/$name.xfs_info.txt"

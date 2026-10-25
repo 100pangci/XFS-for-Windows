@@ -103,7 +103,7 @@ print("mounted content OK: %d files, %d deletions" %
 
 seeds = manifest.get("seeds", {})
 if "shared_pairs" in seeds:
-    block = int(manifest.get("block_size", 1024))
+    block = int(manifest.get("block_size", 4096))
     def pattern(size, seed):
         return bytes(((i * 37 + seed * 17 + 11) & 0xFF)
                      for i in range(size))

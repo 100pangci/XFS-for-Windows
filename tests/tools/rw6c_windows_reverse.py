@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 
-BLOCK = 1024
+BLOCK = 4096
 
 
 def pattern(size, seed):

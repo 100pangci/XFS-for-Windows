@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 
-BLOCK = 1024
+BLOCK = 4096
 
 
 def pattern(size, seed):
@@ -204,7 +204,7 @@ def main():
             for name, data in expected.items()
         },
         "block_size": BLOCK,
-        "seeds": {"shared_pairs": 100},
+        "seeds": {"shared_pairs": 600},
     }
     out = args.json or os.path.join(args.work_dir, "mutated.manifest.json")
     with open(out, "w", encoding="utf-8") as f:
