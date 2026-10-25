@@ -80,9 +80,13 @@ class SyntheticLog {
 
     geo_.block_size = 4096;
     geo_.block_log = 12;
+    geo_.inode_size = 512;
+    geo_.inopblog = 3;
     geo_.agblocks = 1024;
     geo_.agblklog = 10;
     geo_.agcount = 16;
+    geo_.agno_log = 4;
+    geo_.agino_log = 13;
     geo_.dblocks = 1024;
     geo_.logstart = sb_.logstart;
     geo_.logblocks = sb_.logblocks;
@@ -353,19 +357,69 @@ TEST(recovery_scan_uncommitted_transaction_is_dropped) {
   CHECK_EQ(scan.value().transactions.size(), 30u);
 }
 
+TEST(recovery_scan_attri_and_attrd_are_supported) {
+  SyntheticLog log;
+  uint32_t next_tid = 1;
+  // An ATTRI with format/name/value regions must be parsed and kept as a
+  // pending attribute intent, not classified as unsupported.
+  std::vector<uint8_t> attri(40, 0);
+  PutLE16At(attri.data(), 0, lf::kItemAttri);
+  PutLE16At(attri.data(), 2, 3);  // format + name + value
+  PutLE64At(attri.data(), 8, 0xa11ce);
+  PutLE64At(attri.data(), 16, 1);  // synthetic geometry inode range
+  PutLE32At(attri.data(), 24, 1);    // SET
+  PutLE32At(attri.data(), 28, 6);
+  PutLE32At(attri.data(), 32, 3);
+  PutLE32At(attri.data(), 36, 0);
+  std::vector<uint8_t> name(8, 0);
+  std::memcpy(name.data(), "user.x", 6);
+  std::vector<uint8_t> value(4, 0);
+  std::memcpy(value.data(), "abc", 3);
+  auto first = CommitOps(next_tid, {attri, name, value});
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), next_tid, first);
+  ++next_tid;
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK(scan.value().Recoverable());
+  CHECK(scan.value().unsupported_items.empty());
+  auto pending = xfs::CollectPendingIntents(scan.value());
+  CHECK_EQ(pending.size(), 1u);
+  if (!pending.empty()) {
+    CHECK_EQ(pending[0].type, lf::kItemAttri);
+  }
+
+  // The matching ATTRD in a later transaction resolves it.
+  std::vector<uint8_t> attrd(16, 0);
+  PutLE16At(attrd.data(), 0, lf::kItemAttrd);
+  PutLE16At(attrd.data(), 2, 1);
+  PutLE64At(attrd.data(), 8, 0xa11ce);
+  auto second = CommitOps(next_tid, {attrd});
+  uint32_t used = log.WriteRecord(1, 2, 0, xfs::MakeLsn(1, 0), next_tid,
+                                  second);
+  ++next_tid;
+  CHECK_EQ(used, 2u);
+  auto scan2 = log.Scan();
+  CHECK(scan2.ok());
+  if (!scan2.ok()) return;
+  CHECK(scan2.value().Recoverable());
+  CHECK(xfs::CollectPendingIntents(scan2.value()).empty());
+}
+
 TEST(recovery_scan_unsupported_item_refuses) {
   SyntheticLog log;
   uint32_t next_tid = 1;
   FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
   FillCycle(&log, 2, xfs::MakeLsn(2, 2), &next_tid);
 
-  // A committed ATTRI item (attribute update intent) is still an unsupported
-  // semantic in this build.
-  std::vector<uint8_t> attri(lf::kIntentLogFormatSize, 0);
-  PutLE16At(attri.data(), 0, lf::kItemAttri);
-  PutLE16At(attri.data(), 2, 1);  // one region
+  // A committed DQUOT item (quota update) is an unsupported semantic in this
+  // build.  ATTRI/ATTRD are supported by RW-6D.
+  std::vector<uint8_t> dquot(lf::kIntentLogFormatSize, 0);
+  PutLE16At(dquot.data(), 0, lf::kItemDquot);
+  PutLE16At(dquot.data(), 2, 1);  // one region
   const uint32_t tid = next_tid;
-  auto ops = CommitOps(tid, {attri});
+  auto ops = CommitOps(tid, {dquot});
   log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops);
 
   auto scan = log.Scan();
@@ -374,7 +428,7 @@ TEST(recovery_scan_unsupported_item_refuses) {
   CHECK(!scan.value().Recoverable());
   CHECK_EQ(scan.value().unsupported_items.size(), 1u);
   if (!scan.value().unsupported_items.empty()) {
-    CHECK(scan.value().unsupported_items[0].find("XFS_LI_ATTRI") !=
+    CHECK(scan.value().unsupported_items[0].find("XFS_LI_DQUOT") !=
           std::string::npos);
   }
 }
@@ -794,10 +848,10 @@ TEST(recovery_replay_cancel_table) {
 
 TEST(recovery_replay_refuses_unsupported_items) {
   SyntheticLog log;
-  std::vector<uint8_t> attri(lf::kIntentLogFormatSize, 0);
-  PutLE16At(attri.data(), 0, lf::kItemAttri);
-  PutLE16At(attri.data(), 2, 1);
-  auto ops = CommitOps(31, {attri});
+  std::vector<uint8_t> dquot(lf::kIntentLogFormatSize, 0);
+  PutLE16At(dquot.data(), 0, lf::kItemDquot);
+  PutLE16At(dquot.data(), 2, 1);
+  auto ops = CommitOps(31, {dquot});
   log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, ops);
 
   auto scan = log.Scan();
@@ -806,7 +860,7 @@ TEST(recovery_replay_refuses_unsupported_items) {
   auto replay = log.Replay(scan.value(), nullptr);
   CHECK(!replay.ok());
   if (!replay.ok()) {
-    CHECK(replay.error().message.find("XFS_LI_ATTRI") != std::string::npos);
+    CHECK(replay.error().message.find("XFS_LI_DQUOT") != std::string::npos);
   }
 }
 

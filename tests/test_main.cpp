@@ -4,9 +4,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "support/fixture_device.h"
 #include "support/fixture_image.h"
@@ -22,6 +24,7 @@
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
 #include "xfs/superblock.h"
+#include "xfs/xattr.h"
 
 namespace xfstest {
 
@@ -56,6 +59,8 @@ std::filesystem::path MakeTempImage(uint64_t size_bytes) {
 }  // namespace xfstest
 
 namespace {
+
+namespace di = xfs::ondisk::inode;
 
 // Writes a fixture image (a consistent filesystem with one file) to `path`.
 // CI runs this and then verifies the image with Linux xfs_repair/mount and the
@@ -474,6 +479,380 @@ int MakeRw6cFixture(const std::string& path_string) {
   return 0;
 }
 
+// Test-support RW-6D image: a Windows-formatted 1 KiB-block filesystem with
+// every attribute-fork representation. It is not Linux evidence; CI mounts it
+// on Linux and runs xfs_repair, and the Windows-side mutation/crash/ENOSPC
+// tools use it as a base. The manifest records VFS names, values (hex) and
+// formats so both the independent Python probe and Linux can compare.
+int MakeRw6dFixture(const std::string& path_string) {
+  using namespace xfs;
+  constexpr uint32_t kBlock = 1024;
+  auto pattern = [](size_t size, uint32_t seed) {
+    std::vector<uint8_t> out(size);
+    for (size_t i = 0; i < size; ++i) {
+      out[i] = static_cast<uint8_t>((i * 37 + seed * 17 + 11) & 0xFF);
+    }
+    return out;
+  };
+  const uint64_t size_bytes = 384ull << 20;
+  std::string error;
+  const auto* p = reinterpret_cast<const char8_t*>(path_string.data());
+  std::filesystem::path path(std::u8string(p, path_string.size()));
+  auto image = ImageBlockDevice::Create(path, size_bytes, 512, &error);
+  if (!image) {
+    std::fprintf(stderr, "cannot create %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  mkfs::FormatOptions options;
+  options.block_size = kBlock;
+  options.inode_size = 512;
+  options.quiet = true;
+  options.finobt = true;
+  options.inobtcount = true;
+  options.sparse_inodes = true;
+  options.bigtime = true;
+  options.nrext64 = true;
+  options.rmapbt = true;
+  options.reflink = true;
+  auto formatted = mkfs::Format(*image, options);
+  if (!formatted.ok()) {
+    std::fprintf(stderr, "rw6d format failed: %s\n",
+                 formatted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto borrowed = std::make_unique<xfstest::BorrowedBlockDevice>(image.get());
+  auto mounted = XfsFilesystem::Mount(std::move(borrowed), mount_options);
+  if (!mounted.ok()) {
+    std::fprintf(stderr, "rw6d mount failed: %s\n",
+                 mounted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+  XfsFilesystem& fs = *mounted.value();
+  const uint64_t root = fs.RootInode();
+  auto check = [](const char* what, const auto& result) {
+    if (result.ok()) return true;
+    std::fprintf(stderr, "%s: %s\n", what, result.error().Format().c_str());
+    return false;
+  };
+  auto write = [&](uint64_t ino, uint64_t offset,
+                   const std::vector<uint8_t>& data) {
+    auto status = fs.WriteFileData(ino, offset, data.data(), data.size());
+    if (!status.ok()) {
+      std::fprintf(stderr, "rw6d write failed: %s\n",
+                   status.error().Format().c_str());
+      return false;
+    }
+    return true;
+  };
+  auto create = [&](const std::string& name, uint64_t* ino) {
+    auto file = fs.CreateRegularFile(root, name, 0644, 0, 0);
+    if (!file.ok()) {
+      std::fprintf(stderr, "rw6d create %s failed: %s\n", name.c_str(),
+                   file.error().Format().c_str());
+      return false;
+    }
+    *ino = file.value();
+    return true;
+  };
+  auto set = [&](uint64_t ino, std::string_view name,
+                 const std::vector<uint8_t>& value) {
+    auto stored = fs.SetXattr(ino, name, value.data(), value.size(),
+                              XfsFilesystem::XattrSetMode::kUpsert);
+    if (!stored.ok()) {
+      std::fprintf(stderr, "rw6d set %.*s failed: %s\n",
+                   static_cast<int>(name.size()), name.data(),
+                   stored.error().Format().c_str());
+      return false;
+    }
+    return true;
+  };
+  struct FixtureFile {
+    std::string path;
+    uint64_t ino;
+  };
+  std::vector<FixtureFile> files;
+  auto track = [&](const char* name, uint64_t ino) {
+    files.push_back({name, ino});
+  };
+
+  uint64_t short_ino = 0;
+  if (!create("short", &short_ino) || !write(short_ino, 0, pattern(4096, 1)) ||
+      !set(short_ino, "user.alpha", {'h', 'e', 'l', 'l', 'o'}) ||
+      !set(short_ino, "user.beta", pattern(23, 0x0101)) ||
+      !set(short_ino, "trusted.owner", {'t', 'r', 'u', 's', 't'}) ||
+      !set(short_ino, "security.selinux", {'s', 0, 'e', 'l'}) ||
+      !set(short_ino, "system.posix_acl_access", {'a', 'c', 'l'})) {
+    return 1;
+  }
+  track("/short", short_ino);
+
+  uint64_t leaf_ino = 0;
+  if (!create("leaf", &leaf_ino) || !write(leaf_ino, 0, pattern(4096, 2))) {
+    return 1;
+  }
+  for (uint32_t i = 0; i < 5; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "user.l%02u", i);
+    if (!set(leaf_ino, name, pattern(100, 0x2000 + i))) return 1;
+  }
+  track("/leaf", leaf_ino);
+
+  uint64_t node_ino = 0;
+  if (!create("node", &node_ino) || !write(node_ino, 0, pattern(4096, 3))) {
+    return 1;
+  }
+  for (uint32_t i = 0; i < 140; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "user.n%03u", i);
+    if (!set(node_ino, name, pattern(600, 0x9000 + i))) return 1;
+  }
+  track("/node", node_ino);
+
+  uint64_t remote_ino = 0;
+  if (!create("remote", &remote_ino) ||
+      !write(remote_ino, 0, pattern(4096, 4)) ||
+      !set(remote_ino, "user.local", pattern(31, 0x7100)) ||
+      !set(remote_ino, "user.remote", pattern(3000, 0x6d02)) ||
+      !set(remote_ino, "user.remote2", pattern(9000, 0x6d03))) {
+    return 1;
+  }
+  track("/remote", remote_ino);
+
+  uint64_t data_ino = 0;
+  if (!create("data", &data_ino) || !write(data_ino, 0, pattern(4096, 5))) {
+    return 1;
+  }
+  for (uint32_t i = 1; i <= 15; ++i) {
+    auto allocated = fs.AllocateUnwritten(
+        data_ino, static_cast<uint64_t>(i) * 4096, 512);
+    if (!check("rw6d data extent", allocated)) return 1;
+  }
+  if (!set(data_ino, "user.keep", pattern(200, 0xd00d))) return 1;
+  track("/data", data_ino);
+
+  uint64_t filler_ino = 0;
+  if (!create("filler", &filler_ino)) return 1;
+  uint64_t bmbt_ino = 0;
+  if (!create("bmbt", &bmbt_ino) || !write(bmbt_ino, 0, pattern(4096, 6))) {
+    return 1;
+  }
+  for (uint32_t i = 0; i < 80; ++i) {
+    if (i >= 8) {
+      auto allocated = fs.AllocateUnwritten(
+          filler_ino, static_cast<uint64_t>(i) * 512, 512);
+      if (!check("rw6d filler extent", allocated)) return 1;
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "user.b%03u", i);
+    if (!set(bmbt_ino, name, pattern(180, 0xe000 + i))) return 1;
+  }
+  track("/bmbt", bmbt_ino);
+
+  auto mkdir = fs.Mkdir(root, "dir", 0755, 0, 0);
+  if (!check("rw6d mkdir", mkdir)) return 1;
+  auto dir = fs.LookupPath("/dir");
+  if (!dir.ok()) {
+    std::fprintf(stderr, "rw6d lookup /dir failed: %s\n",
+                 dir.error().Format().c_str());
+    return 1;
+  }
+  if (!set(dir.value().ino, "user.dir", pattern(80, 0x3300)) ||
+      !set(dir.value().ino, "trusted.dir", pattern(40, 0x3301))) {
+    return 1;
+  }
+  track("/dir", dir.value().ino);
+
+  auto link = fs.CreateSymlink(root, "link", "target", 0777, 0, 0);
+  if (!check("rw6d symlink", link)) return 1;
+  if (!set(link.value(), "user.link", pattern(64, 0x4400)) ||
+      !set(link.value(), "trusted.link", pattern(32, 0x4401))) {
+    return 1;
+  }
+  track("/link", link.value());
+
+  uint64_t del_ino = 0;
+  if (!create("del", &del_ino) || !write(del_ino, 0, pattern(2048, 7))) {
+    return 1;
+  }
+  for (uint32_t i = 0; i < 40; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "user.d%02u", i);
+    if (!set(del_ino, name, pattern(300, 0xf000 + i))) return 1;
+  }
+  track("/del", del_ino);
+
+  uint64_t rename_ino = 0;
+  if (!create("rename", &rename_ino) ||
+      !write(rename_ino, 0, pattern(1024, 8)) ||
+      !set(rename_ino, "user.r0", pattern(50, 0x8800)) ||
+      !set(rename_ino, "user.r1", pattern(50, 0x8801))) {
+    return 1;
+  }
+  track("/rename", rename_ino);
+
+  uint64_t linkme_ino = 0;
+  if (!create("linkme", &linkme_ino) ||
+      !write(linkme_ino, 0, pattern(1024, 9)) ||
+      !set(linkme_ino, "user.h0", pattern(50, 0x9900))) {
+    return 1;
+  }
+  track("/linkme", linkme_ino);
+
+  // Gather the manifest before the clean-unmount record; the content on disk
+  // is already final and the probe reads metadata, not the log.
+  auto format_name = [](XattrForkFormat format) {
+    switch (format) {
+      case XattrForkFormat::kNone: return "none";
+      case XattrForkFormat::kShortform: return "shortform";
+      case XattrForkFormat::kLeaf: return "leaf";
+      case XattrForkFormat::kNode: return "node";
+      case XattrForkFormat::kExtentsEmpty: return "extents-empty";
+    }
+    return "unknown";
+  };
+  auto json_escape = [](const std::string& text) {
+    std::string out;
+    for (unsigned char c : text) {
+      switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+          if (c < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+          } else {
+            out.push_back(static_cast<char>(c));
+          }
+      }
+    }
+    return out;
+  };
+  auto hex = [](const std::vector<uint8_t>& value) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() * 2);
+    for (uint8_t b : value) {
+      out.push_back(kDigits[b >> 4]);
+      out.push_back(kDigits[b & 0xF]);
+    }
+    return out;
+  };
+
+  const std::string manifest_path = path_string + ".manifest.json";
+  std::ofstream manifest(manifest_path, std::ios::binary);
+  if (!manifest) {
+    std::fprintf(stderr, "cannot create %s\n", manifest_path.c_str());
+    return 1;
+  }
+  manifest << "{\n  \"kind\": \"rw6d-windows-fixture\",\n"
+              "  \"block_size\": 1024,\n  \"inodes\": [\n";
+  bool first_file = true;
+  for (const FixtureFile& f : files) {
+    auto inode = fs.OpenInode(f.ino);
+    if (!check("rw6d open inode", inode)) return 1;
+    auto fork = ReadXattrFork(*image, fs.geometry(), inode.value());
+    if (!check("rw6d read attr fork", fork)) return 1;
+    auto entries = fs.ListXattrs(f.ino);
+    if (!check("rw6d list attrs", entries)) return 1;
+    if (!first_file) manifest << ",\n";
+    first_file = false;
+    manifest << "    {\"ino\": " << f.ino << ", \"path\": \""
+             << json_escape(f.path) << "\", \"format\": \""
+             << format_name(fork.value().format) << "\", \"root_level\": "
+             << fork.value().root_level << ", \"aformat\": "
+             << static_cast<unsigned>(fork.value().aformat)
+             << ", \"attributes\": [";
+    bool first_attr = true;
+    for (const XattrEntry& e : entries.value()) {
+      if (!first_attr) manifest << ", ";
+      first_attr = false;
+      manifest << "{\"name\": \"" << json_escape(e.DisplayName())
+               << "\", \"length\": " << e.value.size()
+               << ", \"value_hex\": \"" << hex(e.value) << "\"}";
+    }
+    manifest << "]}";
+  }
+  manifest << "\n  ],\n  \"deleted\": []\n}\n";
+  manifest.close();
+
+  // Verify the representations this fixture exists to exercise.
+  auto require_format = [&](uint64_t ino, XattrForkFormat want,
+                            const char* what) {
+    auto inode = fs.OpenInode(ino);
+    if (!check("rw6d format inode", inode)) return false;
+    auto fork = ReadXattrFork(*image, fs.geometry(), inode.value());
+    if (!check("rw6d format fork", fork)) return false;
+    if (fork.value().format != want) {
+      std::fprintf(stderr, "rw6d %s: format %s, expected %s\n", what,
+                   format_name(fork.value().format), format_name(want));
+      return false;
+    }
+    return true;
+  };
+  if (!require_format(short_ino, XattrForkFormat::kShortform, "/short") ||
+      !require_format(leaf_ino, XattrForkFormat::kLeaf, "/leaf") ||
+      !require_format(node_ino, XattrForkFormat::kNode, "/node")) {
+    return 1;
+  }
+  {
+    auto inode = fs.OpenInode(node_ino);
+    if (!inode.ok()) return 1;
+    auto fork = ReadXattrFork(*image, fs.geometry(), inode.value());
+    if (!fork.ok() || fork.value().root_level < 2) {
+      std::fprintf(stderr, "rw6d /node did not reach a multi-level DA tree\n");
+      return 1;
+    }
+    auto remote = fs.OpenInode(remote_ino);
+    if (!remote.ok()) return 1;
+    auto remote_fork = ReadXattrFork(*image, fs.geometry(), remote.value());
+    if (!remote_fork.ok() || remote_fork.value().remote_blocks == 0) {
+      std::fprintf(stderr, "rw6d /remote did not allocate remote values\n");
+      return 1;
+    }
+    auto bmbt = fs.OpenInode(bmbt_ino);
+    if (!bmbt.ok()) return 1;
+    auto bmbt_fork = ReadXattrFork(*image, fs.geometry(), bmbt.value());
+    if (!bmbt_fork.ok() ||
+        bmbt_fork.value().aformat != di::kFormatBtree) {
+      std::fprintf(stderr, "rw6d /bmbt did not reach an attribute BMBT\n");
+      return 1;
+    }
+    auto data = fs.OpenInode(data_ino);
+    if (!data.ok() || data.value().format != di::kFormatBtree) {
+      std::fprintf(stderr, "rw6d /data did not convert to a data btree\n");
+      return 1;
+    }
+  }
+
+  Status clean = fs.WriteCleanUnmountRecord();
+  if (!clean.ok()) {
+    std::fprintf(stderr, "rw6d clean unmount failed: %s\n",
+                 clean.error().Format().c_str());
+    return 1;
+  }
+  mounted.value().reset();
+  if (!image->Flush()) {
+    std::fprintf(stderr, "rw6d flush failed: %s\n", image->LastError().c_str());
+    image->Close();
+    return 1;
+  }
+  image->Close();
+  std::printf("rw6d fixture: %s (1 KiB blocks, %zu files)\n",
+              path_string.c_str(), files.size());
+  std::printf("manifest: %s\n", manifest_path.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -486,6 +865,9 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--make-rw6c-fixture") == 0) {
     return MakeRw6cFixture(argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--make-rw6d-fixture") == 0) {
+    return MakeRw6dFixture(argv[2]);
+  }
   std::string filter;
   if (argc == 2 && std::strncmp(argv[1], "--filter=", 9) == 0) {
     filter = argv[1] + 9;
@@ -495,7 +877,8 @@ int main(int argc, char** argv) {
        std::strcmp(argv[1], "-h") == 0)) {
     std::cout << "usage: xfs_tests [--make-fixture <image>] "
                  "[--make-rw6-sparse <image>] "
-                 "[--make-rw6c-fixture <image>] [--filter=<substring>]\n"
+                 "[--make-rw6c-fixture <image>] "
+                 "[--make-rw6d-fixture <image>] [--filter=<substring>]\n"
                  "  no arguments: run the test suite\n"
                  "  --make-fixture <image>: write a fixture image (one "
                  "consistent filesystem with one file) for Linux verification\n"
@@ -503,6 +886,9 @@ int main(int argc, char** argv) {
                  "      with a real sparse inode chunk for Linux verification\n"
                  "  --make-rw6c-fixture <image>: write a Windows-generated\n"
                  "      reflink+rmapbt image with the RW-6C logical fixture\n"
+                 "  --make-rw6d-fixture <image>: write a Windows-generated\n"
+                 "      1 KiB-block image with shortform/leaf/node/multi-level\n"
+                 "      node, remote, attribute-BMBT and namespace attributes\n"
                  "  --filter=<substring>: only run tests whose name contains "
                  "the substring\n";
     return 0;

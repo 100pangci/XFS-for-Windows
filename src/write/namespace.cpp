@@ -631,6 +631,13 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
           .Actual(inode.value().nextents)
           .Metadata("ifree");
     }
+    if (inode.value().HasAttrFork() && inode.value().anextents != 0) {
+      return XFS_ERR(XfsError::kInternal,
+                     "inode attr fork was not truncated before the free")
+          .Ino(ino)
+          .Actual(inode.value().anextents)
+          .Metadata("ifree");
+    }
     BlockAllocator blocks(&txn, device_.get(), &geometry_);
     InodeAllocator inodes(&txn, &blocks, device_.get(), &superblock_,
                           &geometry_);
@@ -739,20 +746,89 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           .Ino(ino)
           .Metadata("ifree");
     }
-    // Attribute-fork mutation is outside RW-6B, but a Linux-created inode can
-    // carry attr extents/bmbt blocks.  Freeing only the data fork would leak
-    // those blocks (and their reverse mappings); refuse instead of corrupting
-    // the ownership ledger.  Local attr data lives inside the inode chunk and
-    // needs no separate free.
+    // xfs_attr_inactive: release every attribute-fork block before the inode
+    // is freed.  The DA tree itself does not need to be re-read here: the
+    // extent map is the ownership authority, and removing whole extents keeps
+    // every intermediate committed image consistent.
     if (inode.value().HasAttrFork() && inode.value().anextents != 0) {
-      // A nonzero di_forkoff with zero attr extents is a legal, empty attr
-      // fork (Linux creates it that way); only a fork with blocks needs the
-      // attr bmap/rmap free this milestone does not implement.
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "cannot free an inode with allocated attribute extents")
-          .Ino(ino)
-          .Actual(inode.value().anextents)
-          .Metadata("ifree");
+      constexpr size_t kAttrExtentsPerTransaction = 48;
+      bool attr_more = false;
+      Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
+        auto fresh = OpenInode(ino);
+        if (!fresh.ok()) return fresh.error();
+        if (fresh.value().nlink != 0) {
+          return XFS_ERR(XfsError::kInvalidArgument,
+                         "refusing to truncate an inode that still has links")
+              .Ino(ino)
+              .Metadata("ifree");
+        }
+        if (!fresh.value().HasAttrFork() ||
+            fresh.value().anextents == 0) {
+          return OkStatus();
+        }
+        BlockAllocator blocks(&txn, device_.get(), &geometry_);
+        XfsInode synth;
+        synth.ino = ino;
+        synth.format = fresh.value().aformat;
+        synth.nextents = fresh.value().anextents;
+        synth.data_fork = fresh.value().attr_fork;
+        DataForkEditor editor(&txn, &blocks, device_.get(), &geometry_,
+                              /*attr_fork=*/true);
+        Status s = editor.Load(synth);
+        if (!s.ok()) return s;
+        editor.SetFreeRemovedBlocks(true);
+        std::vector<XfsExtent> extents = editor.extents();
+        size_t removed = 0;
+        for (const XfsExtent& e : extents) {
+          if (removed >= kAttrExtentsPerTransaction) {
+            attr_more = true;
+            break;
+          }
+          s = editor.RemoveRange(e.startoff, e.EndBlock());
+          if (!s.ok()) return s;
+          ++removed;
+        }
+        auto raw = ReadRawInode(ino);
+        if (!raw.ok()) return raw.error();
+        std::vector<uint8_t> image = std::move(raw.value());
+        std::vector<uint8_t> temp = image;
+        uint32_t data_fields = 0;
+        std::vector<uint8_t> data_region;
+        s = editor.Finalize(&temp, &data_fields, &data_region);
+        if (!s.ok()) return s;
+        const uint8_t aformat = editor.format();
+        const uint32_t anextents = editor.nextents();
+        image[di::kAformat] = aformat;
+        SetInodeAttrExtentCount(image.data(), anextents);
+        PutBE64(image.data(), di::kNblocks,
+                GetBE64(image.data(), di::kNblocks) +
+                    static_cast<uint64_t>(editor.nblocks_delta()));
+        const size_t attr_off = di::kCoreSizeV3 +
+                                static_cast<size_t>(fresh.value().forkoff) * 8;
+        const size_t attr_size = static_cast<size_t>(
+            geometry_.inode_size - attr_off);
+        std::memcpy(image.data() + attr_off, temp.data() + di::kCoreSizeV3,
+                    std::min(attr_size, temp.size() - di::kCoreSizeV3));
+        uint32_t attr_fields = 0;
+        std::vector<uint8_t> attr_region;
+        if (aformat == di::kFormatBtree) {
+          attr_fields = lf::kILogABRoot;
+          attr_region = std::move(data_region);
+        } else if (!editor.extents().empty()) {
+          attr_fields = lf::kILogAExt;
+          attr_region.assign(editor.extents().size() * 16, 0);
+          std::memcpy(attr_region.data(), temp.data() + di::kCoreSizeV3,
+                      attr_region.size());
+        }
+        s = LogPreparedInode(txn, ino, std::move(image), 0, {}, attr_fields,
+                             attr_region);
+        if (!s.ok()) return s;
+        s = blocks.Commit();
+        if (!s.ok()) return s;
+        return OkStatus();
+      });
+      if (!status.ok()) return status;
+      if (attr_more) continue;  // next rolling transaction
     }
     // A symlink whose target lives in remote blocks is freed like Linux
     // xfs_inactive_symlink_rmt: the inode is turned into a regular file (a

@@ -33,6 +33,7 @@
 #include "xfs/bmap_intent.h"
 #include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
+#include "xfs/xattr_intent.h"
 
 namespace xfs {
 namespace {
@@ -1536,8 +1537,8 @@ constexpr ItemTypeEntry kItemTypes[] = {
     {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kIntentDone},
     {lf::kItemCui, "XFS_LI_CUI", RecoveryItemClass::kIntent},
     {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kIntentDone},
-    {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kRefused},
-    {lf::kItemAttrd, "XFS_LI_ATTRD", RecoveryItemClass::kRefused},
+    {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kIntent},
+    {lf::kItemAttrd, "XFS_LI_ATTRD", RecoveryItemClass::kIntentDone},
 };
 
 }  // namespace
@@ -1760,6 +1761,22 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
           scan.unsupported_items.push_back(
               std::string("CUD preflight: ") + parsed.error().Format());
         }
+      } else if (item.type == lf::kItemAttri) {
+        auto parsed = ParseXattrIntent(item.regions, geo);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("ATTRI preflight: ") + parsed.error().Format());
+        }
+      } else if (item.type == lf::kItemAttrd) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("ATTRD item has no format region");
+          continue;
+        }
+        auto parsed = ParseXattrIntentDone(item.regions[0]);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("ATTRD preflight: ") + parsed.error().Format());
+        }
       }
     }
   }
@@ -1775,7 +1792,8 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   // passes; every other intent type refuses before the first write.
   for (const PendingIntent& intent : CollectPendingIntents(scan)) {
     if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
-        intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
+        intent.type == lf::kItemCui || intent.type == lf::kItemBui ||
+        intent.type == lf::kItemAttri) {
       continue;
     }
     scan.unsupported_items.push_back(
@@ -1824,6 +1842,8 @@ std::vector<PendingIntent> CollectPendingIntents(const LogScan& scan) {
           want_type = lf::kItemRui;
         } else if (item.type == lf::kItemCud) {
           want_type = lf::kItemCui;
+        } else if (item.type == lf::kItemAttrd) {
+          want_type = lf::kItemAttri;
         }
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           if (it->type != want_type || it->regions.empty() ||

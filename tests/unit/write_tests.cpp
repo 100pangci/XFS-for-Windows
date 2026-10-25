@@ -279,6 +279,13 @@ TEST(writable_profile_allow_list) {
   no_quota.gquotino = ~0ull;
   no_quota.pquotino = ~0ull;
   CHECK(CheckWritableProfile(no_quota, MakeGeometry(no_quota)).ok());
+
+  // RW-6D: logged extended attributes are supported because ATTRI/ATTRD have
+  // a parser and completion pass.  Unknown log-incompat bits are still refused.
+  XfsSuperblock logged_xattrs = sb;
+  logged_xattrs.features_log_incompat = ondisk::kLogIncompatXattrs;
+  CHECK(CheckWritableProfile(logged_xattrs,
+                             MakeGeometry(logged_xattrs)).ok());
   XfsSuperblock quota_inode = sb;
   quota_inode.uquotino = 70;
   CHECK(!CheckWritableProfile(quota_inode, MakeGeometry(quota_inode)).ok());
@@ -297,7 +304,7 @@ TEST(writable_profile_allow_list) {
       {"quota", [](XfsSuperblock& s) { s.qflags = 0x0001; }},
       {"directory block", [](XfsSuperblock& s) { s.dirblklog = 1; }},      {"external log", [](XfsSuperblock& s) { s.logstart = 0; }},
       {"log-incompat",
-       [](XfsSuperblock& s) { s.features_log_incompat = 0x1; }},
+       [](XfsSuperblock& s) { s.features_log_incompat = 0x2; }},
       {"asciici", [](XfsSuperblock& s) { s.features.asciici = true; }},
   };
   for (const auto& test : cases) {

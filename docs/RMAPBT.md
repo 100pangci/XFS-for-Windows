@@ -4,7 +4,9 @@ Status: **qualified ordinary experimental writes** (`rmapbt=1,reflink=0`
 only). Code revision `5a41fca` passed all **65 jobs** in
 [run 40107607956](https://github.com/100pangci/XFS-for-Windows/actions/runs/40107607956),
 using ordinary `--rw-experimental`, including real-image structural/refusal
-gates. Reflink/refcount/CoW and xattr modification remain refused. This is
+gates. Reflink/refcount/CoW and xattr modification remain refused **in this
+RW-6B milestone**; RW-6C added reflink/CoW and RW-6D added native xattrs (see
+[XATTR.md](XATTR.md)). This is
 experimental image-file support, not production/raw-device write support or
 qualification of every possible kernel RUI producer; sampling limits remain
 explicit below.

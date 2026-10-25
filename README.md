@@ -27,7 +27,7 @@ Block Device Abstraction  (Image, Windows raw device, memory (tests))
 
 Scope: **XFS v5 (`crc=1`), internal log, single data device, no realtime
 device.** Reading and formatting are complete; writing is an experimental,
-allow-listed subset (RW-0..RW-6A) and journal recovery is native (RW-5). A
+allow-listed subset (RW-0..RW-6D) and journal recovery is native (RW-5). A
 filesystem is only modified when this build maintains every structure it uses;
 anything else is refused for read-write and stays readable.
 
@@ -49,19 +49,19 @@ anything else is refused for read-write and stays readable.
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
 | Formatter (mkfs) | yes: standard v5, optional modern inode profile, `--rmapbt` and `--reflink` (both legal reflink/rmap combinations) |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`), including the recovery inventory of a dirty log |
-| **Journal replay (RW-5/6)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI, RUI, BUI and CUI completion and AGI unlinked processing |
-| **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
+| **Journal replay (RW-5/6)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI, RUI, BUI, CUI and ATTRI/ATTRD completion and AGI unlinked processing |
+| **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks and extended attributes can be created |
 | Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
 | Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
 | create / mkdir / unlink / rmdir | yes (RW-3), one transaction per namespace change; unlink frees the data and the inode |
 | rename (atomic, cross-directory, replace) | yes (RW-4): one transaction for both parents, both link counts and the target lifecycle |
 | hard links / link counts / AGI unlinked | yes (RW-4): `xfswin link`, nlink up to XFS_MAXLINK, last-link free |
 | symlink creation (inline + remote) | yes (RW-4): real `S_IFLNK` inodes, v5 `xfs_dsymlink_hdr` remote blocks |
-| xattr / ACL mutation | **not implemented** (refused) |
+| xattrs (shortform / leaf / node / remote / attr BMBT) | **yes (RW-6D)**: reader, writer, deletion, recovery and CLI; ACL/security-descriptor translation is not implemented |
 | Journal writer (metadata transactions) | yes (RW-1, extended in RW-2): log records, inode items, buffer items for AGF/AGFL/btrees, clean unmount records; Linux replays them in CI |
-| Metadata written so far | inode core + data fork, AGF, AGFL, bnobt, cntbt, inobt, finobt, AGI and the superblock counters |
+| Metadata written so far | inode core + data/attr forks, AGF, AGFL, bnobt, cntbt, inobt, finobt, AGI, attribute leaf/node/remote blocks, attribute BMBT and the superblock counters |
 | Modern inode features | **read/write/recovery**: finobt, inobtcount, sparse inode chunks, bigtime, NREXT64 |
-| Parent pointers (`PARENT`) | read-only: accepted; parent xattrs are ignored |
+| Parent pointers (`PARENT`) | read/preserve only: accepted; RW mounting still refuses parent-pointer filesystems |
 | XFS v4, external log, realtime, metadir, zoned | rejected with a clear error |
 
 Both directions are verified on real systems by CI: the Windows-formatted
@@ -158,7 +158,7 @@ mask, counter and inode image.
 | NREXT64 | yes | yes | yes |
 | rmapbt | yes (`check` walks it; the reader does not need it) | experimental, `reflink=0` or `reflink=1` | RMB3 replay and surviving RUI completion |
 | reflink / refcount | yes (typed refcountbt reader) | experimental, ordinary `--rw-experimental` (both rmapbt profiles) | CUI/CUD completion and orphan CoW staging cleanup |
-| xattr | preserved byte-for-byte | **no mutation** | preserved by inode items |
+| xattr | yes (typed attr-fork reader) | yes (RW-6D: shortform/leaf/node/remote/BMBT) | real ATTRI/ATTRD completion; values and namespaces preserved |
 
 The ordinary writable profile is XFS v5 with an internal log and a single data
 device. Reflink, refcountbt, shared truncate/unlink and CoW are enabled by the
@@ -179,7 +179,15 @@ The ordinary-gate code revision `5a41fca` passed all 65 jobs in
 including grown/collapsed Linux-origin rmap trees and full-image no-write
 refusal checks. Support remains experimental and image-file-only.
 
-**The ordinary reflink write gate is open.** Reflink, refcount and CoW passed the twelve-gate Linux evidence ledger in [docs/REFLINK.md](docs/REFLINK.md) on [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954). The gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743) repeated the full RW-6C matrix with plain `--rw-experimental`, so both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` images are ordinary writable profiles. Xattr modification remains unsupported.
+**The ordinary reflink write gate is open.** Reflink, refcount and CoW passed the twelve-gate Linux evidence ledger in [docs/REFLINK.md](docs/REFLINK.md) on [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954). The gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743) repeated the full RW-6C matrix with plain `--rw-experimental`, so both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` images are ordinary writable profiles.
+
+RW-6D adds native extended attributes: shortform, leaf, node and multi-level
+node forks, remote values, the attribute BMBT, forkoff/data-fork conversion and
+inode deletion with attributes. Attribute writes use the ordinary
+`--rw-experimental` opt-in. The Linux qualification ledger is in
+[docs/XATTR.md](docs/XATTR.md); the supported mkfs subset and the parent-pointer
+gap are recorded in [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md). ACL and
+security-descriptor translation remain unsupported.
 
 ## Journal recovery (RW-5)
 
@@ -275,8 +283,9 @@ Scope of this milestone:
   empty data fork, `mkdir` an empty shortform directory, `unlink` removes a
   regular file (freeing its blocks and its inode) and `rmdir` removes an empty
   directory. A non-empty `rmdir` and deleting symlinks or special files are
-  refused before anything is modified. Rename, hard links, symlink creation,
-  xattrs and ACLs are **not** implemented.
+  refused before anything is modified. Rename, hard links and symlink creation
+  arrived in RW-4; native xattrs in RW-6D. ACL semantics are still **not**
+  implemented.
 - **One transaction per namespace change.** `CreateFile`/`Mkdir` commit the
   inode allocation, the new inode, the parent's dirent, timestamps and the
   AGI/inobt/superblock counters together, so a crash leaves either no file or a
@@ -468,10 +477,10 @@ destructive flag), `3` refused for safety reasons.
   operations need. They are an allow-list: a filesystem with features this
   build cannot keep consistent is refused for read-write instead of being
   modified best-effort.
-- xattr and ACL mutation are refused; the core has no transaction for them yet.
-  A dirty journal is replayed by this build before a read-write mount becomes
-  visible (`xfswin recover` does the same offline); a read-only mount refuses a
-  dirty log instead of showing a pre-recovery view
+- xattr storage is implemented (RW-6D); ACL/security-descriptor translation is
+  not. A dirty journal is replayed by this build before a read-write mount
+  becomes visible (`xfswin recover` does the same offline); a read-only mount
+  refuses a dirty log instead of showing a pre-recovery view
   (`--force-unsafe-ro` is the explicit, clearly-warned exception).
 - `xfswin format` is still the only writer of a whole filesystem, and the only
   path that can destroy existing data.

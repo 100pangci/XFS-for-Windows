@@ -127,6 +127,23 @@ constexpr size_t kExtentSize = 16;           // xfs_extent: start u64, len u32
 constexpr size_t kExtentStartOffset = 0;     // u64
 constexpr size_t kExtentLenOffset = 8;       // u32
 
+// xfs_attri_log_format: type u16, size u16, igen u32, id u64, ino u64,
+// op_flags u32, name_len u32, value_len u32, attr_filter u32.  ATTRD is a
+// fixed 16-byte item with its intent id at offset 8.
+constexpr size_t kAttriFormatSize = 40;
+constexpr size_t kAttrdFormatSize = 16;
+constexpr size_t kAttriIdOffset = 8;
+constexpr size_t kAttriInoOffset = 16;
+constexpr size_t kAttriIgenOffset = 4;
+constexpr size_t kAttriOpOffset = 24;
+constexpr size_t kAttriNameLenOffset = 28;
+constexpr size_t kAttriValueLenOffset = 32;
+constexpr size_t kAttriFilterOffset = 36;
+constexpr size_t kAttrdIdOffset = 8;
+constexpr uint32_t kAttriFilterMask =
+    (1u << 1) | (1u << 2) | (1u << 3) | (1u << 7);
+constexpr uint32_t kAttriOpMask = 0xff;
+
 // xfs_rui_log_format: type u16, size u16, nextents u32, rui_id u64, then
 // xfs_map_extent[] (all host order).  RUD is a fixed 16-byte item.
 constexpr size_t kRuiFormatSize = 16;

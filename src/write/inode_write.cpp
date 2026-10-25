@@ -165,7 +165,9 @@ Status XfsFilesystem::UpdateInodeInTransaction(
 Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
                                        std::vector<uint8_t> inode,
                                        uint32_t ilog_fields,
-                                       const std::vector<uint8_t>& fork_region) {
+                                       const std::vector<uint8_t>& fork_region,
+                                       uint32_t attr_ilog_fields,
+                                       const std::vector<uint8_t>& attr_fork_region) {
   if (!geometry_.InoValid(ino)) {
     return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
         .Ino(ino)
@@ -228,19 +230,29 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   if (!logged_region.empty() && (logged_region.size() % 4) != 0) {
     logged_region.resize((logged_region.size() + 3) & ~size_t{3}, 0);
   }
+  std::vector<uint8_t> attr_region = attr_fork_region;
+  if (!attr_region.empty() && (attr_region.size() % 4) != 0) {
+    attr_region.resize((attr_region.size() + 3) & ~size_t{3}, 0);
+  }
   const bool with_region = !logged_region.empty();
-  uint32_t fields = lf::kILogCore | ilog_fields;
+  const bool with_attr = !attr_region.empty();
+  uint32_t fields = lf::kILogCore | ilog_fields | attr_ilog_fields;
   if (!with_region) {
     // No data fork region to log (for example an empty extent list): drop the
     // fork flag, exactly like xfs_inode_item_format does.
     fields &= ~(lf::kILogDExt | lf::kILogDBRoot | lf::kILogDData);
   }
+  if (!with_attr) {
+    fields &= ~(lf::kILogAExt | lf::kILogABRoot | lf::kILogAData);
+  }
+  const uint16_t region_count =
+      static_cast<uint16_t>(2 + (with_region ? 1 : 0) + (with_attr ? 1 : 0));
   std::vector<uint8_t> item_header(lf::kInodeLogFormatSize, 0);
   PutLE16(&item_header, lf::kIlfType, lf::kItemInode);
-  PutLE16(&item_header, lf::kIlfSize,
-          static_cast<uint16_t>(with_region ? 3 : 2));
+  PutLE16(&item_header, lf::kIlfSize, region_count);
   PutLE32(&item_header, lf::kIlfFields, fields);
-  PutLE16(&item_header, lf::kIlfAsize, 0);
+  PutLE16(&item_header, lf::kIlfAsize,
+          static_cast<uint16_t>(attr_region.size()));
   PutLE16(&item_header, lf::kIlfDsize,
           static_cast<uint16_t>(logged_region.size()));
   PutLE64(&item_header, lf::kIlfIno, ino);
@@ -251,6 +263,7 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   txn.AddLogOp(std::move(item_header));
   txn.AddLogOp(std::move(log_dinode));
   if (with_region) txn.AddLogOp(std::move(logged_region));
+  if (with_attr) txn.AddLogOp(std::move(attr_region));
 
   // On-disk inode: the prepared image, with the transaction LSN and a fresh
   // CRC (the fork bytes were written by the caller).

@@ -47,6 +47,7 @@
 #include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
 #include "xfs/transaction.h"
+#include "xfs/xattr_intent.h"
 
 namespace xfs {
 namespace {
@@ -177,7 +178,8 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
   const std::vector<PendingIntent> intents = CollectPendingIntents(scan);
   for (const PendingIntent& intent : intents) {
     if (intent.type != lf::kItemEfi && intent.type != lf::kItemRui &&
-        intent.type != lf::kItemCui && intent.type != lf::kItemBui) {
+        intent.type != lf::kItemCui && intent.type != lf::kItemBui &&
+        intent.type != lf::kItemAttri) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "cannot recover dirty log: unresolved intent " +
                          IntentContext(intent) +
@@ -299,6 +301,54 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
 // transaction and log the matching EFD so a later crash does not redo the
 // work (the done item releases the intent during recovery).
 Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
+  if (intent.type == lf::kItemAttri) {
+    auto parsed = ParseXattrIntent(intent.regions, geometry_);
+    if (!parsed.ok()) return parsed.error();
+    XattrIntent attr = std::move(parsed.value());
+    auto vfs_name = [&]() -> Result<std::string> {
+      const uint8_t nsp = attr.attr_filter & kAttrNspOnDiskMask;
+      if (nsp == kAttrParent) {
+        return XFS_ERR(XfsError::kUnsupportedFeature,
+                       "parent-pointer ATTRI recovery is outside RW-6D")
+            .Metadata("ATTRI");
+      }
+      if (nsp == kAttrSecure) return "security." + attr.name;
+      if (nsp == kAttrRoot) {
+        if (attr.name == "SGI_ACL_FILE") return std::string("system.posix_acl_access");
+        if (attr.name == "SGI_ACL_DEFAULT") {
+          return std::string("system.posix_acl_default");
+        }
+        return "trusted." + attr.name;
+      }
+      return "user." + attr.name;
+    }();
+    if (!vfs_name.ok()) return vfs_name.error();
+    if (attr.op == XattrIntentOp::kRemove) {
+      Status removed = RemoveXattr(attr.ino, vfs_name.value());
+      if (!removed.ok() && removed.error().code != XfsError::kNotFound) {
+        return removed;
+      }
+    } else {
+      // XFS recovery runs SET/REPLACE through xfs_attr_set_iter's add state:
+      // both are idempotent upserts at this point (a replace's old attribute
+      // was removed before the intent was committed).
+      auto stored = SetXattr(
+          attr.ino, vfs_name.value(),
+          attr.value.empty() ? nullptr : attr.value.data(), attr.value.size(),
+          XattrSetMode::kUpsert);
+      if (!stored.ok()) return stored.error();
+    }
+    // Commit the matching ATTRD.  A crash before this record re-runs the
+    // operation above, which is idempotent.
+    return RunTransaction([&](XfsTransaction& txn) -> Status {
+      std::vector<uint8_t> attrd(lf::kAttrdFormatSize, 0);
+      StoreLE16(attrd.data(), lf::kItemAttrd);
+      StoreLE16(attrd.data() + 2, 1);
+      StoreLE64(attrd.data() + lf::kAttrdIdOffset, attr.id);
+      txn.AddLogOp(std::move(attrd));
+      return OkStatus();
+    });
+  }
   if (intent.type == lf::kItemBui) {
     if (intent.regions.empty()) {
       return XFS_ERR(XfsError::kCorruptBtree, "BUI item has no format region")

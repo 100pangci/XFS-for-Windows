@@ -65,14 +65,97 @@ constexpr size_t kLCrc = bt::kLCrc;            // le32
 }  // namespace
 
 DataForkEditor::DataForkEditor(XfsTransaction* txn, BlockAllocator* alloc,
-                               BlockDevice* device, const XfsGeometry* geo)
-    : txn_(txn), alloc_(alloc), device_(device), geo_(geo) {}
+                               BlockDevice* device, const XfsGeometry* geo,
+                               bool attr_fork)
+    : txn_(txn),
+      alloc_(alloc),
+      device_(device),
+      geo_(geo),
+      attr_fork_(attr_fork) {}
 
 DataForkEditor::~DataForkEditor() = default;
 
 // ---------------------------------------------------------------------------
 // Node access
 // ---------------------------------------------------------------------------
+
+Status DataForkEditor::SetForkBytes(uint32_t bytes) {
+  if (!root_.is_root) {
+    fork_bytes_ = bytes;
+    return OkStatus();
+  }
+  if (bytes == fork_bytes_) return OkStatus();
+  const uint32_t old_bytes = fork_bytes_;
+  if (bytes < kRootHeader + kKeySize + kPtrSize || old_bytes < kRootHeader ||
+      root_.data.size() < old_bytes) {
+    return XFS_ERR(XfsError::kCorruptInode, "bmbt root does not fit the fork")
+        .Ino(ino_)
+        .Metadata("inode")
+        .Expected(bytes)
+        .Actual(old_bytes);
+  }
+  const uint16_t level = GetBE16(root_.data.data(), 0);
+  const uint16_t numrecs = GetBE16(root_.data.data(), 2);
+  const size_t old_max = (old_bytes - kRootHeader) / kRecSize;
+  const size_t new_max = (bytes - kRootHeader) / kRecSize;
+  if (new_max == 0 || numrecs > old_max) {
+    return XFS_ERR(XfsError::kCorruptInode, "bmbt root record count invalid")
+        .Ino(ino_)
+        .Metadata("inode")
+        .Actual(numrecs);
+  }
+  if (numrecs > new_max) {
+    // The in-fork root no longer fits the smaller literal area.  Move its
+    // records into a real bmbt block and make the inode root a level+1 node
+    // over it, exactly xfs_btree_new_iroot().
+    if (level >= bt::kMaxTraversalLevels) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "bmbt root cannot grow deeper")
+          .Ino(ino_)
+          .Metadata("inode")
+          .Actual(level);
+    }
+    std::vector<Entry> entries = ReadEntries(root_);
+    if (entries.empty()) {
+      return XFS_ERR(XfsError::kCorruptInode, "bmbt root is empty")
+          .Ino(ino_)
+          .Metadata("inode");
+    }
+    uint64_t fsb = 0;
+    Status s = AllocBmbtBlock(&fsb);
+    if (!s.ok()) return s;
+    Node* child = nullptr;
+    s = AllocNode(fsb, level, numrecs, &child);
+    if (!s.ok()) return s;
+    WriteEntries(*child, entries);
+    fork_bytes_ = bytes;
+    root_.data.assign(bytes, 0);
+    PutBE16(root_.data.data(), 0, static_cast<uint16_t>(level + 1));
+    PutBE16(root_.data.data(), 2, 1);
+    root_.dirty = true;
+    SetNodeKey(root_, 0, entries.front().rec.startoff);
+    SetNodePtr(root_, 0, fsb);
+    return OkStatus();
+  }
+
+  std::vector<uint64_t> keys(numrecs, 0);
+  std::vector<uint64_t> ptrs(numrecs, 0);
+  for (uint16_t i = 0; i < numrecs; ++i) {
+    keys[i] = NodeKey(root_, i);
+    ptrs[i] = NodePtr(root_, i);
+  }
+  fork_bytes_ = bytes;
+  root_.data.assign(bytes, 0);
+  PutBE16(root_.data.data(), 0, level);
+  PutBE16(root_.data.data(), 2, numrecs);
+  for (uint16_t i = 0; i < numrecs; ++i) {
+    PutBE64(root_.data.data(), kRootHeader + i * kKeySize, keys[i]);
+    PutBE64(root_.data.data(), kRootHeader + new_max * kKeySize + i * kPtrSize,
+            ptrs[i]);
+  }
+  root_.dirty = true;
+  return OkStatus();
+}
 
 uint16_t DataForkEditor::NodeLevel(const Node& node) const {
   if (node.is_root) return GetBE16(root_.data.data(), 0);
@@ -380,7 +463,7 @@ uint32_t DataForkEditor::preferred_agno() const {
 Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
   Allocation alloc;
   Status s = alloc_->AllocateOwned(preferred_agno(), 1,
-                                   RmapOwner::Bmbt(ino_), &alloc);
+                                   RmapOwner::Bmbt(ino_, attr_fork_), &alloc);
   if (!s.ok()) return s;
   nblocks_delta_ += 1;  // bmbt blocks are counted by di_nblocks
   *fsb = alloc.fsb;
@@ -388,7 +471,7 @@ Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
 }
 
 Status DataForkEditor::FreeBmbtBlock(uint64_t fsb) {
-  Status s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_));
+  Status s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_, attr_fork_));
   if (!s.ok()) return s;
   nblocks_delta_ -= 1;
   return OkStatus();
@@ -595,8 +678,17 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
       const uint64_t fsb = old.startblock + (overlap_start - old.startoff);
       const uint32_t count =
           static_cast<uint32_t>(overlap_end - overlap_start);
-      Status s = alloc_->ReleaseData(
-          fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
+      Status s;
+      if (attr_fork_) {
+        // Attribute extents are never shared: their rmap owner is the inode's
+        // attr fork at the logical block offset, and the physical blocks go
+        // straight back to free space.
+        s = alloc_->FreeOwned(
+            fsb, count, RmapOwner::Attr(ino_, overlap_start, false));
+      } else {
+        s = alloc_->ReleaseData(
+            fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
+      }
       if (!s.ok()) return s;
       nblocks_delta_ -= static_cast<int64_t>(count);
     }
@@ -1257,7 +1349,7 @@ Status DataForkEditor::Finalize(std::vector<uint8_t>* raw_inode,
   if (format_ == di::kFormatExtents && needs_btree) {
     Status s = ExtentsToBtree();
     if (!s.ok()) return s;
-  } else if (format_ == di::kFormatBtree && !needs_btree) {
+  } else if (format_ == di::kFormatBtree && !needs_btree && allow_collapse_) {
     Status s = CollapseToExtents();
     if (!s.ok()) return s;
   }

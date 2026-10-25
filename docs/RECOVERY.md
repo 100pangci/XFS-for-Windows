@@ -248,7 +248,8 @@ zero-link inodes on the lists), every AGI bucket is walked:
 | `XFS_LI_BUI` / `XFS_LI_BUD` | yes (RW-6C) | deferred data-fork map/unmap completion; one mapping per BUI |
 | `XFS_LI_RUI/RUD` | yes (RW-6B) | rmap intent completion, including surviving RUI |
 | `XFS_LI_CUI/CUD` | yes (RW-6C recovery-only) | refcount/CoW intent completion; see [REFLINK.md](REFLINK.md) |
-| `XFS_LI_ATTRI/ATTRD`, `DQUOT`, `QUOTAOFF`, `IUNLINK` | **refused** | attr/quota are outside the writable profile |
+| `XFS_LI_ATTRI/ATTRD` | yes (RW-6D) | attribute set/replace/remove intent completion; see [XATTR.md](XATTR.md) |
+| `DQUOT`, `QUOTAOFF`, `IUNLINK` | **refused** | quota items are outside the writable profile |
 
 The table is evidence-driven: the Linux dirty-log operation matrix (section 8)
 records which item types the supported operations actually produce
@@ -268,6 +269,12 @@ sources; CI confirms it against real logs):
 | create / mkdir / rmdir | `ICREATE` (new chunk), `INODE`, `BUF` (AGI, inobt, directory blocks, superblock) |
 | rename (all forms) / hardlink | `INODE` (both parents, moved inode, replaced target), `BUF` (directory blocks) |
 | symlink | `ICREATE` when a chunk is allocated, `INODE` (local target), `BUF` (remote symlink block) |
+| setxattr / removexattr | `ATTRI`/`ATTRD`, `INODE`, `BUF` (attr leaf/node, inode cluster, free-space btrees, AGF/AGFL, superblock); remote value blocks are written outside the log |
+
+The Windows writer uses one atomic transaction for an attribute update (inode,
+BMBT/DA/remote-fork metadata and free-space buffers) and pre-flushes remote
+value data, so its own logs contain `INODE`/`BUF`, not `ATTRI`/`ATTRD`. It
+still parses and completes Linux's attribute intents.
 
 ## 8. Verification
 
@@ -358,9 +365,10 @@ list, so the extension is deliberate and small:
 ## 11. Not in this milestone
 
 Not replayed and refused when encountered: external logs, realtime devices,
-quota, attribute intents, ACL translation, parent pointers, metadir, zoned
-filesystems. RUI/RUD, BUI/BUD and CUI/CUD have dedicated completion passes;
+quota items, ACL translation, parent pointers, metadir, zoned filesystems.
+RUI/RUD, BUI/BUD, CUI/CUD and ATTRI/ATTRD have dedicated completion passes;
 CUI/CUD are accepted only on reflink filesystems and are completed by both the
 ordinary writable mount/recovery path and the standalone `recover` command. A
-reflink clone/CoW can log a BUI and CUI in the same transaction. The writable
-feature profile remains allow-listed.
+reflink clone/CoW can log a BUI and CUI in the same transaction. Attribute
+intents are completed by both paths as well (see [XATTR.md](XATTR.md)). The
+writable feature profile remains allow-listed.

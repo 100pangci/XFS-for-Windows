@@ -30,6 +30,7 @@
 #include "xfs/recovery.h"
 #include "xfs/superblock.h"
 #include "xfs/transaction.h"
+#include "xfs/xattr.h"
 
 namespace xfs {
 
@@ -234,6 +235,26 @@ class XfsFilesystem {
   // Physical data-fork extents (for diagnostics, the free-block-reuse matrix
   // and crash-image structure transitions).
   Result<std::vector<XfsExtent>> GetDataExtents(uint64_t ino) const;
+
+  // ---- extended attributes (RW-6D) ----
+  // Names are VFS names: user.*, trusted.*, security.*,
+  // system.posix_acl_access, system.posix_acl_default.  The on-disk suffix and
+  // namespace flags are handled by the core; values are opaque bytes.
+  Result<std::vector<XattrEntry>> ListXattrs(uint64_t ino,
+                                             bool include_private = false) const;
+  Result<XattrEntry> GetXattr(uint64_t ino, std::string_view name) const;
+  enum class XattrSetMode {
+    kUpsert,   // create or replace (XATTR_UPDATE_UPSERT)
+    kCreate,   // fail with kAlreadyExists (XATTR_CREATE)
+    kReplace,  // fail with kNotFound (XATTR_REPLACE)
+  };
+  // Atomic set/replace/remove.  Remote values are written and flushed before
+  // the metadata transaction commits, so a crash leaves the old or the new
+  // value, never a half-written one.  Returns the stored entry on success.
+  Result<XattrEntry> SetXattr(uint64_t ino, std::string_view name,
+                              const void* value, size_t value_len,
+                              XattrSetMode mode);
+  Status RemoveXattr(uint64_t ino, std::string_view name);
 
   // ---- reflink (RW-6C, read-write mounts only) ----
   // Clones [src_offset, src_offset+length) of `src_ino` to `dst_offset` of
@@ -478,9 +499,14 @@ class XfsFilesystem {
       const std::vector<uint8_t>& fork_region,
       const std::function<Status(uint8_t* raw)>& mutate);
   // Logs an already prepared inode image (the LSN and CRC are stamped here).
+  // The optional attr region carries XFS_ILOG_ADATA/AEXT/ABROOT; when both
+  // fork regions are present the log item is format, dinode, data, attr, the
+  // same order xfs_inode_item_format uses.
   Status LogPreparedInode(XfsTransaction& txn, uint64_t ino,
                           std::vector<uint8_t> inode, uint32_t ilog_fields,
-                          const std::vector<uint8_t>& fork_region);
+                          const std::vector<uint8_t>& fork_region,
+                          uint32_t attr_ilog_fields = 0,
+                          const std::vector<uint8_t>& attr_fork_region = {});
 
   // ---- namespace helpers (RW-3) ----
   // Allocates a new free inode chunk in a separate transaction when no AG has

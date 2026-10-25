@@ -200,10 +200,10 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                    "external log devices are not supported for read-write")
         .Metadata("superblock");
   }
-  if (sb.features_log_incompat != 0) {
+  if ((sb.features_log_incompat & ~ondisk::kLogIncompatXattrs) != 0) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "log-incompatible features are set; the log cannot be "
-                   "written safely")
+                   "unknown log-incompatible features are set; the log cannot "
+                   "be written safely")
         .Metadata("superblock")
         .Actual(sb.features_log_incompat);
   }

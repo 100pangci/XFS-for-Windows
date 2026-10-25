@@ -268,7 +268,9 @@ hard links and symlinks). Every metadata change (inode, allocator, free-space
 btrees, superblock counters, directory blocks, inobt/AGI, symlink blocks) goes
 through the journal as a real transaction; every block allocation/free is done
 through the RW-2 allocator and every directory mutation through the RW-3
-writer. xattrs and ACLs are still refused.
+writer. Native extended attributes (RW-6D) are read and written through the
+attribute-fork writer; ACL semantics and security-descriptor translation are
+still refused (their raw storage forms are preserved).
 Roadmap: RW-5 journal replay, RW-6 raw devices
 (VHD first). `docs/JOURNAL.md` is the reference for the log format,
 `docs/ALLOCATOR.md` for the allocator and the data fork editor,

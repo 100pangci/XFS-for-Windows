@@ -218,12 +218,11 @@ cached data can never be served for a reused inode number.
 
 ## 8. Current limitations
 
-- rmapbt and reflink remain refused for read-write by
-  `CheckWritableProfile`; parent pointers, xattr mutation and quota mutation
-  are still out of scope;
 - the inobt/finobt editor supports the same depth as the other btrees
   (16 levels) and refuses (before writing) any structural case it cannot
-  complete;
+  complete. rmapbt and reflink are accepted since RW-6B/RW-6C, and native
+  xattr mutation since RW-6D (`XATTR.md`); parent pointers and quota mutation
+  remain out of scope;
 - the exact-block "continue after the last chunk" allocation of
   `xfs_ialloc_ag_alloc` is not implemented: a new chunk is allocated with the
   geometry's alignment, which is a legal placement Linux continues from;
