@@ -75,6 +75,12 @@ void PrintUsage() {
       "  convert-unwritten <image> <path> <off> <len>  mark them written\n"
       "      --rw-experimental\n"
       "  bmap <image> <path>          dump the physical data extents [--json]\n"
+      "  xattr list <image> <path>    list native extended attributes [--json]\n"
+      "  xattr get <image> <path> <name>  raw value to stdout, or --hex/\n"
+      "      --output=<file>\n"
+      "  xattr set <image> <path> <name> [value | --value-file=<f> |\n"
+      "      --value-hex=<hex>] --rw-experimental [--create|--replace]\n"
+      "  xattr remove <image> <path> <name>  --rw-experimental\n"
       "  extend <image> <path> <size>  grow a file to <size> bytes by writing a\n"
       "      --rw-experimental [--fill=0xNN]\n"
       "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
@@ -2021,6 +2027,231 @@ int CommandSymlink(const std::string& target, const std::string& link_target,
   return 0;
 }
 
+std::string JsonEscape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  for (char c : text) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+bool ReadBinaryFile(const std::string& path, std::vector<uint8_t>* out) {
+  std::ifstream in(ToPath(path), std::ios::binary);
+  if (!in) return false;
+  out->assign(std::istreambuf_iterator<char>(in),
+              std::istreambuf_iterator<char>());
+  return true;
+}
+
+bool ParseHexValue(const std::string& text, std::vector<uint8_t>* out) {
+  std::string compact;
+  for (char c : text) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' ||
+        c == '-') {
+      continue;
+    }
+    compact.push_back(c);
+  }
+  if (compact.size() % 2 != 0) return false;
+  out->clear();
+  out->reserve(compact.size() / 2);
+  auto nibble = [](char c, int* v) {
+    if (c >= '0' && c <= '9') { *v = c - '0'; return true; }
+    if (c >= 'a' && c <= 'f') { *v = c - 'a' + 10; return true; }
+    if (c >= 'A' && c <= 'F') { *v = c - 'A' + 10; return true; }
+    return false;
+  };
+  for (size_t i = 0; i < compact.size(); i += 2) {
+    int hi = 0, lo = 0;
+    if (!nibble(compact[i], &hi) || !nibble(compact[i + 1], &lo)) {
+      return false;
+    }
+    out->push_back(static_cast<uint8_t>((hi << 4) | lo));
+  }
+  return true;
+}
+
+int CommandXattrList(const std::string& target, const std::string& path,
+                     const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto fs = XfsFilesystem::Mount(std::move(dev), MountOptions{});
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto attrs = fs.value()->ListXattrs(inode.value().ino, false);
+  if (!attrs.ok()) {
+    PrintError(attrs.error());
+    return 1;
+  }
+  std::sort(attrs.value().begin(), attrs.value().end(),
+            [](const XattrEntry& a, const XattrEntry& b) {
+              return a.DisplayName() < b.DisplayName();
+            });
+  if (options.json) {
+    std::cout << "[";
+    bool first = true;
+    for (const XattrEntry& e : attrs.value()) {
+      std::cout << (first ? "" : ",") << "\n  {\"name\":\""
+                << JsonEscape(e.DisplayName()) << "\",\"length\":"
+                << e.value.size() << ",\"remote\":"
+                << (e.remote ? "true" : "false") << "}";
+      first = false;
+    }
+    std::cout << (first ? "]\n" : "\n]\n");
+    return 0;
+  }
+  for (const XattrEntry& e : attrs.value()) {
+    std::cout << e.DisplayName() << "\n";
+  }
+  return 0;
+}
+
+int CommandXattrGet(const std::string& target, const std::string& path,
+                    const std::string& name, const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto fs = XfsFilesystem::Mount(std::move(dev), MountOptions{});
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto attr = fs.value()->GetXattr(inode.value().ino, name);
+  if (!attr.ok()) {
+    PrintError(attr.error());
+    return 1;
+  }
+  if (!options.xattr_output.empty()) {
+    std::ofstream out(ToPath(options.xattr_output), std::ios::binary);
+    if (!out) {
+      std::cerr << "error: cannot create " << options.xattr_output << "\n";
+      return 1;
+    }
+    out.write(reinterpret_cast<const char*>(attr.value().value.data()),
+              static_cast<std::streamsize>(attr.value().value.size()));
+    if (!out) {
+      std::cerr << "error: failed to write " << options.xattr_output << "\n";
+      return 1;
+    }
+    return 0;
+  }
+  if (options.xattr_hex) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(attr.value().value.size() * 2);
+    for (uint8_t b : attr.value().value) {
+      text.push_back(kHex[b >> 4]);
+      text.push_back(kHex[b & 0xf]);
+    }
+    std::cout << text << "\n";
+    return 0;
+  }
+  if (!attr.value().value.empty()) {
+    std::fwrite(attr.value().value.data(), 1, attr.value().value.size(),
+                stdout);
+  }
+  return 0;
+}
+
+int CommandXattrSet(const std::string& target, const std::string& path,
+                    const std::string& name, const std::string& literal,
+                    const Options& options, bool replace_mode) {
+  std::vector<uint8_t> value;
+  if (options.xattr_value_is_hex) {
+    if (!ParseHexValue(options.xattr_value_file, &value)) {
+      std::cerr << "error: --value-hex must contain an even number of hex "
+                   "digits\n";
+      return 1;
+    }
+  } else if (!options.xattr_value_file.empty()) {
+    if (!ReadBinaryFile(options.xattr_value_file, &value)) {
+      std::cerr << "error: cannot read " << options.xattr_value_file << "\n";
+      return 1;
+    }
+  } else {
+    value.assign(reinterpret_cast<const uint8_t*>(literal.data()),
+                 reinterpret_cast<const uint8_t*>(literal.data()) +
+                     literal.size());
+  }
+  if (value.size() > kXattrMaxValueBytes) {
+    std::cerr << "error: xattr value exceeds " << kXattrMaxValueBytes
+              << " bytes\n";
+    return 1;
+  }
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto inode = fs->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  XfsFilesystem::XattrSetMode mode = XfsFilesystem::XattrSetMode::kUpsert;
+  if (options.xattr_create) {
+    mode = XfsFilesystem::XattrSetMode::kCreate;
+  } else if (replace_mode) {
+    mode = XfsFilesystem::XattrSetMode::kReplace;
+  }
+  auto stored = fs->SetXattr(inode.value().ino, name,
+                             value.empty() ? nullptr : value.data(),
+                             value.size(), mode);
+  if (!stored.ok()) {
+    PrintError(stored.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "set " << name << " (" << value.size() << " bytes"
+            << (stored.value().remote ? ", remote" : ", local") << ")\n";
+  return 0;
+}
+
+int CommandXattrRemove(const std::string& target, const std::string& path,
+                       const std::string& name, const Options& options) {
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto inode = fs->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  Status removed = fs->RemoveXattr(inode.value().ino, name);
+  if (!removed.ok()) {
+    PrintError(removed.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "removed " << name << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
@@ -2072,6 +2303,17 @@ int Run(const std::vector<std::string>& args) {
     } else if (arg == "--rw-reflink-qualification") {
       // Legacy RW-6C acceptance switch, now accepted as a no-op.
       options.reflink_qualification = true;
+    } else if (arg == "--create") {
+      options.xattr_create = true;
+    } else if (arg == "--hex") {
+      options.xattr_hex = true;
+    } else if (StartsWith(arg, "--value-file=")) {
+      options.xattr_value_file = arg.substr(13);
+    } else if (StartsWith(arg, "--value-hex=")) {
+      options.xattr_value_is_hex = true;
+      options.xattr_value_file = arg.substr(12);
+    } else if (StartsWith(arg, "--output=")) {
+      options.xattr_output = arg.substr(9);
     } else if (arg == "--modern-inode-profile") {
       options.finobt = true;
       options.inobtcount = true;
@@ -2274,6 +2516,56 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandTruncate(positional[1], positional[2], positional[3],
                            options);
+  }
+  if (command == "xattr") {
+    if (positional.size() < 4) {
+      std::cerr << "usage: xfswin xattr <list|get|set|remove> <image> <path> "
+                   "[name] [value] [--rw-experimental]\n";
+      return 1;
+    }
+    const std::string& sub = positional[1];
+    if (sub == "list") {
+      if (positional.size() != 4) {
+        std::cerr << "usage: xfswin xattr list <image> <path> [--json]\n";
+        return 1;
+      }
+      return CommandXattrList(positional[2], positional[3], options);
+    }
+    if (sub == "get") {
+      if (positional.size() != 5) {
+        std::cerr << "usage: xfswin xattr get <image> <path> <name> "
+                     "[--hex] [--output=<file>]\n";
+        return 1;
+      }
+      return CommandXattrGet(positional[2], positional[3], positional[4],
+                             options);
+    }
+    if (sub == "set") {
+      const bool has_inline = positional.size() == 6;
+      const bool has_external =
+          options.xattr_value_is_hex || !options.xattr_value_file.empty();
+      if (positional.size() < 5 || positional.size() > 6 ||
+          (!has_inline && !has_external)) {
+        std::cerr << "usage: xfswin xattr set <image> <path> <name> "
+                     "[value | --value-file=<file> | --value-hex=<hex>] "
+                     "--rw-experimental [--create|--replace]\n";
+        return 1;
+      }
+      return CommandXattrSet(positional[2], positional[3], positional[4],
+                             has_inline ? positional[5] : std::string(),
+                             options, replace_existing);
+    }
+    if (sub == "remove") {
+      if (positional.size() != 5) {
+        std::cerr << "usage: xfswin xattr remove <image> <path> <name> "
+                     "--rw-experimental\n";
+        return 1;
+      }
+      return CommandXattrRemove(positional[2], positional[3], positional[4],
+                                options);
+    }
+    std::cerr << "error: unknown xattr subcommand '" << sub << "'\n";
+    return 1;
   }
   if (command == "create") {
     if (positional.size() != 3) {

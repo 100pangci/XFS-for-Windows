@@ -132,9 +132,10 @@ therefore confines every rewrite to the data fork:
 - the attribute fork bytes are part of the inode image the writer starts from
   and are never touched: the inode core keeps `di_forkoff`/`di_aformat`, and
   the logged region is only the data fork's share of the literal area;
-- attributes are still neither interpreted nor mutated (xattr/ACL support is
-  out of scope), but a rename, link, unlink or dirent edit inside such a
-  directory preserves them byte for byte.
+- attributes are preserved byte-for-byte by the directory writer; RW-6D adds
+  the separate attribute-fork writer (`XATTR.md`), so a directory can carry
+  user/trusted/security entries without weakening the atomic rename/link/unlink
+  transactions.
 
 ### Replace semantics
 
@@ -283,8 +284,9 @@ atomicity wins over accepting an impossible rename.
 
 ## Current limitations
 
-* No xattr/ACL mutation, reflink/clone, quotas, parent pointers, realtime or
-  metadir; those features are refused for read-write mounting.
+* No ACL translation, quotas, parent pointers, realtime or metadir; native
+  xattr storage is implemented in RW-6D (`XATTR.md`), while ACL/security
+  semantics are not. Reflink/clone is implemented in RW-6C.
 * Windows symlinks stay the documented read-only view (the target is exposed
   as file content); no reparse-point tags are produced or consumed.
 * Windows-side journal replay is still out of scope: the Windows writer always

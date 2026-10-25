@@ -120,6 +120,33 @@ jobs:
             --allow-no-rmapbt --json out/rw6c-normap.oracle.json
           if ($LASTEXITCODE -ne 0) { throw "oracle rejected rw6c-normap.img" }
 
+      - name: RW-6D xattr fixture (1 KiB, every attribute representation)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = "build\tests\$env:BUILD_CONFIG\xfs_tests.exe"
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $tests --make-rw6d-fixture out\rw6d-windows.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D fixture build failed" }
+          & $exe check out\rw6d-windows.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D fixture check failed" }
+          $manifest = Get-Content out\rw6d-windows.img.manifest.json -Raw |
+            ConvertFrom-Json
+          $oracleArgs = @(
+            "tests/tools/rw6d_xattr_probe.py",
+            "out/rw6d-windows.img",
+            "--manifest", "out/rw6d-windows.img.manifest.json",
+            "--json", "out/rw6d-windows.oracle.json",
+            "--quiet")
+          foreach ($item in $manifest.inodes) {
+            $oracleArgs += "--inode"
+            $oracleArgs += "$($item.ino)"
+          }
+          python @oracleArgs
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D fixture oracle failed" }
+          python tests/tools/rw6d_format_assert.py out/rw6d-windows.oracle.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D fixture format assertion failed" }
+
       - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
         shell: pwsh
         run: |
@@ -355,6 +382,16 @@ jobs:
           path: |
             out/rw6c-rmap.img
             out/rw6c-normap.img
+          if-no-files-found: error
+
+      - name: Upload the RW-6D Windows xattr fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-windows-fixture
+          path: |
+            out/rw6d-windows.img
+            out/rw6d-windows.img.manifest.json
+            out/rw6d-windows.oracle.json
           if-no-files-found: error
 
   # ===========================================================================
@@ -2918,3 +2955,512 @@ jobs:
           expected=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["crashes"])' rw6c-cui-crash/crash.summary.json)
           test "$checked" -eq "$expected"
           echo "Verified $checked restarted CUI recovery images"
+
+  # ===========================================================================
+  # RW-6D: native extended attributes (shortform / leaf / node / remote / BMBT)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Record what the distribution's default mkfs.xfs actually enables.  This is
+  # the evidence behind docs/DEFAULT_PROFILE.md; it is not a gate for the
+  # writable profile (parent pointers are deliberately disabled for fixtures).
+  # ---------------------------------------------------------------------------
+  linux-record-mkfs-defaults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Record the default and parent=0 profiles
+        run: |
+          set -euo pipefail
+          mkdir -p rw6d-defaults
+          mkfs.xfs -V | tee rw6d-defaults/version.txt
+          truncate -s 512M rw6d-defaults/default.img
+          mkfs.xfs -f rw6d-defaults/default.img \
+            | tee rw6d-defaults/default.mkfs.txt
+          xfs_info rw6d-defaults/default.img \
+            > rw6d-defaults/default.xfs_info.txt 2>&1 || \
+            echo "xfs_info cannot read a regular image file" \
+              >> rw6d-defaults/default.xfs_info.txt
+          xfs_db -r -c 'sb 0' -c 'p' rw6d-defaults/default.img \
+            > rw6d-defaults/default.sb.txt
+          xfs_db -r -c 'version' rw6d-defaults/default.img \
+            > rw6d-defaults/default.version.txt
+
+          if mkfs.xfs 2>&1 | grep -q 'parent='; then
+            truncate -s 512M rw6d-defaults/parentless.img
+            mkfs.xfs -f -n parent=0 rw6d-defaults/parentless.img \
+              | tee rw6d-defaults/parentless.mkfs.txt
+            xfs_info rw6d-defaults/parentless.img \
+              > rw6d-defaults/parentless.xfs_info.txt 2>&1 || \
+              echo "xfs_info cannot read a regular image file" \
+                >> rw6d-defaults/parentless.xfs_info.txt
+            xfs_db -r -c 'sb 0' -c 'p' rw6d-defaults/parentless.img \
+              > rw6d-defaults/parentless.sb.txt
+          else
+            echo "mkfs.xfs has no parent= option" \
+              > rw6d-defaults/parentless.unsupported.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-mkfs-defaults
+          path: rw6d-defaults/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows-side native RW-6D matrix on the 1 KiB fixture: every transition on
+  # a real image (shortform/leaf/node/level-2 node/remote/BMBT), directory and
+  # symlink attributes, data writes, rename/hardlink/unlink and reflink.
+  # ---------------------------------------------------------------------------
+  windows-rw6d-native:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-fixture
+          path: fixture
+
+      - name: Mutate every attribute representation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path rw6d-native | Out-Null
+          Copy-Item fixture/rw6d-windows.img rw6d-native/rw6d-windows.img
+          python tests/tools/rw6d_windows_mutate.py `
+            --exe bin/xfswin.exe `
+            --image rw6d-native/rw6d-windows.img `
+            --manifest fixture/rw6d-windows.img.manifest.json `
+            --work-dir rw6d-native/work `
+            --json rw6d-native/windows-mutated.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D Windows mutation failed" }
+
+      - name: Re-mutate after the simulated reverse pass
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/tools/rw6d_windows_reverse.py `
+            --exe bin/xfswin.exe `
+            --image rw6d-native/rw6d-windows.img `
+            --manifest rw6d-native/windows-mutated.manifest.json `
+            --work-dir rw6d-native/reverse-work `
+            --json rw6d-native/windows-final.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D Windows reverse failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-windows-native
+          path: |
+            rw6d-native/rw6d-windows.img
+            rw6d-native/windows-mutated.manifest.json
+            rw6d-native/windows-final.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Crash matrix: set/replace/remove across every representation, remote data,
+  # node split/merge, BMBT growth, directory attr, unlink and rename.
+  # ---------------------------------------------------------------------------
+  windows-rw6d-crash:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-fixture
+          path: fixture
+
+      - name: Run the RW-6D crash matrix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/tools/rw6d_crash_windows.py `
+            --exe bin/xfswin.exe `
+            --image fixture/rw6d-windows.img `
+            --manifest fixture/rw6d-windows.img.manifest.json `
+            --work-dir crash-rw6d `
+            --zip `
+            --json crash-rw6d/crash.summary.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-crash
+          path: |
+            crash-rw6d/*.zip
+            crash-rw6d/crash.summary.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # ENOSPC: failed remote sets/replacements must leave the image byte-for-byte
+  # equivalent (attribute values and structure) and a shortform set must still
+  # work at zero free blocks.
+  # ---------------------------------------------------------------------------
+  windows-rw6d-enospc:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-fixture
+          path: fixture
+
+      - name: Exhaust free space and require clean failures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path rw6d-enospc | Out-Null
+          Copy-Item fixture/rw6d-windows.img rw6d-enospc/rw6d-enospc.img
+          python tests/tools/rw6d_enospc_windows.py `
+            --exe bin/xfswin.exe `
+            --image rw6d-enospc/rw6d-enospc.img `
+            --manifest fixture/rw6d-windows.img.manifest.json `
+            --work-dir rw6d-enospc/work `
+            --json rw6d-enospc/rw6d-enospc.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D ENOSPC test failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-enospc
+          path: |
+            rw6d-enospc/rw6d-enospc.img
+            rw6d-enospc/rw6d-enospc.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the Windows-created 1 KiB images (multi-level DA node and
+  # attribute BMBT included) with xfs_repair and a kernel mount.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6d-windows:
+    needs: [linux-record-mkfs-defaults, windows-rw6d-native,
+            windows-rw6d-enospc]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-fixture
+          path: fixture
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-native
+          path: native
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-enospc
+          path: enospc
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-created fixture and mutations
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            fixture/rw6d-windows.img \
+            --manifest fixture/rw6d-windows.img.manifest.json \
+            --label "Windows 1 KiB xattr fixture" --require-formats
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            native/rw6d-windows.img \
+            --manifest native/windows-final.manifest.json \
+            --label "Windows 1 KiB xattr re-mutation" --require-formats
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            enospc/rw6d-enospc.img \
+            --manifest enospc/rw6d-enospc.manifest.json \
+            --label "Windows 1 KiB xattr ENOSPC" --require-formats
+
+  # ---------------------------------------------------------------------------
+  # Linux creates the canonical 4 KiB fixtures in both legal reflink profiles.
+  # The generator itself runs xfs_repair and the independent oracle and
+  # requires every representation, including a level-2 DA node.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6d:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Create both xattr fixtures
+        run: |
+          sudo env SIZE_MB=512 bash tests/scripts/make_rw6d_linux.sh rw6d-linux
+          sudo chown -R "$USER" rw6d-linux
+          ls -lh rw6d-linux
+          cat rw6d-linux/rw6d.oracle.txt 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rw6d-linux
+          path: rw6d-linux/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Windows reads every Linux attribute, mutates all representations and
+  # writes windows-mutated.manifest.json.
+  # ---------------------------------------------------------------------------
+  windows-rw6d-roundtrip:
+    needs: [windows-build-test, linux-generate-rw6d]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6d, rw6d-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-linux
+          path: rw6d-linux
+
+      - name: Mutate the Linux xattr image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force `
+            -Path "rw6d-win-${{ matrix.profile }}" | Out-Null
+          Copy-Item "rw6d-linux/${{ matrix.profile }}.img" `
+            "rw6d-win-${{ matrix.profile }}/${{ matrix.profile }}.img" -Force
+          python tests/tools/rw6d_windows_mutate.py `
+            --exe bin/xfswin.exe `
+            --image "rw6d-win-${{ matrix.profile }}/${{ matrix.profile }}.img" `
+            --manifest "rw6d-linux/${{ matrix.profile }}.manifest.json" `
+            --work-dir "rw6d-win-${{ matrix.profile }}/work" `
+            --json "rw6d-win-${{ matrix.profile }}/windows-mutated.manifest.json"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D Windows mutation failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-windows-${{ matrix.profile }}
+          path: |
+            rw6d-win-${{ matrix.profile }}/${{ matrix.profile }}.img
+            rw6d-win-${{ matrix.profile }}/windows-mutated.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the Windows mutation, then performs the reverse mutation on
+  # a real kernel (including the level-2 tree, remote values and BMBT).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6d:
+    needs: windows-rw6d-roundtrip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6d, rw6d-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-windows-${{ matrix.profile }}
+          path: rw6d-win
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows mutation with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            "rw6d-win/${{ matrix.profile }}.img" \
+            --manifest rw6d-win/windows-mutated.manifest.json \
+            --label "Windows-mutated ${{ matrix.profile }}" --require-formats
+
+      - name: Linux reverse mutation
+        run: |
+          mkdir -p rw6d-reverse
+          cp --sparse=always "rw6d-win/${{ matrix.profile }}.img" \
+            rw6d-reverse/reverse.img
+          sudo bash tests/scripts/verify_rw6d_linux_reverse.sh \
+            rw6d-reverse/reverse.img \
+            rw6d-win/windows-mutated.manifest.json \
+            rw6d-reverse/linux-reverse.manifest.json
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            rw6d-reverse/reverse.img \
+            --manifest rw6d-reverse/linux-reverse.manifest.json \
+            --label "Linux-reverse ${{ matrix.profile }}" --require-formats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-reverse-${{ matrix.profile }}
+          path: |
+            rw6d-reverse/reverse.img
+            rw6d-reverse/linux-reverse.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows reads the Linux reverse image and mutates it once more.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw6d-reverse:
+    needs: linux-verify-rw6d
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6d, rw6d-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-reverse-${{ matrix.profile }}
+          path: rw6d-reverse
+
+      - name: Read and re-mutate after the Linux pass
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/tools/rw6d_windows_reverse.py `
+            --exe bin/xfswin.exe `
+            --image rw6d-reverse/reverse.img `
+            --manifest rw6d-reverse/linux-reverse.manifest.json `
+            --work-dir rw6d-reverse/final-work `
+            --json rw6d-reverse/windows-final.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6D Windows reverse failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6d-reverse-final-${{ matrix.profile }}
+          path: |
+            rw6d-reverse/reverse.img
+            rw6d-reverse/windows-final.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux validates the final image after the Windows re-mutation.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6d-final:
+    needs: windows-verify-rw6d-reverse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6d, rw6d-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-reverse-final-${{ matrix.profile }}
+          path: rw6d-final
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the final image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6d_linux.sh \
+            rw6d-final/reverse.img \
+            --manifest rw6d-final/windows-final.manifest.json \
+            --label "RW-6D final ${{ matrix.profile }}" --require-formats
+
+  # ---------------------------------------------------------------------------
+  # Linux replays every restarted RW-6D crash image and requires the archived
+  # old-or-new manifest to match.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6d-crash:
+    needs: windows-rw6d-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6d-crash
+          path: crash-rw6d
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Validate the crash summary
+        run: |
+          python3 - crash-rw6d/crash.summary.json <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if d.get("result") != "ok":
+              raise SystemExit("RW-6D crash summary failed: %r" % d)
+          if int(d.get("crashes", 0)) == 0:
+              raise SystemExit("no RW-6D crash point was reached")
+          if int(d.get("archived", 0)) != int(d.get("crashes", 0)):
+              raise SystemExit("archived crash image count mismatch")
+          print("RW-6D crash summary OK: %d images" % d["crashes"])
+          PY
+          mkdir -p crash-rw6d/current
+          checked=0
+          for archive in crash-rw6d/*.zip; do
+            [ -e "$archive" ] || continue
+            rm -f crash-rw6d/current/*
+            unzip -o "$archive" -d crash-rw6d/current
+            image=$(find crash-rw6d/current -name '*.img' | head -1)
+            manifest=$(find crash-rw6d/current -name '*.manifest.json' | head -1)
+            test -n "$image"
+            test -n "$manifest"
+            sudo bash tests/scripts/verify_rw6d_linux.sh "$image" \
+              --manifest "$manifest" --label "$(basename "$archive")"
+            checked=$((checked + 1))
+          done
+          expected=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["crashes"])' crash-rw6d/crash.summary.json)
+          test "$checked" -eq "$expected"
+          echo "Verified $checked restarted RW-6D crash images"

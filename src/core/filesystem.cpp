@@ -855,41 +855,25 @@ struct InodeCounts {
   uint64_t records = 0;
 };
 
-// Recomputes di_nblocks from the extent map (data extents plus bmbt blocks),
-// the same value xfs_repair checks. Formats without a data fork - shortform
-// (local) directories and symlinks, device nodes, UUID inodes - have no
-// blocks.
-Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
-                           const XfsInode& inode, uint64_t* out) {
-  if (inode.format == di::kFormatLocal || inode.format == di::kFormatDev ||
-      inode.format == di::kFormatUuid) {
-    *out = 0;
-    return OkStatus();
-  }
-  std::vector<XfsExtent> extents;
-  Status s = LoadDataForkExtents(dev, geo, inode, &extents);
-  if (!s.ok()) return s;
-  uint64_t blocks = 0;
-  for (const XfsExtent& e : extents) blocks += e.blockcount;
-  if (inode.format != di::kFormatBtree) {
-    *out = blocks;
-    return OkStatus();
-  }
-  if (inode.data_fork.size() < bt::kBmdrSize) {
-    return XFS_ERR(XfsError::kCorruptInode, "bmbt fork too small")
-        .Ino(inode.ino)
+// Counts the bmbt blocks reachable from an in-fork root.  Shared by the data
+// and attribute forks; only the fork bytes/root counters differ.
+Status CountForkBmbtBlocks(BlockDevice& dev, const XfsGeometry& geo,
+                           uint64_t ino, const std::vector<uint8_t>& fork,
+                           uint16_t root_level, uint16_t root_numrecs,
+                           const char* what, uint64_t* out,
+                           std::vector<uint64_t>* block_list = nullptr) {
+  *out = 0;
+  if (root_level == 0) return OkStatus();
+  if (fork.size() < bt::kBmdrSize) {
+    return XFS_ERR(XfsError::kCorruptInode, std::string(what) + " root too small")
+        .Ino(ino)
         .Metadata("inode");
   }
-  const uint16_t root_level = GetBE16(inode.data_fork.data(), 0);
-  const uint16_t root_numrecs = GetBE16(inode.data_fork.data(), 2);
-  if (root_level == 0) {
-    *out = blocks;
-    return OkStatus();
-  }
   const size_t node_maxrecs =
-      (inode.data_fork.size() - bt::kBmdrSize) / (bt::kBmbtKeySize + bt::kBmbtPtrSize);
+      (fork.size() - bt::kBmdrSize) /
+      (bt::kBmbtKeySize + bt::kBmbtPtrSize);
   BtreeSpec spec;
-  spec.name = "bmbt";
+  spec.name = what;
   spec.format = BtreeFormat::kLong;
   spec.block_size = geo.block_size;
   spec.key_size = bt::kBmbtKeySize;
@@ -898,7 +882,7 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
   spec.magic = ondisk::kBmapCrcMagic;
   spec.max_depth = bt::kMaxTraversalLevels;
   spec.null_ptr = ~0ull;
-  spec.expected_owner = inode.ino;
+  spec.expected_owner = ino;
   spec.owner_size = 8;
   spec.uuid = geo.meta_uuid;
   spec.ptr_to_daddr = [&](uint64_t fsb, uint64_t* daddr) {
@@ -916,24 +900,168 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
   cb.ptr_in_range = [&](uint64_t ptr) {
     return ptr != spec.null_ptr && geo.FsbValid(ptr);
   };
-  cb.visit = [&](uint64_t, const BtreeBlockMeta&, const uint8_t*) -> Status {
+  cb.visit = [&](uint64_t fsb, const BtreeBlockMeta&,
+                 const uint8_t*) -> Status {
     ++bmbt_blocks;
+    if (block_list != nullptr) block_list->push_back(fsb);
     return OkStatus();
   };
   std::vector<uint64_t> children;
   for (uint16_t i = 0; i < root_numrecs; ++i) {
-    const uint64_t ptr = GetBE64(inode.data_fork.data(),
-                                 bt::kBmdrSize + node_maxrecs * 8 + i * 8);
+    const uint64_t ptr =
+        GetBE64(fork.data(), bt::kBmdrSize + node_maxrecs * 8 + i * 8);
     if (ptr == spec.null_ptr) {
-      return XFS_ERR(XfsError::kCorruptInode, "bmbt root has a null child")
-          .Ino(inode.ino)
+      return XFS_ERR(XfsError::kCorruptInode,
+                     std::string(what) + " root has a null child")
+          .Ino(ino)
           .Metadata("inode");
     }
     children.push_back(ptr);
   }
-  s = WalkBtreeForest(spec, children, static_cast<uint16_t>(root_level - 1), cb);
+  Status s = WalkBtreeForest(spec, children,
+                             static_cast<uint16_t>(root_level - 1), cb);
   if (!s.ok()) return s;
-  *out = blocks + bmbt_blocks;
+  *out = bmbt_blocks;
+  return OkStatus();
+}
+
+// Cross-checks every attribute-fork data extent against rmapbt.  DA blocks and
+// remote values use OWN_INODE + ATTR_FORK + logical offset; a missing record or
+// a record owned by another logical block is corruption.
+Status CheckAttrRmap(BlockDevice& dev, const XfsGeometry& geo,
+                     const XfsInode& inode, const XattrFork& fork,
+                     uint64_t sb_lsn) {
+  if (!geo.features.rmapbt) return OkStatus();
+  std::map<uint32_t, RmapTree> trees;
+  auto lookup_rmap = [&](uint64_t fsb, uint32_t flags, uint64_t logical,
+                         const char* what) -> Status {
+    const uint32_t agno = static_cast<uint32_t>(fsb >> geo.agblklog);
+    const uint32_t agbno = static_cast<uint32_t>(
+        fsb & ((1ULL << geo.agblklog) - 1));
+    auto it = trees.find(agno);
+    if (it == trees.end()) {
+      auto loaded = LoadRmapTree(dev, geo, agno, sb_lsn);
+      if (!loaded.ok()) return loaded.error();
+      it = trees.emplace(agno, std::move(loaded.value())).first;
+    }
+    const RmapRecord* covering = nullptr;
+    for (const RmapRecord& rec : it->second.records) {
+      if (rec.key.startblock > agbno) break;
+      if (agbno >= rec.key.startblock && agbno < rec.EndBlock()) {
+        covering = &rec;
+      }
+    }
+    if (covering == nullptr) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     std::string(what) + " has no reverse mapping")
+          .Ino(inode.ino)
+          .Ag(agno)
+          .Agbno(agbno)
+          .Metadata("rmap");
+    }
+    if (covering->key.owner != inode.ino ||
+        (covering->key.flags & kRmapAttrFork) == 0 ||
+        covering->unwritten()) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     std::string(what) +
+                         " reverse mapping has the wrong owner/flags")
+          .Ino(inode.ino)
+          .Ag(agno)
+          .Agbno(agbno)
+          .Metadata("rmap")
+          .Expected(inode.ino)
+          .Actual(covering->key.owner);
+    }
+    uint64_t expected_offset = 0;
+    if (flags == kRmapBmbtBlock) {
+      expected_offset = 0;
+    } else {
+      expected_offset =
+          covering->key.offset + (agbno - covering->key.startblock);
+    }
+    if (expected_offset != logical) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     std::string(what) +
+                         " reverse mapping has the wrong offset")
+          .Ino(inode.ino)
+          .Ag(agno)
+          .Agbno(agbno)
+          .Metadata("rmap")
+          .Expected(logical)
+          .Actual(expected_offset);
+    }
+    return OkStatus();
+  };
+
+  for (const XfsExtent& e : fork.extents) {
+    for (uint64_t i = 0; i < e.blockcount; ++i) {
+      const uint64_t logical = e.startoff + i;
+      Status s = lookup_rmap(e.startblock + i, kRmapAttrFork, logical,
+                             "attr fork block");
+      if (!s.ok()) return s;
+    }
+  }
+  if (inode.aformat == di::kFormatBtree) {
+    std::vector<uint64_t> bmbt;
+    uint64_t count = 0;
+    Status s = CountForkBmbtBlocks(
+        dev, geo, inode.ino, inode.attr_fork,
+        GetBE16(inode.attr_fork.data(), 0), GetBE16(inode.attr_fork.data(), 2),
+        "attr bmbt", &count, &bmbt);
+    if (!s.ok()) return s;
+    for (uint64_t fsb : bmbt) {
+      s = lookup_rmap(fsb, kRmapAttrFork | kRmapBmbtBlock, 0,
+                      "attr bmbt block");
+      if (!s.ok()) return s;
+    }
+  }
+  return OkStatus();
+}
+
+// Recomputes di_nblocks from both forks (data/attr extents plus their bmbt
+// blocks) and verifies the attribute fork at the same time.  This is the value
+// xfs_repair checks.
+Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
+                           const XfsInode& inode, uint64_t* out) {
+  uint64_t blocks = 0;
+  if (inode.format != di::kFormatLocal && inode.format != di::kFormatDev &&
+      inode.format != di::kFormatUuid) {
+    std::vector<XfsExtent> extents;
+    Status s = LoadDataForkExtents(dev, geo, inode, &extents);
+    if (!s.ok()) return s;
+    for (const XfsExtent& e : extents) blocks += e.blockcount;
+    if (inode.format == di::kFormatBtree) {
+      if (inode.data_fork.size() < bt::kBmdrSize) {
+        return XFS_ERR(XfsError::kCorruptInode, "bmbt fork too small")
+            .Ino(inode.ino)
+            .Metadata("inode");
+      }
+      uint64_t bmbt = 0;
+      s = CountForkBmbtBlocks(dev, geo, inode.ino, inode.data_fork,
+                              GetBE16(inode.data_fork.data(), 0),
+                              GetBE16(inode.data_fork.data(), 2), "bmbt",
+                              &bmbt);
+      if (!s.ok()) return s;
+      blocks += bmbt;
+    }
+  }
+  if (inode.HasAttrFork()) {
+    auto attr = ReadXattrFork(dev, geo, inode);
+    if (!attr.ok()) return attr.error();
+    for (const XfsExtent& e : attr.value().extents) {
+      blocks += e.blockcount;
+    }
+    if (inode.aformat == di::kFormatBtree) {
+      uint64_t bmbt = 0;
+      Status s = CountForkBmbtBlocks(dev, geo, inode.ino, inode.attr_fork,
+                                     GetBE16(inode.attr_fork.data(), 0),
+                                     GetBE16(inode.attr_fork.data(), 2),
+                                     "attr bmbt", &bmbt);
+      if (!s.ok()) return s;
+      blocks += bmbt;
+    }
+  }
+  *out = blocks;
   return OkStatus();
 }
 
@@ -1614,6 +1742,32 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
     } else {
       report.Add("root inode", CheckStatus::kOk,
                  "inode " + std::to_string(geo.rootino) + " verified");
+      auto root_attrs = ReadXattrFork(dev, geo, root.value(), live_sb.lsn);
+      if (!root_attrs.ok()) {
+        report.Add("root inode xattrs", CheckStatus::kCorrupt,
+                   root_attrs.error().Format());
+      } else {
+        report.Add("root inode xattrs", CheckStatus::kOk,
+                   std::to_string(root_attrs.value().entries.size()) +
+                       " entries, format " +
+                       [&] {
+                         switch (root_attrs.value().format) {
+                           case XattrForkFormat::kNone: return "none";
+                           case XattrForkFormat::kShortform: return "shortform";
+                           case XattrForkFormat::kLeaf: return "leaf";
+                           case XattrForkFormat::kNode: return "node";
+                           case XattrForkFormat::kExtentsEmpty:
+                             return "empty-extents";
+                         }
+                         return "unknown";
+                       }());
+        Status root_attr_rmap = CheckAttrRmap(
+            dev, geo, root.value(), root_attrs.value(), live_sb.lsn);
+        if (!root_attr_rmap.ok()) {
+          report.Add("root inode attr rmap", CheckStatus::kCorrupt,
+                     root_attr_rmap.error().Format());
+        }
+      }
       auto entries = ListDirectory(geo.rootino);
       if (!entries.ok()) {
         report.Add("root directory", CheckStatus::kCorrupt,
@@ -1623,6 +1777,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                    std::to_string(entries.value().size()) + " entries");
         if (options.root_children) {
           uint32_t bad = 0;
+          uint32_t checked_attrs = 0;
           for (const auto& e : entries.value()) {
             if (e.name == "." || e.name == "..") continue;
             auto inode = OpenInode(e.ino);
@@ -1632,6 +1787,29 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
               ++bad;
               if (bad > 8) break;
               continue;
+            }
+            auto child_attrs =
+                ReadXattrFork(dev, geo, inode.value(), live_sb.lsn);
+            if (!child_attrs.ok()) {
+              report.Add("root entry '" + e.name + "' xattrs",
+                         CheckStatus::kCorrupt,
+                         child_attrs.error().Format());
+              ++bad;
+            } else if (child_attrs.value().HasIncomplete()) {
+              report.Add("root entry '" + e.name + "' xattrs",
+                         CheckStatus::kWarning,
+                         "attribute fork contains an INCOMPLETE entry");
+            }
+            if (child_attrs.ok()) {
+              ++checked_attrs;
+              Status rmap_check = CheckAttrRmap(
+                  dev, geo, inode.value(), child_attrs.value(), live_sb.lsn);
+              if (!rmap_check.ok()) {
+                report.Add("root entry '" + e.name + "' attr rmap",
+                           CheckStatus::kCorrupt,
+                           rmap_check.error().Format());
+                ++bad;
+              }
             }
             uint64_t expected_blocks = 0;
             Status blocks = ExpectedInodeBlocks(dev, geo, inode.value(),
@@ -1649,6 +1827,11 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
               ++bad;
             }
             if (bad > 8) break;
+          }
+          if (bad <= 8 && checked_attrs > 0) {
+            report.Add("root child xattrs", CheckStatus::kOk,
+                       std::to_string(checked_attrs) +
+                           " attribute forks and rmap owners verified");
           }
         }
       }

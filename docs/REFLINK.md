@@ -24,8 +24,10 @@ This milestone implements:
   no-op) and an independent Python oracle.
 
 It deliberately does **not** support realtime refcount, external logs,
-parent-pointers, xattrs, quotas, metadir or online repair. Attribute extents
-still refuse inode freeing, as in RW-6B.
+parent-pointers, quotas, metadir or online repair. Attribute forks were still
+outside the writable profile in RW-6C; [XATTR.md](XATTR.md) (RW-6D) adds
+attribute read/write and attribute-fork freeing, including the attr/BMBT/rmap
+ownership paths this milestone left untouched.
 
 ## Source map
 
@@ -405,8 +407,8 @@ ENOSPC, genuine CUI recovery and the refusal matrix.
 * Refcount intents are completed one CUI per transaction. A 1024-extent CUI
   is covered by the unit matrix, but a CUI larger than one transaction budget
   is refused rather than split with a fresh continuation intent.
-* Attribute forks with allocated extents still cannot be freed; BUI
-  attribute/realtime mappings are refused.
+* Attribute forks with allocated extents can now be freed (RW-6D); BUI
+  attribute/realtime mappings themselves are still refused.
 * A BUI is accepted only with one mapping (the Linux recovery constraint).
 * Exchange-range, online repair, quotas, parent pointers and metadir remain
   outside the writable profile.

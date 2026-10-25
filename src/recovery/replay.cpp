@@ -141,8 +141,14 @@ bool ClassifyMetadata(const uint8_t* buf, size_t len, MetaType* out) {
   switch (da_magic) {
     case ondisk::kDir3Leaf1Magic:
     case ondisk::kDir3LeafnMagic:
-    case ondisk::kDaNode3Magic:
       *out = {"directory leaf/node", 24, 12, true};
+      return true;
+    case ondisk::kDaNode3Magic:
+      // 0x3ebe is shared by directory and attribute DA nodes.
+      *out = {"da node", 24, 12, true};
+      return true;
+    case ondisk::kAttr3LeafMagic:
+      *out = {"attr leaf", 24, 12, true};
       return true;
     default:
       break;
@@ -206,7 +212,8 @@ int64_t OnDiskMetadataLsn(const uint8_t* buf, size_t len, const Uuid& meta_uuid,
       default:
         if (GetBE16(buf + 8) == ondisk::kDir3Leaf1Magic ||
             GetBE16(buf + 8) == ondisk::kDir3LeafnMagic ||
-            GetBE16(buf + 8) == ondisk::kDaNode3Magic) {
+            GetBE16(buf + 8) == ondisk::kDaNode3Magic ||
+            GetBE16(buf + 8) == ondisk::kAttr3LeafMagic) {
           return 32;
         }
         return kNoField;

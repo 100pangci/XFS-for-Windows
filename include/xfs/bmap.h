@@ -42,8 +42,13 @@ class BlockAllocator;
 
 class DataForkEditor {
  public:
+  // `attr_fork` selects the second inode fork.  The bmap tree format is
+  // identical; only the rmap owner flags (ATTR_FORK / BMBT+ATTR_FORK) and the
+  // free path (no refcount sharing) differ.  RW-6D uses this mode for the
+  // attribute fork's extent map and BMBT.
   DataForkEditor(XfsTransaction* txn, BlockAllocator* alloc,
-                 BlockDevice* device, const XfsGeometry* geo);
+                 BlockDevice* device, const XfsGeometry* geo,
+                 bool attr_fork = false);
   ~DataForkEditor();
   DataForkEditor(const DataForkEditor&) = delete;
   DataForkEditor& operator=(const DataForkEditor&) = delete;
@@ -77,7 +82,23 @@ class DataForkEditor {
   // allocated them through the BlockAllocator).
   void AddNblocks(int64_t delta) { nblocks_delta_ += delta; }
   uint32_t nextents() const { return nextents_; }
+  uint8_t format() const { return format_; }
+  uint32_t fork_bytes() const { return fork_bytes_; }
   const std::vector<XfsExtent>& extents() const { return extents_; }
+
+  // Changes the size of the fork image emitted by Finalize.  Used when a
+  // forkoff change gives the data fork more or less literal space, or when
+  // the attribute fork is resized.  The extent/tree contents are unchanged;
+  // if the in-fork btree root no longer fits the new size, a real bmbt block
+  // is allocated and the root becomes a level+1 node over it (the kernel's
+  // xfs_btree_new_iroot path).
+  Status SetForkBytes(uint32_t bytes);
+
+  // Finalize normally converts a btree fork with few extents back to the
+  // extents format.  When expanding a data fork because the attr fork shrank,
+  // Linux keeps the btree format; callers that need that behaviour clear this
+  // flag.  The default remains the RW-2 behaviour (collapse when possible).
+  void SetAllowCollapse(bool allow) { allow_collapse_ = allow; }
 
   // Applies all edits to the fork image inside `raw_inode` (a mutable copy of
   // the inode the caller passed to Load), queues the modified bmbt blocks as
@@ -168,12 +189,14 @@ class DataForkEditor {
   const XfsGeometry* geo_;
 
   uint64_t ino_ = 0;
+  bool attr_fork_ = false;
   uint32_t fork_bytes_ = 0;
   uint8_t format_ = 0;  // on-disk format at Load time, updated by conversions
   std::vector<XfsExtent> extents_;
   uint32_t nextents_ = 0;
   int64_t nblocks_delta_ = 0;
   bool free_removed_ = false;
+  bool allow_collapse_ = true;
   bool loaded_ = false;
 
   Node root_;

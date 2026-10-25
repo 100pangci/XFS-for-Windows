@@ -11,9 +11,11 @@ bigtime
 NREXT64
 ```
 
-The milestone does **not** implement rmapbt, reflink/refcount/CoW, xattr
+The RW-6A milestone does **not** implement rmapbt, reflink/refcount/CoW, xattr
 mutation, quota mutation, parent-pointer mutation, realtime, external logs,
-metadir or zoned filesystems. Those remain separate milestones.
+metadir or zoned filesystems. Those remain separate milestones. Later
+milestones added rmapbt (RW-6B), reflink/CoW (RW-6C) and native xattrs (RW-6D);
+see [XATTR.md](XATTR.md).
 
 The on-disk rules below come from `fs/xfs/libxfs` and `xfsprogs` (the copies in
 `reference/linux/fs/xfs` and `reference/xfsprogs-7.2.0` were used while writing

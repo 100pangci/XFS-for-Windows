@@ -35,6 +35,12 @@ struct Options {
   // scripts keep working.
   bool rmapbt_qualification = false;
   bool reflink_qualification = false;
+  // RW-6D xattr command options.
+  bool xattr_create = false;      // XATTR_CREATE
+  bool xattr_hex = false;         // hex output
+  bool xattr_value_is_hex = false;  // --value-hex input
+  std::string xattr_value_file;   // binary value input
+  std::string xattr_output;       // binary value output
 };
 
 // Runs the CLI. argv excludes the program name.
