@@ -115,6 +115,11 @@ def main():
     new_data = pattern(2 * BLOCK, 901)
     partial = pattern(4 * BLOCK + 300, 29)
     cow_patch = pattern(BLOCK, 73)
+    wide = bytearray((1200 * 2 - 1) * BLOCK)
+    for i in range(1200):
+        offset = i * 2 * BLOCK
+        wide[offset:offset + BLOCK] = pattern(BLOCK, 300 + i)
+    wide = bytes(wide)
 
     require(run.cat("/base/source.bin"), old_source, "Linux source")
     require(run.cat("/base/clone-a.bin"), old_source, "Linux clone-a")
@@ -125,6 +130,9 @@ def main():
     require(run.cat("/base/partial.bin"), partial, "Linux partial")
     require(run.cat("/base/partial-clone.bin"), partial,
             "Linux partial clone")
+    require(run.cat("/base/wide.bin"), wide, "Linux wide source")
+    require(run.cat("/base/wide-clone.bin"), wide, "Linux wide clone")
+    require(run.cat("/base/wide-second.bin"), wide, "Linux wide second clone")
 
     # CoW the first block of a three-way shared source.  The untouched clone
     # must keep the old bytes.
@@ -194,6 +202,9 @@ def main():
         "rw6c/new-clone.bin": new_data,
         "rw6c/three-clone.bin": old_source,
         "rw6c/hole-clone.bin": partial + bytes(100),
+        "base/wide.bin": wide,
+        "base/wide-clone.bin": wide,
+        "base/wide-second.bin": wide,
     }
     manifest = {
         "kind": "rw6c-windows-mutated",
@@ -204,7 +215,7 @@ def main():
             for name, data in expected.items()
         },
         "block_size": BLOCK,
-        "seeds": {"shared_pairs": 600},
+        "seeds": {"shared_pairs": 100, "wide_extents": 1200},
     }
     out = args.json or os.path.join(args.work_dir, "mutated.manifest.json")
     with open(out, "w", encoding="utf-8") as f:

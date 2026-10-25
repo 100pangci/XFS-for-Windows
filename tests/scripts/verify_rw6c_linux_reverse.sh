@@ -153,18 +153,26 @@ expected = {
     "linux/tiny.bin": tiny,
     "linux/tiny-clone.bin": tiny,
 }
-for i in range(600):
+for i in range(100):
     data = pattern(block, 200 + i)
     expected["base/s%03d.bin" % i] = data
     expected["base/d%03d.bin" % i] = data
     expected["base/g%03d.bin" % i] = pattern(block, 500 + i)
     if i % 2 == 0:
         expected["base/q%03d.bin" % i] = data
+wide = bytearray((1200 * 2 - 1) * block)
+for i in range(1200):
+    offset = i * 2 * block
+    wide[offset:offset + block] = pattern(block, 300 + i)
+wide = bytes(wide)
+expected["base/wide.bin"] = wide
+expected["base/wide-clone.bin"] = wide
+expected["base/wide-second.bin"] = wide
 manifest = {
     "kind": "rw6c-linux-reverse",
     "deleted": ["base/clone-b.bin", "rw6c/three-clone.bin"],
     "block_size": block,
-    "seeds": {"shared_pairs": 600},
+    "seeds": {"shared_pairs": 100, "wide_extents": 1200},
     "files": {
         name: {"size": len(data),
                "sha256": hashlib.sha256(data).hexdigest()}

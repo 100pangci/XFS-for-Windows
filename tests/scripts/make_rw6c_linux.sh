@@ -10,9 +10,9 @@
 #   rw6c-normap.img   reflink=1, rmapbt=0
 #
 # Both images contain a deep clone tree (three-way clones, a CoW-modified
-# clone, holes, a partial EOF block and 600 separate shared extents that make
-# the refcount btree at least two levels deep).  The independent RW-6C oracle
-# must accept each image before it is uploaded.
+# clone, holes, a partial EOF block, 100 separated shared pairs and a
+# 1200-extent wide clone that makes the refcount btree at least two levels
+# deep).  The independent RW-6C oracle must accept each image before upload.
 #
 # usage: make_rw6c_linux.sh <outdir>
 set -euo pipefail
@@ -108,9 +108,9 @@ with open(sparse, "wb") as f:
     os.fsync(f.fileno())
 clone(sparse, os.path.join(base, "sparse-clone.bin"))
 
-# 600 shared 1-block extents separated by private gap blocks.  At 4 KiB the
-# refcount leaf holds 505 records, so this forces a non-root refcount block.
-pairs = 600
+# 100 shared 1-block extents separated by private gap blocks for the lifecycle
+# tests.
+pairs = 100
 for i in range(pairs):
     src = os.path.join(base, "s%03d.bin" % i)
     gap = os.path.join(base, "g%03d.bin" % i)
@@ -122,6 +122,20 @@ for i in range(pairs):
     # runs can never merge two test records accidentally.
     if i % 2 == 0:
         clone(src, os.path.join(base, "q%03d.bin" % i))
+
+# A single 1200-extent wide file and two clones.  However the allocator splits
+# the extents across the two AGs, one AG holds at least 600 records; a 4 KiB
+# refcount leaf holds 505, so the tree must grow a non-root node.
+wide_extents = 1200
+wide = os.path.join(base, "wide.bin")
+with open(wide, "wb") as f:
+    for i in range(wide_extents):
+        f.seek(i * 2 * block)
+        f.write(pattern(block, 300 + i))
+    f.flush()
+    os.fsync(f.fileno())
+clone(wide, os.path.join(base, "wide-clone.bin"))
+clone(wide, os.path.join(base, "wide-second.bin"))
 
 entries = {}
 for dirpath, dirnames, filenames in os.walk(root):
@@ -145,12 +159,13 @@ manifest = {
         "partial": 29,
         "sparse": 41,
         "shared_pairs": pairs,
+        "wide_extents": wide_extents,
     },
 }
 with open(manifest_path, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2, sort_keys=True)
-print("fixture: %d files, source=%d bytes, pairs=%d" %
-      (len(entries), len(source_data), pairs))
+print("fixture: %d files, source=%d bytes, pairs=%d, wide=%d" %
+      (len(entries), len(source_data), pairs, wide_extents))
 PY
 }
 
@@ -162,10 +177,10 @@ build_one() {
     truncate -s "${SIZE_MB}M" "$img"
     LOOP=$(losetup --find --show "$img")
     # The writable profile requires one filesystem block per directory block
-    # (xfs_win policy).  Linux mkfs.xfs cannot create 1 KiB directory blocks,
-    # so use 4 KiB blocks and one AG to keep all 600 refcount records in a
-    # single tree.
-    local mkfs_opts="-b size=4096 -d agcount=1 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
+    # (xfs_win policy).  Linux mkfs.xfs cannot create 1 KiB directory blocks
+    # and requires at least two AGs, so use 4 KiB blocks and two AGs; the wide
+    # clone still leaves at least 600 refcount records in one tree.
+    local mkfs_opts="-b size=4096 -d agcount=2 -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=$rmap -i sparse=1,nrext64=1"
     mkfs.xfs -f -q $mkfs_opts $PARENT_OPT "$LOOP"
     mount "$LOOP" "$MOUNT"
     xfs_info "$MOUNT" > "$OUT/$name.xfs_info.txt"
