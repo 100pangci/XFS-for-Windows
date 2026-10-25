@@ -183,6 +183,11 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
   geo.nrext64 = options.nrext64;
   geo.rmapbt = options.rmapbt;
   geo.reflink = options.reflink;
+  geo.parent_pointers = options.parent_pointers || options.modern_default_profile;
+  // xfs_mkfs.c turns exchange-range on when parent pointers are enabled and
+  // the caller did not explicitly disable it.  A parent=1,exchange=0 image is
+  // not a profile this formatter creates.
+  geo.exchrange = geo.parent_pointers || options.modern_default_profile;
 
   // Pre-allocated per-AG metadata blocks: block 0 (sb [+ agf/agi/agfl]) then
   // bno root, cnt root, inobt root and (with finobt) the finobt root.

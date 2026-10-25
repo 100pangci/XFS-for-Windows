@@ -1,10 +1,11 @@
 # Journal recovery (RW-5)
 
 Status: **implemented** for the writable profile (XFS v5, CRC enabled, internal
-log, optional finobt/inobtcount/sparse inodes/bigtime/NREXT64; still no
-rmapbt/reflink/quota/metadir/parent pointers). This note documents what the
-Windows recovery engine does, what it refuses, and how it is verified. It is
-the recovery counterpart of `JOURNAL.md` (the writer).
+log, finobt/inobtcount/sparse inodes/bigtime/NREXT64, rmapbt, reflink/CoW,
+native xattrs and parent pointers; no quota/metadir/realtime/external log).
+This note documents what the Windows recovery engine does, what it refuses, and
+how it is verified. It is the recovery counterpart of `JOURNAL.md` (the
+writer).
 
 ```
 Windows crash / Linux crash
@@ -365,10 +366,14 @@ list, so the extension is deliberate and small:
 ## 11. Not in this milestone
 
 Not replayed and refused when encountered: external logs, realtime devices,
-quota items, ACL translation, parent pointers, metadir, zoned filesystems.
-RUI/RUD, BUI/BUD, CUI/CUD and ATTRI/ATTRD have dedicated completion passes;
-CUI/CUD are accepted only on reflink filesystems and are completed by both the
-ordinary writable mount/recovery path and the standalone `recover` command. A
-reflink clone/CoW can log a BUI and CUI in the same transaction. Attribute
-intents are completed by both paths as well (see [XATTR.md](XATTR.md)). The
-writable feature profile remains allow-listed.
+quota items, ACL translation, metadir, zoned filesystems, and exchange-range
+XMI/XMD operations (the feature bit itself is accepted).  RUI/RUD, BUI/BUD,
+CUI/CUD and ATTRI/ATTRD have dedicated completion passes; CUI/CUD are accepted
+only on reflink filesystems and are completed by both the ordinary writable
+mount/recovery path and the standalone `recover` command. A reflink clone/CoW
+can log a BUI and CUI in the same transaction. ATTRI/ATTRD completion includes
+the private parent-pointer PPTR set/remove/replace operations; a child inode is
+opened by inode + generation, and a missing old record is idempotent during
+recovery. Attribute intents are completed by both paths as well (see
+[XATTR.md](XATTR.md) and [PARENT_POINTERS.md](PARENT_POINTERS.md)). The writable
+feature profile remains allow-listed.

@@ -10,8 +10,8 @@ Scope: the writable profile this build accepts (`CheckWritableProfile`):
 ```text
 XFS v5, crc=1, internal log, single data device
 optional finobt, inobtcount, sparse inode chunks, bigtime, NREXT64
-no rmapbt, no reflink, no parent pointers, no quotas, no realtime,
-no external log, no metadir
+rmapbt/reflink/xattrs/parent pointers are maintained by later milestones
+no quotas, no realtime, external log or metadir
 ```
 
 RW-6A does not change the free-space btree algorithm; it adds inode-btree

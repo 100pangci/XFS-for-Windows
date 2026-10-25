@@ -113,6 +113,14 @@ constexpr uint16_t kItemBui = 0x1244;       // XFS_LI_BUI
 constexpr uint16_t kItemBud = 0x1245;       // XFS_LI_BUD
 constexpr uint16_t kItemAttri = 0x1246;     // XFS_LI_ATTRI
 constexpr uint16_t kItemAttrd = 0x1247;     // XFS_LI_ATTRD
+constexpr uint16_t kItemXmi = 0x1248;       // XFS_LI_XMI (exchange-range)
+constexpr uint16_t kItemXmd = 0x1249;       // XFS_LI_XMD (exchange-range)
+constexpr uint16_t kItemEfiRt = 0x124a;     // XFS_LI_EFI_RT
+constexpr uint16_t kItemEfdRt = 0x124b;     // XFS_LI_EFD_RT
+constexpr uint16_t kItemRuiRt = 0x124c;     // XFS_LI_RUI_RT
+constexpr uint16_t kItemRudRt = 0x124d;     // XFS_LI_RUD_RT
+constexpr uint16_t kItemCuiRt = 0x124e;     // XFS_LI_CUI_RT
+constexpr uint16_t kItemCudRt = 0x124f;     // XFS_LI_CUD_RT
 
 // ---------------------------------------------------------------------------
 // Intent item formats (host byte order, like every log item format)

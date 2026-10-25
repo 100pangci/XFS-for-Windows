@@ -23,11 +23,13 @@ This milestone implements:
 * ordinary `--rw-experimental` CLI access (the legacy qualification flag is a
   no-op) and an independent Python oracle.
 
-It deliberately does **not** support realtime refcount, external logs,
-parent-pointers, quotas, metadir or online repair. Attribute forks were still
-outside the writable profile in RW-6C; [XATTR.md](XATTR.md) (RW-6D) adds
-attribute read/write and attribute-fork freeing, including the attr/BMBT/rmap
-ownership paths this milestone left untouched.
+It deliberately does **not** support realtime refcount, external logs, quotas,
+metadir, zoned filesystems, exchange-range operations or online repair.
+Attribute forks were outside the writable profile in RW-6C; [XATTR.md](XATTR.md)
+(RW-6D) adds attribute read/write and attribute-fork freeing, and
+[PARENT_POINTERS.md](PARENT_POINTERS.md) (RW-6E) adds the private parent-pointer
+namespace. Both use the attr/BMBT/rmap ownership paths this milestone left
+untouched.
 
 ## Source map
 
@@ -298,8 +300,9 @@ ordinary allow-list:
 
 The writer still refuses geometry it cannot maintain, including
 `dirblklog != 0`, allocation groups of 2^31 blocks or more, realtime devices,
-external logs, quotas, parent pointers, metadir and zoned filesystems. Every
-refusal happens before the first write; there is no silent read-only or
+external logs, quotas, metadir, zoned filesystems and exchange-range
+operations. Parent pointers are part of the ordinary profile since RW-6E.
+Every refusal happens before the first write; there is no silent read-only or
 partial-write mount.
 
 ## Testing
@@ -410,8 +413,9 @@ ENOSPC, genuine CUI recovery and the refusal matrix.
 * Attribute forks with allocated extents can now be freed (RW-6D); BUI
   attribute/realtime mappings themselves are still refused.
 * A BUI is accepted only with one mapping (the Linux recovery constraint).
-* Exchange-range, online repair, quotas, parent pointers and metadir remain
-  outside the writable profile.
+* Exchange-range operations, online repair, quotas, metadir and zoned
+  filesystems remain outside the writable profile. Parent pointers are
+  implemented by RW-6E.
 * The Windows formatter's refcount tree is a single empty root leaf; tree
   growth is exercised by the writer, not by mkfs.
 * Linux-created qualification fixtures use 4 KiB blocks because `mkfs.xfs`

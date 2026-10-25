@@ -147,6 +147,72 @@ jobs:
           python tests/tools/rw6d_format_assert.py out/rw6d-windows.oracle.json
           if ($LASTEXITCODE -ne 0) { throw "RW-6D fixture format assertion failed" }
 
+      - name: RW-6E parent pointers (modern default profile, oracle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe mkimage out\rw6e-parent.img 400M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
+          & $exe format out\rw6e-parent.img --yes-i-really-mean-it --modern-default-profile
+          if ($LASTEXITCODE -ne 0) { throw "modern parent format failed" }
+          & $exe create out\rw6e-parent.img /f --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "create on parent fs failed" }
+          & $exe mkdir out\rw6e-parent.img /a --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "mkdir a failed" }
+          & $exe mkdir out\rw6e-parent.img /b --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "mkdir b failed" }
+          & $exe mkdir out\rw6e-parent.img /a/d --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "mkdir a/d failed" }
+          & $exe link out\rw6e-parent.img /f /a/same --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "link a/same failed" }
+          & $exe link out\rw6e-parent.img /f /b/same --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "link b/same failed" }
+          & $exe rename out\rw6e-parent.img /a/same /b/moved --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "cross-dir rename failed" }
+          & $exe rename out\rw6e-parent.img /a/d /b/d2 --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "directory move failed" }
+          & $exe xattr set out\rw6e-parent.img /f user.alpha hello --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "ordinary xattr on parent fs failed" }
+          # Private namespace mutation must be refused even with the parent
+          # profile writable.
+          & $exe xattr remove out\rw6e-parent.img /f parent.f --rw-experimental 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "parent xattr removal was not refused" }
+          $global:LASTEXITCODE = 0
+          & $exe unlink out\rw6e-parent.img /b/moved --rw-experimental
+          if ($LASTEXITCODE -ne 0) { throw "unlink failed" }
+          & $exe check out\rw6e-parent.img --parents --verbose
+          if ($LASTEXITCODE -ne 0) { throw "parent check failed" }
+          & $exe parents out\rw6e-parent.img /f --json > out\rw6e-parents.json
+          if ($LASTEXITCODE -ne 0) { throw "parents diagnostic failed" }
+          python tests/tools/rw6e_parent_probe.py out/rw6e-parent.img `
+            --require-parent --json out/rw6e-parent.oracle.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6E parent oracle failed" }
+
+      - name: RW-6E hardlink-heavy fixture (1 KiB, BMBT, oracle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = "build\tests\$env:BUILD_CONFIG\xfs_tests.exe"
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $tests --make-rw6e-fixture out\rw6e-windows.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6E fixture build failed" }
+          & $exe check out\rw6e-windows.img --verbose
+          if ($LASTEXITCODE -ne 0) { throw "RW-6E fixture check failed" }
+          python tests/tools/rw6e_parent_probe.py out/rw6e-windows.img `
+            --require-parent --json out/rw6e-windows.oracle.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6E fixture oracle failed" }
+
+      - name: RW-6E namespace crash matrix (dirent + parent pointer)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/tools/rw6e_crash_windows.py `
+            --exe build\src\$env:BUILD_CONFIG\xfswin.exe `
+            --base out\rw6e-windows.img `
+            --work-dir out\rw6e-crash
+          if ($LASTEXITCODE -ne 0) { throw "RW-6E crash matrix failed" }
+
       - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
         shell: pwsh
         run: |
@@ -394,6 +460,19 @@ jobs:
             out/rw6d-windows.oracle.json
           if-no-files-found: error
 
+      - name: Upload the RW-6E Windows parent fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6e-windows-fixtures
+          path: |
+            out/rw6e-parent.img
+            out/rw6e-parents.json
+            out/rw6e-parent.oracle.json
+            out/rw6e-windows.img
+            out/rw6e-windows.img.manifest.json
+            out/rw6e-windows.oracle.json
+          if-no-files-found: error
+
   # ===========================================================================
   # RW-6A: modern inode feature profile
   # (finobt + inobtcount + sparse inodes + bigtime + NREXT64)
@@ -401,7 +480,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Linux creates the canonical modern-inode fixture with the distribution's
-  # mkfs.xfs: no rmapbt/reflink/parent pointers (still refused by the writer).
+  # mkfs.xfs: historical RW-6A fixture without rmapbt/reflink/parent pointers.
   # ---------------------------------------------------------------------------
   linux-generate-rw6-modern:
     runs-on: ubuntu-24.04
@@ -2962,8 +3041,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Record what the distribution's default mkfs.xfs actually enables.  This is
-  # the evidence behind docs/DEFAULT_PROFILE.md; it is not a gate for the
-  # writable profile (parent pointers are deliberately disabled for fixtures).
+  # the evidence behind docs/DEFAULT_PROFILE.md; the RW-6E gate runs separately
+  # on a parent-capable modern kernel and uses the unmodified default.
   # ---------------------------------------------------------------------------
   linux-record-mkfs-defaults:
     runs-on: ubuntu-24.04
@@ -3464,3 +3543,52 @@ jobs:
           expected=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["crashes"])' crash-rw6d/crash.summary.json)
           test "$checked" -eq "$expected"
           echo "Verified $checked restarted RW-6D crash images"
+
+  # ---------------------------------------------------------------------------
+  # RW-6E real-kernel qualification.  A stock ubuntu-24.04 runner kernel does
+  # not provide XFS parent pointers, so this job is intentionally opt-in and
+  # must run on a self-hosted runner (or a QEMU/KVM job) with a 7.x kernel
+  # built with CONFIG_XFS_DEBUG and parent pointers.  The helper scripts fail
+  # loudly if the host cannot format/mount parent=1; they never downgrade to
+  # xfs_repair-only evidence.
+  # ---------------------------------------------------------------------------
+  linux-rw6e-parent:
+    if: ${{ vars.XFS_RW6E_LINUX == '1' }}
+    runs-on: [self-hosted, linux, xfs-rw6e]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build reference xfsprogs 7.2.0 and gate the host
+        run: |
+          if ! mkfs.xfs -V 2>&1 | grep -Eq '7\.2|7\.[3-9]|[89]\.'; then
+            make -C reference/xfsprogs-7.2.0 -j"$(nproc)"
+            export PATH="$PWD/reference/xfsprogs-7.2.0/mkfs:$PWD/reference/xfsprogs-7.2.0/db:$PWD/reference/xfsprogs-7.2.0/repair:$PWD/reference/xfsprogs-7.2.0/io:$PWD/reference/xfsprogs-7.2.0/scrub:$PATH"
+            echo "PATH=$PATH" >> "$GITHUB_ENV"
+            echo "XFS_REFERENCE_TOOLS=$PWD/reference/xfsprogs-7.2.0" >> "$GITHUB_ENV"
+          fi
+          uname -a
+          mkfs.xfs -V
+          bash tests/scripts/qualify_rw6e_host.sh rw6e-host
+
+      - name: Create a plain modern mkfs.xfs fixture
+        run: |
+          SIZE_MB=1024 bash tests/scripts/make_rw6e_linux.sh rw6e-linux
+          tar -C rw6e-linux -czf rw6e-linux-fixture.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6e-linux-fixture
+          path: rw6e-linux-fixture.tar.gz
+
+      - name: Linux reverse mutation and audit
+        run: |
+          mkdir -p rw6e-host/mnt
+          mount -o loop rw6e-linux/rw6e.img rw6e-host/mnt
+          python3 tests/tools/rw6e_linux_content.py --verify rw6e-host/mnt \
+            --manifest rw6e-linux/rw6e.manifest.json
+          sync
+          umount rw6e-host/mnt
+          xfs_repair -n rw6e-linux/rw6e.img
+          python3 tests/tools/rw6e_parent_probe.py rw6e-linux/rw6e.img \
+            --require-parent --json rw6e-linux/parent-oracle.json

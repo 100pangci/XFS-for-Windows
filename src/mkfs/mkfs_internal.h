@@ -49,6 +49,8 @@ struct FormatGeometry {
   bool nrext64 = false;
   bool rmapbt = false;
   bool reflink = false;
+  bool parent_pointers = false;
+  bool exchrange = false;
 
   uint64_t logstart = 0;   // absolute fsb
   uint32_t logblocks = 0;

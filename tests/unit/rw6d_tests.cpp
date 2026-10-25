@@ -722,13 +722,14 @@ TEST(rw6d_attr_intent_parser) {
     CHECK(parsed.value().op == XattrIntentOp::kReplace);
   }
   {
-    // Parent-pointer operations are parsed far enough to identify them and
-    // then refused as outside RW-6D.
+    // Parent-pointer operations are valid in RW-6E, but this filesystem does
+    // not have the parent feature.  The parser refuses the intent instead of
+    // replaying it onto a profile that cannot carry the reverse metadata.
     std::vector<std::vector<uint8_t>> regions;
     build(4, kAttrParent, "parent.name", {'p'}, 0x222, &regions);
     auto parsed = ParseXattrIntent(regions, geo);
     CHECK(!parsed.ok());
-    CHECK(parsed.error().code == XfsError::kUnsupportedFeature);
+    CHECK(parsed.error().code == XfsError::kCorruptBtree);
   }
   {
     std::vector<uint8_t> done(16, 0);

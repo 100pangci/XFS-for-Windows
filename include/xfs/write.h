@@ -38,16 +38,17 @@ namespace xfs {
 // ---------------------------------------------------------------------------
 // Checks that the filesystem uses a feature profile this build can modify.
 // RW-6A maintains finobt, inobtcount, sparse inode chunks, bigtime and
-// NREXT64.  RW-6B maintains rmapbt, and RW-6C maintains reflink/refcountbt/
-// CoW.  Parent pointers, quotas, realtime, external log, metadir and zoned
-// XFS remain read-only (or are refused for writing).  The four trailing
-// booleans are legacy overrides retained for source compatibility; they are
-// accepted as no-ops.
+// NREXT64; RW-6B rmapbt; RW-6C reflink/refcountbt/CoW; RW-6E parent pointers
+// and the exchange-range feature bit.  Quotas, realtime, external log,
+// metadir, zoned/zone-gap and needs-repair XFS remain read-only (or are
+// refused for writing).  The trailing booleans are legacy overrides retained
+// for source compatibility; they are accepted as no-ops.
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_recovery = false,
                             bool allow_rmapbt_qualification = false,
                             bool allow_reflink_recovery = false,
-                            bool allow_reflink_qualification = false);
+                            bool allow_reflink_qualification = false,
+                            bool allow_parent_qualification = false);
 
 // Human readable one-line profile description for logs/diagnostics.
 std::string WritableProfileSummary(const XfsSuperblock& sb);

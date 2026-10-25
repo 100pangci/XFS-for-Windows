@@ -28,21 +28,11 @@ std::string Hex32(uint32_t v) {
   return buf;
 }
 
-// Incompat features whose structures a writer must maintain.
-struct IncompatReason {
-  uint32_t bit;
-  const char* name;
-  const char* why;
-};
-
-constexpr IncompatReason kIncompatReasons[] = {
-    // RW-6A implements sparse chunks, bigtime and NREXT64; they are no longer
-    // in the refusal list. Parent pointers still change the attribute fork on
-    // every rename and are a later milestone.
-    {ondisk::kIncompatParent, "parent pointers",
-     "parent pointer xattrs must be written on every rename"},
-};
-
+// Every incompat feature this writer understands is maintained by the
+// mutation paths now: ftype, sparse chunks, meta-uuid, bigtime, NREXT64,
+// exchange-range (feature bit only) and parent pointers (RW-6E).  There is no
+// remaining entry in this refusal list; metadir/zoned/needsrepair are refused
+// separately below because they change the filesystem model itself.
 struct RoCompatReason {
   uint32_t bit;
   const char* name;
@@ -66,7 +56,8 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_recovery,
                             bool allow_rmapbt_qualification,
                             bool allow_reflink_recovery,
-                            bool allow_reflink_qualification) {
+                            bool allow_reflink_qualification,
+                            bool allow_parent_qualification) {
   // The old hidden qualification/recovery overrides are retained as accepted
   // no-ops so existing scripts keep working, but the ordinary allow-list below
   // is now the only gate: reflink is part of the writable profile.
@@ -99,15 +90,10 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
         .Actual(sb.features_incompat);
   }
 
-  for (const auto& reason : kIncompatReasons) {
-    if (sb.features_incompat & reason.bit) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     std::string("incompatible feature '") + reason.name +
-                         "' is read-only in this build: " + reason.why)
-          .Metadata("superblock")
-          .Actual(reason.bit);
-    }
-  }
+  // RW-6E: parent pointers are part of the ordinary writable profile.  The
+  // legacy qualification switch is accepted as a no-op so older scripts keep
+  // working; it no longer widens the allow-list.
+  (void)allow_parent_qualification;
   for (const auto& reason : kRoCompatReasons) {
     if (sb.features_ro_compat & reason.bit) {
       // RW-6B maintains rmapbt; RW-6C maintains the refcount btree and the
@@ -223,6 +209,7 @@ std::string WritableProfileSummary(const XfsSuperblock& sb) {
   if (sb.features.exchrange) summary += ", exchrange";
   if (sb.features.rmapbt) summary += ", rmapbt";
   if (sb.features.reflink) summary += ", reflink";
+  if (sb.features.parent) summary += ", parent-pointers";
   return summary;
 }
 

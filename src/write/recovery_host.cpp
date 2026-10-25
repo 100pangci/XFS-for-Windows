@@ -46,8 +46,10 @@
 #include "xfs/refcount.h"
 #include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
+#include "xfs/parent.h"
 #include "xfs/transaction.h"
 #include "xfs/xattr_intent.h"
+#include "write/xattr_write_internal.h"
 
 namespace xfs {
 namespace {
@@ -305,6 +307,111 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
     auto parsed = ParseXattrIntent(intent.regions, geometry_);
     if (!parsed.ok()) return parsed.error();
     XattrIntent attr = std::move(parsed.value());
+    if (attr.op == XattrIntentOp::kParentSet ||
+        attr.op == XattrIntentOp::kParentRemove ||
+        attr.op == XattrIntentOp::kParentReplace) {
+      // xfs_attr_recover_work opens the child by inode + generation for every
+      // parent operation.  A reused inode number must never receive a stale
+      // deferred pointer.
+      auto child = OpenInode(attr.ino);
+      if (!child.ok()) return child.error();
+      if (child.value().gen != attr.igen) {
+        return XFS_ERR(XfsError::kCorruptInode,
+                       "parent-pointer ATTRI child generation does not match")
+            .Ino(attr.ino)
+            .Expected(child.value().gen)
+            .Actual(attr.igen)
+            .Metadata("ATTRI");
+      }
+      ParentPointer old_pointer;
+      ParentPointer new_pointer;
+      if (attr.op == XattrIntentOp::kParentReplace) {
+        if (attr.value.size() != kParentRecSize ||
+            attr.new_value.size() != kParentRecSize) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "parent-pointer ATTRI replace value is malformed")
+              .Metadata("ATTRI");
+        }
+        old_pointer.parent_ino = GetBE64(attr.value.data(), 0);
+        old_pointer.parent_gen = GetBE32(attr.value.data(), kParentGenOffset);
+        old_pointer.name = attr.old_name;
+        new_pointer.parent_ino = GetBE64(attr.new_value.data(), 0);
+        new_pointer.parent_gen =
+            GetBE32(attr.new_value.data(), kParentGenOffset);
+        new_pointer.name = attr.new_name;
+      } else {
+        if (attr.value.size() != kParentRecSize) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "parent-pointer ATTRI value is malformed")
+              .Metadata("ATTRI");
+        }
+        old_pointer.parent_ino = GetBE64(attr.value.data(), 0);
+        old_pointer.parent_gen = GetBE32(attr.value.data(), kParentGenOffset);
+        old_pointer.name = attr.name;
+        new_pointer = old_pointer;
+      }
+
+      return RunTransaction([&](XfsTransaction& txn) -> Status {
+        auto fresh = OpenInode(attr.ino);
+        if (!fresh.ok()) return fresh.error();
+        if (fresh.value().gen != attr.igen) {
+          return XFS_ERR(XfsError::kCorruptInode,
+                         "parent-pointer ATTRI child generation changed "
+                         "during recovery")
+              .Ino(attr.ino)
+              .Expected(fresh.value().gen)
+              .Actual(attr.igen)
+              .Metadata("ATTRI");
+        }
+        auto fork = ReadXattrFork(*device_, geometry_, fresh.value());
+        if (!fork.ok()) return fork.error();
+        auto raw = ReadRawInode(attr.ino);
+        if (!raw.ok()) return raw.error();
+        BlockAllocator blocks(&txn, device_.get(), &geometry_);
+        Result<PreparedInode> prepared = XFS_ERR(
+            XfsError::kInternal, "unhandled parent-pointer ATTRI operation");
+        switch (attr.op) {
+          case XattrIntentOp::kParentSet:
+            prepared = PrepareParentPointerAdd(
+                txn, blocks, *device_, geometry_, fresh.value(), fork.value(),
+                std::move(raw.value()), old_pointer);
+            break;
+          case XattrIntentOp::kParentRemove:
+            prepared = PrepareParentPointerRemove(
+                txn, blocks, *device_, geometry_, fresh.value(), fork.value(),
+                std::move(raw.value()), old_pointer,
+                /*missing_ok=*/true);
+            break;
+          case XattrIntentOp::kParentReplace:
+            prepared = PrepareParentPointerReplace(
+                txn, blocks, *device_, geometry_, fresh.value(), fork.value(),
+                std::move(raw.value()), old_pointer, new_pointer,
+                /*missing_ok=*/true);
+            break;
+          default:
+            break;
+        }
+        if (!prepared.ok()) return prepared.error();
+        Status s = LogPreparedInode(
+            txn, attr.ino, std::move(prepared.value().image),
+            prepared.value().data_fields, prepared.value().data_region,
+            prepared.value().attr_fields, prepared.value().attr_region);
+        if (!s.ok()) return s;
+        MaybeCrash(CrashPoint::kBeforeIntentDone,
+                   "ATTRI parent id=" + std::to_string(attr.id));
+        std::vector<uint8_t> attrd(lf::kAttrdFormatSize, 0);
+        StoreLE16(attrd.data(), lf::kItemAttrd);
+        StoreLE16(attrd.data() + 2, 1);
+        StoreLE64(attrd.data() + lf::kAttrdIdOffset, attr.id);
+        txn.AddLogOp(std::move(attrd));
+        s = blocks.Commit();
+        if (s.ok()) {
+          MaybeCrash(CrashPoint::kAfterIntentDone,
+                     "ATTRI parent id=" + std::to_string(attr.id));
+        }
+        return s;
+      });
+    }
     auto vfs_name = [&]() -> Result<std::string> {
       const uint8_t nsp = attr.attr_filter & kAttrNspOnDiskMask;
       if (nsp == kAttrParent) {

@@ -204,7 +204,8 @@ Result<std::vector<XattrEntry>> ListXattrs(BlockDevice& device,
                                           const XfsInode& inode,
                                           bool include_private = false);
 Result<XattrEntry> GetXattr(BlockDevice& device, const XfsGeometry& geo,
-                            const XfsInode& inode, std::string_view name);
+                            const XfsInode& inode, std::string_view name,
+                            bool include_private = false);
 
 // Maps a logical attr-fork block to its physical filesystem block.  Returns
 // false when the logical block is a hole.  Used by the oracle and repair paths.

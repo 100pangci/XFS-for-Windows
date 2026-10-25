@@ -30,6 +30,7 @@
 #include "xfs/inode.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/parent.h"
 #include "xfs/refcount.h"
 #include "xfs/rmap.h"
 #include "xfs/superblock.h"
@@ -43,6 +44,8 @@
 
 namespace xfs::cli {
 namespace {
+
+std::string JsonEscape(const std::string& text);
 
 constexpr const char* kVersion = "xfswin 0.1.0 (XFS v5 reader, writer, journal recovery)";
 
@@ -77,10 +80,12 @@ void PrintUsage() {
       "  bmap <image> <path>          dump the physical data extents [--json]\n"
       "  xattr list <image> <path>    list native extended attributes [--json]\n"
       "  xattr get <image> <path> <name>  raw value to stdout, or --hex/\n"
-      "      --output=<file>\n"
+      "      --output=<file>          --include-private reads a parent.* value\n"
       "  xattr set <image> <path> <name> [value | --value-file=<f> |\n"
       "      --value-hex=<hex>] --rw-experimental [--create|--replace]\n"
       "  xattr remove <image> <path> <name>  --rw-experimental\n"
+      "      --include-private         xattr list: show parent.* records\n"
+      "  parents <image> <path>       list reverse parent pointers [--json]\n"
       "  extend <image> <path> <size>  grow a file to <size> bytes by writing a\n"
       "      --rw-experimental [--fill=0xNN]\n"
       "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
@@ -109,6 +114,8 @@ void PrintUsage() {
       "      [--reflink]               format with reflink=1 (refcountbt)\n"
       "      [--rmapbt --reflink]      Linux-legal combined profile\n"
       "                                (both are ordinary writable features)\n"
+      "      [--parent]                parent pointers (implies exchange-range)\n"
+      "      [--modern-default-profile] the xfsprogs 7.2 default feature set\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
       "                                created, overwritten, extended, truncated,\n"
@@ -326,6 +333,7 @@ void PrintGeometry(const XfsSuperblock& sb, const XfsGeometry& geo) {
             << " reflink=" << flags_on(sb.features.reflink)
             << " bigtime=" << flags_on(sb.features.bigtime)
             << " nrext64=" << flags_on(sb.features.nrext64)
+            << " exchrange=" << flags_on(sb.features.exchrange)
             << " parent=" << flags_on(sb.features.parent) << "\n";
 }
 
@@ -798,6 +806,57 @@ int CommandCheck(const std::string& target, const Options& options) {
              : 0;
 }
 
+// `parents`: show the reverse namespace records of one inode.  This is the
+// differential interface against xfs_db ("attr"), xfs_io -c getparents and
+// xfs_scrub's parent checker.
+int CommandParents(const std::string& target, const std::string& path,
+                   const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  MountOptions mount_options;
+  // Diagnostic reads must work on a crash image before recovery.
+  mount_options.force_unsafe_ro = true;
+  auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
+  if (!fs.ok()) {
+    PrintError(fs.error());
+    return 1;
+  }
+  auto inode = fs.value()->LookupPath(path);
+  if (!inode.ok()) {
+    PrintError(inode.error());
+    return 1;
+  }
+  auto parents =
+      ListParents(fs.value()->device(), fs.value()->geometry(), inode.value());
+  if (!parents.ok()) {
+    PrintError(parents.error());
+    return 1;
+  }
+  if (options.json) {
+    std::cout << "{\"inode\":" << inode.value().ino << ",\"parents\":[";
+    bool first = true;
+    for (const ParentPointer& p : parents.value()) {
+      std::cout << (first ? "" : ",") << "\n  {\"parent\":"
+                << p.parent_ino << ",\"generation\":" << p.parent_gen
+                << ",\"name\":\"" << JsonEscape(p.name) << "\"}";
+      first = false;
+    }
+    std::cout << (first ? "]}\n" : "\n]}\n");
+    return 0;
+  }
+  std::cout << "inode " << inode.value().ino << " has "
+            << parents.value().size() << " parent pointer(s)\n";
+  for (const ParentPointer& p : parents.value()) {
+    std::cout << "  parent " << p.parent_ino << " gen " << p.parent_gen
+              << " name '" << p.name << "'\n";
+  }
+  return 0;
+}
+
 int CommandMkImage(const std::string& path_string, const std::string& size) {
   bool ok = false;
   uint64_t bytes = ParseSize(size, &ok);
@@ -1118,6 +1177,8 @@ int CommandFormat(const std::string& target, const Options& options) {
   format_options.nrext64 = options.nrext64;
   format_options.rmapbt = options.rmapbt;
   format_options.reflink = options.reflink;
+  format_options.parent_pointers = options.parent_pointers;
+  format_options.modern_default_profile = options.modern_default_profile;
   auto report = mkfs::Format(*dev, format_options);
   if (!report.ok()) {
     PrintError(report.error());
@@ -1203,6 +1264,8 @@ MountOptions WritableMountOptions(const Options& options) {
       options.rmapbt_qualification;
   mount_options.allow_reflink_qualification =
       options.reflink_qualification;
+  mount_options.allow_parent_qualification =
+      options.parent_qualification;
   return mount_options;
 }
 
@@ -2097,22 +2160,24 @@ int CommandXattrList(const std::string& target, const std::string& path,
     PrintError(inode.error());
     return 1;
   }
-  auto attrs = fs.value()->ListXattrs(inode.value().ino, false);
+  auto attrs =
+      fs.value()->ListXattrs(inode.value().ino, options.include_private);
   if (!attrs.ok()) {
     PrintError(attrs.error());
     return 1;
   }
   std::sort(attrs.value().begin(), attrs.value().end(),
-            [](const XattrEntry& a, const XattrEntry& b) {
-              return a.DisplayName() < b.DisplayName();
+            [&](const XattrEntry& a, const XattrEntry& b) {
+              return a.DisplayName(options.include_private) <
+                     b.DisplayName(options.include_private);
             });
   if (options.json) {
     std::cout << "[";
     bool first = true;
     for (const XattrEntry& e : attrs.value()) {
       std::cout << (first ? "" : ",") << "\n  {\"name\":\""
-                << JsonEscape(e.DisplayName()) << "\",\"length\":"
-                << e.value.size() << ",\"remote\":"
+                << JsonEscape(e.DisplayName(options.include_private))
+                << "\",\"length\":" << e.value.size() << ",\"remote\":"
                 << (e.remote ? "true" : "false") << "}";
       first = false;
     }
@@ -2120,7 +2185,7 @@ int CommandXattrList(const std::string& target, const std::string& path,
     return 0;
   }
   for (const XattrEntry& e : attrs.value()) {
-    std::cout << e.DisplayName() << "\n";
+    std::cout << e.DisplayName(options.include_private) << "\n";
   }
   return 0;
 }
@@ -2143,7 +2208,8 @@ int CommandXattrGet(const std::string& target, const std::string& path,
     PrintError(inode.error());
     return 1;
   }
-  auto attr = fs.value()->GetXattr(inode.value().ino, name);
+  auto attr =
+      fs.value()->GetXattr(inode.value().ino, name, options.include_private);
   if (!attr.ok()) {
     PrintError(attr.error());
     return 1;
@@ -2297,6 +2363,16 @@ int Run(const std::vector<std::string>& args) {
       options.rmapbt = true;
     } else if (arg == "--reflink") {
       options.reflink = true;
+    } else if (arg == "--parent") {
+      options.parent_pointers = true;
+    } else if (arg == "--modern-default-profile") {
+      options.modern_default_profile = true;
+    } else if (arg == "--rw-parent-qualification") {
+      options.parent_qualification = true;
+    } else if (arg == "--include-private") {
+      options.include_private = true;
+    } else if (arg == "--parents") {
+      options.parent_check = true;
     } else if (arg == "--rw-rmapbt-qualification") {
       // Legacy RW-6B acceptance switch, now accepted as a no-op.
       options.rmapbt_qualification = true;
@@ -2516,6 +2592,13 @@ int Run(const std::vector<std::string>& args) {
     }
     return CommandTruncate(positional[1], positional[2], positional[3],
                            options);
+  }
+  if (command == "parents") {
+    if (positional.size() != 3) {
+      std::cerr << "usage: xfswin parents <device|image> <path> [--json]\n";
+      return 1;
+    }
+    return CommandParents(positional[1], positional[2], options);
   }
   if (command == "xattr") {
     if (positional.size() < 4) {

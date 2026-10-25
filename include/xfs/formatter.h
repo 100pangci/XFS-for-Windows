@@ -42,6 +42,16 @@ struct FormatOptions {
   // RW-6C: reflink=1.  rmapbt is independent (both legal combinations are
   // supported by Linux and by the formatter).
   bool reflink = false;
+  // RW-6E: parent pointers.  mkfs.xfs couples parent=1 with exchange-range
+  // (xfs_mkfs.c: "Turn on exchange-range if parent pointers are enabled"),
+  // so the formatter writes both incompat bits and refuses an illegal
+  // parent=1,exchange=0 combination.
+  bool parent_pointers = false;
+  // Modern default-profile helper: crc, ftype, finobt, inobtcount, sparse,
+  // bigtime, NREXT64, rmapbt, reflink, parent pointers and exchange-range.
+  // This is the xfsprogs 7.2 default set minus metadir/realtime/quota; the CI
+  // gate measures the actual distribution default rather than hardcoding it.
+  bool modern_default_profile = false;
 };
 
 struct FormatReport {

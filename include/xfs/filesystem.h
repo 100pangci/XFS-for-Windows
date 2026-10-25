@@ -27,6 +27,7 @@
 #include "xfs/extent.h"
 #include "xfs/inode.h"
 #include "xfs/log_checker.h"
+#include "xfs/parent.h"
 #include "xfs/recovery.h"
 #include "xfs/superblock.h"
 #include "xfs/transaction.h"
@@ -67,6 +68,10 @@ struct MountOptions {
   // Linux qualification ledger and are part of the ordinary writable profile,
   // so this flag is accepted as a no-op for compatibility with older scripts.
   bool allow_reflink_qualification = false;
+  // Legacy RW-6E development switch, now accepted as a no-op.  Parent
+  // pointers are part of the ordinary writable profile after the local and
+  // external qualification ledgers in docs/PARENT_POINTERS.md.
+  bool allow_parent_qualification = false;
 };
 
 struct XfsFileInfo {
@@ -139,6 +144,8 @@ struct CheckOptions {
   bool log = true;
   // Verify every inode referenced from the root directory (shallow tree walk).
   bool root_children = true;
+  // Bidirectional dirent <-> parent-pointer audit on parent=1 filesystems.
+  bool parent_pointers = true;
 };
 
 class XfsFilesystem {
@@ -242,7 +249,8 @@ class XfsFilesystem {
   // namespace flags are handled by the core; values are opaque bytes.
   Result<std::vector<XattrEntry>> ListXattrs(uint64_t ino,
                                              bool include_private = false) const;
-  Result<XattrEntry> GetXattr(uint64_t ino, std::string_view name) const;
+  Result<XattrEntry> GetXattr(uint64_t ino, std::string_view name,
+                              bool include_private = false) const;
   enum class XattrSetMode {
     kUpsert,   // create or replace (XATTR_UPDATE_UPSERT)
     kCreate,   // fail with kAlreadyExists (XATTR_CREATE)
@@ -447,6 +455,19 @@ class XfsFilesystem {
 
   // ---- read-only consistency validation (xfswin check) ----
   CheckReport CheckConsistency(const CheckOptions& options) const;
+
+  // Bidirectional namespace <-> parent-pointer audit (RW-6E).  For every real
+  // non-dot dirent there must be exactly one matching parent pointer on the
+  // child, and every parent pointer must resolve back to the directory entry
+  // that produced it.  Root has no parent pointer and its ".." points to
+  // itself; a linked directory has exactly one parent pointer; a regular
+  // file/symlink/device node has one per hard link.  The audit never writes.
+  Result<ParentNamespaceReport> VerifyParentPointers() const;
+
+  // Enumerates every inode marked allocated by the inobt (sparse chunks
+  // included).  Used by the parent audit to find reverse records on inodes
+  // that are no longer reachable from the root tree.
+  Result<std::vector<uint64_t>> ListAllocatedInodes() const;
 
  private:
   XfsFilesystem() = default;

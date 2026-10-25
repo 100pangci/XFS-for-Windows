@@ -17,8 +17,8 @@ Scope: the writable profile (`CheckWritableProfile`):
 ```text
 XFS v5, crc=1, internal log, single data device
 optional finobt, inobtcount, sparse inode chunks, bigtime, NREXT64
-no rmapbt, no reflink, no parent pointers, no quotas, no realtime,
-no external log, no metadir
+rmapbt/reflink/xattrs/parent pointers are maintained by later milestones
+no quotas, no realtime, external log or metadir
 ```
 
 RW-6A extended this document's original inobt-only model; the finobt,
@@ -220,9 +220,9 @@ cached data can never be served for a reused inode number.
 
 - the inobt/finobt editor supports the same depth as the other btrees
   (16 levels) and refuses (before writing) any structural case it cannot
-  complete. rmapbt and reflink are accepted since RW-6B/RW-6C, and native
-  xattr mutation since RW-6D (`XATTR.md`); parent pointers and quota mutation
-  remain out of scope;
+  complete. rmapbt and reflink are accepted since RW-6B/RW-6C, native xattr
+  mutation since RW-6D (`XATTR.md`), and parent pointers since RW-6E
+  (`PARENT_POINTERS.md`); quota mutation remains out of scope;
 - the exact-block "continue after the last chunk" allocation of
   `xfs_ialloc_ag_alloc` is not implemented: a new chunk is allocated with the
   geometry's alignment, which is a legal placement Linux continues from;

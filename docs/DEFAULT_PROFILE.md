@@ -1,17 +1,19 @@
 # The Linux `mkfs.xfs` default profile and the writable subset
 
-Status: **reference note**, recorded from the XFS source trees in `reference/`
-and re-measured by CI (`linux-record-mkfs-defaults`). The authoritative
-measurement for a particular distribution is the CI artifact, not this file.
+Status: **RW-6E qualification note.**  The modern parent-pointer profile is
+inside the experimental writable allow-list when it stays within the documented
+single-device/internal-log geometry.  The exact xfsprogs and kernel versions
+are recorded by CI; a plain `mkfs.xfs -f` image without `parent=0` is the
+acceptance fixture, not a hand-edited feature-bit hack.
 
 ## Why this note exists
 
-`mkfs.xfs` enables a profile that keeps growing: modern xfsprogs turns on
-rmapbt, reflink, parent pointers, exchange-range, bigtime and NREXT64 by
-default. The Windows formatter and the writable profile intentionally support
-a smaller, explicitly qualified set. A "default `mkfs.xfs`" image therefore is
-**not** guaranteed to be writable by this project, and saying "Linux default"
-without the exact options is not evidence.
+`mkfs.xfs` enables a profile that keeps growing.  The reference 7.2 tree turns
+on crc, finobt, sparse inodes, inobtcount, rmapbt, reflink, bigtime, NREXT64,
+parent pointers and exchange-range by default.  The Windows formatter supports
+this set (minus metadir/realtime/quota) and the writable policy validates the
+actual superblock, so a future default that adds an unsupported feature is
+refused instead of silently corrupted.
 
 ## Build-time defaults (xfsprogs 7.2.0)
 
@@ -39,14 +41,16 @@ From `reference/xfsprogs-7.2.0/mkfs/xfs_mkfs.c`, the `dft` structure:
 | zoned | off |
 
 Distribution packages may patch these defaults; `mkfs.xfs -c` and
-`/etc/mkfs.xfs.conf` can change them at runtime. The CI job records
-`mkfs.xfs -V`, the formatted image's `xfs_info` and `xfs_db` superblock so the
-actual distro profile is known.
+`/etc/mkfs.xfs.conf` can change them at runtime.  CI records `mkfs.xfs -V`, the
+formatted image's `xfs_info` and the `xfs_db` superblock so the actual profile
+is known.  Test logic measures and classifies the resulting features; it does
+not hardcode a version string.
 
 With parent pointers enabled, `mkfs.xfs` also enables exchange-range
-(`xfs_mkfs.c` explicitly couples them) and writes `ATTRBIT`; every new inode
-carries parent-pointer attributes. The ordinary writable profile refuses this
-geometry, so a genuine default image is **read-only** in this build.
+(`xfs_mkfs.c` explicitly couples them).  The exchange-range **bit** does not
+require the exchange operation for ordinary namespace, attribute, reflink or
+write paths; the XMI/XMD operation remains outside RW-6E and its log items are
+refused before the first write.
 
 ## Supported writable geometry
 
@@ -58,60 +62,77 @@ geometry, so a genuine default image is **read-only** in this build.
   the `--modern-inode-profile` set);
 * rmapbt on or off;
 * reflink on or off, in either combination with rmapbt;
+* parent pointers (`XFS_SB_FEAT_INCOMPAT_PARENT`) with the corresponding
+  forward namespace and reverse attr-fork maintenance;
+* exchange-range as a feature bit (operation not implemented);
+* `XFS_SB_FEAT_INCOMPAT_LOG_XATTRS` (logged extended attributes), independent
+  of parent pointers;
 * one internal log, one data device, no realtime device;
-* `dirblklog == blocklog` (one filesystem block per directory block);
-* `XFS_SB_FEAT_INCOMPAT_LOG_XATTRS` (logged extended attributes), now that
-  ATTRI/ATTRD are parsed;
-* `meta_uuid` and exchange-range bits without parent pointers (the formatter
-  and Linux legal combinations are checked by the existing formatter jobs).
+* `dirblklog == blocklog` (one filesystem block per directory block).
 
 Refused before the first write:
 
-* parent pointers (`XFS_SB_FEAT_INCOMPAT_PARENT`);
 * metadir, zoned and needs-repair;
-* quotas, realtime, external logs, unsupported log-incompat bits;
+* quotas, realtime devices, external logs, unsupported log-incompat bits;
 * allocation groups of 2^31 blocks or more (reflink's CoW flag uses bit 31);
-* `dirblklog != blocklog` and `asciici`.
+* `dirblklog != blocklog` and `asciici`;
+* exchange-range *operations*: a log containing XMI/XMD is refused rather than
+  replayed halfway.
 
 Read-only mounts remain permissive for the reader; this list is about the
 writable path.
 
-## How RW qualification fixtures are made
+## The Modern Default Profile Gate
 
-Linux fixtures must disable parent pointers explicitly and can use either
-reflink profile:
+The primary RW-6E fixture is:
 
 ```bash
-truncate -s 512M rw6d.img
-mkfs.xfs -f -q -b size=4096 -d agcount=2 \
-  -m crc=1,finobt=1,inobtcount=1,bigtime=1,reflink=1,rmapbt=1 \
-  -i sparse=1,nrext64=1 -n parent=0 rw6d.img
+truncate -s 512M default.img
+mkfs.xfs -f default.img          # no -n parent=0
+xfs_info default.img
+xfs_db -r -c 'sb 0' -c 'p' default.img
 ```
 
-`tests/scripts/make_rw6d_linux.sh` detects whether the local `mkfs.xfs`
-understands `-n parent=0`; older xfsprogs without parent pointers simply need
-no option. `SIZE_MB` overrides the default size.
+The image must:
 
-The Windows formatter's older minimal profile is deliberately not the Linux
-default: `xfswin format` leaves the modern features off unless requested. The
-RW-6D 1 KiB fixture enables them explicitly (`--make-rw6d-fixture`), so it
-exercises a profile close to modern Linux while keeping one block per
-directory block.
+1. contain the PARENT incompat bit (and exchange-range, as mkfs couples them);
+2. stay within the supported geometry above;
+3. mount read-write through this build with ordinary `--rw-experimental`;
+4. pass `xfswin check`, the independent Python parent oracle, a Linux kernel
+   mount, `xfs_repair -n` and `xfs_scrub` (when available).
 
-## Why 4 KiB Linux fixtures and 1 KiB Windows fixtures
+If a future xfsprogs default adds metadir, zoned, realtime or another
+unsupported feature, the measured feature classification refuses that image
+and the README's claim remains tied to the tested version.  There is no claim
+that *all future* defaults are supported.
 
-`mkfs.xfs` cannot create a 1 KiB directory block on a v5 filesystem with CRC
-enabled (`XFS_MIN_CRC_BLOCKSIZE` is 1024 but the directory block is forced to
-`XFS_MIN_REC_DIRSIZE`, 4096, when the filesystem block is smaller). That would
-set `dirblklog != blocklog`, which the writable policy refuses.
+## How qualification fixtures are made
 
-The Linux fixtures therefore use 4 KiB blocks. A 4 KiB attribute leaf holds 15
-entries with 240-byte names, and a 4 KiB DA node holds at most 504 child
-pointers, so the generator uses 9000 long-name attributes and interleaved
-filler writes to force a level-2 DA node and an attribute BMBT. The Windows
-formatter can create a 1 KiB filesystem with one block per directory block; its
-fixture reaches level 2 with 140 entries of 600 bytes and exercises the same
-writer paths. Both fixtures are verified by Linux.
+Linux fixtures no longer disable parent pointers.  `make_rw6e_linux.sh` runs a
+plain `mkfs.xfs -f`, records the tool version and measured features, mounts the
+image, and creates the parent workload (directories, 1000 hard links to one
+inode, same-name links under different parents, cross-directory renames,
+symlinks, Unicode/long names, xattrs, ACL, reflink + CoW).  See:
+
+```bash
+sudo bash tests/scripts/make_rw6e_linux.sh rw6e-linux
+sudo bash tests/scripts/verify_rw6e_linux.sh rw6e-linux/rw6e.img \
+    rw6e-linux/rw6e.manifest.json
+```
+
+`qualify_rw6e_host.sh` refuses to run if `mkfs.xfs` cannot create `parent=1` or
+the host kernel cannot mount it.  A repair-only result is never accepted as
+substitute evidence.
+
+The Windows formatter exposes the same profile:
+
+```text
+xfswin format image.img --modern-default-profile
+xfswin format image.img --parent        # parent + exchange-range
+```
+
+It refuses profiles that are not legal in the reference xfsprogs (for example,
+inobtcount without finobt).
 
 ## Measured defaults (CI)
 
@@ -143,25 +164,19 @@ sb_features_incompat = 0xb
 sb_features_log_incompat = 0
 ```
 
-`mkfs.xfs` 6.6 has **no `parent=` option** (`parentless.unsupported.txt`), so it
-does not enable parent pointers at all; `nrext64` is also off by default in this
-distro build. The default 4 KiB image is therefore inside the writable profile
-(rmapbt and reflink both on, one block per directory block). The 7.2 source
-defaults above (parent pointers, NREXT64, exchange-range) describe a newer
-builder; on such a distribution the plain default is read-only until
-`-n parent=0` is passed and NREXT64 is chosen explicitly for fixtures.
-
-The expected default for the reference 7.2 tree is on; the CI artifact is the
-record of what the runner's xfsprogs actually enabled. Qualification fixtures
-never rely on the default when parent pointers would make the image read-only.
+`mkfs.xfs` 6.6 has no `parent=` option, so that runner never exercised parent
+pointers.  The RW-6E qualification job is opt-in and needs a parent-capable 7.x
+kernel; `qualify_rw6e_host.sh` is the gate.  The 7.2 source defaults above are
+the target profile, and the CI artifact records what the runner actually
+enabled.
 
 ## Consequences for compatibility claims
 
-* A default Linux image with parent pointers is read-only; this is a documented
-  gap, not a silent downgrade. `xfswin check` still verifies it.
-* An image formatted with `-n parent=0` and the modern features is within the
-  supported profile (rmapbt/reflink both on or off) and is what the RW-6D
-  round-trip jobs use.
-* The Windows formatter's minimal profile is still valid; the writer supports
-  it, and older RW-0..RW-6C jobs continue to use it unchanged.
-* "Linux-created" evidence must name the exact mkfs options. The CI logs do.
+* A plain modern `mkfs.xfs -f` image is the primary RW-6E fixture.  It is
+  accepted by ordinary `--rw-experimental` after the feature measurement and
+  the parent audit pass.
+* An image formatted with `-n parent=0` remains a valid subset.
+* The exact qualified xfsprogs/kernel versions, and the full feature list, must
+  accompany any release claim.  This note intentionally does not promise
+  support for future defaults that add metadir, realtime, quotas or zoned
+  geometry.

@@ -34,8 +34,10 @@
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/parent.h"
 #include "xfs/transaction.h"
 #include "xfs/xattr.h"
+#include "write/xattr_write_internal.h"
 
 namespace xfs {
 namespace {
@@ -83,9 +85,47 @@ std::vector<XattrEntry> SortByHash(std::vector<XattrEntry> entries) {
   return entries;
 }
 
-bool SameKey(const XattrEntry& a, uint8_t flags, const std::string& name) {
-  return (a.flags & kAttrNspOnDiskMask) == (flags & kAttrNspOnDiskMask) &&
-         a.name == name;
+bool IsParentEntry(const XattrEntry& e) {
+  return (e.flags & kAttrNspOnDiskMask) == kAttrParent;
+}
+
+// xfs_attr_match(): namespace + name, and for parent pointers the exact
+// 12-byte xfs_parent_rec value.  Two hard links with the same name under
+// different parents have different hashes; a hash collision is still
+// disambiguated by the value.
+bool SameAttrKey(const XattrEntry& a, const XattrEntry& b) {
+  if ((a.flags & kAttrNspOnDiskMask) != (b.flags & kAttrNspOnDiskMask)) {
+    return false;
+  }
+  if (a.name != b.name) return false;
+  if (IsParentEntry(a) || IsParentEntry(b)) {
+    return a.hash == b.hash && a.value == b.value;
+  }
+  return true;
+}
+
+// The hash that must be written into a leaf/node entry.
+uint32_t EntryHash(const XattrEntry& e) {
+  if (IsParentEntry(e) && !e.remote && e.value.size() == kParentRecSize) {
+    return ParentPointerHash(e.name, GetBE64(e.value.data(), 0));
+  }
+  return AttrHashName(e.name);
+}
+
+Status NormalizeEntryHash(XattrEntry* e, uint64_t ino) {
+  if (e->incomplete) return OkStatus();
+  if (IsParentEntry(*e)) {
+    if (e->remote || e->value.size() != kParentRecSize) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "parent pointer has a non-local or malformed value")
+          .Ino(ino)
+          .Metadata("parent pointer");
+    }
+    Status name_ok = ValidateParentPointerName(e->name, ino);
+    if (!name_ok.ok()) return name_ok;
+  }
+  e->hash = EntryHash(*e);
+  return OkStatus();
 }
 
 // xfs_attr_leaf_newentsize(): a value is local when the resulting local entry
@@ -492,7 +532,7 @@ class TreeEditor {
     bool replacing = false;
     for (auto& [logical, leaf] : leaves_) {
       for (const XattrEntry& e : leaf.entries) {
-        if (SameKey(e, entry.flags, entry.name)) {
+        if (SameAttrKey(e, entry)) {
           target = logical;
           replacing = true;
           break;
@@ -507,7 +547,7 @@ class TreeEditor {
     WorkingLeaf& leaf = leaves_.at(target);
     if (replacing) {
       for (XattrEntry& e : leaf.entries) {
-        if (SameKey(e, entry.flags, entry.name)) {
+        if (SameAttrKey(e, entry)) {
           e = entry;
           break;
         }
@@ -525,12 +565,12 @@ class TreeEditor {
     return SplitLeaf(target);
   }
 
-  Status Remove(uint8_t flags, const std::string& name) {
+  Status Remove(const XattrEntry& entry) {
     uint32_t target = 0;
     bool found = false;
     for (auto& [logical, leaf] : leaves_) {
       for (auto it = leaf.entries.begin(); it != leaf.entries.end(); ++it) {
-        if (SameKey(*it, flags, name)) {
+        if (SameAttrKey(*it, entry)) {
           leaf.entries.erase(it);
           leaf.dirty = true;
           target = logical;
@@ -1261,42 +1301,41 @@ class TreeEditor {
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
-struct PreparedInode {
-  std::vector<uint8_t> image;
-  uint32_t data_fields = 0;
-  std::vector<uint8_t> data_region;
-  uint32_t attr_fields = 0;
-  std::vector<uint8_t> attr_region;
-};
-
 class XattrWriter {
  public:
   XattrWriter(XfsTransaction* txn, BlockAllocator* alloc, BlockDevice* device,
               const XfsGeometry* geo, const XfsInode& inode,
-              const XattrFork& fork, std::vector<uint8_t> raw)
+              const XattrFork& fork, std::vector<uint8_t> raw,
+              bool parent_pointers)
       : txn_(txn),
         alloc_(alloc),
         device_(device),
         geo_(geo),
         inode_(inode),
         fork_(fork),
-        raw_(std::move(raw)) {}
+        raw_(std::move(raw)),
+        parent_pointers_(parent_pointers) {}
 
   ~XattrWriter() = default;
 
   // `changed_index` is the index in `entries` of a new or replaced attribute
   // whose remote value still has to be allocated; `removed_remote` is the old
-  // remote range of a replaced/removed attribute.  `entries` is the complete
-  // desired attribute set.
+  // remote range of a replaced/removed attribute.  `removed_entry` is the
+  // exact old entry for a removal (parent pointers need the whole record, not
+  // just namespace+name).  `entries` is the complete desired attribute set.
   Status Prepare(std::vector<XattrEntry> entries, int changed_index,
                  std::optional<std::pair<uint32_t, uint32_t>> removed_remote,
-                 std::optional<std::pair<uint8_t, std::string>> removed_key,
+                 std::optional<XattrEntry> removed_entry,
                  bool preserve_shortform_empty, PreparedInode* out) {
     entries_ = std::move(entries);
     changed_index_ = changed_index;
     removed_remote_ = removed_remote;
-    removed_key_ = std::move(removed_key);
+    removed_entry_ = std::move(removed_entry);
     preserve_shortform_empty_ = preserve_shortform_empty;
+    for (XattrEntry& entry : entries_) {
+      Status normalized = NormalizeEntryHash(&entry, inode_.ino);
+      if (!normalized.ok()) return normalized;
+    }
     Status s = InitEditor();
     if (!s.ok()) return s;
     s = DecideTarget();
@@ -1389,7 +1428,12 @@ class XattrWriter {
     // btree; in that case an empty shortform fork is retained so the data
     // branch root layout is not disturbed.
     if (entries_.empty()) {
-      if (inode_.format == di::kFormatBtree) {
+      // xfs_attr_shortform_remove keeps an empty shortform fork when the data
+      // fork is a btree, and unconditionally on parent-pointer filesystems
+      // (`!xfs_has_parent(mp)` is part of the fork-removal condition).  The
+      // empty fork keeps the data-fork layout stable until the inode is
+      // reused or freed.
+      if (inode_.format == di::kFormatBtree || parent_pointers_) {
         target_ = Target::kShortform;
         preserve_shortform_empty_ = true;
         uint32_t raw = inode_.forkoff;
@@ -1780,16 +1824,19 @@ class XattrWriter {
     TreeEditor editor(*geo_, inode_, blocks_.get());
     s = editor.Load(fork_);
     if (!s.ok()) return s;
-    if (removed_key_.has_value()) {
-      s = editor.Remove(removed_key_->first, removed_key_->second);
+    if (removed_entry_.has_value()) {
+      s = editor.Remove(*removed_entry_);
       if (!s.ok()) return s;
-    } else if (changed_index_ >= 0) {
+    }
+    if (changed_index_ >= 0) {
       if (static_cast<size_t>(changed_index_) >= entries_.size()) {
         return XFS_ERR(XfsError::kInternal, "changed xattr index is invalid")
             .Ino(inode_.ino)
             .Metadata("xattr");
       }
-      // The tree editor replaces the key if present, otherwise inserts.
+      // The tree editor replaces the key if present, otherwise inserts.  A
+      // rename can remove the old parent pointer and insert the new one in
+      // the same increment (they may even share a hash slot).
       s = editor.Insert(entries_[changed_index_]);
       if (!s.ok()) return s;
     }
@@ -2000,8 +2047,9 @@ class XattrWriter {
   std::vector<XattrEntry> entries_;
   int changed_index_ = -1;
   std::optional<std::pair<uint32_t, uint32_t>> removed_remote_;
-  std::optional<std::pair<uint8_t, std::string>> removed_key_;
+  std::optional<XattrEntry> removed_entry_;
   bool preserve_shortform_empty_ = false;
+  bool parent_pointers_ = false;
   bool remote_written_ = false;
 
   std::unique_ptr<DataForkEditor> editor_;
@@ -2018,6 +2066,23 @@ class XattrWriter {
 
 }  // namespace
 
+Result<PreparedInode> PrepareXattrMutation(
+    XfsTransaction& txn, BlockAllocator& alloc, BlockDevice& device,
+    const XfsGeometry& geo, const XfsInode& inode, const XattrFork& fork,
+    std::vector<uint8_t> raw, std::vector<XattrEntry> entries,
+    int changed_index,
+    std::optional<std::pair<uint32_t, uint32_t>> removed_remote,
+    std::optional<XattrEntry> removed_entry, bool preserve_shortform_empty) {
+  XattrWriter writer(&txn, &alloc, &device, &geo, inode, fork, std::move(raw),
+                     geo.features.parent);
+  PreparedInode prepared;
+  Status s = writer.Prepare(std::move(entries), changed_index, removed_remote,
+                            std::move(removed_entry), preserve_shortform_empty,
+                            &prepared);
+  if (!s.ok()) return s.error();
+  return prepared;
+}
+
 Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrs(
     uint64_t ino, bool include_private) const {
   auto inode = OpenInode(ino);
@@ -2026,10 +2091,12 @@ Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrs(
 }
 
 Result<XattrEntry> XfsFilesystem::GetXattr(uint64_t ino,
-                                           std::string_view name) const {
+                                           std::string_view name,
+                                           bool include_private) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
-  return xfs::GetXattr(*device_, geometry_, inode.value(), name);
+  return xfs::GetXattr(*device_, geometry_, inode.value(), name,
+                       include_private);
 }
 
 Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
@@ -2123,7 +2190,8 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
   if (!txn.ok()) return txn.error();
   BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
   XattrWriter writer(&txn.value(), &alloc, device_.get(), &geometry_,
-                     inode.value(), fork.value(), std::move(raw.value()));
+                     inode.value(), fork.value(), std::move(raw.value()),
+                     geometry_.features.parent);
   PreparedInode prepared;
   Status s = writer.Prepare(std::move(entries), changed_index, removed_remote,
                             std::nullopt, false, &prepared);
@@ -2158,6 +2226,7 @@ Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
 
   std::vector<XattrEntry> entries = fork.value().entries;
   std::optional<std::pair<uint32_t, uint32_t>> removed_remote;
+  std::optional<XattrEntry> removed_entry;
   bool found = false;
   for (auto it = entries.begin(); it != entries.end(); ++it) {
     if ((it->flags & kAttrNspOnDiskMask) == ns.value().flags &&
@@ -2165,6 +2234,7 @@ Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
       if (it->remote && it->remote_blocks != 0) {
         removed_remote = std::make_pair(it->remote_lbno, it->remote_blocks);
       }
+      removed_entry = *it;
       entries.erase(it);
       found = true;
       break;
@@ -2182,12 +2252,11 @@ Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
   if (!txn.ok()) return txn.error();
   BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
   XattrWriter writer(&txn.value(), &alloc, device_.get(), &geometry_,
-                     inode.value(), fork.value(), std::move(raw.value()));
+                     inode.value(), fork.value(), std::move(raw.value()),
+                     geometry_.features.parent);
   PreparedInode prepared;
-  Status s = writer.Prepare(
-      std::move(entries), -1, removed_remote,
-      std::make_pair(static_cast<uint8_t>(ns.value().flags), on_disk_name),
-      false, &prepared);
+  Status s = writer.Prepare(std::move(entries), -1, removed_remote,
+                            std::move(removed_entry), false, &prepared);
   if (!s.ok()) return s.error();
   s = LogPreparedInode(txn.value(), ino, std::move(prepared.image),
                        prepared.data_fields, prepared.data_region,

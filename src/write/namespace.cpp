@@ -32,6 +32,7 @@
 #include "xfs/alloc.h"
 #include "xfs/bmap.h"
 #include "xfs/crash.h"
+#include "xfs/crc32c.h"
 #include "xfs/dir_write.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
@@ -39,7 +40,9 @@
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/parent.h"
 #include "xfs/write.h"
+#include "write/xattr_write_internal.h"
 
 namespace xfs {
 namespace {
@@ -158,6 +161,78 @@ uint32_t RawNextUnlinked(const std::vector<uint8_t>& raw) {
   return GetBE32(raw.data(), di::kNextUnlinked);
 }
 
+// One child's reverse-namespace change.  `remove` and `add` describe the
+// exact records; a rename uses both, a link/create uses only `add`, and an
+// unlink uses only `remove`.
+struct ParentChange {
+  std::optional<ParentPointer> remove;
+  std::optional<ParentPointer> add;
+  bool empty() const { return !remove.has_value() && !add.has_value(); }
+};
+
+Result<PreparedInode> ApplyParentChange(
+    XfsTransaction& txn, BlockAllocator& blocks, BlockDevice& device,
+    const XfsGeometry& geo, const XfsInode& child, const XattrFork& fork,
+    std::vector<uint8_t> raw, const ParentChange& change,
+    bool missing_ok = false) {
+  PreparedInode out;
+  if (change.empty()) {
+    out.image = std::move(raw);
+    return out;
+  }
+  if (!geo.features.parent) {
+    return XFS_ERR(XfsError::kInternal,
+                   "parent-pointer mutation on a filesystem without the "
+                   "feature")
+        .Ino(child.ino)
+        .Metadata("parent pointer");
+  }
+  if (change.remove.has_value() && change.add.has_value()) {
+    return PrepareParentPointerReplace(txn, blocks, device, geo, child, fork,
+                                       std::move(raw), *change.remove,
+                                       *change.add, missing_ok);
+  }
+  if (change.add.has_value()) {
+    return PrepareParentPointerAdd(txn, blocks, device, geo, child, fork,
+                                   std::move(raw), *change.add);
+  }
+  return PrepareParentPointerRemove(txn, blocks, device, geo, child, fork,
+                                    std::move(raw), *change.remove, missing_ok);
+}
+
+// Reads the child's attr fork for an existing inode.  New inodes that are
+// still only in memory pass a default-constructed XattrFork instead.
+Result<XattrFork> ReadChildAttrFork(BlockDevice& device,
+                                    const XfsGeometry& geo,
+                                    const XfsInode& child) {
+  return ReadXattrFork(device, geo, child);
+}
+
+Status ParseChildImage(const XfsGeometry& geo, uint64_t ino,
+                       const std::vector<uint8_t>& raw, XfsInode* out) {
+  // The caller may already have changed link counts or the attr fork in the
+  // in-memory image; the verifier must see a valid CRC.  LogPreparedInode
+  // stamps the final CRC again before the image reaches the device.
+  std::vector<uint8_t> image = raw;
+  UpdateXfsChecksum(image.data(), image.size(), di::kCrc);
+  return ParseInode(image.data(), image.size(), geo, ino, out);
+}
+
+// Combines an attr-fork preparation with the data-fork region the operation
+// already prepared (a new directory/symlink), preferring the data region the
+// attr writer emitted when a forkoff change forced it to relayout the fork.
+void ChooseForkRegions(const PreparedInode& prepared, uint32_t* data_fields,
+                       std::vector<uint8_t>* data_region,
+                       uint32_t* attr_fields,
+                       std::vector<uint8_t>* attr_region) {
+  if (prepared.data_fields != 0 || !prepared.data_region.empty()) {
+    *data_fields = prepared.data_fields;
+    *data_region = prepared.data_region;
+  }
+  *attr_fields = prepared.attr_fields;
+  *attr_region = prepared.attr_region;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -264,7 +339,31 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
       return XFS_ERR(XfsError::kInternal, "cannot build the new inode")
           .Ino(child_ino);
     }
-    s = LogPreparedInode(txn, child_ino, std::move(child), 0, {});
+    uint32_t child_data_fields = 0;
+    std::vector<uint8_t> child_data_region;
+    uint32_t child_attr_fields = 0;
+    std::vector<uint8_t> child_attr_region;
+    if (geometry_.features.parent) {
+      XfsInode parsed;
+      s = ParseChildImage(geometry_, child_ino, child, &parsed);
+      if (!s.ok()) return s;
+      XattrFork empty_fork;
+      empty_fork.format = XattrForkFormat::kNone;
+      ParentChange change;
+      change.add = ParentPointer{parent_ino, parent.value().gen,
+                                 std::string(name)};
+      auto prepared = ApplyParentChange(txn, blocks, *device_, geometry_,
+                                        parsed, empty_fork, std::move(child),
+                                        change);
+      if (!prepared.ok()) return prepared.error();
+      child = std::move(prepared.value().image);
+      ChooseForkRegions(prepared.value(), &child_data_fields,
+                        &child_data_region, &child_attr_fields,
+                        &child_attr_region);
+    }
+    s = LogPreparedInode(txn, child_ino, std::move(child), child_data_fields,
+                         child_data_region, child_attr_fields,
+                         child_attr_region);
     if (!s.ok()) return s;
 
     DataForkEditor fork(&txn, &blocks, device_.get(), &geometry_);
@@ -358,7 +457,31 @@ Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
       return XFS_ERR(XfsError::kInternal, "cannot build the new directory")
           .Ino(child_ino);
     }
-    s = LogPreparedInode(txn, child_ino, std::move(child), lf::kILogDData, sf);
+    uint32_t child_data_fields = lf::kILogDData;
+    std::vector<uint8_t> child_data_region = sf;
+    uint32_t child_attr_fields = 0;
+    std::vector<uint8_t> child_attr_region;
+    if (geometry_.features.parent) {
+      XfsInode parsed;
+      s = ParseChildImage(geometry_, child_ino, child, &parsed);
+      if (!s.ok()) return s;
+      XattrFork empty_fork;
+      empty_fork.format = XattrForkFormat::kNone;
+      ParentChange change;
+      change.add = ParentPointer{parent_ino, parent.value().gen,
+                                 std::string(name)};
+      auto prepared = ApplyParentChange(txn, blocks, *device_, geometry_,
+                                        parsed, empty_fork, std::move(child),
+                                        change);
+      if (!prepared.ok()) return prepared.error();
+      child = std::move(prepared.value().image);
+      ChooseForkRegions(prepared.value(), &child_data_fields,
+                        &child_data_region, &child_attr_fields,
+                        &child_attr_region);
+    }
+    s = LogPreparedInode(txn, child_ino, std::move(child), child_data_fields,
+                         child_data_region, child_attr_fields,
+                         child_attr_region);
     if (!s.ok()) return s;
 
     DataForkEditor fork(&txn, &blocks, device_.get(), &geometry_);
@@ -517,6 +640,27 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
     const uint32_t new_nlink = is_dir ? 0 : nlink - 1;
     PutBE32(child_image.data(), di::kNlink, new_nlink);
 
+    // Remove the reverse record in the same transaction.  This happens before
+    // the directory ".." rewrite because that rewrite may change the child's
+    // literal-area layout; the directory editor is then loaded from the
+    // already-updated image so both edits share one forkoff.
+    uint32_t child_attr_ilog = 0;
+    std::vector<uint8_t> child_attr_region;
+    if (geometry_.features.parent) {
+      auto child_fork = ReadChildAttrFork(*device_, geometry_, child.value());
+      if (!child_fork.ok()) return child_fork.error();
+      ParentChange change;
+      change.remove = ParentPointer{parent_ino, parent.value().gen,
+                                    std::string(name)};
+      auto prepared = ApplyParentChange(
+          txn, blocks, *device_, geometry_, child.value(), child_fork.value(),
+          std::move(child_image), change);
+      if (!prepared.ok()) return prepared.error();
+      child_image = std::move(prepared.value().image);
+      child_attr_ilog = prepared.value().attr_fields;
+      child_attr_region = prepared.value().attr_region;
+    }
+
     // xfs_dir_remove_child: point an unlinked child directory's ".." entry at
     // the root so it never references an inode that may be freed before the
     // child is closed. That edit lives in the *child's* data fork, so it needs
@@ -524,12 +668,15 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
     uint32_t child_ilog = 0;
     std::vector<uint8_t> child_fork_region;
     if (is_dir && parent_ino != geometry_.rootino) {
+      XfsInode updated;
+      s = ParseChildImage(geometry_, entry.ino, child_image, &updated);
+      if (!s.ok()) return s;
       DataForkEditor child_fork(&txn, &blocks, device_.get(), &geometry_);
-      s = child_fork.Load(child.value());
+      s = child_fork.Load(updated);
       if (!s.ok()) return s;
       DirectoryEditor child_dir(&txn, &blocks, device_.get(), &geometry_,
                                 &child_fork);
-      s = child_dir.Load(child.value());
+      s = child_dir.Load(updated);
       if (!s.ok()) return s;
       s = child_dir.RepointDotDot(geometry_.rootino);
       if (!s.ok()) return s;
@@ -557,7 +704,8 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
     s = StoreTimestamp(child_image.data(), di::kCtime, now);
     if (!s.ok()) return s;
     s = LogPreparedInode(txn, entry.ino, std::move(child_image), child_ilog,
-                         child_fork_region);
+                         child_fork_region, child_attr_ilog,
+                         child_attr_region);
     if (!s.ok()) return s;
 
     s = blocks.Commit();
@@ -1122,41 +1270,62 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
     s = src_dir.LogBlocks();
     if (!s.ok()) return s;
 
-    // The moved directory's ".." entry follows it to the new parent
-    // (xfs_dir_replace(tp, src_ip, "..", target_dp)); its editor is separate
-    // from both parents'.
-    std::unique_ptr<DataForkEditor> moved_fork;
-    std::unique_ptr<DirectoryEditor> moved_dir;
-    if (src_is_dir && !same_parent) {
-      moved_fork = std::make_unique<DataForkEditor>(&txn, &blocks,
-                                                    device_.get(), &geometry_);
-      s = moved_fork->Load(moved.value());
-      if (!s.ok()) return s;
-      moved_dir = std::make_unique<DirectoryEditor>(
-          &txn, &blocks, device_.get(), &geometry_, moved_fork.get());
-      s = moved_dir->Load(moved.value());
-      if (!s.ok()) return s;
-      s = moved_dir->RepointDotDot(dst_parent);
-      if (!s.ok()) return s;
-      s = moved_dir->LogBlocks();
-      if (!s.ok()) return s;
-    }
-
-    // --- the moved inode (ctime + optional "..") ---
+    // --- the moved inode: reverse namespace first, then ".." ---
+    // xfs_parent_replacename() removes (src_dp, src_name) and inserts
+    // (target_dp, target_name) as one attr-fork change.  For a cross-parent
+    // directory move the ".." data-fork rewrite is applied to the image that
+    // already carries the new forkoff, using a fresh directory editor.
     {
       auto raw = ReadRawInode(moved.value().ino);
       if (!raw.ok()) return raw.error();
       std::vector<uint8_t> image = std::move(raw.value());
       uint32_t ilog_fields = 0;
       std::vector<uint8_t> fork_region;
-      if (moved_dir) {
-        s = moved_dir->FinalizeInode(&image, &ilog_fields, &fork_region);
+      uint32_t attr_ilog = 0;
+      std::vector<uint8_t> attr_region;
+      if (geometry_.features.parent) {
+        auto fork = ReadChildAttrFork(*device_, geometry_, moved.value());
+        if (!fork.ok()) return fork.error();
+        ParentChange change;
+        change.remove = ParentPointer{src_parent, src_dp.value().gen,
+                                      std::string(src_name)};
+        change.add = ParentPointer{dst_parent, dst_dp.gen,
+                                   std::string(dst_name)};
+        auto prepared = ApplyParentChange(
+            txn, blocks, *device_, geometry_, moved.value(), fork.value(),
+            std::move(image), change);
+        if (!prepared.ok()) return prepared.error();
+        image = std::move(prepared.value().image);
+        attr_ilog = prepared.value().attr_fields;
+        attr_region = prepared.value().attr_region;
+        if (prepared.value().data_fields != 0 ||
+            !prepared.value().data_region.empty()) {
+          ilog_fields = prepared.value().data_fields;
+          fork_region = prepared.value().data_region;
+        }
+      }
+      if (src_is_dir && !same_parent) {
+        XfsInode updated;
+        s = ParseChildImage(geometry_, moved.value().ino, image, &updated);
+        if (!s.ok()) return s;
+        DataForkEditor moved_fork(&txn, &blocks, device_.get(), &geometry_);
+        s = moved_fork.Load(updated);
+        if (!s.ok()) return s;
+        DirectoryEditor moved_dir(&txn, &blocks, device_.get(), &geometry_,
+                                  &moved_fork);
+        s = moved_dir.Load(updated);
+        if (!s.ok()) return s;
+        s = moved_dir.RepointDotDot(dst_parent);
+        if (!s.ok()) return s;
+        s = moved_dir.LogBlocks();
+        if (!s.ok()) return s;
+        s = moved_dir.FinalizeInode(&image, &ilog_fields, &fork_region);
         if (!s.ok()) return s;
       }
       s = StoreTimestamp(image.data(), di::kCtime, now);
       if (!s.ok()) return s;
-      s = LogPreparedInode(txn, moved.value().ino, std::move(image), ilog_fields,
-                           fork_region);
+      s = LogPreparedInode(txn, moved.value().ino, std::move(image),
+                           ilog_fields, fork_region, attr_ilog, attr_region);
       if (!s.ok()) return s;
     }
 
@@ -1165,6 +1334,22 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
       auto raw = ReadRawInode(target.ino);
       if (!raw.ok()) return raw.error();
       std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t attr_ilog = 0;
+      std::vector<uint8_t> attr_region;
+      if (geometry_.features.parent) {
+        auto fork = ReadChildAttrFork(*device_, geometry_, target);
+        if (!fork.ok()) return fork.error();
+        ParentChange change;
+        change.remove = ParentPointer{dst_parent, dst_dp.gen,
+                                      std::string(dst_name)};
+        auto prepared = ApplyParentChange(
+            txn, blocks, *device_, geometry_, target, fork.value(),
+            std::move(image), change);
+        if (!prepared.ok()) return prepared.error();
+        image = std::move(prepared.value().image);
+        attr_ilog = prepared.value().attr_fields;
+        attr_region = prepared.value().attr_region;
+      }
       const uint32_t drops = src_is_dir ? 2u : 1u;
       const uint32_t nlink = GetBE32(image.data(), di::kNlink);
       if (nlink < drops) {
@@ -1197,7 +1382,8 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
       }
       s = StoreTimestamp(image.data(), di::kCtime, now);
       if (!s.ok()) return s;
-      s = LogPreparedInode(txn, target.ino, std::move(image), 0, {});
+      s = LogPreparedInode(txn, target.ino, std::move(image), 0, {}, attr_ilog,
+                           attr_region);
       if (!s.ok()) return s;
       outcome.replaced_ino = target.ino;
       outcome.replaced_new_nlink = new_nlink;
@@ -1266,11 +1452,15 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
     InvalidateCaches(CacheInvalidation::Inode(dst_parent));
   }
   if (outcome.moved_ino != 0) {
-    // A moved directory's ".." entry changed; its listing cache is stale.
+    // A moved directory's ".." entry changed; both its parsed inode and its
+    // directory listing cache are stale.  Invalidate the listing for files
+    // too: it is harmless and keeps the cache policy simple.
     InvalidateCaches(CacheInvalidation::Inode(outcome.moved_ino));
+    InvalidateCaches(CacheInvalidation::Directory(outcome.moved_ino));
   }
   if (outcome.replaced_ino != 0) {
     InvalidateCaches(CacheInvalidation::Inode(outcome.replaced_ino));
+    InvalidateCaches(CacheInvalidation::Directory(outcome.replaced_ino));
   }
   XFS_DEBUG("rename " << src_parent << ":'" << src_name << "' -> " << dst_parent
                       << ":'" << dst_name << "' moved=" << outcome.moved_ino
@@ -1365,7 +1555,8 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
       if (!s.ok()) return s;
     }
 
-    // Source inode: xfs_bumplink (nlink + ctime).
+    // Source inode: xfs_bumplink (nlink + ctime) and the matching parent
+    // pointer, in one logged inode item.
     {
       auto raw = ReadRawInode(ino);
       if (!raw.ok()) return raw.error();
@@ -1378,9 +1569,26 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
             .Metadata("link");
       }
       PutBE32(image.data(), di::kNlink, nlink + 1);
+      uint32_t attr_ilog = 0;
+      std::vector<uint8_t> attr_region;
+      if (geometry_.features.parent) {
+        auto fork = ReadChildAttrFork(*device_, geometry_, source.value());
+        if (!fork.ok()) return fork.error();
+        ParentChange change;
+        change.add = ParentPointer{dst_parent, parent.value().gen,
+                                   std::string(dst_name)};
+        auto prepared = ApplyParentChange(
+            txn, blocks, *device_, geometry_, source.value(), fork.value(),
+            std::move(image), change);
+        if (!prepared.ok()) return prepared.error();
+        image = std::move(prepared.value().image);
+        attr_ilog = prepared.value().attr_fields;
+        attr_region = prepared.value().attr_region;
+      }
       s = StoreTimestamp(image.data(), di::kCtime, now);
       if (!s.ok()) return s;
-      s = LogPreparedInode(txn, ino, std::move(image), 0, {});
+      s = LogPreparedInode(txn, ino, std::move(image), 0, {}, attr_ilog,
+                           attr_region);
       if (!s.ok()) return s;
     }
 
@@ -1483,6 +1691,39 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
           .Ino(child_ino);
     }
 
+    uint32_t child_attr_fields = 0;
+    std::vector<uint8_t> child_attr_region;
+    auto finish_child = [&](uint32_t data_fields,
+                            std::vector<uint8_t> data_region) -> Status {
+      uint32_t effective_data = data_fields;
+      std::vector<uint8_t> effective_region = std::move(data_region);
+      if (geometry_.features.parent) {
+        XfsInode parsed;
+        Status parse = ParseChildImage(geometry_, child_ino, child, &parsed);
+        if (!parse.ok()) return parse;
+        XattrFork empty_fork;
+        empty_fork.format = XattrForkFormat::kNone;
+        ParentChange change;
+        change.add = ParentPointer{parent_ino, parent.value().gen,
+                                   std::string(name)};
+        auto prepared = ApplyParentChange(txn, blocks, *device_, geometry_,
+                                          parsed, empty_fork,
+                                          std::move(child), change);
+        if (!prepared.ok()) return prepared.error();
+        child = std::move(prepared.value().image);
+        if (prepared.value().data_fields != 0 ||
+            !prepared.value().data_region.empty()) {
+          effective_data = prepared.value().data_fields;
+          effective_region = prepared.value().data_region;
+        }
+        child_attr_fields = prepared.value().attr_fields;
+        child_attr_region = prepared.value().attr_region;
+      }
+      return LogPreparedInode(txn, child_ino, std::move(child), effective_data,
+                              effective_region, child_attr_fields,
+                              child_attr_region);
+    };
+
     const size_t local_capacity =
         static_cast<size_t>(geometry_.inode_size) - di::kCoreSizeV3;
     if (target.size() <= local_capacity) {
@@ -1491,8 +1732,7 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
       PutBE64(child.data(), di::kSize, target.size());
       std::memcpy(child.data() + di::kCoreSizeV3, target.data(), target.size());
       std::vector<uint8_t> fork_region(target.begin(), target.end());
-      s = LogPreparedInode(txn, child_ino, std::move(child), lf::kILogDData,
-                           fork_region);
+      s = finish_child(lf::kILogDData, std::move(fork_region));
       if (!s.ok()) return s;
     } else {
       // Remote: one contiguous run of xfs_symlink_blocks() blocks (the
@@ -1526,8 +1766,7 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
       PutBE64(child.data(), di::kNblocks, alloc.len);
       PutBE64(child.data(), di::kSize, target.size());
       std::memcpy(child.data() + di::kCoreSizeV3, fork_region.data(), 16);
-      s = LogPreparedInode(txn, child_ino, std::move(child), lf::kILogDExt,
-                           fork_region);
+      s = finish_child(lf::kILogDExt, std::move(fork_region));
       if (!s.ok()) return s;
 
       // The symlink payload buffer: header + target bytes, one header per
