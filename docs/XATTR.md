@@ -170,7 +170,10 @@ rmap owner. Leaf records are the ordinary 16-byte `xfs_bmbt_rec`. The inode's
 `XFS_ATTR_LOCAL` (bit 0) is a leaf value-placement flag, not a namespace;
 `XFS_ATTR_INCOMPLETE` (bit 7) is the transient kernel state. The raw on-disk
 names `SGI_ACL_FILE` and `SGI_ACL_DEFAULT` in the root namespace are displayed
-as `system.posix_acl_access` and `system.posix_acl_default`.
+as `system.posix_acl_access` and `system.posix_acl_default`. Their stored
+payload is the on-disk XFS ACL structure (`xfs_acl`: big-endian count and
+entries), **not** the little-endian VFS `posix_acl_xattr` blob; the kernel
+converts between the two and this milestone preserves the on-disk bytes.
 
 The hash is `xfs_da_hashname`: rotate left by 7 bits before each character
 group, XOR the bytes, as implemented by `AttrHashName` and the oracle. The

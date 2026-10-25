@@ -59,11 +59,28 @@ def describe_attributes(path, known_names=None):
     for name in sorted(attr_names):
         value = getx(path, name)
         attrs.append({
-            "name": name,
+            "name": display_attribute_name(name),
             "length": len(value),
             "sha256": sha256(value),
         })
     return attrs
+
+
+def display_attribute_name(name):
+    """XFS exposes the raw on-disk ACL names through listxattr as trusted.*."""
+    if name == "trusted.SGI_ACL_FILE":
+        return "system.posix_acl_access"
+    if name == "trusted.SGI_ACL_DEFAULT":
+        return "system.posix_acl_default"
+    return name
+
+
+def linux_attribute_name(name):
+    if name == "system.posix_acl_access":
+        return "trusted.SGI_ACL_FILE"
+    if name == "system.posix_acl_default":
+        return "trusted.SGI_ACL_DEFAULT"
+    return name
 
 
 def is_file(path):
@@ -229,21 +246,25 @@ def verify(root, manifest_path):
             visible = {name for name in listed
                        if name.startswith("trusted.") or
                        (name.startswith("user.") and not symlink)}
-            want_visible = {name for name in expected
+            want_visible = {linux_attribute_name(name)
+                            for name in expected
                             if name.startswith("trusted.") or
+                            name.startswith("system.posix_acl_") or
                             (name.startswith("user.") and not symlink)}
             if visible != want_visible:
                 fail("%s attributes %s != %s" %
                      (item["path"], sorted(visible), sorted(want_visible)))
         for name, want in expected.items():
-            # The kernel owns the security.*/system.* encodings; the
-            # independent raw oracle still verifies their stored bytes.
-            # user.* on a symlink is stored by XFS but VFS getxattr returns
-            # ENODATA (only regular files/directories/sockets allow user.*).
-            if not (name.startswith("trusted.") or
-                    (name.startswith("user.") and not symlink)):
+            # The kernel owns the security.* encoding; the independent raw
+            # oracle still verifies it.  user.* on a symlink is stored by XFS
+            # but VFS getxattr returns ENODATA (only regular files/directories/
+            # sockets allow user.*).  system.posix_acl_* is read through the
+            # raw trusted.SGI_ACL_* name and compared byte-for-byte.
+            linux_name = linux_attribute_name(name)
+            if not (linux_name.startswith("trusted.") or
+                    (linux_name.startswith("user.") and not symlink)):
                 continue
-            value = getx(path, name)
+            value = getx(path, linux_name)
             if "value_hex" in want:
                 expected_value = bytes.fromhex(want["value_hex"])
                 if value != expected_value:
