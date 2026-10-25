@@ -93,7 +93,15 @@ struct BtreeWalkCallbacks {
 
 // Walks the whole tree starting at `root`, verifying every block.
 Status WalkBtree(const BtreeSpec& spec, uint64_t root,
-                 const BtreeWalkCallbacks& callbacks);
+                  const BtreeWalkCallbacks& callbacks);
+
+// Walks all children of an embedded (inode) root as one tree. Sibling and
+// visited-block state spans every subtree, so cross-root-child links are
+// checked instead of mistaking a later child for a new left edge.
+// expected_level describes each root block; 0xffff accepts any root level.
+Status WalkBtreeForest(const BtreeSpec& spec, const std::vector<uint64_t>& roots,
+                      uint16_t expected_level,
+                      const BtreeWalkCallbacks& callbacks);
 
 // Walks down a single path selecting the child whose key is <= target
 // (largest key not greater than target), reporting each visited block.

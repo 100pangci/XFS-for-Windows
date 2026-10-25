@@ -36,6 +36,9 @@ struct FormatOptions {
   bool sparse_inodes = false;
   bool bigtime = false;
   bool nrext64 = false;
+  // RW-6B test/format support.  reflink remains off: this profile is the
+  // writable rmapbt=1,reflink=0 combination.
+  bool rmapbt = false;
 };
 
 struct FormatReport {

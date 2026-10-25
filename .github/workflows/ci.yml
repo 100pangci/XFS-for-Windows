@@ -79,6 +79,22 @@ jobs:
           python tests/tools/rw6_inode_probe.py out/modern.img
           if ($LASTEXITCODE -ne 0) { throw "RW-6A oracle rejected the image" }
 
+      - name: RW-6B Windows-formatted rmapbt image (oracle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe mkimage out\rw6b-rmap.img 300M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
+          & $exe format out\rw6b-rmap.img --yes-i-really-mean-it --rmapbt
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt format failed" }
+          & $exe check out\rw6b-rmap.img --verbose
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt check failed" }
+          & $exe recover out\rw6b-rmap.img --yes-i-really-mean-it
+          if ($LASTEXITCODE -ne 0) { throw "rmapbt recovery preflight failed" }
+          python tests/tools/rw6b_rmap_probe.py out/rw6b-rmap.img
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B oracle rejected the formatted image" }
+
       - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
         shell: pwsh
         run: |
@@ -300,6 +316,13 @@ jobs:
           path: out/rw6-sparse.img
           if-no-files-found: error
 
+      - name: Upload the RW-6B Windows-formatted rmapbt image
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-windows-rmap
+          path: out/rw6b-rmap.img
+          if-no-files-found: error
+
   # ===========================================================================
   # RW-6A: modern inode feature profile
   # (finobt + inobtcount + sparse inodes + bigtime + NREXT64)
@@ -386,6 +409,620 @@ jobs:
           sudo bash tests/scripts/verify_windows_image_linux.sh \
             rw6-sparse/rw6-sparse.img
           python3 tests/tools/rw6_inode_probe.py rw6-sparse/rw6-sparse.img
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: the Windows formatter's rmapbt=1,reflink=0 profile must be accepted
+  # by real xfs_repair, mount and a writable Linux pass (which itself updates
+  # the reverse mappings).  This is also the reverse-interoperability check for
+  # the formatter's ownership records.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6b-formatted:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-rmap
+          path: rw6b-formatted
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-formatted rmapbt image with Linux
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6b-formatted/rw6b-rmap.img
+          python3 tests/tools/rw6b_rmap_probe.py rw6b-formatted/rw6b-rmap.img
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: Linux creates and populates a real rmapbt=1,reflink=0 image with
+  # every forward structure the Windows reader/writer must handle.  The fixture
+  # is required to have an rmapbt at level >= 2.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6b-rmap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Create and populate the rmapbt fixture
+        run: |
+          mkfs.xfs -V
+          sudo env SIZE_MB=2048 bash tests/scripts/make_rw6b_rmap_linux.sh rw6b
+          sudo chown -R "$USER" rw6b
+          cat rw6b/rmap.layout.txt
+          python3 tests/tools/rw6b_rmap_probe.py rw6b/rmap.img
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows reads the Linux-created rmapbt image: typed traversal, CLI dump,
+  # independent ownership oracle, reader differential.
+  # ---------------------------------------------------------------------------
+  windows-read-rw6b-rmap:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+
+      - name: Read and validate the Linux rmapbt image
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_read_windows.ps1 `
+            -Exe "bin\xfswin.exe" -Image "rw6b\rmap.img"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B Windows read validation failed" }
+
+      - name: Refuse malformed Linux rmap metadata without writes
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_refusal_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b\rmap.img" --kind metadata --work-dir rw6b-refusals
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B metadata refusal matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-metadata-refusals
+          path: rw6b-refusals/refusals.json
+          if-no-files-found: error
+
+  windows-rw6b-tree:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+      - name: Exercise actual rmap internal splits and collapse
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_tree_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b\rmap-tree.img" --work-dir rw6b-tree
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B real-image tree matrix failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-tree
+          path: rw6b-tree/
+          if-no-files-found: error
+
+  linux-verify-rw6b-tree:
+    needs: windows-rw6b-tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-tree
+          path: rw6b-tree
+      - run: sudo apt-get update && sudo apt-get install -y xfsprogs
+      - name: Verify the grown and collapsed Linux-origin tree
+        run: |
+          for image in rw6b-tree/*.img; do
+            sudo bash tests/scripts/verify_windows_image_linux.sh "$image"
+            python3 tests/tools/rw6b_rmap_probe.py "$image"
+          done
+          cat rw6b-tree/tree.json
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: Windows mutates the Linux-created rmapbt image through the ordinary
+  # writer API (hidden qualification flag; the public gate stays closed).  The
+  # matrix covers every supported metadata class, runs the independent
+  # forward-derived oracle after every named stage, and leaves an image plus
+  # expected.json for Linux.
+  # ---------------------------------------------------------------------------
+  windows-rw6b-mutation:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+
+      - name: Mutate the Linux-created rmapbt image
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_mutation_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6b\rmap.img" `
+            -WorkDir "rw6b-mutated"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B Windows mutation matrix failed" }
+          Copy-Item "rw6b\MANIFEST.sha256" "rw6b-mutated\MANIFEST.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-windows-mutated
+          path: rw6b-mutated/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: Linux accepts the Windows mutation, verifies every original fixture
+  # entry and every expected Windows result, dumps xfs_db layout, then mutates
+  # the same image again (reverse interoperability).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6b-mutation:
+    needs: windows-rw6b-mutation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-mutated
+          path: rw6b-mutated
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify and then mutate the Windows image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6b_windows_mutation_linux.sh \
+            rw6b-mutated/rmap-windows.img \
+            rw6b-mutated/MANIFEST.sha256 \
+            rw6b-mutated/expected.json \
+            rw6b-linux
+          sudo chown -R "$USER" rw6b-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-linux-mutated
+          path: |
+            rw6b-mutated/rmap-windows.img
+            rw6b-linux/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: Windows accepts the Linux-mutated image, verifies the Linux changes,
+  # mutates it again and writes the final expected state for Linux.
+  # ---------------------------------------------------------------------------
+  windows-rw6b-reverse:
+    needs: linux-verify-rw6b-mutation
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-mutated
+          path: rw6b-linux
+
+      - name: Reverse-read and mutate after the Linux pass
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_reverse_windows.ps1 `
+            -Exe "bin\xfswin.exe" `
+            -SourceImage "rw6b-linux\rw6b-mutated\rmap-windows.img" `
+            -WorkDir "rw6b-round2"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B Windows reverse mutation failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-windows-round2
+          path: |
+            rw6b-round2/rmap-windows-round2.img
+            rw6b-round2/round2.expected.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: final Linux acceptance after Windows -> Linux -> Windows.  Repair,
+  # full manifest/expected-state check, independent oracle, one more Linux
+  # mutation, final repair/oracle/xfs_db.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6b-final:
+    needs: windows-rw6b-reverse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-round2
+          path: rw6b-round2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-mutated
+          path: rw6b-mutated
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Final Linux acceptance and reverse churn
+        run: |
+          sudo bash tests/scripts/verify_rw6b_final_linux.sh \
+            rw6b-round2/rmap-windows-round2.img \
+            rw6b-mutated/MANIFEST.sha256 \
+            rw6b-round2/round2.expected.json \
+            rw6b-final
+          sudo chown -R "$USER" rw6b-final
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-final-evidence
+          path: rw6b-final/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RW-6B near-ENOSPC on a real Linux rmapbt image: allocation plus rmap
+  # metadata must commit completely or fail before the first metadata write.
+  # ---------------------------------------------------------------------------
+  windows-rw6b-enospc:
+    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rmap
+          path: rw6b
+
+      - name: Fill the Linux image and force allocation refusal
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_enospc_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6b\rmap.img" `
+            -WorkDir "rw6b-enospc"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B near-ENOSPC qualification failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-enospc-image
+          path: |
+            rw6b-enospc/rmap-enospc.img
+            rw6b-enospc/enospc.json
+          if-no-files-found: error
+
+  linux-verify-rw6b-enospc:
+    needs: windows-rw6b-enospc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-enospc-image
+          path: rw6b-enospc
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the near-ENOSPC image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6b_enospc_linux.sh \
+            rw6b-enospc/rmap-enospc.img rw6b-enospc/enospc.json
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: writer crash matrix on a real Linux-created rmapbt filesystem.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6b-crash:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Build the Linux rmapbt crash fixture
+        run: |
+          sudo env SIZE_MB=384 bash tests/scripts/make_rw6b_crash_linux.sh \
+            rw6b-crash
+          sudo chown -R "$USER" rw6b-crash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-linux-crash
+          path: |
+            rw6b-crash/rmap-crash.img
+            rw6b-crash/rmap-crash.xfs_info.txt
+          if-no-files-found: error
+
+  windows-rw6b-crash:
+    needs: [windows-build-test, linux-generate-rw6b-crash]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-crash
+          path: rw6b-crash
+
+      - name: Run the RW-6B writer crash matrix
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_crash_rw6b_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6b-crash\rmap-crash.img" `
+            -WorkDir "crash-rw6b"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B writer crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-crash
+          path: |
+            crash-rw6b/*.zip
+            crash-rw6b/cases.json
+          if-no-files-found: error
+
+  linux-verify-rw6b-crash:
+    needs: windows-rw6b-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-crash
+          path: crash-rw6b
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Replay every crash image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6b_crash_linux.sh crash-rw6b
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: capture a genuine Linux log with a committed RUI that survives
+  # without a matching RUD.  This is a real kernel log from a fragmented-file
+  # truncate workload; xfs_logprint and recovery_probe.py must both see it.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6b-rui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs and device-mapper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs dmsetup
+
+      - name: Capture a surviving RUI
+        run: |
+          sudo env SIZE_MB=768 FILES=6 EXTENTS=6000 ROUNDS=40 \
+            MAX_SNAPS=1200 COW_MB=256 \
+            bash tests/scripts/make_rw6b_rui_linux.sh rw6b-rui
+          sudo chown -R "$USER" rw6b-rui
+          cat rw6b-rui/rui.manifest.json
+          grep -q RUI rw6b-rui/rui.logprint.txt
+          python3 tests/tools/recovery_probe.py rw6b-rui/rui.img --json \
+            > /tmp/rui.json
+          grep -q '"XFS_LI_RUI"' /tmp/rui.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-linux-rui
+          path: rw6b-rui/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows completes the genuine surviving RUI in one transaction and the
+  # independent oracle checks the result.
+  # ---------------------------------------------------------------------------
+  windows-recover-rw6b-rui:
+    needs: [windows-build-test, linux-generate-rw6b-rui]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rui
+          path: rw6b-rui
+
+      - name: Complete the surviving RUI with Windows
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_rui_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6b-rui\rui.img" `
+            -WorkDir "rw6b-recovered"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B surviving-RUI recovery failed" }
+
+      - name: Refuse shared RUI operations without writes
+        shell: pwsh
+        run: |
+          python tests/tools/rw6b_refusal_check.py --exe "bin\xfswin.exe" `
+            --source "rw6b-rui\rui.img" --kind shared-rui `
+            --work-dir rw6b-recovered/shared-refusals
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B shared-RUI refusal matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-windows-recovered-rui
+          path: rw6b-recovered/
+          if-no-files-found: error
+
+  linux-verify-rw6b-rui:
+    needs: windows-recover-rw6b-rui
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-windows-recovered-rui
+          path: rw6b-recovered
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows RUI completion with Linux
+        run: |
+          sudo bash tests/scripts/verify_windows_image_linux.sh \
+            rw6b-recovered/rui-windows.img
+          python3 tests/tools/rw6b_rmap_probe.py \
+            rw6b-recovered/rui-windows.img
+
+  # ---------------------------------------------------------------------------
+  # RW-6B: crash Windows while it completes the genuine RUI, restart recovery,
+  # then verify every recovered image with Linux.
+  # ---------------------------------------------------------------------------
+  windows-rw6b-rui-crash:
+    needs: [windows-build-test, linux-generate-rw6b-rui]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-linux-rui
+          path: rw6b-rui
+
+      - name: Crash and restart the genuine RUI completion
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_rw6b_rui_crash_windows.ps1 `
+            -Exe "bin\xfswin.exe" -SourceImage "rw6b-rui\rui.img" `
+            -WorkDir "rw6b-rui-crash"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6B RUI completion crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6b-rui-crash
+          path: rw6b-rui-crash/*.zip
+          if-no-files-found: error
+
+  linux-verify-rw6b-rui-crash:
+    needs: windows-rw6b-rui-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6b-rui-crash
+          path: rw6b-rui-crash
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify every restarted RUI completion on Linux
+        run: |
+          mkdir -p rw6b-rui-crash/current empty-dirty
+          checked=0
+          for archive in rw6b-rui-crash/*.zip; do
+            [ -e "$archive" ] || continue
+            unzip -o "$archive" -d rw6b-rui-crash/current
+            sudo bash tests/scripts/verify_recovery_rw6_linux.sh \
+              empty-dirty rw6b-rui-crash/current
+            python3 tests/tools/rw6b_rmap_probe.py \
+              rw6b-rui-crash/current/*.img
+            rm rw6b-rui-crash/current/*.img
+            checked=$((checked + 1))
+          done
+          test "$checked" -eq 11
+          echo "Verified all $checked restarted RUI completion images"
 
   # ---------------------------------------------------------------------------
   # Windows mutates the Linux-created image (create/write/truncate/rename/

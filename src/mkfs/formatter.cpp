@@ -149,6 +149,15 @@ Result<FormatReport> Format(BlockDevice& device, const FormatOptions& options) {
             .Metadata("formatter");
       }
     }
+    if (geo.rmapbt) {
+      internal::BuildRmapRoot(geo, ag, &block_image);
+      if (!device.Write(ag_byte + uint64_t(geo.rmap_block) * geo.block_size,
+                        block_image.data(), block_image.size())) {
+        return XFS_ERR(XfsError::kIoError, "failed to write rmapbt root")
+            .Ag(ag.agno)
+            .Metadata("formatter");
+      }
+    }
   }
 
   // 3. Inode chunk with the root inode (AG0).

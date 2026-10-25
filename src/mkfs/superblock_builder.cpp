@@ -104,6 +104,7 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   PutBE32(p, sb::kBadFeatures2, features2);
   uint32_t ro_compat = 0;
   if (geo.finobt) ro_compat |= ondisk::kRoCompatFinobt;
+  if (geo.rmapbt) ro_compat |= ondisk::kRoCompatRmapbt;
   if (geo.inobtcount) ro_compat |= ondisk::kRoCompatInobtcnt;
   uint32_t incompat = ondisk::kIncompatFtype;
   if (geo.sparse_inodes) incompat |= ondisk::kIncompatSpinodes;

@@ -231,6 +231,8 @@ TEST(read_file_via_bmbt_btree) {
   PutBE32(block, ondisk::btree::kMagic, ondisk::kBmapCrcMagic);
   PutBE16(block, ondisk::btree::kLevel, 0);
   PutBE16(block, ondisk::btree::kNumrecs, 2);
+  PutBE64(block, ondisk::btree::kLLeftsib, ~0ull);
+  PutBE64(block, ondisk::btree::kLRightSib, ~0ull);
   PutBE64(block, ondisk::btree::kLBlkno, daddr);
   PutBE64(block, ondisk::btree::kLLsn, 0);
   std::memcpy(block + ondisk::btree::kLUuid, geo.meta_uuid.data(), 16);
@@ -271,6 +273,73 @@ TEST(read_file_via_bmbt_btree) {
   CHECK(LoadDataForkExtents(*dev, geo, inode, &extents).ok());
   CHECK_EQ(extents.size(), 2u);
   CHECK_EQ(extents[1].startblock, 300u);
+}
+
+TEST(bmbt_embedded_root_walk_shares_siblings_and_cycle_state) {
+  namespace bt = ondisk::btree;
+  const XfsGeometry geo = MakeTestGeometry();
+  xfstest::MemoryBlockDevice dev(geo.block_size * 1024ull);
+  auto block = [&](uint64_t fsb) { return dev.bytes().data() + fsb * geo.block_size; };
+  auto finish = [&](uint64_t fsb) {
+    UpdateXfsChecksum(block(fsb), geo.block_size, bt::kLCrc);
+  };
+  const size_t ptrbase = bt::kLHeaderLenV5 +
+                        ((geo.block_size - bt::kLHeaderLenV5) / 16) * 8;
+  for (uint64_t fsb : {100ull, 101ull, 102ull, 103ull}) {
+    uint8_t* b = block(fsb);
+    const bool node = fsb < 102;
+    const bool right = fsb == 101 || fsb == 103;
+    PutBE32(b, bt::kMagic, ondisk::kBmapCrcMagic);
+    PutBE16(b, bt::kLevel, node ? 1 : 0);
+    PutBE16(b, bt::kNumrecs, 1);
+    PutBE64(b, bt::kLLeftsib, right ? fsb - 1 : ~0ull);
+    PutBE64(b, bt::kLRightSib, right ? ~0ull : fsb + 1);
+    PutBE64(b, bt::kLBlkno, fsb * geo.block_size / 512);
+    std::memcpy(b + bt::kLUuid, geo.meta_uuid.data(), 16);
+    PutBE64(b, bt::kLOwner, 64);
+    const uint64_t key = right ? 3 : 0;
+    if (node) {
+      PutBE64(b, bt::kLHeaderLenV5, key);
+      PutBE64(b, ptrbase, fsb + 2);
+    } else {
+      uint64_t l0 = 0, l1 = 0;
+      ondisk::EncodeBmbtRec({key, right ? 300ull : 200ull, 1, false}, &l0, &l1);
+      PutBE64(b, bt::kLHeaderLenV5, l0);
+      PutBE64(b, bt::kLHeaderLenV5 + 8, l1);
+    }
+    finish(fsb);
+  }
+  XfsInode inode;
+  inode.ino = 64;
+  inode.mode = kSIfreg | 0644;
+  inode.format = ondisk::inode::kFormatBtree;
+  inode.nextents = 2;
+  inode.size = 4ull * geo.block_size;
+  inode.data_fork.assign(4 + 2 * 16, 0);
+  PutBE16(inode.data_fork.data(), 0, 2);
+  PutBE16(inode.data_fork.data(), 2, 2);
+  PutBE64(inode.data_fork.data(), 4, 0);
+  PutBE64(inode.data_fork.data(), 12, 3);
+  PutBE64(inode.data_fork.data(), 20, 100);
+  PutBE64(inode.data_fork.data(), 28, 101);
+  std::vector<XfsExtent> extents;
+  CHECK(LoadDataForkExtents(dev, geo, inode, &extents).ok());
+  CHECK_EQ(extents.size(), 2u);
+  CHECK_EQ(extents.back().startblock, 300u);
+  auto reject = [&](uint64_t fsb, size_t offset, uint64_t value) {
+    const uint64_t old = GetBE64(block(fsb), offset);
+    PutBE64(block(fsb), offset, value);
+    finish(fsb);
+    CHECK(!LoadDataForkExtents(dev, geo, inode, &extents).ok());
+    PutBE64(block(fsb), offset, old);
+    finish(fsb);
+  };
+  reject(100, bt::kLRightSib, ~0ull);  // forward link across embedded-root children
+  reject(101, bt::kLLeftsib, ~0ull);   // backward link across root children
+  reject(103, bt::kLLeftsib, ~0ull);   // leaf links also span child subtrees
+  reject(103, bt::kLRightSib, 102);    // right edge must terminate
+  PutBE64(inode.data_fork.data(), 28, 100); // repeated root child is a cycle
+  CHECK(!LoadDataForkExtents(dev, geo, inode, &extents).ok());
 }
 
 // ---------------------------------------------------------------------------

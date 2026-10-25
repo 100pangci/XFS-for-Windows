@@ -739,6 +739,21 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           .Ino(ino)
           .Metadata("ifree");
     }
+    // Attribute-fork mutation is outside RW-6B, but a Linux-created inode can
+    // carry attr extents/bmbt blocks.  Freeing only the data fork would leak
+    // those blocks (and their reverse mappings); refuse instead of corrupting
+    // the ownership ledger.  Local attr data lives inside the inode chunk and
+    // needs no separate free.
+    if (inode.value().HasAttrFork() && inode.value().anextents != 0) {
+      // A nonzero di_forkoff with zero attr extents is a legal, empty attr
+      // fork (Linux creates it that way); only a fork with blocks needs the
+      // attr bmap/rmap free this milestone does not implement.
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "cannot free an inode with allocated attribute extents")
+          .Ino(ino)
+          .Actual(inode.value().anextents)
+          .Metadata("ifree");
+    }
     // A symlink whose target lives in remote blocks is freed like Linux
     // xfs_inactive_symlink_rmt: the inode is turned into a regular file (a
     // zero-length symlink must never be visible on disk) in the same
@@ -1416,7 +1431,9 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
             .Ino(child_ino);
       }
       Allocation alloc;
-      s = blocks.Allocate(geometry_.InoAgno(parent_ino), need, &alloc);
+      s = blocks.AllocateOwned(
+          geometry_.InoAgno(parent_ino), need,
+          RmapOwner::Data(child_ino, 0, false), &alloc);
       if (!s.ok()) return s;
       ondisk::BmbtRec rec;
       rec.startoff = 0;

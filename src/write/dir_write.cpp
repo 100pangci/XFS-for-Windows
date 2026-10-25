@@ -1171,9 +1171,52 @@ Status DirectoryEditor::DropDataBlockIfEmpty(uint32_t db, bool empty) {
     if (it != data_blocks_.end()) bests_[db] = DataBestFree(it->second);
     return OkStatus();
   }
-  const uint32_t bestcount = static_cast<uint32_t>(data_size_ >> block_log_);
-  if (db + 1 != bestcount) {
-    bests_[db] = static_cast<uint16_t>(dir_block_size_ - d::kData3HeaderSize);
+  uint32_t last = 0;
+  for (const auto& entry : data_blocks_) last = std::max(last, entry.first);
+  if (db != last) {
+    // xfs_dir2_shrink_inode: an empty middle data block is replaced by the
+    // last data block, then the trailing block is removed.  Leaving empty
+    // blocks in place is rejected by xfs_repair ("empty data block ...
+    // would junk block").
+    auto last_it = data_blocks_.find(last);
+    if (last_it == data_blocks_.end()) {
+      return XFS_ERR(XfsError::kInternal, "directory tail block is missing")
+          .Ino(ino_)
+          .Actual(last);
+    }
+    std::vector<uint8_t> image = std::move(last_it->second);
+    data_blocks_.erase(last_it);
+    const uint64_t new_fsb = FsbForFileBlock(db);
+    if (new_fsb == kNullFsb) {
+      return XFS_ERR(XfsError::kInternal, "directory data block is not mapped")
+          .Ino(ino_)
+          .DirBlock(db);
+    }
+    PutBE64(image.data(), kBlkBlkno, geo_->FsbToByte(new_fsb) / 512);
+    data_blocks_[db] = std::move(image);
+    bests_[db] = DataBestFree(data_blocks_[db]);
+    bests_.erase(last);
+    data_dirty_.insert(db);
+    data_dirty_.erase(last);
+    const uint32_t shift = block_log_ - 3;
+    const uint32_t mask = (1u << shift) - 1;
+    for (auto& entry : leaf_blocks_) {
+      bool dirty = false;
+      for (LeafEnt& ent : entry.second.ents) {
+        if (ent.addr == 0 || (ent.addr >> shift) != last) continue;
+        ent.addr = (db << shift) | (ent.addr & mask);
+        dirty = true;
+      }
+      if (dirty) entry.second.dirty = true;
+    }
+    Status s = FreeDirBlock(last);
+    if (!s.ok()) return s;
+    uint32_t new_last = 0;
+    for (const auto& entry : data_blocks_) {
+      new_last = std::max(new_last, entry.first);
+    }
+    data_size_ = static_cast<uint64_t>(new_last + 1) << block_log_;
+    dirty_ = true;
     return OkStatus();
   }
   Status s = FreeDirBlock(db);
@@ -1181,9 +1224,11 @@ Status DirectoryEditor::DropDataBlockIfEmpty(uint32_t db, bool empty) {
   data_blocks_.erase(db);
   bests_.erase(db);
   data_dirty_.erase(db);
-  uint32_t last = 0;
-  for (const auto& entry : data_blocks_) last = std::max(last, entry.first);
-  data_size_ = static_cast<uint64_t>(last + 1) << block_log_;
+  uint32_t new_last = 0;
+  for (const auto& entry : data_blocks_) {
+    new_last = std::max(new_last, entry.first);
+  }
+  data_size_ = static_cast<uint64_t>(new_last + 1) << block_log_;
   dirty_ = true;
   return OkStatus();
 }
@@ -1219,7 +1264,9 @@ Result<uint32_t> DirectoryEditor::PickDataBlock(uint32_t hash, size_t need) {
 
 Result<uint64_t> DirectoryEditor::AllocDirBlock(uint64_t file_block) {
   Allocation allocation;
-  Status s = alloc_->Allocate(geo_->InoAgno(ino_), 1, &allocation);
+  Status s = alloc_->AllocateOwned(
+      geo_->InoAgno(ino_), 1, RmapOwner::Data(ino_, file_block, false),
+      &allocation);
   if (!s.ok()) return s.error();
   XfsExtent extent;
   extent.startoff = file_block;
@@ -1714,6 +1761,36 @@ Status DirectoryEditor::RebuildNodeTree() {
     return XFS_ERR(XfsError::kInternal, "directory has no leaf blocks")
         .Ino(ino_)
         .Metadata("directory");
+  }
+  // A leaf-format directory stores its only leaf at root_dablk_.  When a
+  // second leaf appears, the da node root must occupy root_dablk_, so move the
+  // old root leaf out of the way first.  Without this, LogBlocks() writes the
+  // leaf and the node to the same physical block and the last write (the
+  // node) leaves the leaf magic zeroed.
+  if (node_blocks_.empty() && leaf_blocks_.size() > 1) {
+    auto root_leaf = leaf_blocks_.find(root_dablk_);
+    if (root_leaf != leaf_blocks_.end()) {
+      uint32_t dablk = root_dablk_ + 1;
+      while (leaf_blocks_.count(dablk) || node_blocks_.count(dablk)) ++dablk;
+      auto alloc = AllocDirBlock(dablk);
+      if (!alloc.ok()) return alloc.error();
+      LeafBlock moved = std::move(root_leaf->second);
+      leaf_blocks_.erase(root_leaf);
+      moved.dablk = dablk;
+      moved.dirty = true;
+      for (auto& entry : leaf_blocks_) {
+        if (entry.second.forw == root_dablk_) {
+          entry.second.forw = dablk;
+          entry.second.dirty = true;
+        }
+        if (entry.second.back == root_dablk_) {
+          entry.second.back = dablk;
+          entry.second.dirty = true;
+        }
+      }
+      leaf_blocks_[dablk] = std::move(moved);
+      dirty_ = true;
+    }
   }
   uint32_t first = 0;
   size_t roots = 0;

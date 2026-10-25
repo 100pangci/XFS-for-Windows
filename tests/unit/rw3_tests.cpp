@@ -14,6 +14,8 @@
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
 #include "xfs/btree.h"
+#include "xfs/crc32c.h"
+#include "xfs/directory.h"
 #include "xfs/endian.h"
 #include "xfs/extent.h"
 #include "xfs/filesystem.h"
@@ -505,7 +507,8 @@ const char* DirFormatName(xfstest::FixtureImage& fixture, uint64_t ino) {
                                    root.size()));
       const uint16_t m = GetBE16(root.data(), 8);
       if (m == ondisk::kDir3Leaf1Magic) return "leaf";
-      return "node";
+      if (m == ondisk::kDaNode3Magic) return "node";
+      return "?";
     }
   }
   return "?";
@@ -781,6 +784,158 @@ TEST(rw3_directory_grows_through_all_formats) {
       auto found = fs.value()->LookupName(root, FixedName(i));
       CHECK_EQ(found.ok(), (i % 2) == 0 ? false : true);
     }
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
+TEST(rw3_leaf_directory_enumerates_data_holes_and_rejects_live_references) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  constexpr uint64_t root = 64;
+  constexpr int kEntries = 300;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    for (int i = 0; i < kEntries; ++i) {
+      CHECK(fs.value()->CreateRegularFile(root, FixedName(i), 0644, 0, 0).ok());
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CHECK_EQ(std::string(DirFormatName(fixture, root)), std::string("leaf"));
+  {
+    auto fs = fixture.Mount(/*read_write=*/false);
+    CHECK(fs.ok());
+    auto original = fs.value()->OpenInode(root);
+    CHECK(original.ok());
+    XfsInode sparse = original.value();
+    const XfsGeometry& geo = fs.value()->geometry();
+    const uint64_t leaf_db = ondisk::dir::kLeafOffset >> geo.block_log;
+    std::vector<XfsExtent> extents;
+    CHECK(LoadDataForkExtents(fixture.storage(), geo, sparse, &extents).ok());
+    auto mapping = MapFileOffset(fixture.storage(), geo, sparse,
+                                 ondisk::dir::kLeafOffset);
+    CHECK(mapping.ok());
+    const uint64_t leaf_offset = geo.FsbToByte(mapping.value().fs_block);
+    std::vector<uint8_t> leaf(geo.block_size, 0);
+    CHECK(fixture.storage().Read(leaf_offset, leaf.data(), leaf.size()));
+    const uint32_t old_count = GetBE32(leaf.data(), leaf.size() - 4);
+    CHECK(old_count >= 2);
+    const size_t old_bests = leaf.size() - 4 - old_count * 2;
+    std::vector<uint16_t> bests;
+    for (uint32_t i = 0; i < old_count; ++i) {
+      bests.push_back(GetBE16(leaf.data(), old_bests + i * 2));
+    }
+    bests.insert(bests.begin() + 1, 0xffffu);
+    const size_t new_bests = leaf.size() - 4 - bests.size() * 2;
+    for (size_t i = 0; i < bests.size(); ++i) {
+      PutBE16(leaf.data(), new_bests + i * 2, bests[i]);
+    }
+    PutBE32(leaf.data(), leaf.size() - 4, static_cast<uint32_t>(bests.size()));
+    const uint16_t count = GetBE16(leaf.data(), ondisk::dir::kLeafHdrCount);
+    const uint32_t dataptrs_per_block = geo.block_size / 8;
+    for (uint16_t i = 0; i < count; ++i) {
+      const size_t off = ondisk::dir::kLeaf3HeaderSize + i * 8 + 4;
+      const uint32_t addr = GetBE32(leaf.data(), off);
+      if (addr >= dataptrs_per_block) {
+        PutBE32(leaf.data(), off, addr + dataptrs_per_block);
+      }
+    }
+    auto publish_leaf = [&]() {
+      UpdateXfsChecksum(leaf.data(), leaf.size(), ondisk::dir::kLeaf3Crc);
+      CHECK(fixture.storage().Write(leaf_offset, leaf.data(), leaf.size()));
+    };
+    publish_leaf();
+
+    // Shift every data block after db0 one logical block to the right,
+    // preserving the physical buffers, entry tags and leaf/free-space layout.
+    sparse.format = ondisk::inode::kFormatExtents;
+    sparse.data_fork.clear();
+    sparse.nextents = 0;
+    for (const XfsExtent& e : extents) {
+      for (uint64_t i = 0; i < e.blockcount; ++i) {
+        uint64_t db = e.startoff + i;
+        if (db > 0 && db < leaf_db) ++db;
+        ondisk::BmbtRec rec{db, e.startblock + i, 1, false};
+        uint64_t l0 = 0, l1 = 0;
+        ondisk::EncodeBmbtRec(rec, &l0, &l1);
+        const size_t off = sparse.data_fork.size();
+        sparse.data_fork.resize(off + 16);
+        PutBE64(sparse.data_fork.data(), off, l0);
+        PutBE64(sparse.data_fork.data(), off + 8, l1);
+        ++sparse.nextents;
+      }
+    }
+    sparse.size += geo.block_size;
+    size_t entries = 0;
+    auto emit = [&](const XfsDirEntry&) -> Status { ++entries; return OkStatus(); };
+    CHECK(xfs::ListDirectory(fixture.storage(), geo, sparse, emit).ok());
+    CHECK_EQ(entries, static_cast<size_t>(kEntries + 3)); // hello.bin, . and ..
+    CHECK(xfs::LookupName(fixture.storage(), geo, sparse, FixedName(299)).ok());
+
+    // Null bests must not silently conceal an allocated block.
+    CHECK(!xfs::ListDirectory(fixture.storage(), geo, original.value(), emit).ok());
+    // Nor may a live leaf pointer refer to the punched-out block.
+    PutBE32(leaf.data(), ondisk::dir::kLeaf3HeaderSize + 4,
+            dataptrs_per_block + ondisk::dir::kData3HeaderSize / 8);
+    publish_leaf();
+    CHECK(!xfs::ListDirectory(fixture.storage(), geo, sparse, emit).ok());
+  }
+  fixture.Reset();
+}
+
+TEST(rw3_directory_node_to_leaf_moves_the_root_leaf) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t root = 64;
+  constexpr int kEntries = 1200;
+  uint64_t dir = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    CHECK(fs.value()->Mkdir(root, "big", 0755, 0, 0).ok());
+    auto found = fs.value()->LookupName(root, "big");
+    CHECK(found.ok());
+    if (!found.ok()) return;
+    dir = found.value().ino;
+    for (int i = 0; i < kEntries; ++i) {
+      auto created = fs.value()->CreateRegularFile(dir, FixedName(i), 0644, 0, 0);
+      CHECK(created.ok());
+      if (!created.ok()) return;
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Enough leaves to require a da node root.  The root leaf must have been
+  // moved out of root_dablk_ (and logged) before the node root was written.
+  CHECK_EQ(std::string(DirFormatName(fixture, dir)), std::string("node"));
+  CheckConsistent(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    for (int i = 0; i < kEntries; ++i) {
+      auto unlinked = fs.value()->Unlink(dir, FixedName(i), false);
+      CHECK(unlinked.ok());
+      if (!unlinked.ok()) return;
+    }
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  // Empty middle data blocks are compacted away and the last node leaf is
+  // converted back to a leaf1 block, so xfs_repair sees no empty data blocks.
+  CHECK_EQ(std::string(DirFormatName(fixture, dir)), std::string("leaf"));
+  CheckConsistent(fixture);
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    auto removed = fs.value()->RemoveEmptyDirectory(root, "big", false);
+    CHECK(removed.ok());
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
   }
   CheckConsistent(fixture);
   fixture.Reset();
