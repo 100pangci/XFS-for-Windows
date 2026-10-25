@@ -31,14 +31,6 @@ need() {
 for tool in curl tar make gcc; do
   need "$tool"
 done
-for header in /usr/include/uuid/uuid.h /usr/include/ini.h \
-              /usr/include/urcu.h /usr/include/blkid/blkid.h; do
-  if [ ! -e "$header" ]; then
-    echo "install_xfsprogs: missing development header: $header" >&2
-    echo "install libinih-dev uuid-dev liburcu-dev libblkid-dev first" >&2
-    exit 1
-  fi
-done
 
 if [ ! -x "$PREFIX/sbin/mkfs.xfs" ]; then
   mkdir -p "$WORK"
