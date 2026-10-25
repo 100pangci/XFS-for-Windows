@@ -595,7 +595,7 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
       const uint64_t fsb = old.startblock + (overlap_start - old.startoff);
       const uint32_t count =
           static_cast<uint32_t>(overlap_end - overlap_start);
-      Status s = alloc_->FreeOwned(
+      Status s = alloc_->ReleaseData(
           fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
       if (!s.ok()) return s;
       nblocks_delta_ -= static_cast<int64_t>(count);

@@ -30,6 +30,7 @@
 #include "xfs/endian.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
+#include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
 
 namespace xfs {
@@ -1532,8 +1533,8 @@ constexpr ItemTypeEntry kItemTypes[] = {
     {lf::kItemQuotaoff, "XFS_LI_QUOTAOFF", RecoveryItemClass::kRefused},
     {lf::kItemRui, "XFS_LI_RUI", RecoveryItemClass::kIntent},
     {lf::kItemRud, "XFS_LI_RUD", RecoveryItemClass::kIntentDone},
-    {lf::kItemCui, "XFS_LI_CUI", RecoveryItemClass::kRefused},
-    {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kRefused},
+    {lf::kItemCui, "XFS_LI_CUI", RecoveryItemClass::kIntent},
+    {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kIntentDone},
     {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kRefused},
     {lf::kItemAttrd, "XFS_LI_ATTRD", RecoveryItemClass::kRefused},
 };
@@ -1713,6 +1714,31 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
           scan.unsupported_items.push_back(
               std::string("RUD preflight: ") + parsed.error().Format());
         }
+      } else if (item.type == lf::kItemCui) {
+        if (!geo.features.reflink) {
+          scan.unsupported_items.push_back(
+              "CUI item present on a filesystem without reflink");
+          continue;
+        }
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("CUI item has no format region");
+          continue;
+        }
+        auto parsed = ParseRefcountIntent(item.regions[0], geo);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("CUI preflight: ") + parsed.error().Format());
+        }
+      } else if (item.type == lf::kItemCud) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("CUD item has no format region");
+          continue;
+        }
+        auto parsed = ParseRefcountIntentDone(item.regions[0]);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("CUD preflight: ") + parsed.error().Format());
+        }
       }
     }
   }
@@ -1727,7 +1753,10 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   // completed (xlog_recover_process_intents). EFI and RUI have completion
   // passes; every other intent type refuses before the first write.
   for (const PendingIntent& intent : CollectPendingIntents(scan)) {
-    if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui) continue;
+    if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
+        intent.type == lf::kItemCui) {
+      continue;
+    }
     scan.unsupported_items.push_back(
         "unresolved intent " +
         std::string(LogItemTypeName(intent.type) ? LogItemTypeName(intent.type)
@@ -1772,6 +1801,8 @@ std::vector<PendingIntent> CollectPendingIntents(const LogScan& scan) {
           want_type = lf::kItemEfi;
         } else if (item.type == lf::kItemRud) {
           want_type = lf::kItemRui;
+        } else if (item.type == lf::kItemCud) {
+          want_type = lf::kItemCui;
         }
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           if (it->type != want_type || it->regions.empty() ||

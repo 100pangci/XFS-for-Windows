@@ -97,6 +97,14 @@ bool Mergeable(const RmapRecord& rec, uint64_t owner, uint32_t flags) {
   return (rec.key.flags & mask) == (flags & mask);
 }
 
+// Reflink allows ordinary written data-fork records to overlap physically.
+// Metadata, bmbt, attr and unwritten records must remain single-owner.
+bool SharingCapable(const RmapRecord& rec) {
+  if (RmapNonInodeOwner(rec.key.owner)) return false;
+  const uint32_t mask = kRmapAttrFork | kRmapBmbtBlock | kRmapUnwritten;
+  return (rec.key.flags & mask) == 0;
+}
+
 bool LogicalAdjacent(const RmapRecord& rec, uint64_t owner, uint32_t flags,
                      uint64_t offset, uint32_t len, bool left) {
   if (IgnoreOffset(owner, flags)) return true;
@@ -279,18 +287,18 @@ class RmapEditor::Impl {
           .Actual(rec.key.startblock)
           .Metadata("rmapbt");
     }
-    if (pos > 0 && ag->records[pos - 1].EndBlock() > rec.key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap insert overlaps previous")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
-    }
-    if (pos < ag->records.size() &&
-        rec.EndBlock() > ag->records[pos].key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap insert overlaps next")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    for (const RmapRecord& other : ag->records) {
+      if (other.key.Compare(rec.key) == 0) continue;
+      if (other.key.startblock < rec.EndBlock() &&
+          rec.key.startblock < other.EndBlock()) {
+        if (!SharingCapable(rec) || !SharingCapable(other)) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "rmap insert overlaps an existing record")
+              .Ag(agno)
+              .Actual(rec.key.startblock)
+              .Metadata("rmapbt");
+        }
+      }
     }
     s = TreeInsert(*ag, rec);
     if (!s.ok()) return s;
@@ -362,17 +370,24 @@ class RmapEditor::Impl {
     const RmapRecord* left = pos > 0 ? &ag->records[pos - 1] : nullptr;
     const RmapRecord* right =
         pos < ag->records.size() ? &ag->records[pos] : nullptr;
-    if (left != nullptr && left->EndBlock() > rec.key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap map overlaps left record")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    bool overlaps = false;
+    for (const RmapRecord& other : ag->records) {
+      if (other.key.startblock < rec.EndBlock() &&
+          rec.key.startblock < other.EndBlock()) {
+        if (!SharingCapable(rec) || !SharingCapable(other)) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "rmap map overlaps an existing record")
+              .Ag(agno)
+              .Actual(rec.key.startblock)
+              .Metadata("rmapbt");
+        }
+        overlaps = true;
+      }
     }
-    if (right != nullptr && rec.EndBlock() > right->key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap map overlaps right record")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    if (overlaps) {
+      // Shared written data never merges with an overlapping record; insert
+      // the additional owner reference as an isolated record.
+      return InsertExact(agno, rec);
     }
 
     const bool have_left =

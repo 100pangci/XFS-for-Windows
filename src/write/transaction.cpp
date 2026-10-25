@@ -755,6 +755,41 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
   return OkStatus();
 }
 
+Status XfsFilesystem::FinishRecoveryClean() {
+  // This method is deliberately restricted to the standalone recovery shape:
+  // an ordinary writable mount keeps writing until its caller unmounts and
+  // must not be silently downgraded.
+  if (!options_.recovery_only) {
+    return XFS_ERR(XfsError::kInternal,
+                   "FinishRecoveryClean is recovery-only")
+        .Metadata("recovery");
+  }
+  const bool was_writable = writable_;
+  writable_ = true;
+  Status status = OkStatus();
+
+  if (!log_position_valid_) {
+    auto position = ReadLogPosition(*device_, geometry_, superblock_);
+    if (!position.ok()) {
+      status = position.error();
+    } else {
+      log_position_ = position.value();
+      log_position_valid_ = true;
+      log_dirty_ = !position.value().clean;
+      if (position.value().clean) {
+        // The post-recovery cleanup either wrote nothing or already closed
+        // the log; do not append a redundant unmount record.
+        writable_ = was_writable;
+        return OkStatus();
+      }
+    }
+  }
+  if (status.ok()) status = WriteCleanUnmountRecord();
+  if (status.ok()) status = Flush();
+  writable_ = was_writable;
+  return status;
+}
+
 Status XfsFilesystem::RefreshSuperblockCounters() {
   // xfs_initialize_perag_data(): lazy superblock counters are not
   // authoritative after a crash. Sum the per-AG headers and adopt the result.

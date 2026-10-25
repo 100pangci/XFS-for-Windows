@@ -359,13 +359,13 @@ TEST(recovery_scan_unsupported_item_refuses) {
   FillCycle(&log, 1, xfs::MakeLsn(1, 0), &next_tid);
   FillCycle(&log, 2, xfs::MakeLsn(2, 2), &next_tid);
 
-  // A committed CUI item (refcount update intent) is still an unsupported
+  // A committed ATTRI item (attribute update intent) is still an unsupported
   // semantic in this build.
-  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(cui.data(), 0, lf::kItemCui);
-  PutLE16At(cui.data(), 2, 1);  // one region
+  std::vector<uint8_t> attri(lf::kIntentLogFormatSize, 0);
+  PutLE16At(attri.data(), 0, lf::kItemAttri);
+  PutLE16At(attri.data(), 2, 1);  // one region
   const uint32_t tid = next_tid;
-  auto ops = CommitOps(tid, {cui});
+  auto ops = CommitOps(tid, {attri});
   log.WriteRecord(2, 62, 60, xfs::MakeLsn(2, 2), tid, ops);
 
   auto scan = log.Scan();
@@ -374,7 +374,7 @@ TEST(recovery_scan_unsupported_item_refuses) {
   CHECK(!scan.value().Recoverable());
   CHECK_EQ(scan.value().unsupported_items.size(), 1u);
   if (!scan.value().unsupported_items.empty()) {
-    CHECK(scan.value().unsupported_items[0].find("XFS_LI_CUI") !=
+    CHECK(scan.value().unsupported_items[0].find("XFS_LI_ATTRI") !=
           std::string::npos);
   }
 }
@@ -794,10 +794,10 @@ TEST(recovery_replay_cancel_table) {
 
 TEST(recovery_replay_refuses_unsupported_items) {
   SyntheticLog log;
-  std::vector<uint8_t> cui(lf::kIntentLogFormatSize, 0);
-  PutLE16At(cui.data(), 0, lf::kItemCui);
-  PutLE16At(cui.data(), 2, 1);
-  auto ops = CommitOps(31, {cui});
+  std::vector<uint8_t> attri(lf::kIntentLogFormatSize, 0);
+  PutLE16At(attri.data(), 0, lf::kItemAttri);
+  PutLE16At(attri.data(), 2, 1);
+  auto ops = CommitOps(31, {attri});
   log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, ops);
 
   auto scan = log.Scan();
@@ -806,7 +806,7 @@ TEST(recovery_replay_refuses_unsupported_items) {
   auto replay = log.Replay(scan.value(), nullptr);
   CHECK(!replay.ok());
   if (!replay.ok()) {
-    CHECK(replay.error().message.find("XFS_LI_CUI") != std::string::npos);
+    CHECK(replay.error().message.find("XFS_LI_ATTRI") != std::string::npos);
   }
 }
 

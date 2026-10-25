@@ -37,6 +37,7 @@ constexpr uint32_t kFibtCrcMagic = 0x46494233;// 'FIB3' finobt (v5)
 constexpr uint32_t kBmapMagic = 0x424d4150;   // 'BMAP' bmbt (v4)
 constexpr uint32_t kBmapCrcMagic = 0x424d4133;// 'BMA3' bmbt (v5)
 constexpr uint32_t kRmapCrcMagic = 0x524d4233; // 'RMB3' rmapbt (v5)
+constexpr uint32_t kRefcountCrcMagic = 0x52334643; // 'R3FC' refcountbt (v5)
 
 constexpr uint16_t kDaNodeMagic = 0xfebe;    // node block (v4)
 constexpr uint16_t kDaNode3Magic = 0x3ebe;   // node block (v5)
@@ -365,6 +366,11 @@ constexpr size_t kBmdrSize = 4;       // inode-embedded bmbt root header
 constexpr size_t kRmapKeySize = 40;   // 2 x xfs_rmap_key (startblock 4 + owner 8 + offset 8)
 constexpr size_t kRmapPtrSize = 4;    // be32 agbno
 constexpr size_t kRmapRecSize = 24;   // xfs_rmap_rec
+// The refcount btree uses the short header, one 4-byte key per node entry and
+// a 12-byte leaf record (XFS_REFCOUNT_KEY_ADDR / XFS_REFCOUNT_PTR_ADDR).
+constexpr size_t kRefcountKeySize = 4;   // rc_startblock be32
+constexpr size_t kRefcountPtrSize = 4;   // be32 agbno
+constexpr size_t kRefcountRecSize = 12;  // startblock, blockcount, refcount
 }  // namespace btree
 
 // ---------------------------------------------------------------------------

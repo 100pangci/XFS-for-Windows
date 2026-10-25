@@ -16,6 +16,7 @@
 #include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/refcount.h"
 #include "xfs/rmap.h"
 #include "xfs/symlink.h"
 #include "xfs/verifier.h"
@@ -272,7 +273,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
           // modify: check the profile first.
           Status profile = CheckWritableProfile(
               fs->superblock_, fs->geometry_, options.recovery_only,
-              options.allow_rmapbt_qualification);
+              options.allow_rmapbt_qualification, options.recovery_only,
+              options.allow_reflink_qualification);
           if (!profile.ok()) {
             auto error = profile.error();
             error.message +=
@@ -345,7 +347,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
     }
     Status profile = CheckWritableProfile(
         fs->superblock_, fs->geometry_, options.recovery_only,
-        options.allow_rmapbt_qualification);
+        options.allow_rmapbt_qualification, options.recovery_only,
+        options.allow_reflink_qualification);
     if (!profile.ok()) {
       auto error = profile.error();
       error.message +=
@@ -366,6 +369,25 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
       if (processed.value() != 0 || cleared != 0) {
         XFS_SB_INFO("unlinked inode recovery: freed="
                     << processed.value() << " cleared_buckets=" << cleared);
+      }
+    }
+    if (fs->geometry_.features.reflink) {
+      // xfs_reflink_recover_cow runs on every writable mount, including a
+      // clean one.  A crash between CoW allocation and remap leaves COW
+      // staging records that no inode references any more.
+      auto cow = fs->RecoverCowStaging();
+      if (!cow.ok()) {
+        auto error = cow.error();
+        error.message +=
+            " (CoW staging recovery is required before a reflink mount)";
+        return error;
+      }
+      if (fs->recovery_report_.has_value()) {
+        fs->recovery_report_->cow_staging_freed = cow.value();
+      }
+      if (cow.value() != 0) {
+        XFS_SB_INFO("CoW staging recovery: freed " << cow.value()
+                                                   << " orphan extents");
       }
     }
     if (options.recovery_only) {
@@ -981,6 +1003,9 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   uint64_t total_ifree = 0;
   bool rmap_seen = false;
   bool rmap_clean = true;
+  bool refcount_seen = false;
+  bool refcount_clean = true;
+  uint64_t refcount_cow_records = 0;
   if (options.allocation_groups) {
     for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
       auto headers = ReadAgHeaders(dev, geo, agno);
@@ -1174,6 +1199,40 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                            std::to_string(rmap_blocks) + " blocks, " +
                            std::to_string(tree.value().records.size()) +
                            " records (structurally verified)");
+          }
+        }
+        if (live_sb.features.reflink) {
+          refcount_seen = true;
+          auto tree = LoadRefcountTree(dev, geo, agno, live_sb.lsn);
+          if (!tree.ok()) {
+            report.Add("AG" + std::to_string(agno) + " refcountbt",
+                       CheckStatus::kCorrupt, tree.error().Format());
+            refcount_clean = false;
+          } else {
+            uint64_t cow_records = 0;
+            uint64_t shared_records = 0;
+            for (const RefcountRecord& rec : tree.value().records) {
+              if (rec.cow()) {
+                ++cow_records;
+              } else {
+                ++shared_records;
+              }
+            }
+            refcount_cow_records += cow_records;
+            report.Add("AG" + std::to_string(agno) + " refcountbt",
+                       CheckStatus::kOk,
+                       "level " + std::to_string(tree.value().level) + ", " +
+                           std::to_string(tree.value().blocks) + " blocks, " +
+                           std::to_string(shared_records) +
+                           " shared + " + std::to_string(cow_records) +
+                           " CoW records (structurally verified)");
+            if (cow_records != 0) {
+              report.Add("AG" + std::to_string(agno) + " CoW staging",
+                         CheckStatus::kWarning,
+                         std::to_string(cow_records) +
+                             " orphan CoW staging extent(s); a writable mount "
+                             "will recover them");
+            }
           }
         }
         if (bno_ok && cnt_ok && rmap_ok) {
@@ -1509,6 +1568,17 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                rmap_clean
                    ? "all AG reverse-mapping trees structurally clean"
                    : "one or more AG reverse-mapping trees failed");
+  }
+  if (refcount_seen) {
+    report.Add("refcountbt",
+               refcount_clean ? CheckStatus::kOk : CheckStatus::kCorrupt,
+               refcount_clean
+                   ? "all AG reference-count trees structurally clean"
+                   : "one or more AG reference-count trees failed");
+    if (refcount_clean && refcount_cow_records == 0) {
+      report.Add("CoW staging", CheckStatus::kOk,
+                 "no orphan CoW staging extents");
+    }
   }
 
   if (options.allocation_groups) {

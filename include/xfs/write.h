@@ -43,7 +43,9 @@ namespace xfs {
 // remain read-only (or are refused for writing).
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_recovery = false,
-                            bool allow_rmapbt_qualification = false);
+                            bool allow_rmapbt_qualification = false,
+                            bool allow_reflink_recovery = false,
+                            bool allow_reflink_qualification = false);
 
 // Human readable one-line profile description for logs/diagnostics.
 std::string WritableProfileSummary(const XfsSuperblock& sb);

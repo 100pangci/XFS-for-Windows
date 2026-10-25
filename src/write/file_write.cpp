@@ -20,6 +20,7 @@
 // which is what makes recovery replay the whole change atomically.
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #include "xfs/alloc.h"
@@ -29,6 +30,7 @@
 #include "xfs/filesystem.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/refcount.h"
 #include "xfs/write.h"
 
 namespace xfs {
@@ -78,7 +80,276 @@ bool IsWrittenExtentForBlock(const std::vector<XfsExtent>& extents,
   return true;
 }
 
+// True when any written file-data extent in [first_block, last_block] has a
+// shared refcountbt record.  Reads the typed trees directly (the caller has no
+// open transaction yet); an unreadable tree is an error, never "not shared".
+Result<bool> RangeHasSharedData(BlockDevice& dev, const XfsGeometry& geo,
+                                const std::vector<XfsExtent>& extents,
+                                uint64_t first_block, uint64_t last_block) {
+  if (!geo.features.reflink || last_block < first_block) return false;
+  std::map<uint32_t, RefcountTree> trees;
+  for (const XfsExtent& e : extents) {
+    if (e.unwritten) continue;
+    if (e.EndBlock() <= first_block || e.startoff > last_block) continue;
+    const uint64_t b0 = std::max(e.startoff, first_block);
+    const uint64_t b1 = std::min(e.EndBlock(), last_block + 1);
+    if (b0 >= b1) continue;
+    const uint64_t fsb = e.startblock + (b0 - e.startoff);
+    if (!geo.FsbRangeValid(fsb, b1 - b0)) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "file extent leaves one AG while checking sharing")
+          .Actual(fsb)
+          .Metadata("refcountbt");
+    }
+    const uint32_t agno = static_cast<uint32_t>(fsb >> geo.agblklog);
+    const uint32_t agbno =
+        static_cast<uint32_t>(fsb & ((1ULL << geo.agblklog) - 1));
+    auto it = trees.find(agno);
+    if (it == trees.end()) {
+      auto tree = LoadRefcountTree(dev, geo, agno, 0);
+      if (!tree.ok()) return tree.error();
+      it = trees.emplace(agno, std::move(tree.value())).first;
+    }
+    if (it->second.OverlapsShared(agbno, static_cast<uint32_t>(b1 - b0))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
+
+Status XfsFilesystem::CleanupCowStagingLocked(
+    const std::vector<CowRun>& runs) {
+  if (runs.empty()) return OkStatus();
+  auto txn = BeginTransaction();
+  if (!txn.ok()) return txn.error();
+  BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
+  for (const CowRun& run : runs) {
+    Status s = alloc.ReleaseCowStaging(run.fsb, run.len);
+    if (!s.ok()) return s;
+  }
+  Status s = alloc.Commit();
+  if (!s.ok()) return s;
+  return CommitTransaction(txn.value());
+}
+
+Result<size_t> XfsFilesystem::CowReplaceRangeLocked(
+    uint64_t ino, const XfsInode& inode,
+    const std::vector<XfsExtent>& extents, uint64_t offset, uint64_t length,
+    const void* buffer, uint64_t new_size) {
+  if (length == 0) return size_t{0};
+  if (offset > (1ull << 54) || length > (1ull << 54) - offset) {
+    return XFS_ERR(XfsError::kOutOfRange, "COW write range out of range")
+        .Ino(ino)
+        .Actual(length)
+        .Metadata("reflink");
+  }
+  const uint64_t block_size = geometry_.block_size;
+  const uint64_t first_block = offset >> geometry_.block_log;
+  const uint64_t last_block = (offset + length - 1) >> geometry_.block_log;
+  const uint64_t block_count = last_block - first_block + 1;
+  const uint64_t old_size = inode.size;
+
+  std::vector<CowRun> runs;
+  {
+    auto txn = BeginTransaction();
+    if (!txn.ok()) return txn.error();
+    BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
+    const uint32_t preferred = geometry_.InoAgno(ino);
+    uint64_t cursor = first_block;
+    uint64_t remaining = block_count;
+    while (remaining > 0) {
+      uint64_t want = remaining;
+      Allocation allocation;
+      Status allocated = XFS_ERR(XfsError::kInternal, "unset allocation");
+      while (true) {
+        allocated = alloc.AllocateCowStaging(
+            preferred, static_cast<uint32_t>(want), &allocation);
+        if (allocated.ok()) break;
+        if (allocated.error().code != XfsError::kNoSpace || want == 1) {
+          return allocated.error();
+        }
+        want = std::max<uint64_t>(1, want / 2);
+      }
+      runs.push_back(CowRun{cursor, allocation.fsb, allocation.len});
+      cursor += allocation.len;
+      remaining -= allocation.len;
+    }
+    Status s = alloc.Commit();
+    if (!s.ok()) return s.error();
+    MaybeCrash(CrashPoint::kCowStaged, "cow staging");
+    s = CommitTransaction(txn.value());
+    if (!s.ok()) return s.error();
+  }
+
+  auto cleanup = [&]() {
+    Status cleaned = CleanupCowStagingLocked(runs);
+    if (!cleaned.ok()) {
+      XFS_INFO("COW staging cleanup deferred to mount recovery: "
+               << cleaned.error().Format());
+    }
+  };
+
+  const auto* src = static_cast<const uint8_t*>(buffer);
+  std::vector<uint8_t> block(static_cast<size_t>(block_size));
+  MaybeCrash(CrashPoint::kBeforeCowDataWrite, "cow data");
+  for (const CowRun& run : runs) {
+    for (uint32_t i = 0; i < run.len; ++i) {
+      const uint64_t b = run.file_block + i;
+      const uint64_t block_start = b << geometry_.block_log;
+      const uint64_t block_end = block_start + block_size;
+      const uint64_t user_start = std::max(offset, block_start);
+      const uint64_t user_end = std::min(offset + length, block_end);
+      const bool full_user =
+          user_start == block_start && user_end == block_end;
+      if (full_user) {
+        if (src != nullptr) {
+          std::memcpy(block.data(), src + (block_start - offset),
+                      static_cast<size_t>(block_size));
+        } else {
+          std::memset(block.data(), 0, block.size());
+        }
+      } else {
+        std::memset(block.data(), 0, block.size());
+        if (block_start < old_size) {
+          const uint64_t want =
+              std::min<uint64_t>(block_size, old_size - block_start);
+          auto read = ReadFileData(*device_, geometry_, inode, block_start,
+                                   block.data(), static_cast<size_t>(want),
+                                   &extents);
+          if (!read.ok()) {
+            cleanup();
+            return read.error();
+          }
+        }
+        if (user_end > user_start) {
+          if (src != nullptr) {
+            std::memcpy(block.data() + (user_start - block_start),
+                        src + (user_start - offset),
+                        static_cast<size_t>(user_end - user_start));
+          } else {
+            std::memset(block.data() + (user_start - block_start), 0,
+                        static_cast<size_t>(user_end - user_start));
+          }
+        }
+      }
+      if (i > 0) {
+        MaybeCrash(CrashPoint::kMidCowDataWrite, "cow data");
+      }
+      const uint64_t device_offset = geometry_.FsbToByte(run.fsb + i);
+      if (!device_->Write(device_offset, block.data(), block.size())) {
+        cleanup();
+        return XFS_ERR(XfsError::kIoError,
+                       "COW file data write failed: " + device_->LastError())
+            .Ino(ino)
+            .Offset(device_offset)
+            .Metadata("device");
+      }
+    }
+  }
+  MaybeCrash(CrashPoint::kAfterCowDataWrite, "cow data");
+  if (!device_->Flush()) {
+    cleanup();
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to flush COW file data: " + device_->LastError())
+        .Ino(ino)
+        .Metadata("device");
+  }
+  InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
+
+  // Remap: replace the whole block range with the staged private blocks and
+  // drop the old shared/private mappings in one atomic metadata transaction.
+  {
+    auto txn = BeginTransaction();
+    if (!txn.ok()) {
+      cleanup();
+      return txn.error();
+    }
+    BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
+    auto fresh = OpenInode(ino);
+    if (!fresh.ok()) {
+      cleanup();
+      return fresh.error();
+    }
+    DataForkEditor editor(&txn.value(), &alloc, device_.get(), &geometry_);
+    Status s = editor.Load(fresh.value());
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    editor.SetFreeRemovedBlocks(true);
+    s = editor.RemoveRange(first_block, last_block + 1);
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    for (const CowRun& run : runs) {
+      // Staging accounting becomes the final private inode owner without any
+      // free-space change; the blocks were already allocated.
+      s = alloc.CommitCowStaging(
+          run.fsb, run.len, RmapOwner::Data(ino, run.file_block, false));
+      if (!s.ok()) {
+        cleanup();
+        return s.error();
+      }
+      XfsExtent mapping;
+      mapping.startoff = run.file_block;
+      mapping.startblock = run.fsb;
+      mapping.blockcount = run.len;
+      mapping.unwritten = false;
+      s = editor.InsertExtent(mapping);
+      if (!s.ok()) {
+        cleanup();
+        return s.error();
+      }
+      editor.AddNblocks(static_cast<int64_t>(run.len));
+    }
+    auto raw = ReadRawInode(ino);
+    if (!raw.ok()) {
+      cleanup();
+      return raw.error();
+    }
+    std::vector<uint8_t> raw_inode = std::move(raw.value());
+    uint32_t ilog_fields = 0;
+    std::vector<uint8_t> fork_region;
+    s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    PutBE64(raw_inode.data(), di::kSize, new_size);
+    PutBE64(raw_inode.data(), di::kFlags2,
+            GetBE64(raw_inode.data(), di::kFlags2) | di::kDiFlag2Reflink);
+    const XfsTimestamp now = CurrentTimestamp();
+    s = StoreModifiedTimes(raw_inode.data(), now);
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
+                         fork_region);
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    s = alloc.Commit();
+    if (!s.ok()) {
+      cleanup();
+      return s.error();
+    }
+    MaybeCrash(CrashPoint::kBeforeCowRemapCommit, "cow remap");
+    s = CommitTransaction(txn.value());
+    if (!s.ok()) {
+      // Once commit was attempted the log may already be durable. Do not try
+      // to cancel staging here; recovery resolves the committed state.
+      return s.error();
+    }
+  }
+  MaybeCrash(CrashPoint::kAfterCowRemap, "cow remap");
+  InvalidateCaches(CacheInvalidation::Extents(ino));
+  return static_cast<size_t>(length);
+}
 
 Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
                                             const void* buffer, size_t length,
@@ -151,6 +422,39 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       (end - 1) >> geometry_.block_log,
       std::max(old_size, end),
   };
+
+  // Reflink sharing changes the write path entirely: a write to a shared
+  // physical extent must be out-of-place.  The preflight reads the typed
+  // refcount trees; an unreadable tree refuses before any data write.
+  auto shared = RangeHasSharedData(*device_, geometry_, *extents.value(),
+                                   plan.first_block, plan.last_block);
+  if (!shared.ok()) return shared.error();
+  if (shared.value()) {
+    constexpr uint64_t kCowChunkBlocks = 64;
+    const auto* src = static_cast<const uint8_t*>(buffer);
+    for (uint64_t b = plan.first_block; b <= plan.last_block;) {
+      const uint64_t b_last =
+          std::min<uint64_t>(plan.last_block, b + kCowChunkBlocks - 1);
+      const uint64_t chunk_start = std::max(offset, b << geometry_.block_log);
+      const uint64_t chunk_end =
+          std::min(end, (b_last + 1) << geometry_.block_log);
+      if (chunk_start >= chunk_end) break;
+      const uint64_t stage_size =
+          b_last == plan.last_block
+              ? plan.new_size
+              : std::max<uint64_t>(old_size,
+                                   (b_last + 1) << geometry_.block_log);
+      auto wrote = CowReplaceRangeLocked(
+          ino, inode.value(), *extents.value(), chunk_start,
+          chunk_end - chunk_start, src + (chunk_start - offset), stage_size);
+      if (!wrote.ok()) return wrote.error();
+      b = b_last + 1;
+    }
+    InvalidateCaches(CacheInvalidation::Extents(ino));
+    XFS_EXT_DEBUG("COW wrote " << length << " bytes at " << offset
+                               << " in inode " << ino);
+    return length;
+  }
 
   // Fast path: the whole range is already allocated and written and EOF does
   // not move - the RW-0/1 path (direct writes + a timestamp transaction).
@@ -753,6 +1057,41 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
     if (!zero_ranges.empty()) {
       std::vector<uint8_t> zeros(static_cast<size_t>(geometry_.block_size), 0);
       for (const WriteMapping& mapping : zero_ranges) {
+        const uint64_t first_block =
+            mapping.file_offset >> geometry_.block_log;
+        const uint64_t last_block =
+            (mapping.file_offset + mapping.byte_count - 1) >>
+            geometry_.block_log;
+        auto shared = RangeHasSharedData(*device_, geometry_, *extents.value(),
+                                         first_block, last_block);
+        if (!shared.ok()) return shared.error();
+        if (shared.value()) {
+          // Zeroing an already existing shared extent is a write: it must be
+          // out-of-place and preserve the bytes before z0 in a partial block.
+          for (uint64_t b = first_block; b <= last_block;) {
+            const uint64_t b_last = std::min<uint64_t>(last_block, b + 63);
+            const uint64_t chunk_end =
+                std::min(mapping.file_offset + mapping.byte_count,
+                         (b_last + 1) << geometry_.block_log);
+            const uint64_t chunk_start =
+                std::max(mapping.file_offset, b << geometry_.block_log);
+            if (chunk_start >= chunk_end) break;
+            const uint64_t stage_size =
+                b_last == last_block
+                    ? new_size
+                    : std::min<uint64_t>(
+                          new_size,
+                          std::max<uint64_t>(
+                              old_size,
+                              (b_last + 1) << geometry_.block_log));
+            auto zeroed = CowReplaceRangeLocked(
+                ino, inode.value(), *extents.value(), chunk_start,
+                chunk_end - chunk_start, nullptr, stage_size);
+            if (!zeroed.ok()) return zeroed.error();
+            b = b_last + 1;
+          }
+          continue;
+        }
         uint64_t remaining = mapping.byte_count;
         uint64_t device_offset =
             geometry_.FsbToByte(mapping.fs_block) +
@@ -808,39 +1147,52 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
     const uint64_t last_block = keep_blocks - 1;
     const XfsExtent* extent = nullptr;
     if (IsWrittenExtentForBlock(*extents.value(), last_block, &extent)) {
-      const uint64_t start_byte =
-          (extent->startoff + (last_block - extent->startoff))
-          << geometry_.block_log;
-      const uint64_t zero_from = new_size;
-      const uint64_t zero_to = start_byte + geometry_.block_size;
-      std::vector<uint8_t> zeros(static_cast<size_t>(geometry_.block_size), 0);
-      uint64_t pos = zero_from;
-      const uint64_t device_base =
-          geometry_.FsbToByte(extent->startblock) +
-          ((last_block - extent->startoff) << geometry_.block_log);
-      while (pos < zero_to) {
-        const size_t chunk =
-            static_cast<size_t>(std::min<uint64_t>(zero_to - pos, zeros.size()));
-        if (!device_->Write(device_base + (pos - start_byte), zeros.data(),
-                            chunk)) {
+      auto shared = RangeHasSharedData(*device_, geometry_, *extents.value(),
+                                       last_block, last_block);
+      if (!shared.ok()) return shared.error();
+      if (shared.value()) {
+        const uint64_t block_end =
+            (last_block + 1) << geometry_.block_log;
+        auto zeroed = CowReplaceRangeLocked(
+            ino, inode.value(), *extents.value(), new_size,
+            block_end - new_size, nullptr, new_size);
+        if (!zeroed.ok()) return zeroed.error();
+        InvalidateCaches(CacheInvalidation::Extents(ino));
+      } else {
+        const uint64_t start_byte =
+            (extent->startoff + (last_block - extent->startoff))
+            << geometry_.block_log;
+        const uint64_t zero_from = new_size;
+        const uint64_t zero_to = start_byte + geometry_.block_size;
+        std::vector<uint8_t> zeros(static_cast<size_t>(geometry_.block_size), 0);
+        uint64_t pos = zero_from;
+        const uint64_t device_base =
+            geometry_.FsbToByte(extent->startblock) +
+            ((last_block - extent->startoff) << geometry_.block_log);
+        while (pos < zero_to) {
+          const size_t chunk =
+              static_cast<size_t>(std::min<uint64_t>(zero_to - pos, zeros.size()));
+          if (!device_->Write(device_base + (pos - start_byte), zeros.data(),
+                              chunk)) {
+            return XFS_ERR(XfsError::kIoError,
+                           "failed to zero the truncated file tail: " +
+                               device_->LastError())
+                .Ino(ino)
+                .Offset(device_base + (pos - start_byte))
+                .Metadata("device");
+          }
+          pos += chunk;
+        }
+        if (!device_->Flush()) {
           return XFS_ERR(XfsError::kIoError,
-                         "failed to zero the truncated file tail: " +
+                         "failed to flush the zeroed file tail: " +
                              device_->LastError())
               .Ino(ino)
-              .Offset(device_base + (pos - start_byte))
               .Metadata("device");
         }
-        pos += chunk;
+        InvalidateCaches(
+            CacheInvalidation::DataRange(ino, zero_from, zero_to - zero_from));
       }
-      if (!device_->Flush()) {
-        return XFS_ERR(XfsError::kIoError,
-                       "failed to flush the zeroed file tail: " +
-                           device_->LastError())
-            .Ino(ino)
-            .Metadata("device");
-      }
-      InvalidateCaches(
-          CacheInvalidation::DataRange(ino, zero_from, zero_to - zero_from));
     }
   }
 

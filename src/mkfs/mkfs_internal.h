@@ -39,6 +39,7 @@ struct FormatGeometry {
   uint32_t ibt_block = 0;
   uint32_t fibt_block = 0;
   uint32_t rmap_block = 0;
+  uint32_t refcount_block = 0;
   uint32_t agfl_block = 0;
 
   bool finobt = false;
@@ -47,6 +48,7 @@ struct FormatGeometry {
   bool bigtime = false;
   bool nrext64 = false;
   bool rmapbt = false;
+  bool reflink = false;
 
   uint64_t logstart = 0;   // absolute fsb
   uint32_t logblocks = 0;
@@ -134,6 +136,11 @@ void BuildFinobtRoot(const FormatGeometry& geo,
 void BuildRmapRoot(const FormatGeometry& geo,
                    const FormatGeometry::AgState& ag,
                    std::vector<uint8_t>* buf);
+// Reference-count btree root (empty single leaf; a freshly formatted
+// filesystem has no shared extents or CoW staging records).
+void BuildRefcountRoot(const FormatGeometry& geo,
+                       const FormatGeometry::AgState& ag,
+                       std::vector<uint8_t>* buf);
 
 // Writes (and returns) the inode chunk contents for AG0: 64 v3 inode cores
 // with the root inode fully populated. `buf` receives chunk_blocks * block_size

@@ -64,6 +64,10 @@ struct MountOptions {
   // continues to refuse rmapbt until every acceptance gate has passed.  Only
   // the hidden `--rw-rmapbt-qualification` CLI flag sets it.
   bool allow_rmapbt_qualification = false;
+  // Hidden RW-6C acceptance switch.  It does not open ordinary reflink writes:
+  // the public gate stays closed until the Linux-created refcount/CoW/crash
+  // qualification ledger is complete.
+  bool allow_reflink_qualification = false;
 };
 
 struct XfsFileInfo {
@@ -233,6 +237,18 @@ class XfsFilesystem {
   // and crash-image structure transitions).
   Result<std::vector<XfsExtent>> GetDataExtents(uint64_t ino) const;
 
+  // ---- reflink (RW-6C, read-write mounts only) ----
+  // Clones [src_offset, src_offset+length) of `src_ino` to `dst_offset` of
+  // `dst_ino` by sharing physical extents (never by copying data).  Offsets
+  // must be filesystem-block aligned; length 0 means "to source EOF".  Holes
+  // and unwritten source extents remain holes in the destination.  The
+  // destination range is replaced atomically per rolling transaction.  A
+  // partial final source block is shared only when the clone also ends at the
+  // destination EOF, matching Linux xfs_reflink_remap_prep.
+  Result<uint64_t> ReflinkRange(uint64_t src_ino, uint64_t src_offset,
+                                uint64_t dst_ino, uint64_t dst_offset,
+                                uint64_t length);
+
   // ---- namespace mutation (RW-3, read-write mounts only) ----
   // Creates a regular file (mode must be a regular-file mode; 0 means 0644)
   // in `parent_ino`. The whole create is one transaction: inode allocation,
@@ -373,6 +389,7 @@ class XfsFilesystem {
     uint64_t intents_completed = 0;
     uint64_t unlinked_inodes_processed = 0;
     uint64_t agi_buckets_cleared = 0;
+    uint64_t cow_staging_freed = 0;
     bool recovered = false;  // false when the log was already clean/empty
   };
   // Runs the whole recovery: scan and validate, replay the committed
@@ -391,6 +408,13 @@ class XfsFilesystem {
   const std::optional<RecoveryReport>& recovery_report() const {
     return recovery_report_;
   }
+
+  // Standalone `xfswin recover` close step. Mount-time post-recovery work
+  // (AGI unlinked lists and orphan CoW staging cleanup) can commit new
+  // transactions after RecoverJournal has already written its closing unmount
+  // record. This re-opens writing just long enough to append a final clean
+  // record and flush, then restores the recovery-only read-only state.
+  Status FinishRecoveryClean();
 
   // Flushes pending writes to stable storage. Returns failure if the device
   // flush fails: callers (WinFsp Flush, clean unmount) must not report
@@ -433,6 +457,22 @@ class XfsFilesystem {
   // ---- inode and data fork write helpers (RW-2) ----
   // Reads the complete on-disk inode image.
   Result<std::vector<uint8_t>> ReadRawInode(uint64_t ino) const;
+  // Replaces every block in [offset, offset+length)'s block range with fresh
+  // private blocks: stage COW blocks (refcount COW + OWN_COW rmap), write and
+  // flush the data, then atomically remap the inode and release the old
+  // mappings.  `buffer` may be nullptr for a pure zero range.  The caller holds
+  // mutation_mutex_ and passes the pre-mutation inode/extent snapshot.
+  struct CowRun {
+    uint64_t file_block = 0;
+    uint64_t fsb = 0;
+    uint32_t len = 0;
+  };
+  Result<size_t> CowReplaceRangeLocked(uint64_t ino, const XfsInode& inode,
+                                       const std::vector<XfsExtent>& extents,
+                                       uint64_t offset, uint64_t length,
+                                       const void* buffer, uint64_t new_size);
+  Status CleanupCowStagingLocked(const std::vector<CowRun>& runs);
+
   // Reads the inode, lets `mutate` change its raw bytes, then logs it (core +
   // optional data fork region) and queues the write-back.
   Status UpdateInodeInTransaction(
@@ -537,6 +577,9 @@ class XfsFilesystem {
   // truncates and frees zero-link inodes, clearing buckets that cannot be
   // walked.
   Result<uint64_t> ProcessAgiUnlinkedLists(uint64_t* buckets_cleared);
+  // xfs_reflink_recover_cow: frees every refcountbt COW staging record left by
+  // a crashed CoW write.  Runs on every writable mount (clean or recovered).
+  Result<uint64_t> RecoverCowStaging();
   Status ClearAgiBucket(uint32_t agno, uint32_t bucket,
                         const char* reason);
 

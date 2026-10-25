@@ -17,7 +17,8 @@ namespace xfs::winfsp {
 // image writable and mounts the filesystem with the writable profile check.
 int RunMountHost(const std::string& target, const std::string& drive,
                  bool force_unsafe_ro, bool verbose, bool read_write,
-                 bool allow_rmapbt_qualification = false);
+                 bool allow_rmapbt_qualification = false,
+                 bool allow_reflink_qualification = false);
 
 // Signals a running mount of `drive` to stop. Returns a process exit code.
 int StopMountHost(const std::string& drive);

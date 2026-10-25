@@ -64,9 +64,28 @@ constexpr RoCompatReason kRoCompatReasons[] = {
 
 Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_recovery,
-                            bool allow_rmapbt_qualification) {
+                            bool allow_rmapbt_qualification,
+                            bool allow_reflink_recovery,
+                            bool allow_reflink_qualification) {
   (void)allow_rmapbt_recovery;
   (void)allow_rmapbt_qualification;
+  const bool reflink_qualified =
+      allow_reflink_recovery || allow_reflink_qualification;
+  if (sb.features.reflink && !reflink_qualified) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "reflink is not yet qualified for ordinary read-write; "
+                   "the refcountbt/CoW writer is available only through the "
+                   "hidden qualification/recovery path")
+        .Metadata("superblock")
+        .Actual(sb.features_ro_compat);
+  }
+  if (sb.features.reflink && geo.agblocks >= (1u << 31)) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "reflink requires allocation groups smaller than 2^31 "
+                   "blocks")
+        .Metadata("superblock")
+        .Actual(geo.agblocks);
+  }
   if (sb.features.incompat_unknown) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "unknown incompatible features " +
@@ -97,7 +116,13 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
   for (const auto& reason : kRoCompatReasons) {
     if (sb.features_ro_compat & reason.bit) {
       // RW-6B: a reverse-mapping filesystem without reflink is writable.
-      if (reason.bit == ondisk::kRoCompatRmapbt && !sb.features.reflink) {
+      // RW-6C: when reflink is explicitly qualified (or this is a
+      // recovery-only completion), the refcount btree is maintained too.
+      if (reason.bit == ondisk::kRoCompatRmapbt &&
+          (!sb.features.reflink || reflink_qualified)) {
+        continue;
+      }
+      if (reason.bit == ondisk::kRoCompatReflink && reflink_qualified) {
         continue;
       }
       return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -205,6 +230,8 @@ std::string WritableProfileSummary(const XfsSuperblock& sb) {
   if (sb.features.bigtime) summary += ", bigtime";
   if (sb.features.nrext64) summary += ", nrext64";
   if (sb.features.exchrange) summary += ", exchrange";
+  if (sb.features.rmapbt) summary += ", rmapbt";
+  if (sb.features.reflink) summary += ", reflink";
   return summary;
 }
 

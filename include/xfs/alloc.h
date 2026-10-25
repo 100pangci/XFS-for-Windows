@@ -36,9 +36,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "xfs/block_device.h"
 #include "xfs/error.h"
+#include "xfs/refcount.h"
 #include "xfs/rmap_editor.h"
 #include "xfs/superblock.h"
 #include "xfs/transaction.h"
@@ -106,6 +108,40 @@ class BlockAllocator {
   Status Free(uint64_t fsb, uint32_t len);
   Status FreeOwned(uint64_t fsb, uint32_t len, const RmapOwner& owner);
   Status FreeUnknown(uint64_t fsb, uint32_t len);
+
+  // Removes one inode mapping from the ownership ledger.  On a reflink
+  // filesystem the owner rmap is removed, the refcount is decreased, and the
+  // physical blocks are returned to free space only when the last reference
+  // disappears.  On older profiles this is exactly FreeOwned.
+  Status ReleaseData(uint64_t fsb, uint32_t len, const RmapOwner& owner);
+
+  // CoW staging.  AllocateCowStaging takes a private run from free space with
+  // rmap owner OWN_COW and records it in refcountbt with COW flag/refcount 1.
+  // CommitCowStaging atomically removes the staging record/owner and installs
+  // the final inode owner; the physical blocks are already allocated.
+  // ReleaseCowStaging cancels an orphan staging extent (mount recovery).
+  Status AllocateCowStaging(uint32_t preferred_agno, uint32_t len,
+                            Allocation* out);
+  Status CommitCowStaging(uint64_t fsb, uint32_t len,
+                          const RmapOwner& final_owner);
+  Status ReleaseCowStaging(uint64_t fsb, uint32_t len);
+
+  // Refcount adjustments used by clone, truncate and CUI recovery.
+  // RefcountDecrease with unknown_owner implements the CUI recovery path: a
+  // range that reaches zero is freed through the OWN_UNKNOWN wildcard.
+  Status RefcountIncrease(uint64_t fsb, uint32_t len);
+  Status RefcountDecrease(uint64_t fsb, uint32_t len,
+                          bool unknown_owner = false);
+  Status RefcountCowAlloc(uint64_t fsb, uint32_t len);
+  Status RefcountCowFree(uint64_t fsb, uint32_t len);
+
+  // Loads AG `agno`'s refcount tree and reports the first shared run that
+  // intersects the physical range.  Returns found=false when not shared.
+  Status FindShared(uint64_t fsb, uint32_t len, RefcountRecord* out,
+                    bool* found);
+  // Enumerates CoW staging records in one AG (requires the tree loaded).
+  Status LoadRefcountAg(uint32_t agno);
+  Status ListCowStaging(uint32_t agno, std::vector<RefcountRecord>* out);
 
   // Written <-> unwritten state conversion for an inode data extent.  This is
   // the rmap half of the bmap conversion; it never changes free space.
