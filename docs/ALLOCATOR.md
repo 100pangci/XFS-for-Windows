@@ -19,6 +19,12 @@ blocks and sparse inode backing as ordinary consumers of this allocator. The
 allocator's fdblocks identity still holds because inobt/finobt blocks are not
 free-space metadata and therefore never enter `agf_btreeblks`.
 
+> Historical scope note: this document describes the RW-2 allocator. RW-6B
+> added the rmapbt allocation/free path and RW-6C adds refcountbt/CoW staging;
+> see [RMAPBT.md](RMAPBT.md) and [REFLINK.md](REFLINK.md). The ordinary gate
+> now accepts both features; the historical profile above is intentionally
+> left as the RW-2 baseline.
+
 ## 1. What a block allocation changes
 
 For this profile one allocation or free touches exactly these structures:

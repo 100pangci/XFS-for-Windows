@@ -119,7 +119,8 @@ class RmapEditor {
   // `unknown_owner` implements the EFI OWN_UNKNOWN wildcard (fully covering
   // record or no overlap at all; partial overlap is corruption).
   Status UnmapExtent(uint32_t agno, const RmapKey& key, uint32_t len,
-                     bool unknown_owner = false);
+                     bool unknown_owner = false,
+                     bool no_overlap_ok = false);
 
   // Linux xfs_rmap_convert.  `old_unwritten` is the current on-disk state;
   // the target is the opposite state.  Exact, prefix, suffix and middle
@@ -139,7 +140,8 @@ class RmapEditor {
   Status AllocateExtent(uint32_t agno, uint32_t startblock, uint32_t len,
                         const RmapOwner& owner);
   Status FreeExtent(uint32_t agno, uint32_t startblock, uint32_t len,
-                    const RmapOwner& owner, bool unknown_owner = false);
+                    const RmapOwner& owner, bool unknown_owner = false,
+                    bool no_overlap_ok = false);
   Status Convert(uint32_t agno, uint32_t startblock, uint32_t len,
                  const RmapOwner& owner, bool old_unwritten);
 

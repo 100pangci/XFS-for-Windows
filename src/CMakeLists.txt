@@ -17,6 +17,10 @@ add_library(xfs_core STATIC
   core/rmap.cpp
   core/rmap_editor.cpp
   core/rmap_intent.cpp
+  core/bmap_intent.cpp
+  core/refcount.cpp
+  core/refcount_editor.cpp
+  core/refcount_intent.cpp
   core/inode.cpp
   core/extent.cpp
   core/directory.cpp
@@ -43,6 +47,7 @@ add_library(xfs_core STATIC
   write/dir_write.cpp
   write/namespace.cpp
   write/file_write.cpp
+  write/reflink.cpp
   write/flush.cpp
   recovery/log_scan.cpp
   recovery/replay.cpp

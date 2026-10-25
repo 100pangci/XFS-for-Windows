@@ -25,6 +25,10 @@ RW-6A extended this document's original inobt-only model; the finobt,
 sparse-chunk and inobtcount rules are described in section 10 and in
 [MODERN_INODE_FEATURES.md](MODERN_INODE_FEATURES.md).
 
+> Historical scope note: this document describes the RW-3 inode allocator.
+> RW-6B/RW-6C later added rmap/refcount ownership paths; see
+> [RMAPBT.md](RMAPBT.md) and [REFLINK.md](REFLINK.md).
+
 ## 1. What an inode allocation changes
 
 | metadata | fields |

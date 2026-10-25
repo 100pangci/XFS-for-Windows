@@ -39,6 +39,9 @@ struct FormatOptions {
   // RW-6B test/format support.  reflink remains off: this profile is the
   // writable rmapbt=1,reflink=0 combination.
   bool rmapbt = false;
+  // RW-6C: reflink=1.  rmapbt is independent (both legal combinations are
+  // supported by Linux and by the formatter).
+  bool reflink = false;
 };
 
 struct FormatReport {

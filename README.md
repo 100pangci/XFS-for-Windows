@@ -47,9 +47,9 @@ anything else is refused for read-write and stays readable.
 | Multi-block directories | read |
 | Internal log cleanliness check | yes; dirty logs are classified by the recovery scanner |
 | WinFsp read-only mount | yes: mounted as `XFS`, reads and hashes verified, all writes rejected (CI) |
-| Formatter (mkfs) | yes: standard v5, optional modern inode profile and `--rmapbt`; no reflink |
+| Formatter (mkfs) | yes: standard v5, optional modern inode profile, `--rmapbt` and `--reflink` (both legal reflink/rmap combinations) |
 | `xfs_repair`-style read-only consistency check | yes (`xfswin check`), including the recovery inventory of a dirty log |
-| **Journal replay (RW-5)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI intent completion and AGI unlinked processing |
+| **Journal replay (RW-5/6)** | yes: Windows-native internal-log recovery (`xfswin recover` / read-write mount), including logs written by the Linux kernel, torn-tail trimming, buffer cancellation, inode/icreate/buffer items, EFI, RUI, BUI and CUI completion and AGI unlinked processing |
 | **Experimental read-write mount** | images only (`--rw-experimental`): files can be created, overwritten, extended, truncated, deleted, renamed and hard-linked; directories can be created, removed and renamed; native symlinks can be created |
 | Writing that grows a file, fills a hole or converts an unwritten extent | yes (RW-2): block allocation, extent map mutation, size update |
 | Truncate (shrink and grow) | yes (RW-2), including freeing blocks back to the allocator |
@@ -147,7 +147,7 @@ profile are replayed by the RW-5 engine and verified back on Linux; the
 independent `tests/tools/rw6_inode_probe.py` cross-checks every tree, hole
 mask, counter and inode image.
 
-## Writable feature table (RW-6B)
+## Writable feature table (RW-6B / RW-6C)
 
 | Feature | Read | Write | Recovery |
 |---|---|---|---|
@@ -156,13 +156,16 @@ mask, counter and inode image.
 | sparse inode chunks | yes | yes | yes |
 | bigtime | yes | yes | yes |
 | NREXT64 | yes | yes | yes |
-| rmapbt | yes (`check` walks it; the reader does not need it) | experimental, **reflink=0 only** | RMB3 replay and surviving RUI completion |
-| reflink / refcount | yes (extents are read normally) | **no** | n/a (refused on write) |
+| rmapbt | yes (`check` walks it; the reader does not need it) | experimental, `reflink=0` or `reflink=1` | RMB3 replay and surviving RUI completion |
+| reflink / refcount | yes (typed refcountbt reader) | experimental, ordinary `--rw-experimental` (both rmapbt profiles) | CUI/CUD completion and orphan CoW staging cleanup |
 | xattr | preserved byte-for-byte | **no mutation** | preserved by inode items |
 
-The writable profile is XFS v5 with an internal log and a single data device.
-A filesystem using reflink, parent pointers, quotas, realtime, an
-external log, metadir or zoned mode is refused before the first write.
+The ordinary writable profile is XFS v5 with an internal log and a single data
+device. Reflink, refcountbt, shared truncate/unlink and CoW are enabled by the
+ordinary `--rw-experimental` opt-in after the twelve-gate Linux qualification
+in [docs/REFLINK.md](docs/REFLINK.md); the legacy `--rw-reflink-qualification`
+flag is accepted as a no-op. Parent pointers, quotas, realtime, an external
+log, metadir or zoned mode are refused before the first write.
 
 RW-6B incrementally maintains ownership on Linux-created `rmapbt=1,reflink=0`
 images through the ordinary `--rw-experimental` opt-in. It never rebuilds the
@@ -176,7 +179,7 @@ The ordinary-gate code revision `5a41fca` passed all 65 jobs in
 including grown/collapsed Linux-origin rmap trees and full-image no-write
 refusal checks. Support remains experimental and image-file-only.
 
-**Reflink/refcount/CoW and xattr modification remain unsupported and refused.**
+**The ordinary reflink write gate is open.** Reflink, refcount and CoW passed the twelve-gate Linux evidence ledger in [docs/REFLINK.md](docs/REFLINK.md) on [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954). The gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743) repeated the full RW-6C matrix with plain `--rw-experimental`, so both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` images are ordinary writable profiles. Xattr modification remains unsupported.
 
 ## Journal recovery (RW-5)
 
@@ -226,9 +229,10 @@ Scope of this milestone:
 - **Allow-list mount policy.** A filesystem may be mounted read-write only if
   this build can maintain every structure it uses. RW-6A added finobt,
   inobtcount, sparse inode chunks, bigtime and NREXT64 to the writable profile.
-  RW-6B additionally maintains rmapbt when reflink is off. Reflink, parent
-  pointers, quotas, realtime devices, external logs,
-  metadir, zoned and case-insensitive directories are still refused for
+  RW-6B additionally maintains rmapbt. RW-6C adds the reflink/refcount/CoW
+  writer to the ordinary profile, including shared truncate/unlink and both
+  rmapbt combinations. Parent pointers, quotas, realtime devices, external
+  logs, metadir, zoned and case-insensitive directories are still refused for
   read-write (they remain readable), with the blocking feature named in the
   error.
 - **Images only.** `\\.\PhysicalDriveN` and volumes refuse `--rw-experimental`
@@ -245,9 +249,10 @@ Scope of this milestone:
   transaction whose item stream exceeds one 32 KiB log record is split across
   several records with `CONTINUE`/`WAS_CONT` fragments and one `COMMIT`, up to
   Linux's `XLOG_MAX_RECORD_BSIZE` (256 KiB); a transaction that would exceed
-  that is refused before anything is written. There is no reflink/refcount support
-  yet; multi-level inobt/finobt roots are fully edited, while the free-space
-  trees are only collapsed one leaf at a time.
+  that is refused before anything is written. Reflink/refcount/CoW are part of
+  the ordinary writable profile, including multi-level bmbt, inobt/finobt and
+  refcountbt roots; the free-space trees are only collapsed one leaf at a
+  time.
 - **Flush is real.** `FlushFileBuffers` failure is an error
   (`STATUS_IO_DEVICE_ERROR`), never success; unmount flushes before the mount
   point disappears.
@@ -493,8 +498,9 @@ Fixed, conservative profile that Linux mounts natively:
 - optional RW-6A profile (`--modern-inode-profile`, or the individual
   `--finobt`, `--inobtcount`, `--sparse-inodes`, `--bigtime`, `--nrext64`
   switches): finobt, inobtcount, sparse inode chunks, bigtime and NREXT64
-- optional `--rmapbt` enables reverse mapping with reflink off; reflink,
-  parent pointers and metadir remain off
+- optional `--rmapbt` enables reverse mapping; optional `--reflink` enables
+  the refcount btree. Both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` are
+  produced. Parent pointers and metadir remain off
 
 The formatter refuses devices that are too small for this profile (a 64 MiB
 log must fit inside one AG).

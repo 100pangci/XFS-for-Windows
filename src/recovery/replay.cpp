@@ -117,6 +117,9 @@ bool ClassifyMetadata(const uint8_t* buf, size_t len, MetaType* out) {
     case ondisk::kRmapCrcMagic:
       *out = {"rmapbt", ondisk::btree::kSLsn, ondisk::btree::kSCrc, true};
       return true;
+    case ondisk::kRefcountCrcMagic:
+      *out = {"refcountbt", ondisk::btree::kSLsn, ondisk::btree::kSCrc, true};
+      return true;
     case ondisk::kDir3BlockMagic:
     case ondisk::kDir3DataMagic:
     case ondisk::kDir3FreeMagic:
@@ -1136,6 +1139,8 @@ void Replayer::ReleaseIntent(const RecoveredItem& item) {
     want = lf::kItemEfi;
   } else if (item.type == lf::kItemRud) {
     want = lf::kItemRui;
+  } else if (item.type == lf::kItemCud) {
+    want = lf::kItemCui;
   }
   for (auto it = intents_.begin(); it != intents_.end(); ++it) {
     if (it->type != want) continue;

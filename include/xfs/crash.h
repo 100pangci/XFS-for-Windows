@@ -40,6 +40,21 @@ enum class CrashPoint {
   kAfterMetadataWrite,
   kBeforeDeviceFlush,
   kAfterDeviceFlush,
+  // Reflink/CoW (RW-6C): staging, data publication, remap, ownership changes,
+  // old-range release and intent completion.
+  kCowStaged,
+  kBeforeCowDataWrite,
+  kMidCowDataWrite,
+  kAfterCowDataWrite,
+  kBeforeCowRemapCommit,
+  kAfterCowRemap,
+  kAfterRefcountUpdate,
+  kAfterRmapUpdate,
+  kAfterBmapSwitch,
+  kBeforeOldRangeRelease,
+  kAfterOldRangeRelease,
+  kBeforeIntentDone,
+  kAfterIntentDone,
   // Journal recovery (RW-5): the scan, the replay passes, the deferred
   // completion phases and the final log-state transition.
   kRecoveryScan,

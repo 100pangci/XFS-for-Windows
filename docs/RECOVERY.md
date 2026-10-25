@@ -245,8 +245,10 @@ zero-link inodes on the lists), every AGI bucket is walked:
 | `XFS_LI_INODE` | yes | core + data/attr fork regions, fields mask; legacy and bigtime timestamps, NREXT64 counters |
 | `XFS_LI_ICREATE` | yes | cluster rebuild; full and sparse (`ialloc_min_blks`) chunk lengths |
 | `XFS_LI_EFI` / `XFS_LI_EFD` | yes | deferred extent free completion + done item |
-| `XFS_LI_BUI` / `XFS_LI_BUD` | replay only | a *surviving* BUI refuses (no bmap completion yet) |
-| `XFS_LI_RUI/RUD`, `CUI/CUD`, `ATTRI/ATTRD`, `DQUOT`, `QUOTAOFF`, `IUNLINK` | **refused** | rmap/reflink/attr/quota are outside the writable profile |
+| `XFS_LI_BUI` / `XFS_LI_BUD` | yes (RW-6C) | deferred data-fork map/unmap completion; one mapping per BUI |
+| `XFS_LI_RUI/RUD` | yes (RW-6B) | rmap intent completion, including surviving RUI |
+| `XFS_LI_CUI/CUD` | yes (RW-6C recovery-only) | refcount/CoW intent completion; see [REFLINK.md](REFLINK.md) |
+| `XFS_LI_ATTRI/ATTRD`, `DQUOT`, `QUOTAOFF`, `IUNLINK` | **refused** | attr/quota are outside the writable profile |
 
 The table is evidence-driven: the Linux dirty-log operation matrix (section 8)
 records which item types the supported operations actually produce
@@ -356,7 +358,9 @@ list, so the extension is deliberate and small:
 ## 11. Not in this milestone
 
 Not replayed and refused when encountered: external logs, realtime devices,
-reflink/refcount, rmap (including writable rmapbt), quota, attribute intents,
-ACL translation, parent pointers, metadir, zoned filesystems. The writable
-feature profile is still allow-listed; RW-6A only removed finobt, inobtcount,
-sparse inodes, bigtime and NREXT64 from the refusal list.
+quota, attribute intents, ACL translation, parent pointers, metadir, zoned
+filesystems. RUI/RUD, BUI/BUD and CUI/CUD have dedicated completion passes;
+CUI/CUD are accepted only on reflink filesystems and are completed by both the
+ordinary writable mount/recovery path and the standalone `recover` command. A
+reflink clone/CoW can log a BUI and CUI in the same transaction. The writable
+feature profile remains allow-listed.

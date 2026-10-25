@@ -9,8 +9,9 @@
 //                           -> re-read superblock -> finish intents
 //                           -> process AGI unlinked lists -> flush
 //   AnalyzeJournal()        the read-only variant for `xfswin check`
-//   CompleteIntent()        xfs_defer_finish_recovery for EFI: free the
-//                           extents in a normal transaction and log the EFD
+//   CompleteIntent()        xfs_defer_finish_recovery for EFI/RUI/BUI/CUI:
+//                           finish one deferred intent in a normal
+//                           transaction and log its done item
 //   ProcessAgiUnlinkedLists()  xlog_recover_process_iunlinks: walk every AGI
 //                           bucket, truncate and free zero-link inodes, clear
 //                           buckets that cannot be walked
@@ -34,12 +35,16 @@
 
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
+#include "xfs/bmap.h"
+#include "xfs/bmap_intent.h"
 #include "xfs/crash.h"
 #include "xfs/endian.h"
 #include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/refcount.h"
+#include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
 #include "xfs/transaction.h"
 
@@ -88,7 +93,10 @@ Result<XfsFilesystem::RecoverySummary> XfsFilesystem::AnalyzeJournal() const {
     // Unresolved intents the completion pass cannot finish are a refusal too:
     // the scan only proves the replay half can be done.
     for (const PendingIntent& intent : CollectPendingIntents(log)) {
-      if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui) continue;
+      if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
+          intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
+        continue;
+      }
       summary.unsupported_items.push_back(
           "unresolved intent " + IntentContext(intent) +
           " requires deferred completion this build does not implement");
@@ -168,7 +176,8 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
   }
   const std::vector<PendingIntent> intents = CollectPendingIntents(scan);
   for (const PendingIntent& intent : intents) {
-    if (intent.type != lf::kItemEfi && intent.type != lf::kItemRui) {
+    if (intent.type != lf::kItemEfi && intent.type != lf::kItemRui &&
+        intent.type != lf::kItemCui && intent.type != lf::kItemBui) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "cannot recover dirty log: unresolved intent " +
                          IntentContext(intent) +
@@ -290,6 +299,157 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
 // transaction and log the matching EFD so a later crash does not redo the
 // work (the done item releases the intent during recovery).
 Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
+  if (intent.type == lf::kItemBui) {
+    if (intent.regions.empty()) {
+      return XFS_ERR(XfsError::kCorruptBtree, "BUI item has no format region")
+          .Metadata("log");
+    }
+    auto parsed = ParseBmapIntent(intent.regions[0], geometry_);
+    if (!parsed.ok()) return parsed.error();
+    const BmapIntent bui = std::move(parsed.value());
+    return RunTransaction([&](XfsTransaction& txn) -> Status {
+      BlockAllocator blocks(&txn, device_.get(), &geometry_);
+      const BmapIntentExtent& e = bui.extents[0];
+      auto inode = OpenInode(e.owner);
+      if (!inode.ok()) return inode.error();
+      if (!inode.value().IsRegular()) {
+        return XFS_ERR(XfsError::kInvalidArgument,
+                       "BUI owner is not a regular file")
+            .Ino(e.owner)
+            .Metadata("BUI");
+      }
+      DataForkEditor editor(&txn, &blocks, device_.get(), &geometry_);
+      Status s = editor.Load(inode.value());
+      if (!s.ok()) return s;
+      const uint64_t endoff = e.startoff + e.len;
+      if (e.type() == BmapIntentType::kMap) {
+        XfsExtent mapping;
+        mapping.startoff = e.startoff;
+        mapping.startblock = e.startblock;
+        mapping.blockcount = e.len;
+        mapping.unwritten = e.unwritten();
+        s = editor.InsertExtent(mapping);
+        if (!s.ok()) return s;
+        editor.AddNblocks(static_cast<int64_t>(e.len));
+        if (geometry_.features.rmapbt) {
+          s = blocks.RmapMap(
+              e.startblock, e.len,
+              RmapOwner::Data(e.owner, e.startoff, e.unwritten()));
+          if (!s.ok()) return s;
+        }
+      } else {
+        // The BUI removes the file mapping; the corresponding EFI (if any)
+        // frees the physical blocks.  If the EFI was processed first it
+        // already removed the rmap owner, which is idempotent for this step.
+        if (geometry_.features.rmapbt) {
+          s = blocks.RmapUnmap(
+              e.startblock, e.len,
+              RmapOwner::Data(e.owner, e.startoff, e.unwritten()),
+              /*no_overlap_ok=*/true);
+          if (!s.ok()) return s;
+        }
+        s = editor.RemoveRange(e.startoff, endoff);
+        if (!s.ok()) return s;
+        editor.AddNblocks(-static_cast<int64_t>(e.len));
+      }
+      auto raw = ReadRawInode(e.owner);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = editor.Finalize(&image, &ilog_fields, &fork_region);
+      if (!s.ok()) return s;
+      s = LogPreparedInode(txn, e.owner, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+      MaybeCrash(CrashPoint::kBeforeIntentDone,
+                 "BUI id=" + std::to_string(bui.id));
+      std::vector<uint8_t> bud(16, 0);
+      StoreLE16(bud.data(), lf::kItemBud);
+      StoreLE16(bud.data() + 2, 1);
+      StoreLE64(bud.data() + lf::kIntentIdOffset, bui.id);
+      txn.AddLogOp(std::move(bud));
+      Status committed = blocks.Commit();
+      if (committed.ok()) {
+        MaybeCrash(CrashPoint::kAfterIntentDone,
+                   "BUI id=" + std::to_string(bui.id));
+      }
+      return committed;
+    });
+  }
+  if (intent.type == lf::kItemCui) {
+    if (!geometry_.features.reflink) {
+      return XFS_ERR(XfsError::kUnsupportedFeature,
+                     "CUI item on a filesystem without reflink")
+          .Metadata("log");
+    }
+    if (intent.regions.empty()) {
+      return XFS_ERR(XfsError::kCorruptBtree, "CUI item has no format region")
+          .Metadata("log");
+    }
+    auto parsed = ParseRefcountIntent(intent.regions[0], geometry_);
+    if (!parsed.ok()) return parsed.error();
+    const RefcountIntent cui = std::move(parsed.value());
+    return RunTransaction([&](XfsTransaction& txn) -> Status {
+      BlockAllocator blocks(&txn, device_.get(), &geometry_);
+      for (const RefcountIntentExtent& e : cui.extents) {
+        Status s = OkStatus();
+        switch (e.type()) {
+          case RefcountIntentType::kIncrease:
+            s = blocks.RefcountIncrease(e.startblock, e.len);
+            MaybeCrash(CrashPoint::kAfterRefcountUpdate,
+                       "CUI increase id=" + std::to_string(cui.id));
+            break;
+          case RefcountIntentType::kDecrease:
+            // A surviving decrease may free a range whose last reference is
+            // gone.  The owning rmap was removed by the original deferred
+            // bmap work, so use the EFI-style OWN_UNKNOWN wildcard.
+            s = blocks.RefcountDecrease(e.startblock, e.len,
+                                        /*unknown_owner=*/true);
+            MaybeCrash(CrashPoint::kAfterRefcountUpdate,
+                       "CUI decrease id=" + std::to_string(cui.id));
+            break;
+          case RefcountIntentType::kAllocCow:
+            // The original transaction also logged the OWN_COW rmap update;
+            // completion owns only the refcount half.
+            s = blocks.RefcountCowAlloc(e.startblock, e.len);
+            break;
+          case RefcountIntentType::kFreeCow:
+            s = blocks.RefcountCowFree(e.startblock, e.len);
+            break;
+          default:
+            return XFS_ERR(XfsError::kUnsupportedFeature,
+                           "unsupported CUI operation")
+                .Actual(e.flags)
+                .Metadata("CUI");
+        }
+        if (!s.ok()) return s;
+      }
+      // CUD must be in the same committed transaction as the refcountbt
+      // buffers. Add it before the allocator budget check.
+      MaybeCrash(CrashPoint::kBeforeIntentDone,
+                 "CUI id=" + std::to_string(cui.id));
+      std::vector<uint8_t> cud(16, 0);
+      StoreLE16(cud.data(), lf::kItemCud);
+      StoreLE16(cud.data() + 2, 1);
+      StoreLE64(cud.data() + lf::kIntentIdOffset, cui.id);
+      txn.AddLogOp(std::move(cud));
+      Status committed = blocks.Commit();
+      if (committed.ok()) {
+        MaybeCrash(CrashPoint::kAfterIntentDone,
+                   "CUI id=" + std::to_string(cui.id));
+        XFS_INFO("CUI completion: id="
+                 << cui.id << " extents=" << cui.extents.size()
+                 << " log_bytes=" << txn.log_bytes()
+                 << " serialized_log_bytes=" << txn.serialized_log_bytes()
+                 << " fits_256k="
+                 << (txn.serialized_log_bytes() <= lf::kMaxRecordBytes
+                         ? "yes"
+                         : "no"));
+      }
+      return committed;
+    });
+  }
   if (intent.type == lf::kItemRui) {
     if (intent.regions.empty()) {
       return XFS_ERR(XfsError::kCorruptBtree, "RUI item has no format region")
@@ -312,14 +472,17 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
         Status s = OkStatus();
         switch (op) {
           case lf::kRmapExtentMap:
+          case lf::kRmapExtentMapShared:
           case lf::kRmapExtentAlloc:
             s = blocks.RmapMap(e.startblock, e.len, owner);
             break;
           case lf::kRmapExtentUnmap:
+          case lf::kRmapExtentUnmapShared:
           case lf::kRmapExtentFree:
             s = blocks.RmapUnmap(e.startblock, e.len, owner);
             break;
           case lf::kRmapExtentConvert:
+          case lf::kRmapExtentConvertShared:
             // The intent records the new state; xfs_rmap_finish_one passes
             // !unwritten as the *old* state to xfs_rmap_convert.
             s = blocks.RmapConvert(e.startblock, e.len, owner,
@@ -410,6 +573,32 @@ Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
     txn.AddLogOp(std::move(efd));
     return blocks.Commit();
   });
+}
+
+Result<uint64_t> XfsFilesystem::RecoverCowStaging() {
+  if (!geometry_.features.reflink) return uint64_t{0};
+  uint64_t freed = 0;
+  for (uint32_t agno = 0; agno < geometry_.agcount; ++agno) {
+    // Read-only scan first; an unreadable tree refuses cleanup instead of
+    // leaving ambiguous staging ownership behind.
+    auto tree = LoadRefcountTree(*device_, geometry_, agno, 0);
+    if (!tree.ok()) return tree.error();
+    for (const RefcountRecord& rec : tree.value().records) {
+      if (!rec.cow()) continue;
+      const uint64_t fsb = geometry_.AgFsb(agno, rec.key.startblock);
+      Status s = RunTransaction([&](XfsTransaction& txn) -> Status {
+        BlockAllocator blocks(&txn, device_.get(), &geometry_);
+        Status released = blocks.ReleaseCowStaging(fsb, rec.blockcount);
+        if (!released.ok()) return released;
+        return blocks.Commit();
+      });
+      if (!s.ok()) return s.error();
+      ++freed;
+      XFS_INFO("recovered orphan CoW staging extent AG" << agno << " block "
+               << rec.key.startblock << " len " << rec.blockcount);
+    }
+  }
+  return freed;
 }
 
 Result<uint64_t> XfsFilesystem::ProcessAgiUnlinkedLists(

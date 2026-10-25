@@ -42,6 +42,7 @@
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/refcount_editor.h"
 
 namespace xfs {
 namespace {
@@ -222,6 +223,7 @@ struct AgState {
   uint32_t longest = 0;
   uint32_t orig_freeblks = 0, orig_flcount = 0, orig_btreeblks = 0;
   uint32_t rmap_root = 0, rmap_level = 0, rmap_blocks = 0;
+  uint32_t refcount_root = 0, refcount_level = 0, refcount_blocks = 0;
 
   std::vector<FreeRec> recs;  // sorted by start, disjoint
   std::unique_ptr<AllocTree> bno, cnt;
@@ -229,6 +231,7 @@ struct AgState {
   bool refilling = false;
   bool counted = false;
   bool rmap_loaded = false;
+  bool refcount_loaded = false;
 
   Status Load(Allocator* allocator, uint32_t agno_in);
   Status InsertRec(const FreeRec& rec);
@@ -274,12 +277,17 @@ class Allocator {
   int64_t fdblocks_delta() const { return fdblocks_delta_; }
 
   bool rmap_enabled() const { return geo_->features.rmapbt; }
+  bool reflink_enabled() const { return geo_->features.reflink; }
   bool rmap_editing() const { return rmap_editing_; }
   uint32_t RmapBlocks(uint32_t agno) const;
+  uint32_t RefcountBlocks(uint32_t agno) const;
+  uint32_t RefcountRoot(uint32_t agno) const;
+  uint32_t RefcountLevel(uint32_t agno) const;
   Status MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
                   const RmapOwner& owner);
   Status UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
-                    const RmapOwner& owner, bool unknown_owner);
+                    const RmapOwner& owner, bool unknown_owner,
+                    bool no_overlap_ok = false);
   Status ConvertOwnedRmap(uint32_t agno, uint32_t agbno, uint32_t len,
                           const RmapOwner& owner, bool old_unwritten);
   Status MapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
@@ -288,10 +296,26 @@ class Allocator {
                        uint64_t owner);
   Status AllocateRmapBlock(uint32_t agno, uint32_t* agbno);
   Status FreeRmapBlock(uint32_t agno, uint32_t agbno);
+  Status AllocateRefcountBlock(uint32_t agno, uint32_t* agbno);
+  Status FreeRefcountBlock(uint32_t agno, uint32_t agbno);
   Status ReserveForRmap(uint32_t agno);
   Status EnsureAgflInternal(uint32_t agno, uint32_t want);
   Status FreeBlocksInternal(uint64_t fsb, uint32_t len, const RmapOwner* owner,
                             bool unknown_owner);
+  Status FreeRaw(uint32_t agno, uint32_t agbno, uint32_t len);
+  Status ReleaseDataInternal(uint64_t fsb, uint32_t len,
+                             const RmapOwner& owner);
+  Status RefcountIncreaseInternal(uint32_t agno, uint32_t agbno, uint32_t len);
+  Status RefcountDecreaseInternal(uint32_t agno, uint32_t agbno, uint32_t len,
+                                  bool unmap_unknown, bool free_raw);
+  Status CowAllocInternal(uint32_t agno, uint32_t agbno, uint32_t len);
+  Status CowFreeInternal(uint32_t agno, uint32_t agbno, uint32_t len);
+  Status RefcountFreeCallback(uint32_t agno, uint32_t agbno, uint32_t len);
+  Status FreePendingRefcountBlocks();
+  Status LoadRefcount(uint32_t agno);
+  bool FindSharedExtent(uint64_t fsb, uint32_t len, RefcountRecord* out) const;
+  Status ListCowStaging(uint32_t agno,
+                        std::vector<RefcountRecord>* out) const;
 
  private:
   struct OutBuffer {
@@ -308,29 +332,55 @@ class Allocator {
   std::map<uint32_t, std::unique_ptr<AgState>> ags_;
   std::map<uint64_t, OutBuffer> buffers_;
   std::unique_ptr<RmapEditor> rmap_;
+  std::unique_ptr<RefcountEditor> refcount_;
   bool rmap_editing_ = false;
+  bool refcount_editing_ = false;
+  bool refcount_free_unknown_ = false;
   int64_t fdblocks_delta_ = 0;
+  std::map<uint32_t, std::vector<uint32_t>> pending_refcount_frees_;
 };
 
 Allocator::Allocator(XfsTransaction* txn, BlockDevice* device,
                      const XfsGeometry* geo)
     : txn_(txn), device_(device), geo_(geo) {
-  if (!geo_->features.rmapbt) return;
-  RmapEditor::Hooks hooks;
-  hooks.alloc_block = [this](uint32_t agno, uint32_t* agbno) {
-    return AllocateRmapBlock(agno, agbno);
-  };
-  hooks.free_block = [this](uint32_t agno, uint32_t agbno) {
-    return FreeRmapBlock(agno, agbno);
-  };
-  hooks.publish_block = [this](uint32_t agno, uint32_t agbno,
-                               const uint8_t* data, size_t len) {
-    std::vector<uint8_t> buffer(data, data + len);
-    const uint64_t offset = FsbToByte(geo_->AgFsb(agno, agbno));
-    return txn_->AddMetadataBuffer(offset, std::move(buffer), lf::kBlftBtree,
-                                   bt::kSLsn, bt::kSCrc, "rmapbt");
-  };
-  rmap_ = std::make_unique<RmapEditor>(device_, geo_, std::move(hooks));
+  if (geo_->features.rmapbt) {
+    RmapEditor::Hooks hooks;
+    hooks.alloc_block = [this](uint32_t agno, uint32_t* agbno) {
+      return AllocateRmapBlock(agno, agbno);
+    };
+    hooks.free_block = [this](uint32_t agno, uint32_t agbno) {
+      return FreeRmapBlock(agno, agbno);
+    };
+    hooks.publish_block = [this](uint32_t agno, uint32_t agbno,
+                                 const uint8_t* data, size_t len) {
+      std::vector<uint8_t> buffer(data, data + len);
+      const uint64_t offset = FsbToByte(geo_->AgFsb(agno, agbno));
+      return txn_->AddMetadataBuffer(offset, std::move(buffer), lf::kBlftBtree,
+                                     bt::kSLsn, bt::kSCrc, "rmapbt");
+    };
+    rmap_ = std::make_unique<RmapEditor>(device_, geo_, std::move(hooks));
+  }
+  if (geo_->features.reflink) {
+    RefcountEditor::Hooks hooks;
+    hooks.alloc_block = [this](uint32_t agno, uint32_t* agbno) {
+      return AllocateRefcountBlock(agno, agbno);
+    };
+    hooks.free_block = [this](uint32_t agno, uint32_t agbno) {
+      return FreeRefcountBlock(agno, agbno);
+    };
+    hooks.publish_block = [this](uint32_t agno, uint32_t agbno,
+                                 const uint8_t* data, size_t len) {
+      std::vector<uint8_t> buffer(data, data + len);
+      const uint64_t offset = FsbToByte(geo_->AgFsb(agno, agbno));
+      return txn_->AddMetadataBuffer(offset, std::move(buffer), lf::kBlftBtree,
+                                     bt::kSLsn, bt::kSCrc, "refcountbt");
+    };
+    hooks.free_extent = [this](uint32_t agno, uint32_t agbno, uint32_t len) {
+      return RefcountFreeCallback(agno, agbno, len);
+    };
+    refcount_ = std::make_unique<RefcountEditor>(device_, geo_,
+                                                 std::move(hooks));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1127,20 @@ Status AgState::Load(Allocator* allocator, uint32_t agno_in) {
           .Metadata("AGF");
     }
   }
+  refcount_root = GetBE32(af, agf::kRefcountRoot);
+  refcount_level = GetBE32(af, agf::kRefcountLevel);
+  refcount_blocks = GetBE32(af, agf::kRefcountBlocks);
+  if (geo->features.reflink) {
+    if (refcount_root == kNullAgBlock || !geo->AgbnoValid(agno, refcount_root) ||
+        refcount_level < 1 || refcount_level > bt::kMaxTraversalLevels ||
+        refcount_blocks == 0 || refcount_blocks > length) {
+      return XFS_ERR(XfsError::kCorruptAgHeader,
+                     "AGF refcount root/level/blocks is invalid")
+          .Ag(agno)
+          .Actual(refcount_root)
+          .Metadata("AGF");
+    }
+  }
 
   bno = std::make_unique<AllocTree>(owner, agno, TreeKind::kBno, "bnobt");
   cnt = std::make_unique<AllocTree>(owner, agno, TreeKind::kCnt, "cntbt");
@@ -1534,12 +1598,55 @@ Status Allocator::LoadAg(uint32_t agno, AgState** out) {
     }
     raw->rmap_loaded = true;
   }
+  if (reflink_enabled() && !raw->refcount_loaded) {
+    s = refcount_->Load(agno, raw->refcount_root, raw->refcount_level,
+                        raw->refcount_blocks);
+    if (!s.ok()) {
+      ags_.erase(agno);
+      return s;
+    }
+    raw->refcount_loaded = true;
+  }
   return OkStatus();
 }
 
 uint32_t Allocator::RmapBlocks(uint32_t agno) const {
   if (!rmap_) return 0;
   return rmap_->Blocks(agno);
+}
+
+uint32_t Allocator::RefcountBlocks(uint32_t agno) const {
+  if (!refcount_) return 0;
+  return refcount_->Blocks(agno);
+}
+
+uint32_t Allocator::RefcountRoot(uint32_t agno) const {
+  if (!refcount_) return kNullAgBlock;
+  return refcount_->Root(agno);
+}
+
+uint32_t Allocator::RefcountLevel(uint32_t agno) const {
+  if (!refcount_) return 0;
+  return refcount_->Level(agno);
+}
+
+Status Allocator::LoadRefcount(uint32_t agno) {
+  if (!reflink_enabled()) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "filesystem does not have reflink enabled")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  AgState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  if (!ag->refcount_loaded) {
+    s = refcount_->Load(agno, ag->refcount_root, ag->refcount_level,
+                        ag->refcount_blocks);
+    if (!s.ok()) return s;
+    ag->refcount_loaded = true;
+  }
+  return OkStatus();
 }
 
 Status Allocator::MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
@@ -1562,7 +1669,8 @@ Status Allocator::MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
 }
 
 Status Allocator::UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
-                             const RmapOwner& owner, bool unknown_owner) {
+                             const RmapOwner& owner, bool unknown_owner,
+                             bool no_overlap_ok) {
   if (!rmap_enabled()) return OkStatus();
   if (rmap_editing_) {
     return XFS_ERR(XfsError::kInternal,
@@ -1571,7 +1679,8 @@ Status Allocator::UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
         .Metadata("rmapbt");
   }
   rmap_editing_ = true;
-  Status s = rmap_->FreeExtent(agno, agbno, len, owner, unknown_owner);
+  Status s = rmap_->FreeExtent(agno, agbno, len, owner, unknown_owner,
+                                no_overlap_ok);
   rmap_editing_ = false;
   if (s.ok()) {
     auto it = ags_.find(agno);
@@ -1658,6 +1767,61 @@ Status Allocator::FreeRmapBlock(uint32_t agno, uint32_t agbno) {
         .Metadata("rmapbt");
   }
   return it->second->PutTreeBlock(agbno);
+}
+
+Status Allocator::AllocateRefcountBlock(uint32_t agno, uint32_t* agbno) {
+  auto it = ags_.find(agno);
+  if (it == ags_.end()) {
+    return XFS_ERR(XfsError::kInternal,
+                   "refcount tree block allocation before the AG is loaded")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  const RmapOwner owner = RmapOwner::Metadata(kRmapOwnerRefc);
+  Allocation allocation;
+  Status s = it->second->AllocateBestFit(1, &owner, &allocation);
+  if (!s.ok()) return s;
+  if (allocation.len != 1) {
+    return XFS_ERR(XfsError::kInternal,
+                   "refcount block allocation returned more than one block")
+        .Ag(agno)
+        .Actual(allocation.len)
+        .Metadata("refcountbt");
+  }
+  *agbno = static_cast<uint32_t>(allocation.fsb &
+                                 ((1ULL << geo_->agblklog) - 1));
+  ags_[agno]->agf_dirty = true;
+  return OkStatus();
+}
+
+Status Allocator::FreeRefcountBlock(uint32_t agno, uint32_t agbno) {
+  if (ags_.count(agno) == 0) {
+    return XFS_ERR(XfsError::kInternal,
+                   "refcount tree block free before the AG is loaded")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  pending_refcount_frees_[agno].push_back(agbno);
+  ags_[agno]->agf_dirty = true;
+  return OkStatus();
+}
+
+Status Allocator::FreePendingRefcountBlocks() {
+  for (auto& entry : pending_refcount_frees_) {
+    const uint32_t agno = entry.first;
+    std::vector<uint32_t> blocks = std::move(entry.second);
+    entry.second.clear();
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+    for (uint32_t agbno : blocks) {
+      const uint64_t fsb = geo_->AgFsb(agno, agbno);
+      const RmapOwner owner = RmapOwner::Metadata(kRmapOwnerRefc);
+      Status s = FreeBlocksInternal(fsb, 1, &owner, false);
+      if (!s.ok()) return s;
+    }
+  }
+  pending_refcount_frees_.clear();
+  return OkStatus();
 }
 
 Status Allocator::EnsureAgflInternal(uint32_t agno, uint32_t want) {
@@ -1779,6 +1943,223 @@ Status Allocator::FreeBlocksInternal(uint64_t fsb, uint32_t len,
   return OkStatus();
 }
 
+Status Allocator::FreeRaw(uint32_t agno, uint32_t agbno, uint32_t len) {
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot free zero blocks")
+        .Ag(agno)
+        .Metadata("allocator");
+  }
+  if (static_cast<uint64_t>(agbno) + len > geo_->AgBlocksFor(agno)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "free range is not inside one AG")
+        .Ag(agno)
+        .Actual(len)
+        .Metadata("allocator");
+  }
+  AgState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  for (const FreeRec& r : ag->recs) {
+    if (agbno < r.start + r.len && r.start < agbno + len) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "freeing blocks that are already free")
+          .Ag(agno)
+          .Actual(agbno)
+          .Metadata("free space");
+    }
+  }
+  FreeRec left;
+  bool have_left = false;
+  FreeRec right;
+  bool have_right = false;
+  for (const FreeRec& r : ag->recs) {
+    if (r.start + r.len == agbno) {
+      left = r;
+      have_left = true;
+    }
+    if (r.start == agbno + len) {
+      right = r;
+      have_right = true;
+    }
+  }
+  if (have_left && have_right) {
+    s = ag->RemoveRec(left);
+    if (!s.ok()) return s;
+    s = ag->RemoveRec(right);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{left.start, left.len + len + right.len});
+  } else if (have_left) {
+    s = ag->RemoveRec(left);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{left.start, left.len + len});
+  } else if (have_right) {
+    s = ag->RemoveRec(right);
+    if (!s.ok()) return s;
+    s = ag->InsertRec(FreeRec{agbno, len + right.len});
+  } else {
+    s = ag->InsertRec(FreeRec{agbno, len});
+  }
+  if (!s.ok()) return s;
+  ag->freeblks += len;
+  ag->RecomputeLongest();
+  ag->agf_dirty = true;
+  return OkStatus();
+}
+
+Status Allocator::RefcountFreeCallback(uint32_t agno, uint32_t agbno,
+                                       uint32_t len) {
+  if (refcount_free_unknown_) {
+    const uint64_t fsb = geo_->AgFsb(agno, agbno);
+    return FreeBlocksInternal(fsb, len, nullptr, true);
+  }
+  return FreeRaw(agno, agbno, len);
+}
+
+Status Allocator::RefcountIncreaseInternal(uint32_t agno, uint32_t agbno,
+                                           uint32_t len) {
+  if (!reflink_enabled()) return OkStatus();
+  Status s = LoadRefcount(agno);
+  if (!s.ok()) return s;
+  if (refcount_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive refcount ownership update")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  refcount_editing_ = true;
+  s = refcount_->Increase(agno, agbno, len);
+  refcount_editing_ = false;
+  return s;
+}
+
+Status Allocator::RefcountDecreaseInternal(uint32_t agno, uint32_t agbno,
+                                           uint32_t len, bool unmap_unknown,
+                                           bool free_raw) {
+  if (!reflink_enabled()) {
+    return free_raw ? FreeRaw(agno, agbno, len) : OkStatus();
+  }
+  Status s = LoadRefcount(agno);
+  if (!s.ok()) return s;
+  if (refcount_editing_) {
+    return XFS_ERR(XfsError::kInternal,
+                   "recursive refcount ownership update")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  // The range may span several AGs?  Callers always pass one-AG ranges.
+  refcount_editing_ = true;
+  refcount_free_unknown_ = unmap_unknown;
+  s = refcount_->Decrease(agno, agbno, len);
+  refcount_free_unknown_ = false;
+  refcount_editing_ = false;
+  if (!s.ok()) return s;
+  (void)free_raw;
+  return OkStatus();
+}
+
+Status Allocator::CowAllocInternal(uint32_t agno, uint32_t agbno,
+                                   uint32_t len) {
+  if (!reflink_enabled()) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "CoW staging requires reflink")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  Status s = LoadRefcount(agno);
+  if (!s.ok()) return s;
+  if (refcount_editing_) {
+    return XFS_ERR(XfsError::kInternal, "recursive CoW refcount update")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  refcount_editing_ = true;
+  s = refcount_->CowAlloc(agno, agbno, len);
+  refcount_editing_ = false;
+  return s;
+}
+
+Status Allocator::CowFreeInternal(uint32_t agno, uint32_t agbno,
+                                  uint32_t len) {
+  if (!reflink_enabled()) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "CoW staging requires reflink")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  Status s = LoadRefcount(agno);
+  if (!s.ok()) return s;
+  if (refcount_editing_) {
+    return XFS_ERR(XfsError::kInternal, "recursive CoW refcount update")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  refcount_editing_ = true;
+  s = refcount_->CowFree(agno, agbno, len);
+  refcount_editing_ = false;
+  return s;
+}
+
+Status Allocator::ReleaseDataInternal(uint64_t fsb, uint32_t len,
+                                      const RmapOwner& owner) {
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot release zero blocks")
+        .Fsb(fsb)
+        .Metadata("refcountbt");
+  }
+  if (!geo_->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "release range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo_->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo_->agblklog) - 1));
+  AgState* ag = nullptr;
+  Status s = LoadAg(agno, &ag);
+  if (!s.ok()) return s;
+  if (rmap_enabled()) {
+    s = ReserveForRmap(agno);
+    if (!s.ok()) return s;
+    s = UnmapOwned(agno, agbno, len, owner, false);
+    if (!s.ok()) return s;
+  }
+  if (!reflink_enabled()) {
+    return FreeRaw(agno, agbno, len);
+  }
+  // The refcount callback frees ranges whose last reference disappeared.
+  return RefcountDecreaseInternal(agno, agbno, len, false, true);
+}
+
+bool Allocator::FindSharedExtent(uint64_t fsb, uint32_t len,
+                                 RefcountRecord* out) const {
+  if (!reflink_enabled()) return false;
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo_->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo_->agblklog) - 1));
+  auto it = ags_.find(agno);
+  if (it == ags_.end() || !it->second->refcount_loaded) return false;
+  return refcount_->FindShared(agno, agbno, len, out);
+}
+
+Status Allocator::ListCowStaging(uint32_t agno,
+                                 std::vector<RefcountRecord>* out) const {
+  out->clear();
+  if (!reflink_enabled()) return OkStatus();
+  auto it = ags_.find(agno);
+  if (it == ags_.end() || !it->second->refcount_loaded) {
+    return XFS_ERR(XfsError::kInternal,
+                   "refcount AG is not loaded for CoW recovery")
+        .Ag(agno)
+        .Metadata("refcountbt");
+  }
+  for (const RefcountRecord& rec : refcount_->Records(agno)) {
+    if (rec.cow()) out->push_back(rec);
+  }
+  return OkStatus();
+}
+
 Status Allocator::AddBuffer(uint64_t offset, std::vector<uint8_t> data,
                             uint16_t type, size_t lsn_offset,
                             size_t crc_offset, const char* what) {
@@ -1804,6 +2185,16 @@ Status Allocator::Commit() {
   // merges/returns, but never rebuilds either tree.
   for (auto& entry : ags_) {
     Status s = entry.second->DrainDeferredTreeBlocks();
+    if (!s.ok()) return s;
+  }
+  // Refcountbt blocks freed by the editor are queued: free them only now, so
+  // a subsequent tree split in the same transaction cannot reuse a block that
+  // the editor still holds.  This edits the free trees and rmap.
+  Status pending = FreePendingRefcountBlocks();
+  if (!pending.ok()) return pending;
+  if (refcount_) {
+    // Publish refcount blocks before the AGF that points at their new root.
+    Status s = refcount_->Commit();
     if (!s.ok()) return s;
   }
   if (rmap_) {
@@ -1840,6 +2231,13 @@ Status Allocator::Commit() {
         PutBE32(af, agf::kRmapRoot, rmap_->Root(ag.agno));
         PutBE32(af, agf::kRmapLevel, rmap_->Level(ag.agno));
         PutBE32(af, agf::kRmapBlocks, blocks);
+      }
+      if (reflink_enabled()) {
+        // agf_btreeblks deliberately excludes refcountbt (xfs_ag.c); the
+        // refcount tree has its own block counter.
+        PutBE32(af, agf::kRefcountRoot, refcount_->Root(ag.agno));
+        PutBE32(af, agf::kRefcountLevel, refcount_->Level(ag.agno));
+        PutBE32(af, agf::kRefcountBlocks, refcount_->Blocks(ag.agno));
       }
       PutBE32(af, agf::kBtreeblks, btreeblks);
       PutBE32(af, agf::kBnoRoot, ag.bno->root());
@@ -2134,6 +2532,202 @@ Status BlockAllocator::FreeUnknown(uint64_t fsb, uint32_t len) {
   return impl_->alloc->FreeBlocksInternal(fsb, len, nullptr, true);
 }
 
+Status BlockAllocator::ReleaseData(uint64_t fsb, uint32_t len,
+                                   const RmapOwner& owner) {
+  return impl_->alloc->ReleaseDataInternal(fsb, len, owner);
+}
+
+Status BlockAllocator::AllocateCowStaging(uint32_t preferred_agno,
+                                          uint32_t len, Allocation* out) {
+  if (len == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
+        .Metadata("allocator");
+  }
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->features.reflink) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "CoW staging requires reflink")
+        .Metadata("refcountbt");
+  }
+  if (preferred_agno >= geo->agcount) preferred_agno = 0;
+  for (uint32_t i = 0; i < geo->agcount; ++i) {
+    const uint32_t agno = (preferred_agno + i) % geo->agcount;
+    Status s = impl_->alloc->ReserveForRmap(agno);
+    if (!s.ok()) {
+      if (s.error().code == XfsError::kNoSpace) continue;
+      return s;
+    }
+    AgState* ag = nullptr;
+    s = impl_->alloc->LoadAg(agno, &ag);
+    if (!s.ok()) return s;
+    const RmapOwner owner = RmapOwner::Metadata(kRmapOwnerCow);
+    s = ag->AllocateBestFit(len, &owner, out);
+    if (!s.ok()) {
+      if (s.error().code == XfsError::kNoSpace) continue;
+      return s;
+    }
+    const uint32_t agbno =
+        static_cast<uint32_t>(out->fsb & ((1ULL << geo->agblklog) - 1));
+    s = impl_->alloc->CowAllocInternal(agno, agbno, out->len);
+    if (!s.ok()) return s;
+    return OkStatus();
+  }
+  return XFS_ERR(XfsError::kNoSpace, "no AG has a free extent that large")
+      .Metadata("allocator")
+      .Actual(len);
+}
+
+Status BlockAllocator::CommitCowStaging(uint64_t fsb, uint32_t len,
+                                        const RmapOwner& final_owner) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->features.reflink) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "CoW staging requires reflink")
+        .Fsb(fsb)
+        .Metadata("refcountbt");
+  }
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "CoW staging range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->CowFreeInternal(agno, agbno, len);
+  if (!s.ok()) return s;
+  if (impl_->alloc->rmap_enabled()) {
+    s = impl_->alloc->UnmapOwned(
+        agno, agbno, len, RmapOwner::Metadata(kRmapOwnerCow), false);
+    if (!s.ok()) return s;
+    s = impl_->alloc->MapOwned(agno, agbno, len, final_owner);
+    if (!s.ok()) return s;
+  }
+  return OkStatus();
+}
+
+Status BlockAllocator::ReleaseCowStaging(uint64_t fsb, uint32_t len) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->features.reflink) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "CoW staging requires reflink")
+        .Fsb(fsb)
+        .Metadata("refcountbt");
+  }
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "CoW staging range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->CowFreeInternal(agno, agbno, len);
+  if (!s.ok()) return s;
+  if (impl_->alloc->rmap_enabled()) {
+    s = impl_->alloc->UnmapOwned(
+        agno, agbno, len, RmapOwner::Metadata(kRmapOwnerCow), false);
+    if (!s.ok()) return s;
+  }
+  return impl_->alloc->FreeRaw(agno, agbno, len);
+}
+
+Status BlockAllocator::RefcountIncrease(uint64_t fsb, uint32_t len) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "refcount increase range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  return impl_->alloc->RefcountIncreaseInternal(agno, agbno, len);
+}
+
+Status BlockAllocator::RefcountDecrease(uint64_t fsb, uint32_t len,
+                                        bool unknown_owner) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "refcount decrease range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  return impl_->alloc->RefcountDecreaseInternal(agno, agbno, len,
+                                                unknown_owner, true);
+}
+
+Status BlockAllocator::RefcountCowAlloc(uint64_t fsb, uint32_t len) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "CoW refcount range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  return impl_->alloc->CowAllocInternal(agno, agbno, len);
+}
+
+Status BlockAllocator::RefcountCowFree(uint64_t fsb, uint32_t len) {
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "CoW refcount range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  return impl_->alloc->CowFreeInternal(agno, agbno, len);
+}
+
+Status BlockAllocator::FindShared(uint64_t fsb, uint32_t len,
+                                  RefcountRecord* out, bool* found) {
+  *found = false;
+  const XfsGeometry* geo = impl_->alloc->geo();
+  if (!geo->features.reflink) return OkStatus();
+  if (!geo->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "shared query range is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata("refcountbt");
+  }
+  const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
+  const uint32_t agbno =
+      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
+  Status s = impl_->alloc->LoadRefcount(agno);
+  if (!s.ok()) return s;
+  *found = impl_->alloc->FindSharedExtent(fsb, len, out);
+  return OkStatus();
+}
+
+Status BlockAllocator::LoadRefcountAg(uint32_t agno) {
+  return impl_->alloc->LoadRefcount(agno);
+}
+
+Status BlockAllocator::ListCowStaging(uint32_t agno,
+                                      std::vector<RefcountRecord>* out) {
+  return impl_->alloc->ListCowStaging(agno, out);
+}
+
 Status BlockAllocator::ConvertOwned(uint64_t fsb, uint32_t len,
                                     const RmapOwner& owner,
                                     bool old_unwritten) {
@@ -2183,7 +2777,8 @@ Status BlockAllocator::RmapMap(uint64_t fsb, uint32_t len,
 }
 
 Status BlockAllocator::RmapUnmap(uint64_t fsb, uint32_t len,
-                                 const RmapOwner& owner) {
+                                 const RmapOwner& owner,
+                                 bool no_overlap_ok) {
   if (!impl_->alloc->rmap_enabled()) return OkStatus();
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->FsbRangeValid(fsb, len)) {
@@ -2202,7 +2797,8 @@ Status BlockAllocator::RmapUnmap(uint64_t fsb, uint32_t len,
   s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
   (void)ag;
-  return impl_->alloc->UnmapOwned(agno, agbno, len, owner, false);
+  return impl_->alloc->UnmapOwned(agno, agbno, len, owner, false,
+                                  no_overlap_ok);
 }
 
 Status BlockAllocator::RmapConvert(uint64_t fsb, uint32_t len,

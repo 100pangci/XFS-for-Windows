@@ -85,6 +85,11 @@ void BuildAgfImage(const FormatGeometry& geo, const FormatGeometry::AgState& ag,
     PutBE32(p, agf::kRmapLevel, 1);
     PutBE32(p, agf::kRmapBlocks, 1);
   }
+  if (geo.reflink) {
+    PutBE32(p, agf::kRefcountRoot, geo.refcount_block);
+    PutBE32(p, agf::kRefcountLevel, 1);
+    PutBE32(p, agf::kRefcountBlocks, 1);
+  }
   std::memcpy(p + agf::kUuid, geo.meta_uuid.data(), 16);
   PutBE64(p, agf::kLsn, 0);
   UpdateXfsChecksum(p, geo.sector_size, agf::kCrc);
@@ -220,6 +225,9 @@ void BuildRmapRoot(const FormatGeometry& geo,
   records.push_back({geo.ibt_block, 1, kRmapOwnerInobt});
   if (geo.finobt) records.push_back({geo.fibt_block, 1, kRmapOwnerInobt});
   if (geo.rmapbt) records.push_back({geo.rmap_block, 1, kRmapOwnerAg});
+  if (geo.reflink) {
+    records.push_back({geo.refcount_block, 1, kRmapOwnerRefc});
+  }
 
   // Active AGFL entries are owned by OWN_AG.  The formatter fills them from
   // the start of free space, so they are contiguous; group anyway.
@@ -284,6 +292,15 @@ void BuildRmapRoot(const FormatGeometry& geo,
     // this limit.
     buf->assign(geo.block_size, 0);
   }
+  FinishBtreeCrc(geo, buf);
+}
+
+void BuildRefcountRoot(const FormatGeometry& geo,
+                       const FormatGeometry::AgState& ag,
+                       std::vector<uint8_t>* buf) {
+  buf->assign(geo.block_size, 0);
+  InitBtreeHeader(geo, buf, ondisk::kRefcountCrcMagic, 0, ag.agno,
+                  geo.refcount_block);
   FinishBtreeCrc(geo, buf);
 }
 

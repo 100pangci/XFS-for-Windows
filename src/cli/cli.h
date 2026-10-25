@@ -28,10 +28,13 @@ struct Options {
   bool nrext64 = false;
   // RW-6B formatter/test profile: rmapbt=1, reflink=0.
   bool rmapbt = false;
-  // Hidden qualification override: permits ordinary mutation of a
-  // rmapbt=1,reflink=0 image before the writable gate is opened. Never set by
-  // `--rw-experimental` alone; the RW-6B acceptance jobs use it explicitly.
+  // RW-6C formatter/test profile: reflink=1 with independent rmapbt choice.
+  bool reflink = false;
+  // Legacy hidden qualification overrides.  Both feature sets are part of the
+  // ordinary writable profile now; the flags are parsed and ignored so older
+  // scripts keep working.
   bool rmapbt_qualification = false;
+  bool reflink_qualification = false;
 };
 
 // Runs the CLI. argv excludes the program name.

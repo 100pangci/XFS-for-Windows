@@ -97,6 +97,14 @@ bool Mergeable(const RmapRecord& rec, uint64_t owner, uint32_t flags) {
   return (rec.key.flags & mask) == (flags & mask);
 }
 
+// Reflink allows ordinary written data-fork records to overlap physically.
+// Metadata, bmbt, attr and unwritten records must remain single-owner.
+bool SharingCapable(const RmapRecord& rec) {
+  if (RmapNonInodeOwner(rec.key.owner)) return false;
+  const uint32_t mask = kRmapAttrFork | kRmapBmbtBlock | kRmapUnwritten;
+  return (rec.key.flags & mask) == 0;
+}
+
 bool LogicalAdjacent(const RmapRecord& rec, uint64_t owner, uint32_t flags,
                      uint64_t offset, uint32_t len, bool left) {
   if (IgnoreOffset(owner, flags)) return true;
@@ -279,18 +287,18 @@ class RmapEditor::Impl {
           .Actual(rec.key.startblock)
           .Metadata("rmapbt");
     }
-    if (pos > 0 && ag->records[pos - 1].EndBlock() > rec.key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap insert overlaps previous")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
-    }
-    if (pos < ag->records.size() &&
-        rec.EndBlock() > ag->records[pos].key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap insert overlaps next")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    for (const RmapRecord& other : ag->records) {
+      if (other.key.Compare(rec.key) == 0) continue;
+      if (other.key.startblock < rec.EndBlock() &&
+          rec.key.startblock < other.EndBlock()) {
+        if (!SharingCapable(rec) || !SharingCapable(other)) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "rmap insert overlaps an existing record")
+              .Ag(agno)
+              .Actual(rec.key.startblock)
+              .Metadata("rmapbt");
+        }
+      }
     }
     s = TreeInsert(*ag, rec);
     if (!s.ok()) return s;
@@ -362,17 +370,24 @@ class RmapEditor::Impl {
     const RmapRecord* left = pos > 0 ? &ag->records[pos - 1] : nullptr;
     const RmapRecord* right =
         pos < ag->records.size() ? &ag->records[pos] : nullptr;
-    if (left != nullptr && left->EndBlock() > rec.key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap map overlaps left record")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    bool overlaps = false;
+    for (const RmapRecord& other : ag->records) {
+      if (other.key.startblock < rec.EndBlock() &&
+          rec.key.startblock < other.EndBlock()) {
+        if (!SharingCapable(rec) || !SharingCapable(other)) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "rmap map overlaps an existing record")
+              .Ag(agno)
+              .Actual(rec.key.startblock)
+              .Metadata("rmapbt");
+        }
+        overlaps = true;
+      }
     }
-    if (right != nullptr && rec.EndBlock() > right->key.startblock) {
-      return XFS_ERR(XfsError::kCorruptBtree, "rmap map overlaps right record")
-          .Ag(agno)
-          .Actual(rec.key.startblock)
-          .Metadata("rmapbt");
+    if (overlaps) {
+      // Shared written data never merges with an overlapping record; insert
+      // the additional owner reference as an isolated record.
+      return InsertExact(agno, rec);
     }
 
     const bool have_left =
@@ -438,7 +453,7 @@ class RmapEditor::Impl {
   }
 
   Status UnmapExtent(uint32_t agno, const RmapKey& key, uint32_t len,
-                     bool unknown_owner) {
+                     bool unknown_owner, bool no_overlap_ok) {
     Ag* ag = FindAg(agno);
     if (ag == nullptr) return AgMissingStatus(agno);
     if (len == 0) {
@@ -495,7 +510,9 @@ class RmapEditor::Impl {
           break;
         }
       }
-      if (unknown_owner && !overlap) return OkStatus();
+      if ((unknown_owner || no_overlap_ok) && !overlap) {
+        return OkStatus();
+      }
       return XFS_ERR(XfsError::kCorruptBtree,
                      unknown_owner ? "OWN_UNKNOWN unmap partially overlaps "
                                      "an existing rmap record"
@@ -641,7 +658,7 @@ class RmapEditor::Impl {
     RmapKey key;
     key.startblock = startblock;
     key.owner = owner;
-    return UnmapExtent(agno, key, len, false);
+    return UnmapExtent(agno, key, len, false, false);
   }
 
   Status AllocateExtent(uint32_t agno, uint32_t startblock, uint32_t len,
@@ -656,13 +673,14 @@ class RmapEditor::Impl {
   }
 
   Status FreeExtent(uint32_t agno, uint32_t startblock, uint32_t len,
-                    const RmapOwner& owner, bool unknown_owner) {
+                    const RmapOwner& owner, bool unknown_owner,
+                    bool no_overlap_ok) {
     RmapKey key;
     key.startblock = startblock;
     key.owner = unknown_owner ? kRmapOwnerUnknown : owner.owner;
     key.offset = owner.offset;
     key.flags = owner.flags;
-    return UnmapExtent(agno, key, len, unknown_owner);
+    return UnmapExtent(agno, key, len, unknown_owner, no_overlap_ok);
   }
 
   Status Convert(uint32_t agno, uint32_t startblock, uint32_t len,
@@ -1692,8 +1710,8 @@ Status RmapEditor::MapExtent(uint32_t agno, const RmapRecord& rec) {
   return impl_->MapExtent(agno, rec);
 }
 Status RmapEditor::UnmapExtent(uint32_t agno, const RmapKey& key, uint32_t len,
-                               bool unknown_owner) {
-  return impl_->UnmapExtent(agno, key, len, unknown_owner);
+                               bool unknown_owner, bool no_overlap_ok) {
+  return impl_->UnmapExtent(agno, key, len, unknown_owner, no_overlap_ok);
 }
 Status RmapEditor::ConvertExtent(uint32_t agno, const RmapKey& key,
                                  uint32_t len, bool old_unwritten) {
@@ -1712,8 +1730,10 @@ Status RmapEditor::AllocateExtent(uint32_t agno, uint32_t startblock,
   return impl_->AllocateExtent(agno, startblock, len, owner);
 }
 Status RmapEditor::FreeExtent(uint32_t agno, uint32_t startblock, uint32_t len,
-                              const RmapOwner& owner, bool unknown_owner) {
-  return impl_->FreeExtent(agno, startblock, len, owner, unknown_owner);
+                              const RmapOwner& owner, bool unknown_owner,
+                              bool no_overlap_ok) {
+  return impl_->FreeExtent(agno, startblock, len, owner, unknown_owner,
+                           no_overlap_ok);
 }
 Status RmapEditor::Convert(uint32_t agno, uint32_t startblock, uint32_t len,
                            const RmapOwner& owner, bool old_unwritten) {

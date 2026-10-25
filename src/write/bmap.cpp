@@ -595,7 +595,7 @@ Status DataForkEditor::RemoveRange(uint64_t first_block, uint64_t end_block) {
       const uint64_t fsb = old.startblock + (overlap_start - old.startoff);
       const uint32_t count =
           static_cast<uint32_t>(overlap_end - overlap_start);
-      Status s = alloc_->FreeOwned(
+      Status s = alloc_->ReleaseData(
           fsb, count, RmapOwner::Data(ino_, overlap_start, old.unwritten));
       if (!s.ok()) return s;
       nblocks_delta_ -= static_cast<int64_t>(count);
@@ -657,6 +657,46 @@ void DataForkEditor::FixKeysUpward(const std::vector<Frame>& path,
   }
 }
 
+// xfs_btree_rshift(): make room by moving the last entry of `node` to the
+// front of its right sibling.  Refuse when the insertion slot itself would be
+// moved; the caller then tries the left sibling and finally a split.
+bool DataForkEditor::ShiftForInsertRight(const std::vector<Frame>& path,
+                                         Node* node, size_t* pos) {
+  if (path.empty()) return false;
+  const Frame& frame = path.back();
+  Node& parent = *frame.node;
+  const size_t idx = frame.index;
+  const uint16_t pn = NodeNumRecs(parent);
+  const uint16_t n = NodeNumRecs(*node);
+  if (idx + 1 >= pn || n < 2 || *pos + 1 >= n) return false;
+  Node* right = FindNode(NodePtr(parent, idx + 1));
+  if (right == nullptr || NodeNumRecs(*right) >= NodeMaxRecs(*right)) {
+    return false;
+  }
+  BorrowLast(*node, *right);
+  SetNodeKey(parent, idx + 1, FirstKey(*right));
+  return true;
+}
+
+// xfs_btree_lshift(): make room by moving the first entry of `node` to the
+// end of its left sibling and updating the parent key for `node`.
+bool DataForkEditor::ShiftForInsertLeft(const std::vector<Frame>& path,
+                                        Node* node, size_t* pos) {
+  if (path.empty()) return false;
+  const Frame& frame = path.back();
+  Node& parent = *frame.node;
+  const size_t idx = frame.index;
+  if (idx == 0 || *pos == 0) return false;
+  Node* left = FindNode(NodePtr(parent, idx - 1));
+  if (left == nullptr || NodeNumRecs(*left) >= NodeMaxRecs(*left)) {
+    return false;
+  }
+  BorrowFirst(*node, *left);
+  FixKeysUpward(path, *node);
+  --*pos;
+  return true;
+}
+
 Status DataForkEditor::TreeInsert(const XfsExtent& rec) {
   std::vector<Frame> path;
   Node* cur = &root_;
@@ -672,10 +712,9 @@ Status DataForkEditor::TreeInsert(const XfsExtent& rec) {
     }
     cur = child;
   }
-  const uint16_t n = NodeNumRecs(*cur);
+  uint16_t n = NodeNumRecs(*cur);
   size_t pos = 0;
   while (pos < n && NodeLeafRec(*cur, pos).startoff < rec.startoff) ++pos;
-  const bool at_front = pos == 0;
 
   uint64_t child_fsb = 0;
   XfsExtent child_key;
@@ -687,6 +726,19 @@ Status DataForkEditor::TreeInsert(const XfsExtent& rec) {
         .Ino(ino_)
         .Metadata("bmbt");
   }
+  if (n >= NodeMaxRecs(*cur)) {
+    // xfs_btree_make_block_unfull(): shift into a sibling first.  A split
+    // changes the block count and the on-disk tree shape, so matching the
+    // kernel's shift-before-split order is also required for byte-exact
+    // reflink recovery.
+    if (!ShiftForInsertRight(path, cur, &pos)) {
+      ShiftForInsertLeft(path, cur, &pos);
+    }
+    n = NodeNumRecs(*cur);
+    pos = 0;
+    while (pos < n && NodeLeafRec(*cur, pos).startoff < rec.startoff) ++pos;
+  }
+  const bool at_front = pos == 0;
   if (n < NodeMaxRecs(*cur)) {
     for (size_t i = n; i > pos; --i) {
       SetNodeLeafRec(*cur, i, NodeLeafRec(*cur, i - 1));
@@ -720,8 +772,14 @@ Status DataForkEditor::TreeInsert(const XfsExtent& rec) {
     path.pop_back();
     Node& parent = *frame.node;
     const uint16_t level = NodeLevel(parent);
-    const uint16_t pn = NodeNumRecs(parent);
-    const size_t insert_pos = frame.index + 1;
+    uint16_t pn = NodeNumRecs(parent);
+    size_t insert_pos = frame.index + 1;
+    if (pn >= NodeMaxRecs(parent)) {
+      if (!ShiftForInsertRight(path, &parent, &insert_pos)) {
+        ShiftForInsertLeft(path, &parent, &insert_pos);
+      }
+      pn = NodeNumRecs(parent);
+    }
     if (pn < NodeMaxRecs(parent)) {
       for (size_t i = pn; i > insert_pos; --i) {
         SetNodeKey(parent, i, NodeKey(parent, i - 1));
@@ -756,8 +814,9 @@ Status DataForkEditor::TreeInsert(const XfsExtent& rec) {
     }
     uint64_t right_fsb = 0;
     XfsExtent right_key;
-    Status s = SplitNode(parent, node_entries, &right_fsb, &right_key);
-    if (!s.ok()) return s;
+    Status split_status =
+        SplitNode(parent, node_entries, &right_fsb, &right_key);
+    if (!split_status.ok()) return split_status;
     child_fsb = right_fsb;
     child_key = right_key;
   }

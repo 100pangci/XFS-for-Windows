@@ -30,6 +30,7 @@
 #include "xfs/inode.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/refcount.h"
 #include "xfs/rmap.h"
 #include "xfs/superblock.h"
 #include "xfs/win_name_map.h"
@@ -56,6 +57,9 @@ void PrintUsage() {
       "  info <device|image>           show superblock and geometry\n"
       "  check <device|image>          read-only consistency validation\n"
       "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
+      "  refcount <device|image> [--ag=N]  typed refcountbt records\n"
+      "  reflink <image> <src> <dst> <off> <len>  shared-extent clone\n"
+      "      --rw-experimental        (len 0 clones to source EOF)\n"
       "  recover <image>               replay the journal (RW-5)\n"
       "      --yes-i-really-mean-it    required: recovery writes metadata\n"
       "  journal <device|image>        dump the internal log structure\n"
@@ -95,7 +99,10 @@ void PrintUsage() {
       "                                inodes + bigtime + NREXT64\n"
       "      [--finobt] [--inobtcount] [--sparse-inodes] [--bigtime]\n"
       "      [--nrext64]               select individual RW-6A features\n"
-      "      [--rmapbt]                format with rmapbt=1 (reflink stays off)\n"
+      "      [--rmapbt]                format with rmapbt=1\n"
+      "      [--reflink]               format with reflink=1 (refcountbt)\n"
+      "      [--rmapbt --reflink]      Linux-legal combined profile\n"
+      "                                (both are ordinary writable features)\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
       "                                created, overwritten, extended, truncated,\n"
@@ -559,7 +566,11 @@ void PrintJournalJson(const LogScan& scan) {
       } else if ((item.type == logfmt::kItemEfi ||
                   item.type == logfmt::kItemEfd ||
                   item.type == logfmt::kItemBui ||
-                  item.type == logfmt::kItemBud) &&
+                  item.type == logfmt::kItemBud ||
+                  item.type == logfmt::kItemRui ||
+                  item.type == logfmt::kItemRud ||
+                  item.type == logfmt::kItemCui ||
+                  item.type == logfmt::kItemCud) &&
                  item.regions[0].size() >= logfmt::kIntentLogFormatSize) {
         const uint8_t* p = item.regions[0].data();
         uint64_t id = 0;
@@ -567,6 +578,21 @@ void PrintJournalJson(const LogScan& scan) {
           id = (id << 8) | p[logfmt::kIntentIdOffset + byte];
         }
         std::cout << ", \"id\": " << id;
+        if (item.type == logfmt::kItemCui) {
+          const uint32_t nextents = LoadLE32(p + logfmt::kIntentNextentsOffset);
+          std::cout << ", \"nextents\": " << nextents << ", \"extents\": [";
+          for (uint32_t ext_i = 0; ext_i < nextents; ++ext_i) {
+            const size_t base = logfmt::kIntentLogFormatSize + ext_i * 16;
+            if (base + 16 > item.regions[0].size()) break;
+            const uint8_t* e = p + base;
+            std::cout << (ext_i == 0 ? "" : ", ") << "{\"startblock\": "
+                      << (static_cast<uint64_t>(LoadLE32(e + 0)) |
+                          (static_cast<uint64_t>(LoadLE32(e + 4)) << 32))
+                      << ", \"len\": " << LoadLE32(e + 8)
+                      << ", \"op\": " << (LoadLE32(e + 12) & 0xff) << "}";
+          }
+          std::cout << "]";
+        }
       }
       std::cout << "}";
     }
@@ -656,6 +682,52 @@ int CommandRmap(const std::string& target, int only_ag) {
         else std::cout << " written";
       }
       std::cout << "\n";
+    }
+  }
+  return failures == 0 ? 0 : 1;
+}
+
+int CommandRefcount(const std::string& target, int only_ag) {
+  std::string error;
+  auto dev = OpenTarget(target, false, false, &error);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  auto sb = ReadSuperblock(*dev, 0, true);
+  if (!sb.ok()) {
+    PrintError(sb.error());
+    return 1;
+  }
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  if (!geo.features.reflink) {
+    std::cout << "reflink: disabled\n";
+    return 0;
+  }
+  if (only_ag >= static_cast<int>(geo.agcount)) {
+    std::cerr << "error: AG " << only_ag << " is out of range\n";
+    return 1;
+  }
+  int failures = 0;
+  for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
+    if (only_ag >= 0 && static_cast<uint32_t>(only_ag) != agno) continue;
+    auto tree = LoadRefcountTree(*dev, geo, agno, sb.value().lsn);
+    if (!tree.ok()) {
+      std::cout << "AG " << agno << ": CORRUPT - "
+                << tree.error().Format() << "\n";
+      ++failures;
+      continue;
+    }
+    std::cout << "AG " << agno << "\n"
+              << "  root: " << tree.value().root << "\n"
+              << "  level: " << tree.value().level << "\n"
+              << "  blocks: " << tree.value().blocks << "\n"
+              << "  records: " << tree.value().records.size() << "\n";
+    for (const RefcountRecord& r : tree.value().records) {
+      std::cout << "  block " << r.key.startblock << ".."
+                << (r.EndBlock() - 1) << " "
+                << (r.cow() ? "cow" : "shared") << " refcount "
+                << r.refcount << "\n";
     }
   }
   return failures == 0 ? 0 : 1;
@@ -1039,6 +1111,7 @@ int CommandFormat(const std::string& target, const Options& options) {
   format_options.bigtime = options.bigtime;
   format_options.nrext64 = options.nrext64;
   format_options.rmapbt = options.rmapbt;
+  format_options.reflink = options.reflink;
   auto report = mkfs::Format(*dev, format_options);
   if (!report.ok()) {
     PrintError(report.error());
@@ -1072,7 +1145,8 @@ int CommandMount(const std::string& target, const std::string& drive,
   return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
                               options.verbose || options.debug,
                               options.rw_experimental,
-                              options.rmapbt_qualification);
+                              options.rmapbt_qualification,
+                              options.reflink_qualification);
 #else
   (void)target;
   (void)drive;
@@ -1114,13 +1188,15 @@ bool ParseU64(const std::string& text, uint64_t* out) {
 }
 
 // Every ordinary mutation opens a writable mount through this helper.  The
-// hidden qualification bit is the only way to bypass the rmapbt gate; the
-// public --rw-experimental flag alone must keep refusing rmapbt images.
+// legacy qualification flags are forwarded as accepted no-ops; the ordinary
+// --rw-experimental flag is the real opt-in for every writable feature.
 MountOptions WritableMountOptions(const Options& options) {
   MountOptions mount_options;
   mount_options.read_write = true;
   mount_options.allow_rmapbt_qualification =
       options.rmapbt_qualification;
+  mount_options.allow_reflink_qualification =
+      options.reflink_qualification;
   return mount_options;
 }
 
@@ -1626,6 +1702,43 @@ bool CloseWritable(XfsFilesystem& fs) {
   return true;
 }
 
+int CommandReflink(const std::string& target, const std::string& src_path,
+                   const std::string& dst_path,
+                   const std::string& src_offset_text,
+                   const std::string& dst_offset_text,
+                   const std::string& length_text, const Options& options) {
+  uint64_t src_offset = 0, dst_offset = 0, length = 0;
+  if (!ParseU64(src_offset_text, &src_offset) ||
+      !ParseU64(dst_offset_text, &dst_offset) ||
+      !ParseU64(length_text, &length)) {
+    std::cerr << "error: offsets and length must be decimal or 0x-prefixed "
+                 "integers\n";
+    return 1;
+  }
+  std::unique_ptr<XfsFilesystem> fs;
+  int rc = OpenWritable(target, options, &fs);
+  if (rc != 0) return rc;
+  auto src = fs->LookupPath(src_path);
+  if (!src.ok()) {
+    PrintError(src.error());
+    return 1;
+  }
+  auto dst = fs->LookupPath(dst_path);
+  if (!dst.ok()) {
+    PrintError(dst.error());
+    return 1;
+  }
+  auto cloned = fs->ReflinkRange(src.value().ino, src_offset,
+                                 dst.value().ino, dst_offset, length);
+  if (!cloned.ok()) {
+    PrintError(cloned.error());
+    return 1;
+  }
+  if (!CloseWritable(*fs)) return 1;
+  std::cout << "reflinked " << cloned.value() << " bytes\n";
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // recover: journal replay as a standalone command (RW-5). Writes metadata, so
 // it demands --yes-i-really-mean-it; the same image-only policy as the other
@@ -1659,6 +1772,13 @@ int CommandRecover(const std::string& target, const Options& options) {
   auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
   if (!fs.ok()) {
     PrintError(fs.error());
+    return 1;
+  }
+  // Mount may have committed post-recovery AGI/Cow cleanup after the journal
+  // pass wrote its first closing record. Close the log again if needed.
+  Status finished = fs.value()->FinishRecoveryClean();
+  if (!finished.ok()) {
+    PrintError(finished.error());
     return 1;
   }
   const auto& report = fs.value()->recovery_report();
@@ -1944,10 +2064,14 @@ int Run(const std::vector<std::string>& args) {
       options.nrext64 = true;
     } else if (arg == "--rmapbt") {
       options.rmapbt = true;
+    } else if (arg == "--reflink") {
+      options.reflink = true;
     } else if (arg == "--rw-rmapbt-qualification") {
-      // Hidden RW-6B acceptance switch. It only has an effect together with
-      // --rw-experimental; ordinary mounts still refuse rmapbt.
+      // Legacy RW-6B acceptance switch, now accepted as a no-op.
       options.rmapbt_qualification = true;
+    } else if (arg == "--rw-reflink-qualification") {
+      // Legacy RW-6C acceptance switch, now accepted as a no-op.
+      options.reflink_qualification = true;
     } else if (arg == "--modern-inode-profile") {
       options.finobt = true;
       options.inobtcount = true;
@@ -2037,6 +2161,24 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandRmap(positional[1], rmap_ag);
+  }
+  if (command == "refcount") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin refcount <device|image> [--ag=N]\n";
+      return 1;
+    }
+    return CommandRefcount(positional[1], rmap_ag);
+  }
+  if (command == "reflink") {
+    if (positional.size() != 7) {
+      std::cerr << "usage: xfswin reflink <image> <src> <dst> <src-offset> "
+                   "<dst-offset> <length> --rw-experimental\n"
+                   "       length 0 clones to the source EOF\n";
+      return 1;
+    }
+    return CommandReflink(positional[1], positional[2], positional[3],
+                          positional[4], positional[5], positional[6],
+                          options);
   }
   if (command == "recover") {
     if (positional.size() != 2) {
@@ -2236,6 +2378,8 @@ int Run(const std::vector<std::string>& args) {
       mount_options.read_write = options.rw_experimental;
       mount_options.allow_rmapbt_qualification =
           options.rmapbt_qualification;
+      mount_options.allow_reflink_qualification =
+          options.reflink_qualification;
       auto fs = XfsFilesystem::Mount(std::move(dev), mount_options);
       if (!fs.ok()) {
         PrintError(fs.error());

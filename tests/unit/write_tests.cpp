@@ -222,9 +222,6 @@ TEST(writable_profile_allow_list) {
   refused(ondisk::kIncompatFtype | ondisk::kIncompatParent, 0, "parent");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatMetadir, 0, "metadir");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatZoned, 0, "zoned");
-  refused(ondisk::kIncompatFtype, ondisk::kRoCompatReflink, "reflink");
-  refused(ondisk::kIncompatFtype,
-          ondisk::kRoCompatRmapbt | ondisk::kRoCompatReflink, "reflink");
 
   // RW-6A features are part of the writable profile.
   const uint32_t modern_incompat = ondisk::kIncompatFtype |
@@ -256,15 +253,16 @@ TEST(writable_profile_allow_list) {
   rmap.features.rmapbt = true;
   rmap.features.reflink = false;
   CHECK(CheckWritableProfile(rmap, MakeGeometry(rmap)).ok());
-  // Reflink and the rmapbt+reflink combination stay refused.
+  // RW-6C: reflink and the rmapbt+reflink combination are ordinary writable
+  // profiles after the public qualification ledger passed.
   XfsSuperblock reflink = sb;
   reflink.features_ro_compat |= ondisk::kRoCompatReflink;
   reflink.features.reflink = true;
-  CHECK(!CheckWritableProfile(reflink, MakeGeometry(reflink)).ok());
+  CHECK(CheckWritableProfile(reflink, MakeGeometry(reflink)).ok());
   XfsSuperblock both = rmap;
   both.features_ro_compat |= ondisk::kRoCompatReflink;
   both.features.reflink = true;
-  CHECK(!CheckWritableProfile(both, MakeGeometry(both)).ok());
+  CHECK(CheckWritableProfile(both, MakeGeometry(both)).ok());
 
   // Features with no on-disk impact for our mutations are allowed.
   XfsSuperblock allowed = sb;

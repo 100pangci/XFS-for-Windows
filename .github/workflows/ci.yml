@@ -95,6 +95,31 @@ jobs:
           python tests/tools/rw6b_rmap_probe.py out/rw6b-rmap.img
           if ($LASTEXITCODE -ne 0) { throw "RW-6B oracle rejected the formatted image" }
 
+      - name: RW-6C Windows-formatted reflink images (both profiles)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          & $exe mkimage out\rw6c-rmap.img 300M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage rmap failed" }
+          & $exe format out\rw6c-rmap.img --yes-i-really-mean-it --reflink --rmapbt
+          if ($LASTEXITCODE -ne 0) { throw "reflink+rmapbt format failed" }
+          & $exe check out\rw6c-rmap.img
+          if ($LASTEXITCODE -ne 0) { throw "reflink+rmapbt check failed" }
+          python tests/tools/rw6c_refcount_probe.py out/rw6c-rmap.img `
+            --json out/rw6c-rmap.oracle.json
+          if ($LASTEXITCODE -ne 0) { throw "oracle rejected rw6c-rmap.img" }
+
+          & $exe mkimage out\rw6c-normap.img 300M
+          if ($LASTEXITCODE -ne 0) { throw "mkimage normap failed" }
+          & $exe format out\rw6c-normap.img --yes-i-really-mean-it --reflink
+          if ($LASTEXITCODE -ne 0) { throw "reflink-only format failed" }
+          & $exe check out\rw6c-normap.img
+          if ($LASTEXITCODE -ne 0) { throw "reflink-only check failed" }
+          python tests/tools/rw6c_refcount_probe.py out/rw6c-normap.img `
+            --allow-no-rmapbt --json out/rw6c-normap.oracle.json
+          if ($LASTEXITCODE -ne 0) { throw "oracle rejected rw6c-normap.img" }
+
       - name: RW-6A sparse-chunk fixture (for Linux xfs_repair)
         shell: pwsh
         run: |
@@ -321,6 +346,15 @@ jobs:
         with:
           name: rw6b-windows-rmap
           path: out/rw6b-rmap.img
+          if-no-files-found: error
+
+      - name: Upload the RW-6C Windows-formatted reflink images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-windows-formatted
+          path: |
+            out/rw6c-rmap.img
+            out/rw6c-normap.img
           if-no-files-found: error
 
   # ===========================================================================
@@ -2249,3 +2283,638 @@ jobs:
         run: |
           ls -l recovered-linux | head -40
           sudo bash tests/scripts/verify_recovery_linux.sh recovered-linux
+
+  # ===========================================================================
+  # RW-6C: reflink / refcountbt / CoW qualification.
+  #
+  # None of these jobs opens the public read-write gate. They exercise the
+  # hidden qualification path and produce the Linux evidence recorded in
+  # docs/REFLINK.md.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Windows-formatted reflink images must be accepted by the real xfsprogs and
+  # kernel for both legal profiles (rmapbt=0/1).
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6c-windows-formatter:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: reflink, image: rw6c-normap.img }
+          - { profile: reflink-rmapbt, image: rw6c-rmap.img }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-windows-formatted
+          path: images
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows-formatted reflink image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6c_linux.sh \
+            "images/${{ matrix.image }}" \
+            --label "Windows formatter ${{ matrix.profile }}"
+
+  # ---------------------------------------------------------------------------
+  # Linux creates the canonical reflink fixtures. The generator itself runs
+  # xfs_repair -n and the independent refcount oracle before uploading.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Create both reflink fixtures
+        run: |
+          sudo env SIZE_MB=384 \
+            bash tests/scripts/make_rw6c_linux.sh rw6c-linux
+          sudo chown -R "$USER" rw6c-linux
+          ls -lh rw6c-linux
+          cat rw6c-linux/rw6c.oracle.txt
+          cat rw6c-linux/rw6c-normap.oracle.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-linux
+          path: rw6c-linux/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows mutates the Linux-created image: CoW source, clone, clone-of-clone,
+  # shared truncate/unlink and a partial-EOF grow. The tool checks every byte
+  # and runs the raw oracle.
+  # ---------------------------------------------------------------------------
+  windows-rw6c-roundtrip:
+    needs: [windows-build-test, linux-generate-rw6c]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-linux
+          path: rw6c-linux
+
+      - name: Mutate the Linux reflink image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "rw6c-win-${{ matrix.profile }}" | Out-Null
+          Copy-Item "rw6c-linux\${{ matrix.profile }}.img" `
+            "rw6c-win-${{ matrix.profile }}\${{ matrix.profile }}.img" -Force
+          python tests/tools/rw6c_windows_mutate.py `
+            --exe "bin\xfswin.exe" `
+            --image "rw6c-win-${{ matrix.profile }}\${{ matrix.profile }}.img" `
+            --work-dir "rw6c-win-${{ matrix.profile }}" `
+            --json "rw6c-win-${{ matrix.profile }}\mutated.manifest.json"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C Windows mutation failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-windows-${{ matrix.profile }}
+          path: rw6c-win-${{ matrix.profile }}/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux verifies the Windows mutation with xfs_repair, the independent
+  # oracle and a kernel mount, then performs the reverse mutation.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6c:
+    needs: windows-rw6c-roundtrip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-windows-${{ matrix.profile }}
+          path: rw6c-win
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows mutation with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6c_linux.sh \
+            "rw6c-win/${{ matrix.profile }}.img" \
+            --manifest rw6c-win/mutated.manifest.json \
+            --label "Windows-mutated ${{ matrix.profile }}"
+
+      - name: Linux reverse mutation
+        run: |
+          mkdir -p rw6c-reverse
+          cp --sparse=always "rw6c-win/${{ matrix.profile }}.img" \
+            rw6c-reverse/reverse.img
+          sudo bash tests/scripts/verify_rw6c_linux_reverse.sh \
+            rw6c-reverse/reverse.img \
+            rw6c-reverse/linux-reverse.manifest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-reverse-${{ matrix.profile }}
+          path: |
+            rw6c-reverse/reverse.img
+            rw6c-reverse/linux-reverse.manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows reads and mutates the image after the Linux reverse pass.
+  # ---------------------------------------------------------------------------
+  windows-verify-rw6c-reverse:
+    needs: linux-verify-rw6c
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-reverse-${{ matrix.profile }}
+          path: rw6c-reverse
+
+      - name: Read and re-mutate after the Linux pass
+        shell: pwsh
+        run: |
+          python tests/tools/rw6c_windows_reverse.py `
+            --exe "bin\xfswin.exe" `
+            --image rw6c-reverse/reverse.img `
+            --manifest rw6c-reverse/linux-reverse.manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C reverse interoperability failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-reverse-final-${{ matrix.profile }}
+          path: |
+            rw6c-reverse/reverse.img
+            rw6c-reverse/reverse-final.oracle.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux validates the final image after the Windows re-mutation.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6c-final:
+    needs: windows-verify-rw6c-reverse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-reverse-final-${{ matrix.profile }}
+          path: rw6c-final
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the final image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6c_linux.sh \
+            rw6c-final/reverse.img \
+            --label "RW-6C final ${{ matrix.profile }}"
+
+  # ---------------------------------------------------------------------------
+  # Crash matrix: clone, CoW and shared truncate at every meaningful window.
+  # Each image is recovered on Windows, oracled, and archived with its
+  # expected old-or-new content manifest.
+  # ---------------------------------------------------------------------------
+  windows-rw6c-crash:
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rmap, normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: Run the RW-6C clone/CoW/truncate crash matrix
+        shell: pwsh
+        run: |
+          python tests/tools/rw6c_crash_windows.py `
+            --exe "bin\xfswin.exe" `
+            --work-dir "crash-rw6c-${{ matrix.profile }}" `
+            --profile ${{ matrix.profile }} `
+            --zip `
+            --json "crash-rw6c-${{ matrix.profile }}\crash.summary.json"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-crash-${{ matrix.profile }}
+          path: |
+            crash-rw6c-${{ matrix.profile }}/*.zip
+            crash-rw6c-${{ matrix.profile }}/crash.summary.json
+          if-no-files-found: error
+
+  linux-verify-rw6c-crash:
+    needs: windows-rw6c-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rmap, normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-crash-${{ matrix.profile }}
+          path: crash-rw6c
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Validate the crash summary
+        run: |
+          python3 - crash-rw6c/crash.summary.json <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if d.get("result") != "ok":
+              raise SystemExit("Windows crash summary failed: %r" % d)
+          if int(d.get("crashes", 0)) != int(d.get("cases", -1)):
+              raise SystemExit("not every crash point was reached")
+          if int(d.get("cases", 0)) < 10:
+              raise SystemExit("crash matrix is too small")
+          print("crash summary OK: %d cases" % d["cases"])
+          PY
+
+      - name: Verify every crash image with Linux
+        run: |
+          mkdir -p crash-rw6c/current
+          checked=0
+          for archive in crash-rw6c/*.zip; do
+            [ -e "$archive" ] || continue
+            rm -f crash-rw6c/current/*
+            unzip -o "$archive" -d crash-rw6c/current
+            image=$(find crash-rw6c/current -name '*.img' | head -1)
+            manifest=$(find crash-rw6c/current -name '*.manifest.json' | head -1)
+            test -n "$image"
+            test -n "$manifest"
+            sudo bash tests/scripts/verify_rw6c_linux.sh "$image" \
+              --manifest "$manifest" --label "$(basename "$archive")"
+            checked=$((checked + 1))
+          done
+          test "$checked" -ge 10
+          echo "Verified $checked RW-6C crash images with Linux"
+
+  # ---------------------------------------------------------------------------
+  # Read-only paths and unsupported reflink geometry must still refuse and
+  # change nothing, for both profiles.
+  # ---------------------------------------------------------------------------
+  windows-rw6c-refusal:
+    needs: [windows-build-test, linux-generate-rw6c]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-linux
+          path: rw6c-linux
+
+      - name: No-write refusal matrix (read-only paths and unsupported geometry)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path rw6c-refusal | Out-Null
+          Copy-Item rw6c-linux\rw6c.img rw6c-refusal\rw6c.img
+          python tests/tools/rw6c_refusal_check.py `
+            --exe "bin\xfswin.exe" --image rw6c-refusal/rw6c.img `
+            --src /base/source.bin --dst /base/clone-a.bin `
+            --empty-dir /emptydir --require-rmapbt `
+            --json rw6c-refusal/rw6c-refusal.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C reflink refusal matrix failed" }
+          Copy-Item rw6c-linux\rw6c-normap.img rw6c-refusal\rw6c-normap.img
+          python tests/tools/rw6c_refusal_check.py `
+            --exe "bin\xfswin.exe" --image rw6c-refusal/rw6c-normap.img `
+            --src /base/source.bin --dst /base/clone-a.bin `
+            --empty-dir /emptydir `
+            --json rw6c-refusal/rw6c-normap-refusal.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C reflink-only refusal matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-refusal
+          path: rw6c-refusal/*.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # ENOSPC: fill until no single block is free, then require a 4-block CoW
+  # write to fail cleanly with no staging record and no data change.
+  # ---------------------------------------------------------------------------
+  windows-rw6c-enospc:
+    needs: [windows-build-test, linux-generate-rw6c]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-linux
+          path: rw6c-linux
+
+      - name: Fill the image and exercise the ENOSPC CoW path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "rw6c-enospc-${{ matrix.profile }}" | Out-Null
+          Copy-Item "rw6c-linux\${{ matrix.profile }}.img" `
+            "rw6c-enospc-${{ matrix.profile }}\source.img" -Force
+          python tests/tools/rw6c_enospc_windows.py `
+            --exe "bin\xfswin.exe" `
+            --image "rw6c-enospc-${{ matrix.profile }}\source.img" `
+            --work-dir "rw6c-enospc-${{ matrix.profile }}" `
+            --json "rw6c-enospc-${{ matrix.profile }}\enospc.json"
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C ENOSPC qualification failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-enospc-${{ matrix.profile }}
+          path: |
+            rw6c-enospc-${{ matrix.profile }}/enospc.img
+            rw6c-enospc-${{ matrix.profile }}/enospc.json
+          if-no-files-found: error
+
+  linux-verify-rw6c-enospc:
+    needs: windows-rw6c-enospc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [rw6c, rw6c-normap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-enospc-${{ matrix.profile }}
+          path: rw6c-enospc
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the ENOSPC image with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6c_enospc_linux.sh \
+            rw6c-enospc/enospc.img rw6c-enospc/enospc.json
+
+  # ---------------------------------------------------------------------------
+  # Genuine Linux CUI capture: clone/CoW churn plus atomic dm-snapshots until
+  # a committed refcount intent has no matching done item. The kernel-recovered
+  # copy is the semantic oracle.
+  # ---------------------------------------------------------------------------
+  linux-generate-rw6c-cui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs and dmsetup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs dmsetup
+
+      - name: Capture a surviving CUI
+        run: |
+          sudo env SIZE_MB=768 COW_MB=512 ROUNDS=100000 THREADS=8 \
+            EXTENTS=1024 MAX_SNAPS=2500 \
+            bash tests/scripts/make_rw6c_cui_linux.sh rw6c-cui
+          sudo chown -R "$USER" rw6c-cui
+          cat rw6c-cui/cui.manifest.json
+          grep -q CUI rw6c-cui/cui.logprint.txt
+          python3 tests/tools/rw6c_refcount_probe.py \
+            rw6c-cui/cui.kernel-recovered.img --json /tmp/kernel.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-cui
+          path: rw6c-cui/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows completes the genuine CUI and must match the kernel-recovered
+  # semantic state exactly (sharing, CoW count and free blocks).
+  # ---------------------------------------------------------------------------
+  windows-recover-rw6c-cui:
+    needs: [windows-build-test, linux-generate-rw6c-cui]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-cui
+          path: rw6c-cui
+
+      - name: Complete the surviving CUI on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path rw6c-recovered | Out-Null
+          Copy-Item rw6c-cui/cui.img rw6c-recovered/cui-windows.img -Force
+          python tests/tools/rw6c_cui_recover.py `
+            --exe "bin\xfswin.exe" `
+            --image rw6c-recovered/cui-windows.img `
+            --kernel-oracle rw6c-cui/cui.kernel.oracle.json `
+            --json rw6c-recovered/recovery.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C genuine CUI recovery failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-windows-recovered-cui
+          path: rw6c-recovered/
+          if-no-files-found: error
+
+  linux-verify-rw6c-cui:
+    needs: windows-recover-rw6c-cui
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-windows-recovered-cui
+          path: rw6c-recovered
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify the Windows CUI completion with Linux
+        run: |
+          sudo bash tests/scripts/verify_rw6c_linux.sh \
+            rw6c-recovered/cui-windows.img --label "Windows CUI completion"
+
+  # ---------------------------------------------------------------------------
+  # Crash Windows while it completes the genuine CUI, restart recovery and
+  # require convergence, no duplicate CUD and the same semantic state.
+  # ---------------------------------------------------------------------------
+  windows-rw6c-cui-crash:
+    needs: [windows-build-test, linux-generate-rw6c-cui]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-cui
+          path: rw6c-cui
+
+      - name: Crash and restart the genuine CUI completion
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path rw6c-cui-crash | Out-Null
+          python tests/tools/rw6c_cui_recover.py `
+            --exe "bin\xfswin.exe" `
+            --image rw6c-cui/cui.img `
+            --kernel-oracle rw6c-cui/cui.kernel.oracle.json `
+            --crash-dir rw6c-cui-crash `
+            --zip `
+            --json rw6c-cui-crash/crash.summary.json
+          if ($LASTEXITCODE -ne 0) { throw "RW-6C CUI crash matrix failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6c-cui-crash
+          path: |
+            rw6c-cui-crash/*.zip
+            rw6c-cui-crash/crash.summary.json
+          if-no-files-found: error
+
+  linux-verify-rw6c-cui-crash:
+    needs: windows-rw6c-cui-crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6c-cui-crash
+          path: rw6c-cui-crash
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Verify every restarted CUI recovery with Linux
+        run: |
+          python3 - rw6c-cui-crash/crash.summary.json <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if d.get("result") != "ok":
+              raise SystemExit("CUI crash summary failed: %r" % d)
+          if int(d.get("crashes", 0)) == 0:
+              raise SystemExit("no CUI recovery crash point was reached")
+          if len(d.get("runs", [])) != int(d.get("crashes", 0)):
+              raise SystemExit("crash summary run count mismatch")
+          print("CUI crash summary OK: %d crashes" % d["crashes"])
+          PY
+          mkdir -p rw6c-cui-crash/current
+          checked=0
+          for archive in rw6c-cui-crash/*.zip; do
+            [ -e "$archive" ] || continue
+            rm -f rw6c-cui-crash/current/*
+            unzip -o "$archive" -d rw6c-cui-crash/current
+            image=$(find rw6c-cui-crash/current -name '*.img' | head -1)
+            test -n "$image"
+            sudo bash tests/scripts/verify_rw6c_linux.sh "$image" \
+              --label "$(basename "$archive")"
+            checked=$((checked + 1))
+          done
+          expected=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["crashes"])' rw6c-cui-crash/crash.summary.json)
+          test "$checked" -eq "$expected"
+          echo "Verified $checked restarted CUI recovery images"

@@ -13,9 +13,9 @@
 //   struct xfs_rud_log_format { u16 type; u16 size; u32 pad; u64 id; };
 //
 // `startblock` is an encoded filesystem block, not a linear daddr.  The parser
-// validates every extent and refuses shared (reflink) operations: this build
-// keeps reflink disabled, and a recovery that cannot reproduce refcount
-// semantics must fail before the first metadata write.
+// validates every extent.  Shared (reflink) operations are refused unless the
+// filesystem has the reflink feature; RW-6C accepts them as ordinary data-fork
+// rmap updates and relies on the companion CUI/CUD for refcount ownership.
 #pragma once
 
 #include <cstdint>

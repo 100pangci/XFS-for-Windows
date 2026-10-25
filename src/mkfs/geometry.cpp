@@ -182,6 +182,7 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
   geo.bigtime = options.bigtime;
   geo.nrext64 = options.nrext64;
   geo.rmapbt = options.rmapbt;
+  geo.reflink = options.reflink;
 
   // Pre-allocated per-AG metadata blocks: block 0 (sb [+ agf/agi/agfl]) then
   // bno root, cnt root, inobt root and (with finobt) the finobt root.
@@ -194,8 +195,10 @@ Status ComputeFormatGeometry(const FormatOptions& options, uint64_t device_size,
   geo.fibt_block = geo.finobt ? geo.ibt_block + 1 : 0;
   const uint32_t after_inobt = geo.finobt ? geo.fibt_block : geo.ibt_block;
   geo.rmap_block = geo.rmapbt ? after_inobt + 1 : 0;
+  const uint32_t after_rmap = geo.rmapbt ? geo.rmap_block : after_inobt;
+  geo.refcount_block = geo.reflink ? after_rmap + 1 : 0;
   geo.prealloc_blocks =
-      (geo.rmapbt ? geo.rmap_block : after_inobt) + 1;
+      (geo.reflink ? geo.refcount_block : after_rmap) + 1;
 
   // Minimum AGFL length for a 1-level bno+cnt btree pair:
   // per tree: min(level+1, maxlevels)*2 - 2 = 2; two trees -> 4.  rmapbt adds
