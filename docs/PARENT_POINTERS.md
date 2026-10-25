@@ -258,15 +258,31 @@ It records `mkfs.xfs -V`, `xfs_info`, `xfs_db -r -c 'sb 0' -c p`, the kernel
 The harness expects:
 
 ```text
-xfsprogs >= 7.2.0 (reference/xfsprogs-7.2.0)
-Linux kernel with XFS parent pointers and logged attrs
+xfsprogs 7.2.0 built from kernel.org
+Linux kernel with XFS parent pointers and logged attrs (6.16 or newer)
 CONFIG_XFS_DEBUG=y when the ATTRI/ATTRD debug path is required
 ```
 
-The QEMU/KVM job is opt-in (`XFS_RW6E_LINUX=1` repository variable) because a
-stock Ubuntu runner does not contain a parent-capable 7.x kernel.  A hosted run
-must attach the kernel artifact and record its version; the harness fails
-loudly otherwise.
+The GitHub-hosted `linux-rw6e-parent`, `linux-verify-rw6e-windows` and
+`linux-verify-rw6e-mutation` jobs run on `ubuntu-24.04` (kernel
+6.17.0-1022-azure in October 2026). `tests/scripts/install_xfsprogs_7_2_0.sh`
+builds the reference xfsprogs from kernel.org because the distribution package
+is too old for `-n parent=1`. No opt-in variable, self-hosted runner, or QEMU
+kernel artifact is involved. A job that cannot format or mount `parent=1`
+fails; the harness never substitutes `xfs_repair`-only evidence.
+
+The three hosted directions are:
+
+1. `linux-verify-rw6e-windows` verifies the Windows formatter and 1 KiB
+   Windows fixture with the real kernel, `xfs_repair -n`, `xfs_scrub` and the
+   independent Python oracle.
+2. `linux-rw6e-parent` creates a plain `mkfs.xfs -f` fixture, runs the
+   deterministic 1000-hardlink workload, and publishes it for Windows.
+3. `windows-rw6e-linux-roundtrip` mutates that Linux image through Windows
+   (create, mkdir, link, cross-directory rename, replace, directory move,
+   unlink, rmdir, symlink, xattr), audits it with `xfswin check --parents` and
+   the Python oracle, then `linux-verify-rw6e-mutation` verifies both the
+   original Linux workload and the Windows-added entries through the kernel.
 
 ## Qualification ledger
 

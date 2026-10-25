@@ -853,7 +853,8 @@ Python oracle, mounts through the real kernel, checks the manifest, and runs
 `xfs_scrub` where available and `xfs_repair -n`. A host that cannot create or
 mount `parent=1` is a hard failure, not a reason to weaken the evidence.
 
-The hosted real-kernel job is opt-in (`XFS_RW6E_LINUX=1`) because the stock
-Ubuntu 24.04 runner kernel is not parent-capable; it must run on the 7.x
-self-hosted/QEMU profile described in
+The hosted real-kernel jobs use GitHub's `ubuntu-24.04` image (kernel
+6.17.0-1022-azure) and build xfsprogs 7.2.0 from kernel.org with
+`tests/scripts/install_xfsprogs_7_2_0.sh`. They are not opt-in and do not need
+a self-hosted or QEMU runner. See
 [PARENT_POINTERS.md](PARENT_POINTERS.md).

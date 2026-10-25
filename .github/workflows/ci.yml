@@ -3544,51 +3544,261 @@ jobs:
           test "$checked" -eq "$expected"
           echo "Verified $checked restarted RW-6D crash images"
 
+  # ===========================================================================
+  # RW-6E: parent pointers on a real Linux kernel, on GitHub-hosted runners.
+  #
+  # The ubuntu-24.04 runner kernel is 6.17.0-1022-azure. XFS parent pointers
+  # and the exchange-range feature bit are present from 6.16; the runner's
+  # packaged xfsprogs (6.6) is too old to format them.  The helper below builds
+  # the reference xfsprogs 7.2.0 from kernel.org, so these jobs need neither a
+  # self-hosted runner nor a repository opt-in variable.  The helper scripts
+  # still fail loudly if the host cannot format or mount parent=1; they never
+  # downgrade to xfs_repair-only evidence.
+  # ===========================================================================
+
   # ---------------------------------------------------------------------------
-  # RW-6E real-kernel qualification.  A stock ubuntu-24.04 runner kernel does
-  # not provide XFS parent pointers, so this job is intentionally opt-in and
-  # must run on a self-hosted runner (or a QEMU/KVM job) with a 7.x kernel
-  # built with CONFIG_XFS_DEBUG and parent pointers.  The helper scripts fail
-  # loudly if the host cannot format/mount parent=1; they never downgrade to
-  # xfs_repair-only evidence.
+  # Windows-formatted parent images and the independent Python oracle are
+  # verified through a real Linux kernel, xfs_repair and xfs_scrub.
   # ---------------------------------------------------------------------------
-  linux-rw6e-parent:
-    if: ${{ vars.XFS_RW6E_LINUX == '1' }}
-    runs-on: [self-hosted, linux, xfs-rw6e]
-    timeout-minutes: 240
+  linux-verify-rw6e-windows:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build reference xfsprogs 7.2.0 and gate the host
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6e-windows-fixtures
+          path: rw6e-windows
+
+      - name: Install build dependencies and xfsprogs 7.2.0
         run: |
-          if ! mkfs.xfs -V 2>&1 | grep -Eq '7\.2|7\.[3-9]|[89]\.'; then
-            make -C reference/xfsprogs-7.2.0 -j"$(nproc)"
-            export PATH="$PWD/reference/xfsprogs-7.2.0/mkfs:$PWD/reference/xfsprogs-7.2.0/db:$PWD/reference/xfsprogs-7.2.0/repair:$PWD/reference/xfsprogs-7.2.0/io:$PWD/reference/xfsprogs-7.2.0/scrub:$PATH"
-            echo "PATH=$PATH" >> "$GITHUB_ENV"
-            echo "XFS_REFERENCE_TOOLS=$PWD/reference/xfsprogs-7.2.0" >> "$GITHUB_ENV"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Show the Linux oracle versions
+        run: |
           uname -a
           mkfs.xfs -V
-          bash tests/scripts/qualify_rw6e_host.sh rw6e-host
+          xfs_db -V
+          xfs_repair -V
 
-      - name: Create a plain modern mkfs.xfs fixture
+      - name: Verify the Windows-formatted modern parent image
         run: |
-          SIZE_MB=1024 bash tests/scripts/make_rw6e_linux.sh rw6e-linux
-          tar -C rw6e-linux -czf rw6e-linux-fixture.tar.gz .
+          mkdir -p rw6e-evidence
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_rw6e_linux.sh \
+            rw6e-windows/rw6e-parent.img "" rw6e-evidence/windows-parent
+
+      - name: Verify the Windows 1 KiB parent fixture
+        run: |
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_rw6e_linux.sh \
+            rw6e-windows/rw6e-windows.img "" rw6e-evidence/windows-1k
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6e-linux-windows-evidence
+          path: rw6e-evidence/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The canonical fixture is a plain `mkfs.xfs -f` image: no parent=0, no
+  # hand-edited bits.  The runner's kernel must mount it read-write.
+  # ---------------------------------------------------------------------------
+  linux-rw6e-parent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies and xfsprogs 7.2.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Gate the host on real parent-pointer format and mount
+        run: |
+          uname -a
+          mkfs.xfs -V
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/qualify_rw6e_host.sh rw6e-host
+
+      - name: Create and populate the plain modern mkfs.xfs fixture
+        run: |
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            SIZE_MB=1024 bash tests/scripts/make_rw6e_linux.sh rw6e-linux
+          sudo chown -R "$USER" rw6e-linux
+          cat rw6e-linux/version.txt
+          cat rw6e-linux/features.txt
+          cat rw6e-linux/xfs_info.txt
+          grep -q 'parent=1' rw6e-linux/features.txt
+          grep -q 'exchrange=1' rw6e-linux/features.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: rw6e-linux-fixture
-          path: rw6e-linux-fixture.tar.gz
+          path: rw6e-linux/
+          if-no-files-found: error
 
-      - name: Linux reverse mutation and audit
+  # ---------------------------------------------------------------------------
+  # Windows reads the Linux-created parent image, performs every namespace
+  # mutation that changes a parent pointer, audits it with the independent
+  # oracle, and leaves an image for the Linux kernel to verify.
+  # ---------------------------------------------------------------------------
+  windows-rw6e-linux-roundtrip:
+    needs: [windows-build-test, linux-rw6e-parent]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6e-linux-fixture
+          path: rw6e-linux
+
+      - name: Mutate the Linux parent image with Windows
+        shell: pwsh
         run: |
-          mkdir -p rw6e-host/mnt
-          mount -o loop rw6e-linux/rw6e.img rw6e-host/mnt
-          python3 tests/tools/rw6e_linux_content.py --verify rw6e-host/mnt \
-            --manifest rw6e-linux/rw6e.manifest.json
-          sync
-          umount rw6e-host/mnt
-          xfs_repair -n rw6e-linux/rw6e.img
-          python3 tests/tools/rw6e_parent_probe.py rw6e-linux/rw6e.img \
-            --require-parent --json rw6e-linux/parent-oracle.json
+          $ErrorActionPreference = 'Stop'
+          $exe = "bin\xfswin.exe"
+          $work = "rw6e-roundtrip"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $img = "$work\rw6e.img"
+          Copy-Item "rw6e-linux\rw6e.img" $img -Force
+
+          function Run([string[]]$Arguments) {
+            & $exe @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "xfswin $($Arguments -join ' ') failed: $LASTEXITCODE"
+            }
+          }
+
+          Run @('check', $img, '--parents', '--verbose')
+          Run @('create', $img, '/windows.bin', '--rw-experimental')
+          Run @('pwrite', $img, '/windows.bin', '0', '--rw-experimental',
+            '--text=WINDOWS-RW6E')
+          Run @('mkdir', $img, '/win-dir', '--rw-experimental')
+          Run @('create', $img, '/win-dir/child', '--rw-experimental')
+          Run @('pwrite', $img, '/win-dir/child', '0', '--rw-experimental',
+            '--text=CHILD')
+          Run @('link', $img, '/win-dir/child', '/win-dir/renamed',
+            '--rw-experimental')
+          Run @('mkdir', $img, '/win-move', '--rw-experimental')
+          Run @('rename', $img, '/win-dir', '/win-move/dir',
+            '--rw-experimental')
+          Run @('xattr', 'set', $img, '/win-move/dir/child', 'user.ci',
+            'hello', '--rw-experimental')
+          Run @('create', $img, '/win-move/dir/after', '--rw-experimental')
+          Run @('unlink', $img, '/win-move/dir/after', '--rw-experimental')
+          Run @('symlink', $img, 'target', '/win-move/link',
+            '--rw-experimental')
+          Run @('create', $img, '/win-empty', '--rw-experimental')
+          Run @('rmdir', $img, '/win-empty', '--rw-experimental')
+          Run @('create', $img, '/win-delete', '--rw-experimental')
+          Run @('unlink', $img, '/win-delete', '--rw-experimental')
+          Run @('create', $img, '/win-victim', '--rw-experimental')
+          Run @('pwrite', $img, '/win-victim', '0', '--rw-experimental',
+            '--text=VICTIM')
+          Run @('create', $img, '/win-source', '--rw-experimental')
+          Run @('pwrite', $img, '/win-source', '0', '--rw-experimental',
+            '--text=REPLACED')
+          Run @('rename', $img, '/win-source', '/win-victim', '--replace',
+            '--rw-experimental')
+          Run @('check', $img, '--parents', '--verbose')
+
+          & $exe parents $img /windows.bin --json |
+            Out-File -Encoding utf8 "$work\windows.parents.json"
+          if ($LASTEXITCODE -ne 0) { throw "parents /windows.bin failed" }
+          & $exe parents $img /win-move/dir/child --json |
+            Out-File -Encoding utf8 "$work\child.parents.json"
+          if ($LASTEXITCODE -ne 0) { throw "parents /win-move/dir/child failed" }
+
+          python tests/tools/rw6e_parent_probe.py $img --require-parent `
+            --json "$work\parent.oracle.json"
+          if ($LASTEXITCODE -ne 0) {
+            throw "RW-6E parent oracle rejected the Windows mutation"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6e-windows-mutated
+          path: |
+            rw6e-roundtrip/rw6e.img
+            rw6e-roundtrip/windows.parents.json
+            rw6e-roundtrip/child.parents.json
+            rw6e-roundtrip/parent.oracle.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux checks the original Linux workload and every Windows-added entry
+  # through the real kernel, re-runs xfs_repair/xfs_scrub and the independent
+  # sampler oracle on the same image.
+  # ---------------------------------------------------------------------------
+  linux-verify-rw6e-mutation:
+    needs: windows-rw6e-linux-roundtrip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6e-linux-fixture
+          path: rw6e-linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw6e-windows-mutated
+          path: rw6e-win
+
+      - name: Install build dependencies and xfsprogs 7.2.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Show the Linux oracle versions
+        run: |
+          uname -a
+          mkfs.xfs -V
+          xfs_db -V
+          xfs_repair -V
+
+      - name: Verify the Windows mutation with Linux
+        run: |
+          mkdir -p rw6e-evidence
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_rw6e_linux.sh \
+            rw6e-win/rw6e.img rw6e-linux/rw6e.manifest.json \
+            rw6e-evidence/windows-mutation
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_rw6e_windows_linux.sh \
+            rw6e-win/rw6e.img rw6e-evidence/windows-state
+          cp rw6e-win/parent.oracle.json rw6e-evidence/
+          cp rw6e-win/windows.parents.json rw6e-evidence/
+          cp rw6e-win/child.parents.json rw6e-evidence/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rw6e-linux-mutation-evidence
+          path: rw6e-evidence/
+          if-no-files-found: error

@@ -375,8 +375,9 @@ sudo bash tests/scripts/verify_rw6e_linux.sh rw6e-linux/rw6e.img \
 
 They refuse to run on a host whose `mkfs.xfs` or kernel cannot create/mount a
 `parent=1` filesystem; they never silently downgrade to `xfs_repair`-only
-evidence. The real-kernel job is opt-in because stock Ubuntu runners do not
-provide a parent-capable 7.x kernel.
+evidence. The RW-6E Linux jobs run on GitHub-hosted `ubuntu-24.04` (kernel
+6.17.0-1022-azure) and build xfsprogs 7.2.0 from kernel.org first; there is no
+opt-in variable or self-hosted runner.
 
 ## Milestone history
 

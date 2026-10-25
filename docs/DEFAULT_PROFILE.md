@@ -164,11 +164,15 @@ sb_features_incompat = 0xb
 sb_features_log_incompat = 0
 ```
 
-`mkfs.xfs` 6.6 has no `parent=` option, so that runner never exercised parent
-pointers.  The RW-6E qualification job is opt-in and needs a parent-capable 7.x
-kernel; `qualify_rw6e_host.sh` is the gate.  The 7.2 source defaults above are
-the target profile, and the CI artifact records what the runner actually
-enabled.
+`mkfs.xfs` 6.6 has no `parent=` option, so that older observation could not
+exercise parent pointers. The RW-6E jobs now run on GitHub-hosted
+`ubuntu-24.04` (kernel 6.17.0-1022-azure), install xfsprogs 7.2.0 from
+kernel.org with `tests/scripts/install_xfsprogs_7_2_0.sh`, and run plain
+`mkfs.xfs -f` as the acceptance fixture. The 7.2 source defaults above are the
+target profile; the job artifacts record the actual runner, tool version,
+`xfs_info` and superblock bits. `qualify_rw6e_host.sh` remains the hard gate:
+a runner that cannot format or mount `parent=1` fails instead of producing
+repair-only evidence.
 
 ## Consequences for compatibility claims
 

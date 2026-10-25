@@ -404,7 +404,7 @@ Local Windows results are support evidence, not Linux evidence.
 | 3 | Windows mutation: shortform/leaf/node/level-2/remote/BMBT, namespaces, dir/symlink, data, rename/link/unlink, reflink | local fixture pass | **verified**: `windows-rw6d-native` passed; Linux verified the re-mutated 1 KiB image (318 attributes/4 files) and the 4 KiB mutations (9485 attributes/11 files) |
 | 4 | DA node split/merge/borrow/root collapse and node → leaf → shortform reverse transitions | unit matrix pass | **verified**: `linux-verify-rw6d` and `windows-verify-rw6d-reverse` passed the level-2 tree on both profiles; `linux-verify-rw6d-final` passed the final image |
 | 5 | Remote value ordering, replace/free and crash consistency | unit + 66 crash images pass locally | **verified**: `windows-rw6d-crash` produced 66 old-or-new images; `linux-verify-rw6d-crash` accepted all 66 after Windows recovery |
-| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients and parent-pointer PPTR operations | parser unit tests, synthetic PPTR completion and log-scan tests pass; Linux parent workload generates genuine PPTR ATTRI/ATTRD under the RW-6E harness | ordinary logged-xattr replace transients still require a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the RW-6E opt-in 7.x harness covers parent PPTR records, not the `larp` debug knob, and its hosted run is the external evidence |
+| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients and parent-pointer PPTR operations | parser unit tests, synthetic PPTR completion and log-scan tests pass; Linux parent workload generates genuine PPTR ATTRI/ATTRD under the RW-6E harness | ordinary logged-xattr replace transients still require a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the hosted RW-6E parent harness covers parent PPTR records, not the `larp` debug knob, and its hosted run is the external evidence |
 | 7 | Crash matrix: every injection point accepted by Linux with old-or-new state | 66/66 recovered locally | **verified**: `linux-verify-rw6d-crash` checked 66/66 restarted images with `xfs_repair -n`, the kernel xattr walk and the archived old-or-new manifest |
 | 8 | ENOSPC: failed writes leave the image equivalent; shortform still works | 335 MB fill, unchanged oracle | **verified**: `windows-rw6d-enospc` passed, then `linux-verify-rw6d-windows` accepted the 280-attribute ENOSPC image with `xfs_repair -n` and a kernel mount |
 | 9 | Linux → Windows → Linux churn and a final audit | local simulation pass | **verified**: both profiles completed `windows-rw6d-roundtrip` → Linux reverse → `windows-verify-rw6d-reverse` → `linux-verify-rw6d-final` |
@@ -430,8 +430,8 @@ Linux evidence.
   enabled. The Ubuntu CI runner is non-debug, so the parser has unit coverage
   and synthetic format tests but no genuine ordinary ATTRI log yet; that gate
   stays pending rather than being claimed from Windows-generated data. The
-  RW-6E opt-in 7.x parent harness generates genuine **PPTR** ATTRI/ATTRD
-  records (parent pointers always use the logged-attr machinery), which closes
+  hosted RW-6E parent harness generates genuine **PPTR** ATTRI/ATTRD records
+  (parent pointers always use the logged-attr machinery), which closes
   the parent-intent half of that work; it does not replace the `larp` knob for
   ordinary user-attribute replace transients.
 * The Linux 4 KiB fixture needs 9000 long-name attributes to force a level-2
