@@ -17,6 +17,7 @@ add_library(xfs_core STATIC
   core/rmap.cpp
   core/rmap_editor.cpp
   core/rmap_intent.cpp
+  core/bmap_intent.cpp
   core/refcount.cpp
   core/refcount_editor.cpp
   core/refcount_intent.cpp

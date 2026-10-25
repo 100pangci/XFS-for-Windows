@@ -286,7 +286,8 @@ class Allocator {
   Status MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
                   const RmapOwner& owner);
   Status UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
-                    const RmapOwner& owner, bool unknown_owner);
+                    const RmapOwner& owner, bool unknown_owner,
+                    bool no_overlap_ok = false);
   Status ConvertOwnedRmap(uint32_t agno, uint32_t agbno, uint32_t len,
                           const RmapOwner& owner, bool old_unwritten);
   Status MapMetadata(uint32_t agno, uint32_t agbno, uint32_t len,
@@ -1668,7 +1669,8 @@ Status Allocator::MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
 }
 
 Status Allocator::UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
-                             const RmapOwner& owner, bool unknown_owner) {
+                             const RmapOwner& owner, bool unknown_owner,
+                             bool no_overlap_ok) {
   if (!rmap_enabled()) return OkStatus();
   if (rmap_editing_) {
     return XFS_ERR(XfsError::kInternal,
@@ -1677,7 +1679,8 @@ Status Allocator::UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
         .Metadata("rmapbt");
   }
   rmap_editing_ = true;
-  Status s = rmap_->FreeExtent(agno, agbno, len, owner, unknown_owner);
+  Status s = rmap_->FreeExtent(agno, agbno, len, owner, unknown_owner,
+                                no_overlap_ok);
   rmap_editing_ = false;
   if (s.ok()) {
     auto it = ags_.find(agno);
@@ -2774,7 +2777,8 @@ Status BlockAllocator::RmapMap(uint64_t fsb, uint32_t len,
 }
 
 Status BlockAllocator::RmapUnmap(uint64_t fsb, uint32_t len,
-                                 const RmapOwner& owner) {
+                                 const RmapOwner& owner,
+                                 bool no_overlap_ok) {
   if (!impl_->alloc->rmap_enabled()) return OkStatus();
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->FsbRangeValid(fsb, len)) {
@@ -2793,7 +2797,8 @@ Status BlockAllocator::RmapUnmap(uint64_t fsb, uint32_t len,
   s = impl_->alloc->LoadAg(agno, &ag);
   if (!s.ok()) return s;
   (void)ag;
-  return impl_->alloc->UnmapOwned(agno, agbno, len, owner, false);
+  return impl_->alloc->UnmapOwned(agno, agbno, len, owner, false,
+                                  no_overlap_ok);
 }
 
 Status BlockAllocator::RmapConvert(uint64_t fsb, uint32_t len,

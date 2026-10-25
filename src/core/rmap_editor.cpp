@@ -453,7 +453,7 @@ class RmapEditor::Impl {
   }
 
   Status UnmapExtent(uint32_t agno, const RmapKey& key, uint32_t len,
-                     bool unknown_owner) {
+                     bool unknown_owner, bool no_overlap_ok) {
     Ag* ag = FindAg(agno);
     if (ag == nullptr) return AgMissingStatus(agno);
     if (len == 0) {
@@ -510,7 +510,9 @@ class RmapEditor::Impl {
           break;
         }
       }
-      if (unknown_owner && !overlap) return OkStatus();
+      if ((unknown_owner || no_overlap_ok) && !overlap) {
+        return OkStatus();
+      }
       return XFS_ERR(XfsError::kCorruptBtree,
                      unknown_owner ? "OWN_UNKNOWN unmap partially overlaps "
                                      "an existing rmap record"
@@ -656,7 +658,7 @@ class RmapEditor::Impl {
     RmapKey key;
     key.startblock = startblock;
     key.owner = owner;
-    return UnmapExtent(agno, key, len, false);
+    return UnmapExtent(agno, key, len, false, false);
   }
 
   Status AllocateExtent(uint32_t agno, uint32_t startblock, uint32_t len,
@@ -671,13 +673,14 @@ class RmapEditor::Impl {
   }
 
   Status FreeExtent(uint32_t agno, uint32_t startblock, uint32_t len,
-                    const RmapOwner& owner, bool unknown_owner) {
+                    const RmapOwner& owner, bool unknown_owner,
+                    bool no_overlap_ok) {
     RmapKey key;
     key.startblock = startblock;
     key.owner = unknown_owner ? kRmapOwnerUnknown : owner.owner;
     key.offset = owner.offset;
     key.flags = owner.flags;
-    return UnmapExtent(agno, key, len, unknown_owner);
+    return UnmapExtent(agno, key, len, unknown_owner, no_overlap_ok);
   }
 
   Status Convert(uint32_t agno, uint32_t startblock, uint32_t len,
@@ -1707,8 +1710,8 @@ Status RmapEditor::MapExtent(uint32_t agno, const RmapRecord& rec) {
   return impl_->MapExtent(agno, rec);
 }
 Status RmapEditor::UnmapExtent(uint32_t agno, const RmapKey& key, uint32_t len,
-                               bool unknown_owner) {
-  return impl_->UnmapExtent(agno, key, len, unknown_owner);
+                               bool unknown_owner, bool no_overlap_ok) {
+  return impl_->UnmapExtent(agno, key, len, unknown_owner, no_overlap_ok);
 }
 Status RmapEditor::ConvertExtent(uint32_t agno, const RmapKey& key,
                                  uint32_t len, bool old_unwritten) {
@@ -1727,8 +1730,10 @@ Status RmapEditor::AllocateExtent(uint32_t agno, uint32_t startblock,
   return impl_->AllocateExtent(agno, startblock, len, owner);
 }
 Status RmapEditor::FreeExtent(uint32_t agno, uint32_t startblock, uint32_t len,
-                              const RmapOwner& owner, bool unknown_owner) {
-  return impl_->FreeExtent(agno, startblock, len, owner, unknown_owner);
+                              const RmapOwner& owner, bool unknown_owner,
+                              bool no_overlap_ok) {
+  return impl_->FreeExtent(agno, startblock, len, owner, unknown_owner,
+                           no_overlap_ok);
 }
 Status RmapEditor::Convert(uint32_t agno, uint32_t startblock, uint32_t len,
                            const RmapOwner& owner, bool old_unwritten) {

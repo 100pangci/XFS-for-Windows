@@ -637,8 +637,26 @@ def item_summary(item):
     elif tid == 0x123F and len(first) >= 28:
         out.update({"ag": be32(first, 4), "agbno": be32(first, 8),
                     "count": be32(first, 12)})
-    elif tid in (0x1236, 0x1237, 0x1244, 0x1245) and len(first) >= 16:
+    elif tid in (0x1236, 0x1237, 0x1245) and len(first) >= 16:
         out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
+    elif tid == 0x1244 and len(first) >= 16:
+        out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
+        count = le32(first, 4)
+        extents = []
+        for i in range(count):
+            base = 16 + i * 32
+            if base + 32 > len(first):
+                break
+            flags = le32(first, base + 28)
+            extents.append({
+                "owner": struct.unpack_from("<Q", first, base)[0],
+                "startblock": struct.unpack_from("<Q", first, base + 8)[0],
+                "startoff": struct.unpack_from("<Q", first, base + 16)[0],
+                "len": le32(first, base + 24),
+                "flags": flags,
+                "op": flags & 0xFF,
+            })
+        out.update({"nextents": count, "extents": extents})
     elif tid in (0x1240, 0x1241) and len(first) >= 16:
         out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
         if tid == 0x1240:

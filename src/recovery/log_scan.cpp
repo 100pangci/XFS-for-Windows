@@ -30,6 +30,7 @@
 #include "xfs/endian.h"
 #include "xfs/log.h"
 #include "xfs/log_format.h"
+#include "xfs/bmap_intent.h"
 #include "xfs/refcount_intent.h"
 #include "xfs/rmap_intent.h"
 
@@ -1714,6 +1715,26 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
           scan.unsupported_items.push_back(
               std::string("RUD preflight: ") + parsed.error().Format());
         }
+      } else if (item.type == lf::kItemBui) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("BUI item has no format region");
+          continue;
+        }
+        auto parsed = ParseBmapIntent(item.regions[0], geo);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("BUI preflight: ") + parsed.error().Format());
+        }
+      } else if (item.type == lf::kItemBud) {
+        if (item.regions.empty()) {
+          scan.unsupported_items.push_back("BUD item has no format region");
+          continue;
+        }
+        auto parsed = ParseBmapIntentDone(item.regions[0]);
+        if (!parsed.ok()) {
+          scan.unsupported_items.push_back(
+              std::string("BUD preflight: ") + parsed.error().Format());
+        }
       } else if (item.type == lf::kItemCui) {
         if (!geo.features.reflink) {
           scan.unsupported_items.push_back(
@@ -1754,7 +1775,7 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   // passes; every other intent type refuses before the first write.
   for (const PendingIntent& intent : CollectPendingIntents(scan)) {
     if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
-        intent.type == lf::kItemCui) {
+        intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
       continue;
     }
     scan.unsupported_items.push_back(

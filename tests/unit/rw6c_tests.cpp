@@ -20,6 +20,7 @@
 #include "test_util.h"
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
+#include "xfs/bmap_intent.h"
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
@@ -372,6 +373,29 @@ std::vector<uint8_t> MakeCui(uint64_t id, uint64_t startblock, uint32_t len,
     StoreLE32(region.data() + lf::kIntentLogFormatSize + 8, len);
     StoreLE32(region.data() + lf::kIntentLogFormatSize + 12, flags);
   }
+  return region;
+}
+
+std::vector<uint8_t> MakeBui(uint64_t id, uint64_t owner, uint64_t startblock,
+                             uint64_t startoff, uint32_t len, uint32_t flags) {
+  std::vector<uint8_t> region(lf::kIntentLogFormatSize + 32, 0);
+  StoreLE16(region.data(), lf::kItemBui);
+  StoreLE16(region.data() + 2, 1);
+  StoreLE32(region.data() + lf::kIntentNextentsOffset, 1);
+  StoreLE64(region.data() + lf::kIntentIdOffset, id);
+  StoreLE64(region.data() + lf::kIntentLogFormatSize, owner);
+  StoreLE64(region.data() + lf::kIntentLogFormatSize + 8, startblock);
+  StoreLE64(region.data() + lf::kIntentLogFormatSize + 16, startoff);
+  StoreLE32(region.data() + lf::kIntentLogFormatSize + 24, len);
+  StoreLE32(region.data() + lf::kIntentLogFormatSize + 28, flags);
+  return region;
+}
+
+std::vector<uint8_t> MakeBud(uint64_t id) {
+  std::vector<uint8_t> region(16, 0);
+  StoreLE16(region.data(), lf::kItemBud);
+  StoreLE16(region.data() + 2, 1);
+  StoreLE64(region.data() + lf::kIntentIdOffset, id);
   return region;
 }
 
@@ -1086,6 +1110,145 @@ TEST(rw6c_recovery_close_after_orphan_cow_cleanup) {
 // ---------------------------------------------------------------------------
 // CUI/CUD parsing, lifetime and R3FC inventory
 // ---------------------------------------------------------------------------
+
+TEST(rw6c_bui_parser_and_bmap_completion) {
+  Image image = MakeImage(true, true, 4096, true);
+  const uint64_t root = image.fs->RootInode();
+  auto src = image.fs->CreateRegularFile(root, "bui-src", 0644, 0, 0);
+  auto dst = image.fs->CreateRegularFile(root, "bui-dst", 0644, 0, 0);
+  CHECK(src.ok() && dst.ok());
+  Allocation pool;
+  CHECK(image.fs
+            ->RunTransaction([&](XfsTransaction& txn) -> Status {
+              BlockAllocator alloc(&txn, &image.fs->device(),
+                                   &image.fs->geometry());
+              Status s = alloc.AllocateOwned(
+                  0, 8, RmapOwner::Data(src.value(), 0, false), &pool);
+              if (!s.ok()) return s;
+              return alloc.Commit();
+            })
+            .ok());
+  CHECK(image.fs->WriteCleanUnmountRecord().ok());
+  image.fs.reset();
+
+  auto sb = ReadSuperblock(*image.device, 0, true);
+  CHECK(sb.ok());
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  auto append = [&](const std::vector<uint8_t>& item, uint32_t tid) -> bool {
+    auto position = ReadLogPosition(*image.device, geo, sb.value());
+    if (!position.ok()) {
+      ::xfstest::Fail(__FILE__, __LINE__, position.error().Format());
+    }
+    LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = tid;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = MakeLsn(position.value().cycle,
+                              position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = BuildLogRecord(params, CommitOps(tid, {item}));
+    if (!record.ok()) {
+      ::xfstest::Fail(__FILE__, __LINE__, record.error().Format());
+    }
+    CHECK(image.device->Write(
+        geo.FsbToByte(sb.value().logstart) +
+            static_cast<uint64_t>(params.block) * 512,
+        record.value().data(), record.value().size()));
+    CHECK(image.device->Flush());
+    return true;
+  };
+  auto recover = [&]() -> std::unique_ptr<XfsFilesystem> {
+    MountOptions options;
+    options.read_write = true;
+    options.recovery_only = true;
+    options.clean_log_after_recovery = true;
+    auto mounted = XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get()),
+        options);
+    if (!mounted.ok()) {
+      ::xfstest::Fail(__FILE__, __LINE__, mounted.error().Format());
+    }
+    CHECK(mounted.value()->FinishRecoveryClean().ok());
+    return std::move(mounted.value());
+  };
+
+  const uint64_t bui_id = 0x6d0001;
+  const std::vector<uint8_t> map_item =
+      MakeBui(bui_id, dst.value(), pool.fsb, 0, 2, 1);
+  auto parsed = ParseBmapIntent(map_item, geo);
+  CHECK(parsed.ok());
+  CHECK_EQ(parsed.value().extents[0].owner, dst.value());
+  CHECK(parsed.value().extents[0].type() == BmapIntentType::kMap);
+  CHECK(!ParseBmapIntent(
+             MakeBui(1, dst.value(), pool.fsb, 0, 2,
+                     kBmapIntentAttrFork | 1),
+             geo)
+             .ok());
+  CHECK(!ParseBmapIntent(
+             MakeBui(1, dst.value(), pool.fsb, 0, 2,
+                     kBmapIntentRealtime | 1),
+             geo)
+             .ok());
+  CHECK(!ParseBmapIntent(MakeBui(1, dst.value(), pool.fsb, 0, 2, 3), geo)
+             .ok());
+  CHECK(ParseBmapIntentDone(MakeBud(1)).ok());
+  CHECK(!ParseBmapIntentDone(std::vector<uint8_t>(12, 0)).ok());
+
+  CHECK(append(map_item, 0x6d01));
+  {
+    auto mounted = recover();
+    CHECK(mounted->recovery_report().has_value());
+    CHECK_EQ(mounted->recovery_report()->intents_completed, 1u);
+    auto extents = mounted->GetDataExtents(dst.value());
+    CHECK(extents.ok());
+    CHECK_EQ(extents.value().size(), 1u);
+    if (!extents.value().empty()) {
+      CHECK_EQ(extents.value()[0].startblock, pool.fsb);
+      CHECK_EQ(extents.value()[0].blockcount, 2u);
+      CHECK(!extents.value()[0].unwritten);
+    }
+    const uint32_t agno = static_cast<uint32_t>(pool.fsb >> geo.agblklog);
+    const uint32_t agbno = static_cast<uint32_t>(
+        pool.fsb & ((1ULL << geo.agblklog) - 1));
+    auto rmap = LoadRmapTree(*image.device, geo, agno);
+    CHECK(rmap.ok());
+    CHECK(rmap.value()
+              .LookupEq(RmapKey{agbno, dst.value(), 0, 0})
+              .ok());
+    CHECK(rmap.value()
+              .LookupEq(RmapKey{agbno, src.value(), 0, 0})
+              .ok());
+    mounted.reset();
+  }
+
+  const std::vector<uint8_t> unmap_item =
+      MakeBui(bui_id + 1, dst.value(), pool.fsb, 0, 2, 2);
+  CHECK(append(unmap_item, 0x6d02));
+  {
+    auto mounted = recover();
+    CHECK(mounted->recovery_report().has_value());
+    CHECK_EQ(mounted->recovery_report()->intents_completed, 1u);
+    auto extents = mounted->GetDataExtents(dst.value());
+    CHECK(extents.ok());
+    CHECK(extents.value().empty());
+    const uint32_t agno = static_cast<uint32_t>(pool.fsb >> geo.agblklog);
+    const uint32_t agbno = static_cast<uint32_t>(
+        pool.fsb & ((1ULL << geo.agblklog) - 1));
+    auto rmap = LoadRmapTree(*image.device, geo, agno);
+    CHECK(rmap.ok());
+    CHECK(!rmap.value()
+               .LookupEq(RmapKey{agbno, dst.value(), 0, 0})
+               .ok());
+    CHECK(rmap.value()
+              .LookupEq(RmapKey{agbno, src.value(), 0, 0})
+              .ok());
+    mounted.reset();
+  }
+  CHECK(image.device->Flush());
+}
 
 TEST(rw6c_cui_completion_large_intent) {
   for (bool rmapbt : {false, true}) {

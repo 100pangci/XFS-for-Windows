@@ -36,6 +36,7 @@ still refuse inode freeing, as in RW-6B.
 | CoW write and shared-aware size changes | `src/write/file_write.cpp` |
 | Data-fork release hook | `src/write/bmap.cpp` |
 | CUI/CUD format | `include/xfs/refcount_intent.h`, `src/core/refcount_intent.cpp` |
+| BUI/BUD format (deferred data-fork map/unmap) | `include/xfs/bmap_intent.h`, `src/core/bmap_intent.cpp` |
 | Intent preflight and lifetime | `src/recovery/log_scan.cpp` |
 | Intent completion and orphan CoW cleanup | `src/write/recovery_host.cpp` |
 | Formatter | `src/mkfs/geometry.cpp`, `src/mkfs/ag_builder.cpp`, `src/mkfs/formatter.cpp`, `src/mkfs/superblock_builder.cpp` |
@@ -240,6 +241,24 @@ transaction per intent:
 * a crash before log commit leaves the intent pending; a crash after commit
   leaves the CUD and the new refcount state.
 
+BUI/BUD are the companion deferred data-fork mapping intents.  A reflink clone
+and a CoW remap both log the destination mapping through a BUI, often in the
+same transaction as the CUI.  Recovery accepts a BUI only with exactly one
+map or unmap operation, validates it against the inode and AG geometry, and
+completes it in a normal transaction:
+
+* MAP inserts the data-fork extent, accounts `di_nblocks`, and adds the inode
+  rmap owner (written or unwritten);
+* UNMAP removes the inode rmap owner and the data-fork extent; the paired EFI,
+  if present, performs the physical free.  A missing rmap owner is accepted
+  when no other owner overlaps, which makes BUI/EFI completion order
+  independent;
+* a matching BUD is logged in the same transaction as the inode/bmap buffers.
+
+Attribute-fork and realtime BUI extents are refused.  The completion order is
+the recovered log item order; BUI map/unmap is idempotent with respect to a
+previously completed EFI free.
+
 Mount then runs orphan CoW recovery, which removes any completed allocate-CoW
 record that no inode references.
 
@@ -313,7 +332,7 @@ The following was observed on Windows before the Linux qualification run. It
 is recorded to make the implementation state auditable, not to claim any
 Linux gate:
 
-* full unit/integration suite: **165 tests passed**;
+* full unit/integration suite: **167 tests passed**;
 * `--make-rw6c-fixture` produced a Windows-formatted, 1 KiB-block
   `reflink=1,rmapbt=1` image with 100 separated shared extents; the independent
   oracle accepted it (104 shared records / 123 shared blocks, refcount tree
@@ -330,7 +349,12 @@ Linux gate:
   was refused with `no space left`, left `/base/cow.bin` byte-identical,
   leaked no CoW record and passed the oracle;
 * a simulated Linux reverse pass (Windows-created equivalent data) was read,
-  checked against the manifest, mutated again and accepted by the oracle.
+  checked against the manifest, mutated again and accepted by the oracle;
+* the genuine Linux CUI/BUI/CUD snapshot captured by run `40159734421`
+  (`linux-generate-rw6c-cui`, CUI op 1 + BUI map op 1) was completed by
+  Windows both directly and through 17 recovery crash points; the resulting
+  sharing/CoW/free-block state matched the kernel-recovered oracle.  Linux
+  re-verification of the Windows output is still a CI gate.
 
 Genuine Linux-created images, genuine CUI/CUD logs, Linux crash replay and
 Linux xfs_repair/mount evidence remain the CI gates below. The local fixture
@@ -351,7 +375,7 @@ passed; local tests and Windows self-consistency are not Linux evidence.
 | 5 | Clone semantics: holes, unwritten, partial EOF, all-hole and self rules | unit tests pass | **pending Linux mount/content verify** |
 | 6 | CoW write ordering and destination isolation | unit tests pass | **pending Linux/crash verify** |
 | 7 | Shared truncate/unlink, three-way clone and last-reference release | unit tests pass | **pending Linux verify** |
-| 8 | Genuine Linux CUI without CUD completes on Windows | parser/lifetime unit tests only | **pending genuine-log CI** |
+| 8 | Genuine Linux CUI without CUD completes on Windows, including its BUI | local completion and 17 crash points against run `40159734421` artifact; kernel oracle matched | **pending Linux verification of the Windows output** |
 | 9 | Orphan CoW staging recovery after a crash | unit mount-cleanup test passes | **pending crash CI** |
 | 10 | Crash matrix for clone, CoW, truncate/unlink and recovery; every image accepted by Linux | crash points exist; Windows-side replay not yet run | **pending CI** |
 | 11 | ENOSPC and no-write refusal matrix leave the image byte-identical or structurally valid | mount refusal unit test | **pending CI** |
@@ -364,9 +388,12 @@ to name the runs/artifacts.
 ## Known limitations
 
 * Realtime refcountbt (`refcount=1` for the realtime group) is unsupported.
-* Refcount intents are completed one CUI per transaction; an unusually large
-  CUI that does not fit a log record is refused rather than split.
-* Attribute forks with allocated extents still cannot be freed.
+* Refcount intents are completed one CUI per transaction. A 1024-extent CUI
+  is covered by the unit matrix, but a CUI larger than one transaction budget
+  is refused rather than split with a fresh continuation intent.
+* Attribute forks with allocated extents still cannot be freed; BUI
+  attribute/realtime mappings are refused.
+* A BUI is accepted only with one mapping (the Linux recovery constraint).
 * Exchange-range, online repair, quotas, parent pointers and metadir remain
   outside the writable profile.
 * The Windows formatter's refcount tree is a single empty root leaf; tree

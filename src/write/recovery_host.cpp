@@ -9,8 +9,9 @@
 //                           -> re-read superblock -> finish intents
 //                           -> process AGI unlinked lists -> flush
 //   AnalyzeJournal()        the read-only variant for `xfswin check`
-//   CompleteIntent()        xfs_defer_finish_recovery for EFI: free the
-//                           extents in a normal transaction and log the EFD
+//   CompleteIntent()        xfs_defer_finish_recovery for EFI/RUI/BUI/CUI:
+//                           finish one deferred intent in a normal
+//                           transaction and log its done item
 //   ProcessAgiUnlinkedLists()  xlog_recover_process_iunlinks: walk every AGI
 //                           bucket, truncate and free zero-link inodes, clear
 //                           buckets that cannot be walked
@@ -34,6 +35,8 @@
 
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
+#include "xfs/bmap.h"
+#include "xfs/bmap_intent.h"
 #include "xfs/crash.h"
 #include "xfs/endian.h"
 #include "xfs/ialloc.h"
@@ -91,7 +94,7 @@ Result<XfsFilesystem::RecoverySummary> XfsFilesystem::AnalyzeJournal() const {
     // the scan only proves the replay half can be done.
     for (const PendingIntent& intent : CollectPendingIntents(log)) {
       if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
-          intent.type == lf::kItemCui) {
+          intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
         continue;
       }
       summary.unsupported_items.push_back(
@@ -174,7 +177,7 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
   const std::vector<PendingIntent> intents = CollectPendingIntents(scan);
   for (const PendingIntent& intent : intents) {
     if (intent.type != lf::kItemEfi && intent.type != lf::kItemRui &&
-        intent.type != lf::kItemCui) {
+        intent.type != lf::kItemCui && intent.type != lf::kItemBui) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "cannot recover dirty log: unresolved intent " +
                          IntentContext(intent) +
@@ -296,6 +299,84 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverScannedLog(
 // transaction and log the matching EFD so a later crash does not redo the
 // work (the done item releases the intent during recovery).
 Status XfsFilesystem::CompleteIntent(const PendingIntent& intent) {
+  if (intent.type == lf::kItemBui) {
+    if (intent.regions.empty()) {
+      return XFS_ERR(XfsError::kCorruptBtree, "BUI item has no format region")
+          .Metadata("log");
+    }
+    auto parsed = ParseBmapIntent(intent.regions[0], geometry_);
+    if (!parsed.ok()) return parsed.error();
+    const BmapIntent bui = std::move(parsed.value());
+    return RunTransaction([&](XfsTransaction& txn) -> Status {
+      BlockAllocator blocks(&txn, device_.get(), &geometry_);
+      const BmapIntentExtent& e = bui.extents[0];
+      auto inode = OpenInode(e.owner);
+      if (!inode.ok()) return inode.error();
+      if (!inode.value().IsRegular()) {
+        return XFS_ERR(XfsError::kInvalidArgument,
+                       "BUI owner is not a regular file")
+            .Ino(e.owner)
+            .Metadata("BUI");
+      }
+      DataForkEditor editor(&txn, &blocks, device_.get(), &geometry_);
+      Status s = editor.Load(inode.value());
+      if (!s.ok()) return s;
+      const uint64_t endoff = e.startoff + e.len;
+      if (e.type() == BmapIntentType::kMap) {
+        XfsExtent mapping;
+        mapping.startoff = e.startoff;
+        mapping.startblock = e.startblock;
+        mapping.blockcount = e.len;
+        mapping.unwritten = e.unwritten();
+        s = editor.InsertExtent(mapping);
+        if (!s.ok()) return s;
+        editor.AddNblocks(static_cast<int64_t>(e.len));
+        if (geometry_.features.rmapbt) {
+          s = blocks.RmapMap(
+              e.startblock, e.len,
+              RmapOwner::Data(e.owner, e.startoff, e.unwritten()));
+          if (!s.ok()) return s;
+        }
+      } else {
+        // The BUI removes the file mapping; the corresponding EFI (if any)
+        // frees the physical blocks.  If the EFI was processed first it
+        // already removed the rmap owner, which is idempotent for this step.
+        if (geometry_.features.rmapbt) {
+          s = blocks.RmapUnmap(
+              e.startblock, e.len,
+              RmapOwner::Data(e.owner, e.startoff, e.unwritten()),
+              /*no_overlap_ok=*/true);
+          if (!s.ok()) return s;
+        }
+        s = editor.RemoveRange(e.startoff, endoff);
+        if (!s.ok()) return s;
+        editor.AddNblocks(-static_cast<int64_t>(e.len));
+      }
+      auto raw = ReadRawInode(e.owner);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> image = std::move(raw.value());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = editor.Finalize(&image, &ilog_fields, &fork_region);
+      if (!s.ok()) return s;
+      s = LogPreparedInode(txn, e.owner, std::move(image), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s;
+      MaybeCrash(CrashPoint::kBeforeIntentDone,
+                 "BUI id=" + std::to_string(bui.id));
+      std::vector<uint8_t> bud(16, 0);
+      StoreLE16(bud.data(), lf::kItemBud);
+      StoreLE16(bud.data() + 2, 1);
+      StoreLE64(bud.data() + lf::kIntentIdOffset, bui.id);
+      txn.AddLogOp(std::move(bud));
+      Status committed = blocks.Commit();
+      if (committed.ok()) {
+        MaybeCrash(CrashPoint::kAfterIntentDone,
+                   "BUI id=" + std::to_string(bui.id));
+      }
+      return committed;
+    });
+  }
   if (intent.type == lf::kItemCui) {
     if (!geometry_.features.reflink) {
       return XFS_ERR(XfsError::kUnsupportedFeature,

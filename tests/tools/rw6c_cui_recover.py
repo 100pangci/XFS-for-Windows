@@ -41,20 +41,34 @@ def journal(exe, image):
     return json.loads(text)
 
 
-def active_cuis(scan):
+def all_active_intents(scan):
     active = {}
+    pairs = {
+        "XFS_LI_CUI": ("XFS_LI_CUD", "CUI"),
+        "XFS_LI_BUI": ("XFS_LI_BUD", "BUI"),
+    }
+    done = {done_type: (start_type, label)
+            for start_type, (done_type, label) in pairs.items()}
     for trans in scan.get("transactions", []):
         for item in trans.get("items", []):
-            if item.get("type") not in ("XFS_LI_CUI", "XFS_LI_CUD"):
+            typ = item.get("type")
+            if typ not in pairs and typ not in done:
                 continue
             ident = item.get("id")
             if ident is None:
-                raise SystemExit("CUI/CUD journal item has no id")
-            if item["type"] == "XFS_LI_CUI":
-                active[ident] = item
+                raise SystemExit("%s journal item has no id" % typ)
+            if typ in pairs:
+                active[(typ, ident)] = item
             else:
-                active.pop(ident, None)
+                start_type = done[typ][0]
+                active.pop((start_type, ident), None)
     return active
+
+
+def active_cuis(scan):
+    return {(typ, ident): item
+            for (typ, ident), item in all_active_intents(scan).items()
+            if typ == "XFS_LI_CUI"}
 
 
 def oracle(python, script, image):
@@ -105,6 +119,7 @@ def crash_points(scan):
         for extent in item.get("extents") or []:
             if int(extent.get("op", 0)) in (1, 2):
                 adjust_extents += 1
+    intents = all_active_intents(scan)
     points = [
         "recovery_scan:1",
         "recovery_before_pass2:1",
@@ -116,11 +131,11 @@ def crash_points(scan):
         "recovery_mid_iunlinks:1",
         "recovery_before_log_clean:1",
         "recovery_after_log_clean:1",
-        "before_intent_done:1",
-        "after_intent_done:1",
     ]
-    for hit in range(1, min(3, len(cuis)) + 1):
+    for hit in range(1, min(3, len(intents)) + 1):
         points.append("recovery_mid_intents:%d" % hit)
+        points.append("before_intent_done:%d" % hit)
+        points.append("after_intent_done:%d" % hit)
     for hit in range(1, min(3, adjust_extents) + 1):
         points.append("after_refcount_update:%d" % hit)
     return points

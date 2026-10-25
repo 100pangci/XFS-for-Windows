@@ -151,7 +151,8 @@ class BlockAllocator {
   // RUI completion: apply the rmap half of a recovered intent without
   // touching the free-space trees (the original transaction already did).
   Status RmapMap(uint64_t fsb, uint32_t len, const RmapOwner& owner);
-  Status RmapUnmap(uint64_t fsb, uint32_t len, const RmapOwner& owner);
+  Status RmapUnmap(uint64_t fsb, uint32_t len, const RmapOwner& owner,
+                   bool no_overlap_ok = false);
   Status RmapConvert(uint64_t fsb, uint32_t len, const RmapOwner& owner,
                      bool old_unwritten);
 
