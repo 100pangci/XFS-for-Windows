@@ -39,7 +39,23 @@ PY
 
 mkdir -p "$MNT"
 mount -o loop "$IMG" "$MNT"
-trap 'umount "$MNT" 2>/dev/null || true' EXIT
+umount_retry() {
+  local mp="$1"
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if umount "$mp" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rw6e: cannot unmount $mp" >&2
+  findmnt -T "$mp" || true
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -vm "$mp" || true
+  fi
+  umount -l "$mp"
+}
+trap 'umount_retry "$MNT" 2>/dev/null || true' EXIT
 python3 "$ROOT/tests/tools/rw6e_linux_content.py" --make "$MNT" \
     --manifest "$MANIFEST"
 sync
@@ -55,7 +71,7 @@ if command -v xfs_scrub >/dev/null 2>&1; then
     fi
   fi
 fi
-umount "$MNT"
+umount_retry "$MNT"
 trap - EXIT
 xfs_repair -n "$IMG" | tee "$OUT/xfs_repair.txt"
 echo "rw6e: Linux fixture ready at $IMG"

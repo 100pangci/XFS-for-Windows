@@ -42,15 +42,36 @@ MNT="$WORK/mnt"
 mkdir -p "$MNT"
 truncate -s 512M "$WORK/kernel-probe.img"
 mkfs.xfs -f -q -n parent=1 "$WORK/kernel-probe.img"
+
+umount_retry() {
+  local mp="$1"
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if umount "$mp" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rw6e: cannot unmount $mp" >&2
+  findmnt -T "$mp" || true
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -vm "$mp" || true
+  fi
+  umount -l "$mp"
+}
+
 if ! mount -o loop "$WORK/kernel-probe.img" "$MNT"; then
   echo "rw6e: this kernel cannot mount a parent=1 XFS image; refusing to downgrade to xfs_repair-only evidence" >&2
   exit 1
 fi
 if ! touch "$MNT/kernel-ok"; then
   echo "rw6e: parent filesystem mounted read-only or is not writable" >&2
-  umount "$MNT" || true
+  umount_retry "$MNT" || true
   exit 1
 fi
 sync
-umount "$MNT"
+if ! umount_retry "$MNT"; then
+  echo "rw6e: parent-pointer mount could not be unmounted" >&2
+  exit 1
+fi
 echo "rw6e: host parent-pointer mount/format probe passed"
