@@ -3708,10 +3708,10 @@ jobs:
           Run @('unlink', $img, '/win-move/dir/after', '--rw-experimental')
           Run @('symlink', $img, 'target', '/win-move/link',
             '--rw-experimental')
-          Run @('create', $img, '/win-empty', '--rw-experimental')
-          Run @('rmdir', $img, '/win-empty', '--rw-experimental')
           Run @('create', $img, '/win-delete', '--rw-experimental')
           Run @('unlink', $img, '/win-delete', '--rw-experimental')
+          Run @('mkdir', $img, '/win-empty', '--rw-experimental')
+          Run @('rmdir', $img, '/win-empty', '--rw-experimental')
           Run @('create', $img, '/win-victim', '--rw-experimental')
           Run @('pwrite', $img, '/win-victim', '0', '--rw-experimental',
             '--text=VICTIM')
