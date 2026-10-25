@@ -25,9 +25,9 @@ echo "== xfsprogs =="
 mkfs.xfs -V
 
 PROBE="$WORK/parent-probe.img"
-truncate -s 64M "$PROBE"
+truncate -s 512M "$PROBE"
 if ! mkfs.xfs -f -q -n parent=1 "$PROBE" >"$WORK/probe.mkfs.log" 2>&1; then
-  echo "rw6e: mkfs.xfs does not support -n parent=1" >&2
+  echo "rw6e: mkfs.xfs cannot format -n parent=1" >&2
   cat "$WORK/probe.mkfs.log" >&2
   exit 1
 fi
@@ -40,7 +40,7 @@ fi
 
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
-truncate -s 64M "$WORK/kernel-probe.img"
+truncate -s 512M "$WORK/kernel-probe.img"
 mkfs.xfs -f -q -n parent=1 "$WORK/kernel-probe.img"
 if ! mount -o loop "$WORK/kernel-probe.img" "$MNT"; then
   echo "rw6e: this kernel cannot mount a parent=1 XFS image; refusing to downgrade to xfs_repair-only evidence" >&2

@@ -62,9 +62,9 @@ if ! mkfs.xfs -V 2>&1 | grep -q "version $VERSION"; then
 fi
 
 PROBE="$WORK/parent-probe.img"
-truncate -s 64M "$PROBE"
+truncate -s 512M "$PROBE"
 if ! mkfs.xfs -f -q -n parent=1 "$PROBE" >/dev/null 2>&1; then
-  echo "install_xfsprogs: built mkfs.xfs still rejects -n parent=1" >&2
+  echo "install_xfsprogs: built mkfs.xfs cannot format -n parent=1" >&2
   exit 1
 fi
 rm -f "$PROBE"
