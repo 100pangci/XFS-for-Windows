@@ -186,8 +186,12 @@ node forks, remote values, the attribute BMBT, forkoff/data-fork conversion and
 inode deletion with attributes. Attribute writes use the ordinary
 `--rw-experimental` opt-in. The Linux qualification ledger is in
 [docs/XATTR.md](docs/XATTR.md); the supported mkfs subset and the parent-pointer
-gap are recorded in [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md). ACL and
-security-descriptor translation remain unsupported.
+gap are recorded in [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md). The
+ordinary attribute write/round-trip gates passed in
+[run 40199011913](https://github.com/100pangci/XFS-for-Windows/actions/runs/40199011913);
+genuine Linux `ATTRI`/`ATTRD` logs still need a `CONFIG_XFS_DEBUG` kernel, so
+that one ledger row remains open. ACL and security-descriptor translation remain
+unsupported.
 
 ## Journal recovery (RW-5)
 

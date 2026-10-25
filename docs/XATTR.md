@@ -1,10 +1,19 @@
 # Native extended attributes (RW-6D)
 
-Status: **implementation complete, Linux qualification pending.** The writable
-profile accepts attribute creation, replacement, removal and preservation on
-ordinary `--rw-experimental` mounts. The gate is not opened merely by this
-document: the qualification ledger at the end must be filled from a CI run,
-exactly like RW-6B and RW-6C.
+Status: **ordinary attribute writes and Windows/Linux round trips qualified on
+2026-10-25** after every gate in the qualification ledger below passed on
+[run 40199011913](https://github.com/100pangci/XFS-for-Windows/actions/runs/40199011913),
+with one explicit exception: genuine Linux `ATTRI`/`ATTRD` logs require a
+`CONFIG_XFS_DEBUG` kernel with the sysfs `larp` knob enabled, and the Ubuntu
+runner is non-debug. Row 6 therefore remains **pending**; the writer itself
+uses one atomic transaction and does not emit those intents, so ordinary
+attribute writes are not blocked by that gap. Recovery of a Linux log that
+actually contains attribute intents is the part that still needs the debug
+kernel.
+
+The writable profile accepts attribute creation, replacement, removal and
+preservation on ordinary `--rw-experimental` mounts. This document, not the
+implementation status table in the README, is the qualification record.
 
 This milestone implements:
 
@@ -386,16 +395,21 @@ Local Windows results are support evidence, not Linux evidence.
 
 | # | Gate | Local status | Linux/independent evidence |
 |---|---|---|---|
-| 1 | Windows 1 KiB formatter fixture: all representations accepted by `xfs_repair -n` and mount | fixture, check, oracle pass | pending |
-| 2 | Linux-created 4 KiB fixtures, both reflink profiles: Windows reads every value, `check` and oracle pass | tools implemented | pending |
-| 3 | Windows mutation: shortform/leaf/node/level-2/remote/BMBT, namespaces, dir/symlink, data, rename/link/unlink, reflink | local fixture pass | pending |
-| 4 | DA node split/merge/borrow/root collapse and node → leaf → shortform reverse transitions | unit matrix pass | pending |
-| 5 | Remote value ordering, replace/free and crash consistency | unit + 66 crash images pass locally | pending |
-| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients | parser unit tests pass | pending: Linux emits these only in a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the distro runner is non-debug, so this needs a dedicated debug-kernel run |
-| 7 | Crash matrix: every injection point accepted by Linux with old-or-new state | 66/66 recovered locally | pending |
-| 8 | ENOSPC: failed writes leave the image equivalent; shortform still works | 335 MB fill, unchanged oracle | pending |
-| 9 | Linux → Windows → Linux churn and a final audit | local simulation pass | pending |
-| 10 | `check` agrees with `xfs_repair -n` on attr extents, BMBT, remote blocks, `di_nblocks` and rmap ownership | check tests pass | pending |
+| 1 | Windows 1 KiB formatter fixture: all representations accepted by `xfs_repair -n` and mount | fixture, check, oracle pass | **verified**: `linux-verify-rw6d-windows` passed `xfs_repair -n`, the oracle (`leaf,node,shortform`, max-level 2) and the kernel check of 279 attributes |
+| 2 | Linux-created 4 KiB fixtures, both reflink profiles: Windows reads every value, `check` and oracle pass | tools implemented | **verified**: `linux-generate-rw6d` produced both profiles; `windows-rw6d-roundtrip` passed for `rw6d` and `rw6d-normap`; `linux-verify-rw6d` then checked 9485 attributes on the rmap profile and passed the normap profile |
+| 3 | Windows mutation: shortform/leaf/node/level-2/remote/BMBT, namespaces, dir/symlink, data, rename/link/unlink, reflink | local fixture pass | **verified**: `windows-rw6d-native` passed; Linux verified the re-mutated 1 KiB image (318 attributes/4 files) and the 4 KiB mutations (9485 attributes/11 files) |
+| 4 | DA node split/merge/borrow/root collapse and node → leaf → shortform reverse transitions | unit matrix pass | **verified**: `linux-verify-rw6d` and `windows-verify-rw6d-reverse` passed the level-2 tree on both profiles; `linux-verify-rw6d-final` passed the final image |
+| 5 | Remote value ordering, replace/free and crash consistency | unit + 66 crash images pass locally | **verified**: `windows-rw6d-crash` produced 66 old-or-new images; `linux-verify-rw6d-crash` accepted all 66 after Windows recovery |
+| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients | parser unit tests and log-scan test pass | pending: Linux emits these only in a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the distro runner is non-debug, so this needs a dedicated debug-kernel run |
+| 7 | Crash matrix: every injection point accepted by Linux with old-or-new state | 66/66 recovered locally | **verified**: `linux-verify-rw6d-crash` checked 66/66 restarted images with `xfs_repair -n`, the kernel xattr walk and the archived old-or-new manifest |
+| 8 | ENOSPC: failed writes leave the image equivalent; shortform still works | 335 MB fill, unchanged oracle | **verified**: `windows-rw6d-enospc` passed, then `linux-verify-rw6d-windows` accepted the 280-attribute ENOSPC image with `xfs_repair -n` and a kernel mount |
+| 9 | Linux → Windows → Linux churn and a final audit | local simulation pass | **verified**: both profiles completed `windows-rw6d-roundtrip` → Linux reverse → `windows-verify-rw6d-reverse` → `linux-verify-rw6d-final` |
+| 10 | `check` agrees with `xfs_repair -n` on attr extents, BMBT, remote blocks, `di_nblocks` and rmap ownership | check tests pass | **verified**: every RW-6D Linux job ran `xfs_repair -n` clean; Windows `xfswin check` passed every mutable image (40 OK checks on the 1 KiB fixture), including the independent oracle's block/rmap walk |
+
+Rows 1–5 and 7–10 are verified by [run 40199011913](https://github.com/100pangci/XFS-for-Windows/actions/runs/40199011913).
+Row 6 stays open until a debug-kernel run captures genuine `ATTRI`/`ATTRD` records; the
+format parser and log-scan classification are covered by unit tests, but that is not
+Linux evidence.
 
 ## Known limitations
 

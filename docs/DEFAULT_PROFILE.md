@@ -126,6 +126,31 @@ default.version.txt        xfs_db -r -c 'version'
 parentless.*               the same for mkfs.xfs -n parent=0
 ```
 
+The first measured runner (Ubuntu 24.04, xfsprogs **6.6.0**) produced:
+
+```text
+mkfs.xfs version 6.6.0
+meta-data  isize=512 agcount=4 agsize=32768 blks
+           attr=2, projid32bit=1, crc=1, finobt=1, sparse=1,
+           rmapbt=1, reflink=1, bigtime=1, inobtcount=1, nrext64=0
+data       bsize=4096 blocks=131072
+naming     version=2 bsize=4096 ascii-ci=0 ftype=1
+log        internal bsize=4096 blocks=16384 version=2 lazy-count=1
+realtime   none
+sb_dirblklog = 0
+sb_features_ro_compat = 0xf
+sb_features_incompat = 0xb
+sb_features_log_incompat = 0
+```
+
+`mkfs.xfs` 6.6 has **no `parent=` option** (`parentless.unsupported.txt`), so it
+does not enable parent pointers at all; `nrext64` is also off by default in this
+distro build. The default 4 KiB image is therefore inside the writable profile
+(rmapbt and reflink both on, one block per directory block). The 7.2 source
+defaults above (parent pointers, NREXT64, exchange-range) describe a newer
+builder; on such a distribution the plain default is read-only until
+`-n parent=0` is passed and NREXT64 is chosen explicitly for fixtures.
+
 The expected default for the reference 7.2 tree is on; the CI artifact is the
 record of what the runner's xfsprogs actually enabled. Qualification fixtures
 never rely on the default when parent pointers would make the image read-only.
