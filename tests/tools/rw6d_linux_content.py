@@ -195,8 +195,8 @@ def create(root):
 
 
 def create_paths(root):
-    names = ["short", "leaf", "node", "remote", "data", "bmbt", "del",
-             "rename", "linkme", "dir", "link"]
+    names = ["short", "leaf", "node", "remote", "data", "bmbt", "deep",
+             "del", "rename", "linkme", "dir", "link"]
     return {"/" + name: os.stat(os.path.join(root, name),
                                 follow_symlinks=False).st_ino
             for name in names}
