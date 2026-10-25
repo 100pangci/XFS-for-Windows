@@ -17,8 +17,9 @@ OUT=${1:?usage: make_rw6c_cui_linux.sh <outdir>}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SIZE_MB=${SIZE_MB:-768}
 COW_MB=${COW_MB:-512}
-ROUNDS=${ROUNDS:-400}
+ROUNDS=${ROUNDS:-100000}
 THREADS=${THREADS:-8}
+EXTENTS=${EXTENTS:-1024}
 MAX_SNAPS=${MAX_SNAPS:-2500}
 WORK=$(mktemp -d)
 LOOP=""
@@ -106,15 +107,18 @@ import subprocess
 import sys
 import threading
 
-root, threads, rounds = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+root, threads, rounds, extents = (sys.argv[1], int(sys.argv[2]),
+                                   int(sys.argv[3]), int(sys.argv[4]))
 block = 4096
 base = os.path.join(root, "base.bin")
 if not os.path.exists(base):
+    # Many separated extents make the clone produce a large CUI.  The active
+    # CUI window (between the remap transaction commit and deferred refcount
+    # completion) is then wide enough for an atomic snapshot to catch.
     with open(base, "wb") as f:
-        seed = 12345
-        for _ in range(8192):
-            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-            f.write(seed.to_bytes(4, "little"))
+        for i in range(extents):
+            f.seek(i * 2 * block)
+            f.write(bytes(((i * 13 + j * 7) & 0xFF) for j in range(block)))
         f.flush()
         os.fsync(f.fileno())
 
@@ -152,7 +156,7 @@ for t in threads:
     t.join()
 PY
 
-python3 "$WORK/workload.py" "$MOUNT" "$THREADS" "$ROUNDS" &
+python3 "$WORK/workload.py" "$MOUNT" "$THREADS" "$ROUNDS" "$EXTENTS" &
 WRITER_PID=$!
 
 log_has_surviving_cui() {
@@ -181,8 +185,7 @@ if not active:
     raise SystemExit(2)
 for ident in sorted(active):
     print("surviving CUI id:", ident,
-          "nextents:", active[ident].get("nextents"),
-          "extents:", active[ident].get("extents"))
+          "nextents:", active[ident].get("nextents"))
 PY
 }
 
@@ -338,7 +341,8 @@ manifest = {
     "snapshots_examined": attempts,
     "surviving_cui": [
         {"id": ident, "nextents": item.get("nextents"),
-         "extents": item.get("extents")}
+         "ops": sorted({int(e.get("op", 0))
+                       for e in (item.get("extents") or [])})}
         for ident, item in active.items()
     ],
     "logprint": "cui.logprint.txt",

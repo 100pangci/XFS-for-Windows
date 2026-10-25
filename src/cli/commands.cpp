@@ -580,7 +580,18 @@ void PrintJournalJson(const LogScan& scan) {
         std::cout << ", \"id\": " << id;
         if (item.type == logfmt::kItemCui) {
           const uint32_t nextents = LoadLE32(p + logfmt::kIntentNextentsOffset);
-          std::cout << ", \"nextents\": " << nextents;
+          std::cout << ", \"nextents\": " << nextents << ", \"extents\": [";
+          for (uint32_t ext_i = 0; ext_i < nextents; ++ext_i) {
+            const size_t base = logfmt::kIntentLogFormatSize + ext_i * 16;
+            if (base + 16 > item.regions[0].size()) break;
+            const uint8_t* e = p + base;
+            std::cout << (ext_i == 0 ? "" : ", ") << "{\"startblock\": "
+                      << (static_cast<uint64_t>(LoadLE32(e + 0)) |
+                          (static_cast<uint64_t>(LoadLE32(e + 4)) << 32))
+                      << ", \"len\": " << LoadLE32(e + 8)
+                      << ", \"op\": " << (LoadLE32(e + 12) & 0xff) << "}";
+          }
+          std::cout << "]";
         }
       }
       std::cout << "}";

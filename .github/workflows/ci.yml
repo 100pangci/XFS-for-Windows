@@ -2753,8 +2753,9 @@ jobs:
 
       - name: Capture a surviving CUI
         run: |
-          sudo env SIZE_MB=768 COW_MB=512 ROUNDS=1500 THREADS=8 \
-            MAX_SNAPS=2500 bash tests/scripts/make_rw6c_cui_linux.sh rw6c-cui
+          sudo env SIZE_MB=768 COW_MB=512 ROUNDS=100000 THREADS=8 \
+            EXTENTS=1024 MAX_SNAPS=2500 \
+            bash tests/scripts/make_rw6c_cui_linux.sh rw6c-cui
           sudo chown -R "$USER" rw6c-cui
           cat rw6c-cui/cui.manifest.json
           grep -q CUI rw6c-cui/cui.logprint.txt

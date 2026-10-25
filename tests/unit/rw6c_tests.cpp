@@ -25,6 +25,7 @@
 #include "xfs/filesystem.h"
 #include "xfs/formatter.h"
 #include "xfs/log_format.h"
+#include "xfs/log_record.h"
 #include "xfs/ondisk.h"
 #include "xfs/recovery.h"
 #include "xfs/refcount.h"
@@ -341,6 +342,20 @@ RefcountRecord Cow(uint32_t start, uint32_t len) {
   rec.blockcount = len;
   rec.refcount = 1;
   return rec;
+}
+
+std::vector<LogOp> CommitOps(uint32_t tid,
+                             std::vector<std::vector<uint8_t>> regions) {
+  std::vector<LogOp> ops;
+  ops.push_back(LogOp(lf::kFlagStartTrans, {}));
+  std::vector<uint8_t> header;
+  AppendTransHeader(&header, tid, static_cast<uint32_t>(regions.size()));
+  ops.push_back(LogOp(0, std::move(header)));
+  for (auto& region : regions) {
+    ops.push_back(LogOp(0, std::move(region)));
+  }
+  ops.push_back(LogOp(lf::kFlagCommitTrans, {}));
+  return ops;
 }
 
 std::vector<uint8_t> MakeCui(uint64_t id, uint64_t startblock, uint32_t len,
@@ -1071,6 +1086,100 @@ TEST(rw6c_recovery_close_after_orphan_cow_cleanup) {
 // ---------------------------------------------------------------------------
 // CUI/CUD parsing, lifetime and R3FC inventory
 // ---------------------------------------------------------------------------
+
+TEST(rw6c_cui_completion_large_intent) {
+  for (bool rmapbt : {false, true}) {
+    Image image = MakeImage(true, rmapbt, 4096, true);
+    // Reserve a private block pool so refcount tree growth cannot land inside
+    // the ranges named by the synthetic intent.
+    Allocation pool;
+    CHECK(image.fs
+              ->RunTransaction([&](XfsTransaction& txn) -> Status {
+                BlockAllocator alloc(&txn, &image.fs->device(),
+                                     &image.fs->geometry());
+                Status s = rmapbt
+                               ? alloc.AllocateFromAgOwned(
+                                     0, 2048, 1,
+                                     RmapOwner::Data(
+                                         image.fs->superblock().rootino, 0,
+                                         false),
+                                     &pool)
+                               : alloc.AllocateFromAg(0, 2048, 1, &pool);
+                if (!s.ok()) return s;
+                return alloc.Commit();
+              })
+              .ok());
+    CHECK(image.fs->WriteCleanUnmountRecord().ok());
+    image.fs.reset();
+
+    auto sb = ReadSuperblock(*image.device, 0, true);
+    CHECK(sb.ok());
+    const XfsGeometry geo = MakeGeometry(sb.value());
+    auto position = ReadLogPosition(*image.device, geo, sb.value());
+    CHECK(position.ok());
+    constexpr uint32_t kExtents = 1024;
+    std::vector<uint8_t> cui(lf::kIntentLogFormatSize + kExtents * 16, 0);
+    StoreLE16(cui.data(), lf::kItemCui);
+    StoreLE16(cui.data() + 2, 1);
+    StoreLE32(cui.data() + lf::kIntentNextentsOffset, kExtents);
+    StoreLE64(cui.data() + lf::kIntentIdOffset, 0x6c0001);
+    for (uint32_t i = 0; i < kExtents; ++i) {
+      const uint64_t fsb = pool.fsb + i * 2;
+      StoreLE64(cui.data() + lf::kIntentLogFormatSize + i * 16, fsb);
+      StoreLE32(cui.data() + lf::kIntentLogFormatSize + i * 16 + 8, 1);
+      StoreLE32(cui.data() + lf::kIntentLogFormatSize + i * 16 + 12, 1);
+    }
+    LogRecordParams params;
+    params.cycle = position.value().cycle;
+    params.block = position.value().next_block;
+    params.tid = 0x6c0001;
+    params.prev_block = position.value().prev_block;
+    params.tail_lsn = MakeLsn(position.value().cycle,
+                              position.value().next_block);
+    params.log_blocks = position.value().log_blocks;
+    params.record_size = position.value().record_size;
+    params.uuid = geo.meta_uuid;
+    auto record = BuildLogRecord(params, CommitOps(0x6c0001, {cui}));
+    if (!record.ok()) {
+      ::xfstest::Fail(__FILE__, __LINE__, record.error().Format());
+    }
+    CHECK(image.device->Write(
+        geo.FsbToByte(sb.value().logstart) +
+            static_cast<uint64_t>(params.block) * 512,
+        record.value().data(), record.value().size()));
+    CHECK(image.device->Flush());
+
+    MountOptions recovery;
+    recovery.read_write = true;
+    recovery.recovery_only = true;
+    recovery.clean_log_after_recovery = false;
+    auto mounted = XfsFilesystem::Mount(
+        std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get()),
+        recovery);
+    if (!mounted.ok()) {
+      ::xfstest::Fail(__FILE__, __LINE__, mounted.error().Format());
+    }
+    CHECK(mounted.value()->recovery_report().has_value());
+    CHECK_EQ(mounted.value()->recovery_report()->intents_completed, 1u);
+    auto tree = LoadRefcountTree(*image.device, geo, 0);
+    if (!tree.ok()) ::xfstest::Fail(__FILE__, __LINE__, tree.error().Format());
+    CHECK_EQ(tree.value().records.size(), kExtents);
+    mounted.value().reset();
+
+    auto after = ReadSuperblock(*image.device, 0, true);
+    CHECK(after.ok());
+    auto scan = ScanLog(*image.device, after.value(),
+                        MakeGeometry(after.value()));
+    CHECK(scan.ok());
+    uint32_t cuds = 0;
+    for (const RecoveredTransaction& trans : scan.value().transactions) {
+      for (const RecoveredItem& item : trans.items) {
+        if (item.type == lf::kItemCud) ++cuds;
+      }
+    }
+    CHECK_EQ(cuds, 1u);
+  }
+}
 
 TEST(rw6c_cui_cud_parser_matrix) {
   Image image = MakeImage(true, false);
