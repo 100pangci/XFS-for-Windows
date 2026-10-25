@@ -14,8 +14,25 @@ WORK="${2:-$(mktemp -d)}"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
 
+umount_retry() {
+  local mp="$1"
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if umount "$mp" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rw6e windows verification: cannot unmount $mp" >&2
+  findmnt -T "$mp" || true
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -vm "$mp" || true
+  fi
+  umount -l "$mp"
+}
+
 mount -o loop "$IMG" "$MNT"
-trap 'umount "$MNT" 2>/dev/null || true' EXIT
+trap 'umount_retry "$MNT" 2>/dev/null || true' EXIT
 
 fail() {
   echo "rw6e windows verification: $*" >&2
@@ -63,6 +80,6 @@ if value != b"hello":
 PY
 
 sync
-umount "$MNT"
+umount_retry "$MNT"
 trap - EXIT
 echo "rw6e: Windows-added namespace and content verified on Linux"
