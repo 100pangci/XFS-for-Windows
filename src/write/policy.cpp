@@ -51,9 +51,9 @@ struct RoCompatReason {
 
 constexpr RoCompatReason kRoCompatReasons[] = {
     // RW-6A maintains finobt and the AGI btree block counters.  RW-6B has the
-    // rmapbt writer; rmapbt=1,reflink=0 is writable through the ordinary
-    // read-write gate.  Reflink remains entirely unsupported: the refcount
-    // btree and shared extents are outside this milestone.
+    // rmapbt writer.  RW-6C has the refcountbt/CoW/reflink writer, opened for
+    // ordinary read-write after all twelve qualification gates passed; both
+    // features are skipped in this loop below.
     {ondisk::kRoCompatRmapbt, "rmapbt",
      "the reverse mapping btree must track every allocation"},
     {ondisk::kRoCompatReflink, "reflink",
@@ -67,18 +67,13 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
                             bool allow_rmapbt_qualification,
                             bool allow_reflink_recovery,
                             bool allow_reflink_qualification) {
+  // The old hidden qualification/recovery overrides are retained as accepted
+  // no-ops so existing scripts keep working, but the ordinary allow-list below
+  // is now the only gate: reflink is part of the writable profile.
   (void)allow_rmapbt_recovery;
   (void)allow_rmapbt_qualification;
-  const bool reflink_qualified =
-      allow_reflink_recovery || allow_reflink_qualification;
-  if (sb.features.reflink && !reflink_qualified) {
-    return XFS_ERR(XfsError::kUnsupportedFeature,
-                   "reflink is not yet qualified for ordinary read-write; "
-                   "the refcountbt/CoW writer is available only through the "
-                   "hidden qualification/recovery path")
-        .Metadata("superblock")
-        .Actual(sb.features_ro_compat);
-  }
+  (void)allow_reflink_recovery;
+  (void)allow_reflink_qualification;
   if (sb.features.reflink && geo.agblocks >= (1u << 31)) {
     return XFS_ERR(XfsError::kUnsupportedGeometry,
                    "reflink requires allocation groups smaller than 2^31 "
@@ -115,14 +110,10 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
   }
   for (const auto& reason : kRoCompatReasons) {
     if (sb.features_ro_compat & reason.bit) {
-      // RW-6B: a reverse-mapping filesystem without reflink is writable.
-      // RW-6C: when reflink is explicitly qualified (or this is a
-      // recovery-only completion), the refcount btree is maintained too.
-      if (reason.bit == ondisk::kRoCompatRmapbt &&
-          (!sb.features.reflink || reflink_qualified)) {
-        continue;
-      }
-      if (reason.bit == ondisk::kRoCompatReflink && reflink_qualified) {
+      // RW-6B maintains rmapbt; RW-6C maintains the refcount btree and the
+      // shared-extent lifecycle.  Both are now ordinary writable features.
+      if (reason.bit == ondisk::kRoCompatRmapbt ||
+          reason.bit == ondisk::kRoCompatReflink) {
         continue;
       }
       return XFS_ERR(XfsError::kUnsupportedFeature,

@@ -53,20 +53,18 @@ struct MountOptions {
   // Finish a mount-time recovery with a clean-unmount record (the standalone
   // `xfswin recover` shape). Read-write mounts keep the log writable instead.
   bool clean_log_after_recovery = false;
-  // Internal recovery-only path: allow the profile check to accept the
-  // rmapbt=1,reflink=0 feature set so a dirty rmapbt log can be recovered
-  // before the general writable gate is opened.  It does not make ordinary
-  // read-write mounts legal; `xfswin recover` is the only caller and closes
-  // the filesystem immediately after the completion pass.
+  // Internal recovery-only path: finish a dirty log with the writable
+  // completion machinery and close the filesystem instead of exposing a
+  // general read-write mount.  The feature profile itself is now ordinary;
+  // `xfswin recover` is the only caller.
   bool recovery_only = false;
-  // Qualification-only override for the RW-6B mutation matrix.  It is
-  // deliberately separate from `read_write` so ordinary `--rw-experimental`
-  // continues to refuse rmapbt until every acceptance gate has passed.  Only
-  // the hidden `--rw-rmapbt-qualification` CLI flag sets it.
+  // Legacy qualification override for the RW-6B mutation matrix.  rmapbt is
+  // now part of the ordinary writable profile, so this flag is accepted as a
+  // no-op for compatibility with older scripts.
   bool allow_rmapbt_qualification = false;
-  // Hidden RW-6C acceptance switch.  It does not open ordinary reflink writes:
-  // the public gate stays closed until the Linux-created refcount/CoW/crash
-  // qualification ledger is complete.
+  // Legacy RW-6C acceptance switch.  Reflink/refcount/CoW passed the public
+  // Linux qualification ledger and are part of the ordinary writable profile,
+  // so this flag is accepted as a no-op for compatibility with older scripts.
   bool allow_reflink_qualification = false;
 };
 

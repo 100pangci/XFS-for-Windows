@@ -102,7 +102,7 @@ void PrintUsage() {
       "      [--rmapbt]                format with rmapbt=1\n"
       "      [--reflink]               format with reflink=1 (refcountbt)\n"
       "      [--rmapbt --reflink]      Linux-legal combined profile\n"
-      "                                (write access to reflink is qualification-only)\n"
+      "                                (both are ordinary writable features)\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images only; files can be\n"
       "                                created, overwritten, extended, truncated,\n"
@@ -1188,8 +1188,8 @@ bool ParseU64(const std::string& text, uint64_t* out) {
 }
 
 // Every ordinary mutation opens a writable mount through this helper.  The
-// hidden qualification bit is the only way to bypass the rmapbt gate; the
-// public --rw-experimental flag alone must keep refusing rmapbt images.
+// legacy qualification flags are forwarded as accepted no-ops; the ordinary
+// --rw-experimental flag is the real opt-in for every writable feature.
 MountOptions WritableMountOptions(const Options& options) {
   MountOptions mount_options;
   mount_options.read_write = true;
@@ -2067,12 +2067,10 @@ int Run(const std::vector<std::string>& args) {
     } else if (arg == "--reflink") {
       options.reflink = true;
     } else if (arg == "--rw-rmapbt-qualification") {
-      // Hidden RW-6B acceptance switch. It only has an effect together with
-      // --rw-experimental; ordinary mounts still refuse rmapbt.
+      // Legacy RW-6B acceptance switch, now accepted as a no-op.
       options.rmapbt_qualification = true;
     } else if (arg == "--rw-reflink-qualification") {
-      // Hidden RW-6C acceptance switch. Like the rmapbt switch, it is not a
-      // public interface and does not open the ordinary reflink gate.
+      // Legacy RW-6C acceptance switch, now accepted as a no-op.
       options.reflink_qualification = true;
     } else if (arg == "--modern-inode-profile") {
       options.finobt = true;

@@ -365,7 +365,6 @@ int MakeRw6cFixture(const std::string& path_string) {
 
   MountOptions mount_options;
   mount_options.read_write = true;
-  mount_options.allow_reflink_qualification = true;
   auto borrowed = std::make_unique<xfstest::BorrowedBlockDevice>(image.get());
   auto mounted = XfsFilesystem::Mount(std::move(borrowed), mount_options);
   if (!mounted.ok()) {

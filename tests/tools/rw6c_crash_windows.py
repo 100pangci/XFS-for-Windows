@@ -82,7 +82,7 @@ def make_base(exe, work, profile):
     if profile == "rmap":
         args.insert(2, "--rmapbt")
     must(exe, args)
-    qual = ["--rw-experimental", "--rw-reflink-qualification"]
+    qual = ["--rw-experimental"]
     must(exe, ["create", image, "/src"] + qual)
     must(exe, ["create", image, "/dst"] + qual)
     must(exe, ["create", image, "/clone"] + qual)
@@ -116,7 +116,7 @@ def main():
     patch_path = os.path.join(work, "cow-patch.bin")
     with open(patch_path, "wb") as f:
         f.write(cow_patch)
-    qual = ["--rw-experimental", "--rw-reflink-qualification"]
+    qual = ["--rw-experimental"]
 
     cases = [
         ("cow", "cow_staged:1"),

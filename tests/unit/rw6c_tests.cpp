@@ -72,7 +72,6 @@ Image MakeImage(bool reflink, bool rmapbt, uint32_t block_size = 4096,
   if (mount) {
     MountOptions mount_options;
     mount_options.read_write = true;
-    mount_options.allow_reflink_qualification = true;
     auto borrowed =
         std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get());
     auto mounted = XfsFilesystem::Mount(std::move(borrowed), mount_options);
@@ -1005,22 +1004,17 @@ TEST(rw6c_many_shared_extents_grow_and_collapse_real_tree) {
   CHECK(fs.WriteCleanUnmountRecord().ok());
 }
 
-TEST(rw6c_ordinary_reflink_write_gate_stays_closed) {
-  Image image = MakeImage(true, true);
-  MountOptions options;
-  options.read_write = true;
-  auto refused = XfsFilesystem::Mount(
-      std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get()),
-      options);
-  CHECK(!refused.ok());
-  CHECK(refused.error().code == XfsError::kUnsupportedFeature);
-  CHECK(refused.error().message.find("reflink") != std::string::npos);
-
-  options.allow_reflink_qualification = true;
-  auto allowed = XfsFilesystem::Mount(
-      std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get()),
-      options);
-  CHECK(allowed.ok());
+TEST(rw6c_ordinary_reflink_write_gate_is_open) {
+  // The public qualification ledger is complete; a plain --rw-experimental
+  // mount now accepts the reflink profile and can create/write a file.
+  Image image = MakeImage(true, true, 4096, true);
+  XfsFilesystem& fs = *image.fs;
+  auto file = fs.CreateRegularFile(fs.RootInode(), "ordinary.bin", 0644, 0, 0);
+  CHECK(file.ok());
+  if (!file.ok()) return;
+  std::vector<uint8_t> data = Pattern(4096, 0x6f70656e);
+  CHECK(fs.WriteFileData(file.value(), 0, data.data(), data.size()).ok());
+  CHECK(fs.WriteCleanUnmountRecord().ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,7 +1059,6 @@ TEST(rw6c_orphan_cow_staging_cleanup_on_mount) {
 
     MountOptions mount_options;
     mount_options.read_write = true;
-    mount_options.allow_reflink_qualification = true;
     auto remounted = XfsFilesystem::Mount(
         std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get()),
         mount_options);

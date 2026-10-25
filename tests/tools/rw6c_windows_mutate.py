@@ -60,31 +60,27 @@ class Runner:
             raise SystemExit("%s is still readable" % path)
 
     def create(self, path):
-        self.run(["create", self.image, path, "--rw-experimental",
-                  "--rw-reflink-qualification"])
+        self.run(["create", self.image, path, "--rw-experimental"])
 
     def mkdir(self, path):
-        self.run(["mkdir", self.image, path, "--rw-experimental",
-                  "--rw-reflink-qualification"])
+        self.run(["mkdir", self.image, path, "--rw-experimental"])
 
     def put(self, path, data, work):
         temp = os.path.join(work, "input.bin")
         with open(temp, "wb") as f:
             f.write(data)
-        self.run(["pwrite", self.image, path, "0", "--rw-experimental",
-                  "--rw-reflink-qualification", "--from=" + temp])
+        self.run(["pwrite", self.image, path, "0", "--rw-experimental", "--from=" + temp])
 
     def clone(self, src, dst, length=0):
         self.run(["reflink", self.image, src, dst, "0", "0", str(length),
-                  "--rw-experimental", "--rw-reflink-qualification"])
+                  "--rw-experimental"])
 
     def truncate(self, path, size):
         self.run(["truncate", self.image, path, str(size),
-                  "--rw-experimental", "--rw-reflink-qualification"])
+                  "--rw-experimental"])
 
     def unlink(self, path):
-        self.run(["unlink", self.image, path, "--rw-experimental",
-                  "--rw-reflink-qualification"])
+        self.run(["unlink", self.image, path, "--rw-experimental"])
 
 
 def require(actual, expected, what):

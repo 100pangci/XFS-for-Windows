@@ -30,12 +30,10 @@ struct Options {
   bool rmapbt = false;
   // RW-6C formatter/test profile: reflink=1 with independent rmapbt choice.
   bool reflink = false;
-  // Hidden qualification override: permits ordinary mutation of a
-  // rmapbt=1,reflink=0 image before the writable gate is opened. Never set by
-  // `--rw-experimental` alone; the RW-6B acceptance jobs use it explicitly.
+  // Legacy hidden qualification overrides.  Both feature sets are part of the
+  // ordinary writable profile now; the flags are parsed and ignored so older
+  // scripts keep working.
   bool rmapbt_qualification = false;
-  // Hidden RW-6C qualification override for refcountbt/CoW mutation. It never
-  // affects an ordinary `--rw-experimental` mount.
   bool reflink_qualification = false;
 };
 

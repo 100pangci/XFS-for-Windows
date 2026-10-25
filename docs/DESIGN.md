@@ -60,9 +60,9 @@ CLI (xfswin.exe)                       WinFsp host
 7. A read-write mount is an allow-list (`CheckWritableProfile`): read-write is
    permitted only if this build can maintain every structure the filesystem
    uses. RW-6A maintains finobt, inobtcount, sparse inode chunks, bigtime and
-   NREXT64; RW-6B adds ordinary rmapbt when reflink is off. RW-6C implements
-   reflink/refcount/CoW behind a hidden qualification switch. The ordinary
-   gate still refuses reflink; see [REFLINK.md](REFLINK.md). Parent pointers,
+   NREXT64; RW-6B adds ordinary rmapbt. RW-6C adds reflink/refcount/CoW to the
+   ordinary profile after the public Linux qualification; see
+   [REFLINK.md](REFLINK.md). Parent pointers,
    quotas, realtime, external logs, metadir and zoned filesystems are refused
    for read-write with the blocking feature named, never updated best-effort.
 8. A fast-path mutation validates its whole effect before it writes anything

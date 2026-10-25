@@ -2616,8 +2616,8 @@ jobs:
           echo "Verified $checked RW-6C crash images with Linux"
 
   # ---------------------------------------------------------------------------
-  # Ordinary --rw-experimental must still refuse reflink and change nothing,
-  # for both profiles.
+  # Read-only paths and unsupported reflink geometry must still refuse and
+  # change nothing, for both profiles.
   # ---------------------------------------------------------------------------
   windows-rw6c-refusal:
     needs: [windows-build-test, linux-generate-rw6c]
@@ -2636,7 +2636,7 @@ jobs:
           name: rw6c-linux
           path: rw6c-linux
 
-      - name: No-write refusal matrix
+      - name: No-write refusal matrix (read-only paths and unsupported geometry)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

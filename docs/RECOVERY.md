@@ -359,8 +359,8 @@ list, so the extension is deliberate and small:
 
 Not replayed and refused when encountered: external logs, realtime devices,
 quota, attribute intents, ACL translation, parent pointers, metadir, zoned
-filesystems. RUI/RUD, BUI/BUD and CUI/CUD have dedicated completion passes; CUI/CUD are
-accepted only on reflink filesystems and are exercised by the recovery-only
-qualification path, not by the ordinary write gate. A reflink clone/CoW can
-log a BUI and CUI in the same transaction. The writable feature
-profile remains allow-listed.
+filesystems. RUI/RUD, BUI/BUD and CUI/CUD have dedicated completion passes;
+CUI/CUD are accepted only on reflink filesystems and are completed by both the
+ordinary writable mount/recovery path and the standalone `recover` command. A
+reflink clone/CoW can log a BUI and CUI in the same transaction. The writable
+feature profile remains allow-listed.

@@ -79,7 +79,7 @@ def main():
     shutil.copyfile(args.image, image)
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     probe = os.path.join(repo, "tools", "rw6c_refcount_probe.py")
-    qual = ["--rw-experimental", "--rw-reflink-qualification"]
+    qual = ["--rw-experimental"]
     free_before, block = info(exe, image)
     if block not in (1024, 2048, 4096, 8192):
         raise SystemExit("unexpected filesystem block size %d" % block)

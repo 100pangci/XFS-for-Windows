@@ -1,12 +1,13 @@
 # Reflink, refcountbt and CoW (RW-6C)
 
-Status: **qualification only**. Ordinary `--rw-experimental` still refuses a
-`reflink=1` filesystem. The implementation is reachable only through the
-hidden `--rw-reflink-qualification` switch (CLI `--rw-reflink-qualification`,
-`MountOptions::allow_reflink_qualification`) and through the recovery-only
-path (`xfswin recover` / `MountOptions::recovery_only`). The public gate is
-not opened by this document; it opens only when every gate in the ledger below
-has independent Linux evidence.
+Status: **ordinary writable profile, opened 2026-10-25** after every gate in
+the qualification ledger below passed on
+[run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954).
+Ordinary `--rw-experimental` now accepts `reflink=1` filesystems with
+`rmapbt=0` or `rmapbt=1`. The former hidden switch
+(`--rw-reflink-qualification`, `MountOptions::allow_reflink_qualification`)
+and the recovery-only path remain accepted for compatibility, but reflink no
+longer depends on them.
 
 This milestone implements:
 
@@ -19,7 +20,8 @@ This milestone implements:
 * CUI/CUD log intent parsing, preflight, lifetime matching and completion;
 * mount-time orphan CoW staging cleanup;
 * formatter support for `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1`;
-* a qualification-only CLI and an independent Python oracle.
+* ordinary `--rw-experimental` CLI access (the legacy qualification flag is a
+  no-op) and an independent Python oracle.
 
 It deliberately does **not** support realtime refcount, external logs,
 parent-pointers, xattrs, quotas, metadir or online repair. Attribute extents
@@ -281,16 +283,22 @@ free-space-only release accounting for shared blocks.
 
 ## Policy and refusal
 
-`CheckWritableProfile` keeps the ordinary reflink refusal. The hidden
-qualification flag is independent of `read_write`:
+`CheckWritableProfile` accepts `reflink=1` and `reflink=1,rmapbt=1` through the
+ordinary allow-list:
 
-* `--rw-experimental` alone: `reflink=1` is refused before any write;
-* `--rw-experimental --rw-reflink-qualification`: hidden mutation path;
-* `xfswin recover --yes-i-really-mean-it`: recovery-only path, accepts reflink
-  to complete intents and orphan staging, then closes the mount;
+* `--rw-experimental` alone: the public opt-in, including reflink, refcountbt,
+  shared truncate/unlink and CoW;
+* `--rw-experimental --rw-reflink-qualification`: the legacy flag is accepted
+  as a no-op for compatibility with older scripts;
+* `xfswin recover --yes-i-really-mean-it`: still the explicit recovery path,
+  including CUI/CUD completion and orphan CoW staging cleanup;
 * read-only mounts are unchanged.
 
-The refusal is an error, never a silent read-only or partial-write mount.
+The writer still refuses geometry it cannot maintain, including
+`dirblklog != 0`, allocation groups of 2^31 blocks or more, realtime devices,
+external logs, quotas, parent pointers, metadir and zoned filesystems. Every
+refusal happens before the first write; there is no silent read-only or
+partial-write mount.
 
 ## Testing
 
@@ -311,7 +319,7 @@ ctest --test-dir build -C RelWithDebInfo --output-on-failure
 * clone/holes/unwritten/partial EOF/all-hole/local-fork behavior;
 * CoW write, destination isolation, source preservation and cache reads;
 * three-way clones, truncate, unlink and last-reference release;
-* the ordinary read-write refusal;
+* ordinary `--rw-experimental` writable acceptance;
 * orphan CoW staging cleanup on the next writable mount;
 * CUI/CUD structural matrices and lifetime/ID reuse;
 * overlapping written-data rmap records with one private CoW block.
@@ -343,8 +351,8 @@ Linux gate:
 * `rw6c_windows_mutate.py` completed CoW source isolation, four clones,
   partial-EOF growth, shared truncate and unlink; all content assertions and
   the oracle passed;
-* the no-write refusal matrix left both the 4 KiB oracle image and the 1 KiB
-  fixture byte-identical;
+* the no-write refusal matrix left the Linux fixture, a patched
+  `dirblklog=2` copy and the Windows fixture byte-identical;
 * the clone/CoW/truncate crash matrix recovered **17/17** injection points on
   both the rmap and reflink-only profiles, with the oracle clean after every
   restart;
@@ -353,15 +361,15 @@ Linux gate:
   leaked no CoW record and passed the oracle;
 * a simulated Linux reverse pass (Windows-created equivalent data) was read,
   checked against the manifest, mutated again and accepted by the oracle;
-* the genuine Linux CUI/BUI/CUD snapshot captured by run `40159734421`
-  (`linux-generate-rw6c-cui`, CUI op 1 + BUI map op 1) was completed by
-  Windows both directly and through 17 recovery crash points; the resulting
-  sharing/CoW/free-block state matched the kernel-recovered oracle.  Linux
-  re-verification of the Windows output is still a CI gate.
+* genuine Linux CUI/BUI/CUD snapshots from runs `40159734421` and
+  `40165123954` were completed by Windows both directly and through 22
+  recovery crash points; shared records/blocks, CoW state, `fdblocks` and the
+  bmbt block count matched the kernel-recovered oracle exactly.
 
-Genuine Linux-created images, genuine CUI/CUD logs, Linux crash replay and
-Linux xfs_repair/mount evidence remain the CI gates below. The local fixture
-helper is test support; it is never described as Linux evidence.
+These local checks are support evidence. The Linux-created fixtures, genuine
+CUI logs, crash replays and mount/`xfs_repair` results in the ledger below are
+the qualification evidence; the local fixture helper is never described as
+Linux evidence.
 
 ## Qualification ledger
 
@@ -371,22 +379,21 @@ passed; local tests and Windows self-consistency are not Linux evidence.
 
 | # | Gate | Local status | Linux/independent evidence |
 |---|---|---|---|
-| 1 | Formatter emits both legal profiles (`reflink=1,rmapbt=0/1`) accepted by Linux `xfs_repair -n` and mount | formatter/reader unit tests pass | **pending CI** |
-| 2 | Typed reader rejects corruption and agrees with the independent oracle | unit matrix, oracle smoke pass | **pending CI on Linux-created images** |
-| 3 | Refcount B+tree reaches level >= 2 in a persistent real image and collapses cleanly | unit level-3 editor test and level-2 100-file test pass | **pending Linux verify** |
-| 4 | Linux-created reflink fixture round trip, both profiles | none locally (no Linux env) | **pending CI** |
-| 5 | Clone semantics: holes, unwritten, partial EOF, all-hole and self rules | unit tests pass | **pending Linux mount/content verify** |
-| 6 | CoW write ordering and destination isolation | unit tests pass | **pending Linux/crash verify** |
-| 7 | Shared truncate/unlink, three-way clone and last-reference release | unit tests pass | **pending Linux verify** |
-| 8 | Genuine Linux CUI without CUD completes on Windows, including its BUI | local completion and 17 crash points against run `40159734421` artifact; kernel oracle matched | **pending Linux verification of the Windows output** |
-| 9 | Orphan CoW staging recovery after a crash | unit mount-cleanup test passes | **pending crash CI** |
-| 10 | Crash matrix for clone, CoW, truncate/unlink and recovery; every image accepted by Linux | crash points exist; Windows-side replay not yet run | **pending CI** |
-| 11 | ENOSPC and no-write refusal matrix leave the image byte-identical or structurally valid | mount refusal unit test | **pending CI** |
-| 12 | Cross-OS churn/reverse interoperability and a final code/document audit | none | **pending CI** |
+| 1 | Formatter emits both legal profiles (`reflink=1,rmapbt=0/1`) accepted by Linux `xfs_repair -n` and mount | formatter/reader unit tests pass | **verified**: `linux-verify-rw6c-windows-formatter` passed both profiles in run 40165123954 |
+| 2 | Typed reader rejects corruption and agrees with the independent oracle | unit matrix, oracle smoke pass | **verified**: Windows read/mutated both Linux-created fixtures; `linux-verify-rw6c` accepted 1309 records/1326 blocks on top of a level-2 tree |
+| 3 | Refcount B+tree reaches level >= 2 in a persistent real image and collapses cleanly | unit level-3 editor test and level-2 real-image test pass | **verified**: `linux-generate-rw6c` produced `shared=1305 blocks=1323 max-refcount-level=2` for both profiles; final images also reached level 2 |
+| 4 | Linux-created reflink fixture round trip, both profiles | none locally | **verified**: `windows-rw6c-roundtrip`, `linux-verify-rw6c` and `linux-verify-rw6c-final` all passed both profiles |
+| 5 | Clone semantics: holes, unwritten, partial EOF, all-hole and self rules | unit tests pass | **verified**: Windows mutation/reverse manifests and Linux mount content checks passed on both Linux fixtures |
+| 6 | CoW write ordering and destination isolation | unit tests pass | **verified**: all 17 clone/CoW/truncate crash images on both profiles were accepted by Linux; the 22 genuine-CUI crash images were also accepted |
+| 7 | Shared truncate/unlink, three-way clone and last-reference release | unit tests pass | **verified**: Windows mutation, Linux reverse and final Linux mount/content checks passed on both profiles |
+| 8 | Genuine Linux CUI without CUD completes on Windows, including its BUI | local completion and 22 crash points on genuine artifacts; kernel oracle matched | **verified**: `windows-recover-rw6c-cui`, `linux-verify-rw6c-cui`, `windows-rw6c-cui-crash` and `linux-verify-rw6c-cui-crash` passed; final state matched the kernel oracle exactly |
+| 9 | Orphan CoW staging recovery after a crash | unit mount-cleanup test passes | **verified**: the `cow-cow_staged-1` crash case and every crash image were accepted by Linux |
+| 10 | Crash matrix for clone, CoW, truncate/unlink and recovery; every image accepted by Linux | crash points exist and Windows-side replay passed | **verified**: `linux-verify-rw6c-crash` checked 17/17 images on both profiles; the CUI crash job checked 22/22 restarted recoveries |
+| 11 | ENOSPC and no-write refusal matrix leave the image byte-identical or structurally valid | mount refusal unit test | **verified**: `windows-rw6c-enospc`/`linux-verify-rw6c-enospc` passed both profiles; `windows-rw6c-refusal` checked read-only paths and `dirblklog=2` geometry byte-identically |
+| 12 | Cross-OS churn/reverse interoperability and a final code/document audit | local simulation passed | **verified**: the full Windows -> Linux -> Windows -> Linux round trip passed on both profiles; the final Linux oracle accepted 1310 records/1326 blocks |
 
-No row currently claims Linux verification. The ordinary gate must remain
-closed until rows 1-12 are backed by real evidence and this table is updated
-to name the runs/artifacts.
+All twelve rows are verified by [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954).
+The ordinary reflink write gate was opened on 2026-10-25 on that basis.
 
 ## Known limitations
 

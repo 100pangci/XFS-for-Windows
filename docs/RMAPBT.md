@@ -355,7 +355,8 @@ staged replay view and completion feasibility before writes.
 
 ## 9. Implementation snapshot before external acceptance
 
-Implemented on `rw-6b`, with the ordinary writable gate still closed:
+Implemented on `rw-6b`; the ordinary writable gate was opened after the
+qualification in section 12:
 
 * `include/xfs/rmap.h` / `src/core/rmap.cpp`: typed `RmapKey`/`RmapRecord`/
   `RmapTree`; exact/LE/GE/predecessor/successor lookups; traversal with CRC,
@@ -416,8 +417,9 @@ Implemented on `rw-6b`, with the ordinary writable gate still closed:
 The early implementation snapshot above did not authorize writable rmapbt.
 The subsequent Linux-created fixture, mutation, genuine surviving-RUI,
 crash, ENOSPC and repeated interoperability evidence is recorded below.
-The ordinary gate now selects only `rmapbt=1,reflink=0`; run `40107607956`
-passed using ordinary opt-in, not the former qualification switch.
+The RW-6B gate was opened with `rmapbt=1,reflink=0`; run `40107607956`
+passed using ordinary opt-in, not the former qualification switch. RW-6C
+subsequently added `rmapbt=1,reflink=1` to the same ordinary gate.
 
 ## 10. Independent ownership proof and acceptance gates
 
