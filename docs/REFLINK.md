@@ -393,7 +393,11 @@ passed; local tests and Windows self-consistency are not Linux evidence.
 | 12 | Cross-OS churn/reverse interoperability and a final code/document audit | local simulation passed | **verified**: the full Windows -> Linux -> Windows -> Linux round trip passed on both profiles; the final Linux oracle accepted 1310 records/1326 blocks |
 
 All twelve rows are verified by [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954).
-The ordinary reflink write gate was opened on 2026-10-25 on that basis.
+The ordinary reflink write gate was opened on 2026-10-25 on that basis. The
+gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743)
+then repeated the RW-6C matrix with plain `--rw-experimental`; every RW-6C job
+passed, including the Linux round trip, reverse/final mounts, crash matrices,
+ENOSPC, genuine CUI recovery and the refusal matrix.
 
 ## Known limitations
 

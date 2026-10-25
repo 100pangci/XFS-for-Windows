@@ -179,7 +179,7 @@ The ordinary-gate code revision `5a41fca` passed all 65 jobs in
 including grown/collapsed Linux-origin rmap trees and full-image no-write
 refusal checks. Support remains experimental and image-file-only.
 
-**The ordinary reflink write gate is open.** Reflink, refcount and CoW passed the twelve-gate Linux evidence ledger in [docs/REFLINK.md](docs/REFLINK.md) on [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954), so plain `--rw-experimental` now accepts both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` images. Xattr modification remains unsupported.
+**The ordinary reflink write gate is open.** Reflink, refcount and CoW passed the twelve-gate Linux evidence ledger in [docs/REFLINK.md](docs/REFLINK.md) on [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954). The gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743) repeated the full RW-6C matrix with plain `--rw-experimental`, so both `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1` images are ordinary writable profiles. Xattr modification remains unsupported.
 
 ## Journal recovery (RW-5)
 
