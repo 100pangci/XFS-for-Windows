@@ -44,10 +44,16 @@ python3 "$ROOT/tests/tools/rw6e_linux_content.py" --make "$MNT" \
     --manifest "$MANIFEST"
 sync
 if command -v xfs_scrub >/dev/null 2>&1; then
-  xfs_scrub -n "$MNT" 2>&1 | tee "$OUT/xfs_scrub.txt" || {
-    echo "rw6e: xfs_scrub rejected the Linux fixture" >&2
-    exit 1
-  }
+  if ! xfs_scrub -n "$MNT" 2>&1 | tee "$OUT/xfs_scrub.txt"; then
+    if grep -q 'Kernel metadata scrubbing facility is not available' \
+        "$OUT/xfs_scrub.txt"; then
+      echo "rw6e: kernel has no online scrub ioctl; recording a skip" \
+        | tee -a "$OUT/xfs_scrub.txt"
+    else
+      echo "rw6e: xfs_scrub rejected the Linux fixture" >&2
+      exit 1
+    fi
+  fi
 fi
 umount "$MNT"
 trap - EXIT

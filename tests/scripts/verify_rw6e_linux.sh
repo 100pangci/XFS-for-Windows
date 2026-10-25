@@ -29,8 +29,14 @@ if [ -n "$MANIFEST" ]; then
 fi
 if command -v xfs_scrub >/dev/null 2>&1; then
   if ! xfs_scrub -n "$MNT" 2>&1 | tee "$WORK/xfs_scrub.txt"; then
-    echo "rw6e: xfs_scrub rejected the image" >&2
-    exit 1
+    if grep -q 'Kernel metadata scrubbing facility is not available' \
+        "$WORK/xfs_scrub.txt"; then
+      echo "rw6e: kernel has no online scrub ioctl; recording a skip" \
+        | tee -a "$WORK/xfs_scrub.txt"
+    else
+      echo "rw6e: xfs_scrub rejected the image" >&2
+      exit 1
+    fi
   fi
 fi
 umount "$MNT"
