@@ -170,6 +170,24 @@ void TestProfile(bool reflink, bool rmapbt) {
   fork = ReadFork(image, ino);
   CHECK(fork.format == XattrForkFormat::kLeaf);
   ExpectBytes(Get(image, ino, "user.v300"), v300);
+  {
+    // The single free region must be between the 8-byte entry table and the
+    // first name/value byte.  Claiming the used name/value area as free makes
+    // Linux insert over existing attributes.
+    auto fsb = AttrLogicalToPhysical(fork, image.geo, 0);
+    CHECK(fsb.ok());
+    std::vector<uint8_t> block(image.geo.block_size);
+    CHECK(image.device->Read(image.geo.FsbToByte(fsb.value()), block.data(),
+                            block.size()));
+    const uint32_t count = GetBE16(block.data(), 56);
+    const uint32_t firstused = GetBE16(block.data(), 60);
+    const uint32_t entries_end = 80 + count * 8;
+    const uint32_t free_base = GetBE16(block.data(), 64);
+    const uint32_t free_size = GetBE16(block.data(), 66);
+    CHECK_EQ(free_base, entries_end);
+    CHECK_EQ(free_base + free_size, firstused);
+    CHECK(entries_end <= firstused);
+  }
 
   // Remote value (512-byte blocks: the local entry limit is 384 bytes).
   auto remote = Pattern(3000, 0x6d02);

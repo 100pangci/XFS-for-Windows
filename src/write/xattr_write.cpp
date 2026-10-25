@@ -268,9 +268,14 @@ std::vector<uint8_t> BuildLeaf(const XfsGeometry& geo, uint64_t ino,
   const uint32_t entries_end =
       static_cast<uint32_t>(kLeafHeader +
                             entries.size() * kAttrLeafEntrySize);
+  // The name/value area occupies [firstused, blocksize); the only free region
+  // in a freshly rebuilt leaf is between the entry table and that area.
+  // xfs_attr3_leaf_create initialises freemap[0] this way, and Linux's
+  // insertion path uses it as the first-fit free region.
+  const uint32_t free_size =
+      cursor >= entries_end ? cursor - entries_end : 0;
   PutBE16(block.data(), 64, static_cast<uint16_t>(entries_end));
-  PutBE16(block.data(), 66,
-          static_cast<uint16_t>(geo.block_size - entries_end));
+  PutBE16(block.data(), 66, static_cast<uint16_t>(free_size));
   for (size_t i = 1; i < kAttrLeafMapSize; ++i) {
     PutBE16(block.data(), 64 + i * 4, 0);
     PutBE16(block.data(), 64 + i * 4 + 2, 0);
