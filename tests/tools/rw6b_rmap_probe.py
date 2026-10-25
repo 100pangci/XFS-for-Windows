@@ -202,7 +202,8 @@ def read_agf(img, geo, agno):
         "flfirst": u32(buf, 40), "fllast": u32(buf, 44),
         "flcount": u32(buf, 48), "freeblks": u32(buf, 52),
         "longest": u32(buf, 56), "btreeblks": u32(buf, 60),
-        "rmap_blocks": u32(buf, 80),
+        "rmap_blocks": u32(buf, 80), "refcount_blocks": u32(buf, 84),
+        "refcount_root": u32(buf, 88), "refcount_level": u32(buf, 92),
     }
 
 
@@ -654,7 +655,14 @@ def intersect(a_start, a_len, b_start, b_len):
     return max(a_start, b_start), max(0, end - max(a_start, b_start))
 
 
-def check_ag(img, geo, agno):
+def check_ag(img, geo, agno, refcount_blocks=None, cow_blocks=None):
+    """Derive ownership from the forward metadata and compare it to rmapbt.
+
+    `refcount_blocks` / `cow_blocks` are optional per-AG additions used by the
+    RW-6C oracle: refcountbt blocks are owned by OWN_REFC, and active CoW
+    staging ranges by OWN_COW.  Reflink allows ordinary written data-fork
+    records to overlap physically; those overlaps are legal.
+    """
     agf = read_agf(img, geo, agno)
     agi = read_agi(img, geo, agno)
     owners = []
@@ -708,6 +716,14 @@ def check_ag(img, geo, agno):
     data_blocks = []
     inode_count = scan_inode_owners(img, geo, agno, owners, data_blocks)
 
+    if geo.reflink:
+        if refcount_blocks is None:
+            fail("AG%d: reflink oracle did not supply refcount tree blocks" %
+                 agno)
+        add_blocks(owners, refcount_blocks, OWN_REFC)
+        for block in cow_blocks or []:
+            add_expected(owners, block, 1, OWN_COW)
+
     rmap = load_rmap(img, geo, agno, agf)
     if rmap is None:
         return {"ag": agno, "rmapbt": False, "owners": owners}, errors
@@ -717,11 +733,16 @@ def check_ag(img, geo, agno):
     expected = normalize(owners)
     actual_norm = normalize(actual)
 
-    # Overlap detection on actual physical coverage. rmapbt=1,reflink=0 has
-    # no legal duplication at all.
+    # Overlap detection on actual physical coverage.  rmapbt=1,reflink=0 has
+    # no legal duplication.  With reflink, two ordinary written data-fork
+    # records (normal inode owner, no attr/bmbt/unwritten flags) may overlap
+    # because both inodes share the same physical blocks.
     for i in range(1, len(actual_norm)):
         p, c = actual_norm[i - 1], actual_norm[i]
         if p[0] + p[1] > c[0]:
+            if geo.reflink and p[4] == 0 and c[4] == 0 and \
+                    not (p[2] & (1 << 63)) and not (c[2] & (1 << 63)):
+                continue
             errors["overlap_errors"].append(
                 {"first": list(p), "second": list(c)})
 

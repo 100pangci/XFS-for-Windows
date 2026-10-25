@@ -657,6 +657,23 @@ def item_summary(item):
                     "op": le32(first, base + 28) & 0xFF,
                 })
             out.update({"nextents": count, "extents": extents})
+    elif tid in (0x1242, 0x1243) and len(first) >= 16:
+        out.update({"id": struct.unpack_from("<Q", first, 8)[0]})
+        if tid == 0x1242:
+            count = le32(first, 4)
+            extents = []
+            for i in range(count):
+                base = 16 + i * 16
+                if base + 16 > len(first):
+                    break
+                flags = le32(first, base + 12)
+                extents.append({
+                    "startblock": struct.unpack_from("<Q", first, base)[0],
+                    "len": le32(first, base + 8),
+                    "flags": flags,
+                    "op": flags & 0xFF,
+                })
+            out.update({"nextents": count, "extents": extents})
     return out
 
 

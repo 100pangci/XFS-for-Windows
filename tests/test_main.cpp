@@ -320,6 +320,161 @@ int MakeRw6SparseFixture(const std::string& path_string) {
   return 0;
 }
 
+// Test-support RW-6C image with the same logical content as the Linux fixture
+// in tests/scripts/make_rw6c_linux.sh.  It is not Linux evidence; it lets the
+// Windows-side mutation, crash and ENOSPC tools be exercised locally without a
+// Linux host.
+int MakeRw6cFixture(const std::string& path_string) {
+  using namespace xfs;
+  constexpr uint32_t kBlock = 1024;
+  auto pattern = [](size_t size, uint32_t seed) {
+    std::vector<uint8_t> out(size);
+    for (size_t i = 0; i < size; ++i) {
+      out[i] = static_cast<uint8_t>((i * 37 + seed * 17 + 11) & 0xFF);
+    }
+    return out;
+  };
+  const uint64_t size_bytes = 384ull << 20;
+  std::string error;
+  const auto* p = reinterpret_cast<const char8_t*>(path_string.data());
+  std::filesystem::path path(std::u8string(p, path_string.size()));
+  auto image = ImageBlockDevice::Create(path, size_bytes, 512, &error);
+  if (!image) {
+    std::fprintf(stderr, "cannot create %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  mkfs::FormatOptions options;
+  options.block_size = kBlock;
+  options.inode_size = 512;
+  options.quiet = true;
+  options.finobt = true;
+  options.inobtcount = true;
+  options.sparse_inodes = true;
+  options.bigtime = true;
+  options.nrext64 = true;
+  options.rmapbt = true;
+  options.reflink = true;
+  auto formatted = mkfs::Format(*image, options);
+  if (!formatted.ok()) {
+    std::fprintf(stderr, "rw6c format failed: %s\n",
+                 formatted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  mount_options.allow_reflink_qualification = true;
+  auto borrowed = std::make_unique<xfstest::BorrowedBlockDevice>(image.get());
+  auto mounted = XfsFilesystem::Mount(std::move(borrowed), mount_options);
+  if (!mounted.ok()) {
+    std::fprintf(stderr, "rw6c mount failed: %s\n",
+                 mounted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+  XfsFilesystem& fs = *mounted.value();
+  const uint64_t root = fs.RootInode();
+  auto write = [&](uint64_t ino, uint64_t offset,
+                   const std::vector<uint8_t>& data) -> bool {
+    auto status = fs.WriteFileData(ino, offset, data.data(), data.size());
+    if (!status.ok()) {
+      std::fprintf(stderr, "rw6c write failed: %s\n",
+                   status.error().Format().c_str());
+      return false;
+    }
+    return true;
+  };
+  auto create = [&](const std::string& name, uint64_t* ino) -> bool {
+    auto file = fs.CreateRegularFile(root, name, 0644, 0, 0);
+    if (!file.ok()) {
+      std::fprintf(stderr, "rw6c create %s failed: %s\n", name.c_str(),
+                   file.error().Format().c_str());
+      return false;
+    }
+    *ino = file.value();
+    return true;
+  };
+  if (!fs.Mkdir(root, "base", 0755, 0, 0).ok() ||
+      !fs.Mkdir(root, "emptydir", 0755, 0, 0).ok()) {
+    std::fprintf(stderr, "rw6c mkdir failed\n");
+    return 1;
+  }
+  auto base = fs.LookupPath("/base");
+  if (!base.ok()) return 1;
+  const uint64_t base_ino = base.value().ino;
+  auto create_in = [&](const std::string& name, uint64_t* ino) -> bool {
+    auto file = fs.CreateRegularFile(base_ino, name, 0644, 0, 0);
+    if (!file.ok()) {
+      std::fprintf(stderr, "rw6c create /base/%s failed: %s\n", name.c_str(),
+                   file.error().Format().c_str());
+      return false;
+    }
+    *ino = file.value();
+    return true;
+  };
+
+  uint64_t source = 0, clone_a = 0, clone_b = 0, cow = 0, three = 0;
+  if (!create_in("source.bin", &source) ||
+      !write(source, 0, pattern(16 * kBlock, 11))) return 1;
+  auto clone = [&](uint64_t src, uint64_t dst) -> bool {
+    auto cloned = fs.ReflinkRange(src, 0, dst, 0, 0);
+    if (!cloned.ok()) {
+      std::fprintf(stderr, "rw6c clone failed: %s\n",
+                   cloned.error().Format().c_str());
+      return false;
+    }
+    return true;
+  };
+  if (!create_in("clone-a.bin", &clone_a) || !clone(source, clone_a) ||
+      !create_in("clone-b.bin", &clone_b) || !clone(source, clone_b) ||
+      !create_in("cow.bin", &cow) || !clone(source, cow) ||
+      !create_in("three.bin", &three) || !clone(source, three)) return 1;
+  if (!write(cow, 2 * kBlock, pattern(kBlock, 73))) return 1;
+
+  uint64_t partial = 0, partial_clone = 0, sparse = 0, sparse_clone = 0;
+  if (!create_in("partial.bin", &partial) ||
+      !write(partial, 0, pattern(4 * kBlock + 300, 29)) ||
+      !create_in("partial-clone.bin", &partial_clone) ||
+      !clone(partial, partial_clone)) return 1;
+  if (!create_in("sparse.bin", &sparse) ||
+      !write(sparse, 2 * kBlock, pattern(2 * kBlock, 41)) ||
+      !create_in("sparse-clone.bin", &sparse_clone) ||
+      !clone(sparse, sparse_clone)) return 1;
+
+  for (uint32_t i = 0; i < 100; ++i) {
+    char src_name[16], gap_name[16], dst_name[16];
+    std::snprintf(src_name, sizeof(src_name), "s%03u.bin", i);
+    std::snprintf(gap_name, sizeof(gap_name), "g%03u.bin", i);
+    std::snprintf(dst_name, sizeof(dst_name), "d%03u.bin", i);
+    uint64_t src = 0, gap = 0, dst = 0;
+    if (!create_in(src_name, &src) ||
+        !write(src, 0, pattern(kBlock, 200 + i)) ||
+        !create_in(gap_name, &gap) ||
+        !write(gap, 0, pattern(kBlock, 500 + i)) ||
+        !create_in(dst_name, &dst) || !clone(src, dst)) return 1;
+  }
+
+  Status clean = fs.WriteCleanUnmountRecord();
+  if (!clean.ok()) {
+    std::fprintf(stderr, "rw6c clean unmount failed: %s\n",
+                 clean.error().Format().c_str());
+    return 1;
+  }
+  mounted.value().reset();
+  if (!image->Flush()) {
+    std::fprintf(stderr, "rw6c flush failed: %s\n",
+                 image->LastError().c_str());
+    image->Close();
+    return 1;
+  }
+  image->Close();
+  std::printf("rw6c fixture: %s (reflink=1,rmapbt=1,1 KiB blocks)\n",
+              path_string.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -329,6 +484,9 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--make-rw6-sparse") == 0) {
     return MakeRw6SparseFixture(argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--make-rw6c-fixture") == 0) {
+    return MakeRw6cFixture(argv[2]);
+  }
   std::string filter;
   if (argc == 2 && std::strncmp(argv[1], "--filter=", 9) == 0) {
     filter = argv[1] + 9;
@@ -337,12 +495,15 @@ int main(int argc, char** argv) {
       (std::strcmp(argv[1], "--help") == 0 ||
        std::strcmp(argv[1], "-h") == 0)) {
     std::cout << "usage: xfs_tests [--make-fixture <image>] "
-                 "[--make-rw6-sparse <image>] [--filter=<substring>]\n"
+                 "[--make-rw6-sparse <image>] "
+                 "[--make-rw6c-fixture <image>] [--filter=<substring>]\n"
                  "  no arguments: run the test suite\n"
                  "  --make-fixture <image>: write a fixture image (one "
                  "consistent filesystem with one file) for Linux verification\n"
                  "  --make-rw6-sparse <image>: write a modern-inode filesystem\n"
                  "      with a real sparse inode chunk for Linux verification\n"
+                 "  --make-rw6c-fixture <image>: write a Windows-generated\n"
+                 "      reflink+rmapbt image with the RW-6C logical fixture\n"
                  "  --filter=<substring>: only run tests whose name contains "
                  "the substring\n";
     return 0;
