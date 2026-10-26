@@ -174,6 +174,16 @@ target profile; the job artifacts record the actual runner, tool version,
 a runner that cannot format or mount `parent=1` fails instead of producing
 repair-only evidence.
 
+[Run 40221845841](https://github.com/100pangci/XFS-for-Windows/actions/runs/40221845841)
+verified this profile on Linux **6.17.0-1022-azure** with xfsprogs **7.2.0**:
+plain `mkfs.xfs -f` enabled `parent=1`, `exchrange=1` and incompat bits
+`0xeb`. The image passed the Linux → Windows → Linux namespace/content
+round trip, the independent parent oracle (**1023/1023** edges/pointers), and
+`xfs_repair -n`. Online scrub was explicitly skipped because the Azure kernel
+did not provide its metadata scrub facility. See
+[PARENT_POINTERS.md](PARENT_POINTERS.md#github-actions-linux-evidence-2026-10-26)
+for the measured coverage and remaining qualification gates.
+
 ## Consequences for compatibility claims
 
 * A plain modern `mkfs.xfs -f` image is the primary RW-6E fixture.  It is

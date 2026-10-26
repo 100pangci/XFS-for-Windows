@@ -1,12 +1,11 @@
 # Parent pointers (RW-6E)
 
-Status: **implemented and qualified by the Windows matrix and independent raw
-oracle in this tree; the Linux kernel / xfsprogs qualification harness is part
-of the change but its hosted run is the external acceptance gate.**  Ordinary
+Status: **implemented, with hosted Linux interoperability verified by
+[run 40221845841](https://github.com/100pangci/XFS-for-Windows/actions/runs/40221845841).** Ordinary
 `--rw-experimental` now accepts a parent-pointer filesystem once the profile
-passes `CheckWritableProfile`.  No CI run URL is claimed in this document; the
-ledger below distinguishes local evidence from the Linux jobs that must be
-recorded before a release is called qualified.
+passes `CheckWritableProfile`. The evidence below distinguishes the passing
+interoperability workload from still-pending recovery and stress gates; a green
+CI run does not close every qualification row.
 
 This is the qualification record and the research notebook for RW-6E.  The
 authority is the source in `reference/linux/fs/xfs/` and
@@ -274,8 +273,8 @@ fails; the harness never substitutes `xfs_repair`-only evidence.
 The three hosted directions are:
 
 1. `linux-verify-rw6e-windows` verifies the Windows formatter and 1 KiB
-   Windows fixture with the real kernel, `xfs_repair -n`, `xfs_scrub` and the
-   independent Python oracle.
+   Windows fixture with the real kernel, `xfs_repair -n` and the independent
+   Python oracle; `xfs_scrub` runs only when the kernel supports online scrub.
 2. `linux-rw6e-parent` creates a plain `mkfs.xfs -f` fixture, runs the
    deterministic 1000-hardlink workload, and publishes it for Windows.
 3. `windows-rw6e-linux-roundtrip` mutates that Linux image through Windows
@@ -286,9 +285,9 @@ The three hosted directions are:
 
 ## Qualification ledger
 
-Rows marked "local" are evidence from this working tree.  Rows marked
-"harness" require the recorded Linux run; this document does not claim them
-without a URL.
+Rows marked "local" are evidence from this working tree. Rows marked
+"harness" are not automatically closed by a successful interoperability run;
+see the measured coverage and remaining gates below.
 
 | # | Gate | Local status | Linux/independent evidence |
 |---|---|---|---|
@@ -305,6 +304,43 @@ without a URL.
 | 11 | ENOSPC leaves dirent and PP unchanged | inherited RW-6D/RW-4 transaction behavior; parent fixture job added | harness |
 | 12 | plain modern `mkfs.xfs` profile | formatter `--modern-default-profile` check + oracle clean; ordinary RW policy now accepts parent | harness |
 | 13 | README/docs consistency | rewritten | review gate |
+
+## GitHub Actions Linux evidence (2026-10-26)
+
+[PR #10](https://github.com/100pangci/XFS-for-Windows/pull/10),
+[run 40221845841](https://github.com/100pangci/XFS-for-Windows/actions/runs/40221845841)
+tested commit `e9993b31bdf39f00ac16439457a6571920eb0a38`:
+**109/109 jobs passed**, including all four RW-6E interoperability jobs.
+
+* Environment: GitHub-hosted Ubuntu 24.04, Linux **6.17.0-1022-azure**,
+  xfsprogs **7.2.0** built from kernel.org.
+* `linux-rw6e-parent`: plain `mkfs.xfs -f` enabled `parent=1`,
+  `exchrange=1` (`features_incompat=0xeb`); a real writable kernel mount
+  created 1011 entries and 5 directories, with 1003 links to the heavy inode.
+  `xfs_repair -n` passed after unmount.
+* `linux-verify-rw6e-windows`: both Windows-created images passed real kernel
+  mounts and `xfs_repair -n` before/after mounting. The independent oracle
+  reported **5/5** edges/pointers for the modern formatter workload and
+  **611/611** for the 1 KiB hardlink-heavy fixture.
+* `windows-rw6e-linux-roundtrip`: Windows accepted the Linux-created image
+  with ordinary `--rw-experimental`, mutated its namespace, and passed
+  `check --parents` and the Python oracle: **1023/1023** edges/pointers,
+  with no parent-audit errors.
+* `linux-verify-rw6e-mutation`: the kernel verified the original 1011-entry,
+  5-directory manifest and the Windows-added namespace/content, hardlink,
+  symlink and xattr checks. `xfs_repair -n` passed before and after the first
+  verification mount; the raw oracle again reported **1023/1023**, clean.
+* `windows-build-test` also passed the **64/64** parent-enabled namespace
+  crash/recovery cases. Those recovered images were checked on Windows,
+  not uploaded for independent Linux replay in this run.
+
+**Online scrub is not qualified by this run.** The Azure kernel reported
+`Kernel metadata scrubbing facility is not available`; the jobs recorded an
+explicit scrub capability skip, not a successful scrub. Real writable kernel
+mounts, content checks, the independent raw oracle and `xfs_repair -n` remained
+mandatory. Genuine surviving Linux PPTR ATTRI/ATTRD capture/recovery,
+Linux replay of the parent crash matrix, parent-specific ENOSPC, and complete
+tree-collapse/namespace stress coverage remain separate qualification gates.
 
 ## Windows local evidence (2026-10-26)
 
@@ -332,7 +368,7 @@ without a URL.
   image-file-only.
 * Quotas, realtime devices, external logs, metadir and zoned filesystems remain
   outside the writable profile.
-* The debug-kernel ATTRI/ATTRD capture for ordinary logged xattrs
-  (`docs/XATTR.md` row 6) still requires the opt-in modern-kernel harness; the
-  parent-path PPTR parser/completion is covered locally and by the same
-  harness.
+* Ordinary logged-xattr ATTRI/ATTRD capture (`docs/XATTR.md` row 6) still
+  requires a debug kernel with `larp=1`. Parent-path PPTR parser/completion
+  has local synthetic coverage; the hosted clean-image round trip does not
+  prove recovery of a genuine surviving Linux parent intent.
