@@ -3,14 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - image file block device (*.img / *.raw).
 //
-// Write semantics:
-//   - Read/Write are positioned I/O: there is no shared file position, so
-//     concurrent reads do not serialize behind each other.
+// I/O semantics:
+//   - Read/Write are positioned I/O (FILE_FLAG_OVERLAPPED on Windows,
+//     pread/pwrite on POSIX): independent ranges can be in flight at once.
 //   - Write never tears a caller's buffer and never silently short-writes;
 //     a short transfer is retried and then reported as a failure.
-//   - Flush is a durable flush (FlushFileBuffers on Windows): it returns only
-//     after the data has been handed to stable storage, and reports failure
-//     instead of pretending success.
+//   - Flush is a durability barrier: it waits for earlier writes, excludes
+//     new writes during the durable flush, and reports failure instead of
+//     pretending success.
 #pragma once
 
 #include <filesystem>
