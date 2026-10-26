@@ -30,6 +30,18 @@ struct Options {
   bool rmapbt = false;
   // RW-6C formatter/test profile: reflink=1 with independent rmapbt choice.
   bool reflink = false;
+  // RW-6E formatter: parent pointers (implies exchange-range) or the full
+  // modern xfsprogs 7.2 default profile.
+  bool parent_pointers = false;
+  bool modern_default_profile = false;
+  // Legacy RW-6E development switch, accepted as a no-op now that parent
+  // pointers are part of the ordinary writable profile.
+  bool parent_qualification = false;
+  // xattr list: expose private XFS_ATTR_PARENT entries as parent.*.
+  bool include_private = false;
+  // check --parents: force the bidirectional parent audit (it is on by default
+  // for parent=1 filesystems).
+  bool parent_check = false;
   // Legacy hidden qualification overrides.  Both feature sets are part of the
   // ordinary writable profile now; the flags are parsed and ignored so older
   // scripts keep working.

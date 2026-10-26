@@ -868,6 +868,158 @@ int MakeRw6dFixture(const std::string& path_string) {
   return 0;
 }
 
+// Test-support RW-6E image: a Windows-formatted 1 KiB-block modern profile
+// with the parent feature and a large hardlink set.  The independent Python
+// oracle (tests/tools/rw6e_parent_probe.py) reads the raw image; Linux mounts
+// it and runs xfs_repair/scrub.
+int MakeRw6eFixture(const std::string& path_string) {
+  using namespace xfs;
+  constexpr uint32_t kBlock = 1024;
+  const uint64_t size_bytes = 512ull << 20;
+  std::string error;
+  const auto* p = reinterpret_cast<const char8_t*>(path_string.data());
+  std::filesystem::path path(std::u8string(p, path_string.size()));
+  auto image = ImageBlockDevice::Create(path, size_bytes, 512, &error);
+  if (!image) {
+    std::fprintf(stderr, "cannot create %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  mkfs::FormatOptions options;
+  options.block_size = kBlock;
+  options.inode_size = 512;
+  options.quiet = true;
+  options.modern_default_profile = true;
+  auto formatted = mkfs::Format(*image, options);
+  if (!formatted.ok()) {
+    std::fprintf(stderr, "rw6e format failed: %s\n",
+                 formatted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+
+  MountOptions mount_options;
+  mount_options.read_write = true;
+  auto borrowed = std::make_unique<xfstest::BorrowedBlockDevice>(image.get());
+  auto mounted = XfsFilesystem::Mount(std::move(borrowed), mount_options);
+  if (!mounted.ok()) {
+    std::fprintf(stderr, "rw6e mount failed: %s\n",
+                 mounted.error().Format().c_str());
+    image->Close();
+    return 1;
+  }
+  XfsFilesystem& fs = *mounted.value();
+  const uint64_t root = fs.RootInode();
+  auto fail = [](const char* what, const ErrorContext& error) {
+    std::fprintf(stderr, "rw6e %s failed: %s\n", what, error.Format().c_str());
+    return 1;
+  };
+
+  auto mkdir = [&](const std::string& name) -> Result<uint64_t> {
+    Status s = fs.Mkdir(root, name, 0755, 0, 0);
+    if (!s.ok()) return s.error();
+    auto entry = fs.LookupName(root, name);
+    if (!entry.ok()) return entry.error();
+    return entry.value().ino;
+  };
+  auto d1 = mkdir("d1");
+  auto d2 = mkdir("d2");
+  if (!d1.ok()) return fail("mkdir d1", d1.error());
+  if (!d2.ok()) return fail("mkdir d2", d2.error());
+  auto sub = fs.Mkdir(d1.value(), "sub", 0755, 0, 0);
+  if (!sub.ok()) return fail("mkdir sub", sub.error());
+  auto sub_ino = fs.LookupName(d1.value(), "sub");
+  if (!sub_ino.ok()) return fail("lookup sub", sub_ino.error());
+
+  auto victim = fs.CreateRegularFile(d2.value(), "victim", 0644, 0, 0);
+  if (!victim.ok()) return fail("create victim", victim.error());
+  auto xfile = fs.CreateRegularFile(d1.value(), "x", 0644, 0, 0);
+  if (!xfile.ok()) return fail("create x", xfile.error());
+  auto empty = fs.Mkdir(d1.value(), "empty", 0755, 0, 0);
+  if (!empty.ok()) return fail("mkdir empty", empty.error());
+
+  auto file = fs.CreateRegularFile(d1.value(), "f", 0644, 0, 0);
+  if (!file.ok()) return fail("create f", file.error());
+  const uint64_t file_ino = file.value();
+  const std::vector<uint8_t> content(8192, 0x5a);
+  auto write = fs.WriteFileData(file_ino, 0, content.data(), content.size());
+  if (!write.ok()) return fail("write f", write.error());
+  auto user_attr = fs.SetXattr(file_ino, "user.alpha", "parent-test", 11,
+                               XfsFilesystem::XattrSetMode::kUpsert);
+  if (!user_attr.ok()) return fail("set user.alpha", user_attr.error());
+  std::vector<uint8_t> remote(3000, 0x33);
+  auto remote_attr = fs.SetXattr(file_ino, "user.remote", remote.data(),
+                                 remote.size(),
+                                 XfsFilesystem::XattrSetMode::kUpsert);
+  if (!remote_attr.ok()) return fail("set user.remote", remote_attr.error());
+
+  for (int i = 0; i < 600; ++i) {
+    char name[24];
+    std::snprintf(name, sizeof(name), "h%04d", i);
+    Status s = fs.Link(file_ino, root, name);
+    if (!s.ok()) return fail("link", s.error());
+  }
+  Status same1 = fs.Link(file_ino, d1.value(), "same");
+  if (!same1.ok()) return fail("link d1/same", same1.error());
+  Status same2 = fs.Link(file_ino, d2.value(), "same");
+  if (!same2.ok()) return fail("link d2/same", same2.error());
+  auto renamed = fs.Rename(d1.value(), "f", d2.value(), "moved", false);
+  if (!renamed.ok()) return fail("rename", renamed.error());
+  auto moved = fs.Rename(d2.value(), "moved", d2.value(), "moved2", false);
+  if (!moved.ok()) return fail("same-dir rename", moved.error());
+  auto sym = fs.CreateSymlink(root, "sym", "d2/moved2", 0777, 0, 0);
+  if (!sym.ok()) return fail("symlink", sym.error());
+
+  auto clone = fs.CreateRegularFile(d2.value(), "clone", 0644, 0, 0);
+  if (!clone.ok()) return fail("create clone", clone.error());
+  auto cl = fs.ReflinkRange(file_ino, 0, clone.value(), 0, 4096);
+  if (!cl.ok()) return fail("reflink", cl.error());
+
+  auto info = fs.GetFileInfo(file_ino);
+  if (!info.ok() || info.value().nlink != 603) {
+    std::fprintf(stderr, "rw6e fixture hardlink count mismatch\n");
+    return 1;
+  }
+  Status clean = fs.WriteCleanUnmountRecord();
+  if (!clean.ok()) return fail("clean unmount", clean.error());
+  auto audit = fs.VerifyParentPointers();
+  if (!audit.ok() || !audit.value().clean()) {
+    std::fprintf(stderr, "rw6e fixture parent audit failed: %s\n",
+                 audit.ok() ? audit.value().Summary().c_str()
+                            : audit.error().Format().c_str());
+    return 1;
+  }
+  mounted.value().reset();
+  if (!image->Flush()) {
+    std::fprintf(stderr, "rw6e flush failed: %s\n", image->LastError().c_str());
+    image->Close();
+    return 1;
+  }
+  image->Close();
+
+  const std::string manifest_path = path_string + ".manifest.json";
+  std::filesystem::path manifest_file(std::u8string(
+      reinterpret_cast<const char8_t*>(manifest_path.data()),
+      manifest_path.size()));
+  std::ofstream manifest(manifest_file);
+  manifest << "{\n"
+           << "  \"kind\": \"rw6e-windows-fixture\",\n"
+           << "  \"root_ino\": " << root << ",\n"
+           << "  \"file_ino\": " << file_ino << ",\n"
+           << "  \"sub_ino\": " << sub_ino.value().ino << ",\n"
+           << "  \"hardlink_ino\": " << file_ino << ",\n"
+           << "  \"hardlinks\": 603,\n"
+           << "  \"dirs\": [\"d1\", \"d2\", \"d1/sub\"],\n"
+           << "  \"file\": \"/d2/moved2\",\n"
+           << "  \"size\": " << content.size() << "\n"
+           << "}\n";
+  manifest.close();
+  std::printf("rw6e fixture: %s (1 KiB blocks, modern default + parent)\n",
+              path_string.c_str());
+  std::printf("manifest: %s\n", manifest_path.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -883,6 +1035,9 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--make-rw6d-fixture") == 0) {
     return MakeRw6dFixture(argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--make-rw6e-fixture") == 0) {
+    return MakeRw6eFixture(argv[2]);
+  }
   std::string filter;
   if (argc == 2 && std::strncmp(argv[1], "--filter=", 9) == 0) {
     filter = argv[1] + 9;
@@ -893,7 +1048,8 @@ int main(int argc, char** argv) {
     std::cout << "usage: xfs_tests [--make-fixture <image>] "
                  "[--make-rw6-sparse <image>] "
                  "[--make-rw6c-fixture <image>] "
-                 "[--make-rw6d-fixture <image>] [--filter=<substring>]\n"
+                 "[--make-rw6d-fixture <image>] "
+                 "[--make-rw6e-fixture <image>] [--filter=<substring>]\n"
                  "  no arguments: run the test suite\n"
                  "  --make-fixture <image>: write a fixture image (one "
                  "consistent filesystem with one file) for Linux verification\n"
@@ -904,6 +1060,9 @@ int main(int argc, char** argv) {
                  "  --make-rw6d-fixture <image>: write a Windows-generated\n"
                  "      1 KiB-block image with shortform/leaf/node/multi-level\n"
                  "      node, remote, attribute-BMBT and namespace attributes\n"
+                 "  --make-rw6e-fixture <image>: write a Windows-generated\n"
+                 "      1 KiB modern-default parent-pointer image with 600 hard\n"
+                 "      links, directory moves, xattrs and a reflink clone\n"
                  "  --filter=<substring>: only run tests whose name contains "
                  "the substring\n";
     return 0;

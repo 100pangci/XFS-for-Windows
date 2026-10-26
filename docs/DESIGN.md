@@ -110,13 +110,14 @@ Shared header checks (per structure):
 Feature policy:
 
 - Supported incompat features: `FTYPE`, `SPINODES`, `META_UUID`, `BIGTIME`,
-  `NREXT64`, `EXCHRANGE` (no on-disk impact for reading).
-- `PARENT` (parent pointers) is accepted read-only: the directory and inode
-  layouts are unchanged; parent pointers are stored as private `parent`
-  xattrs (parent inode + generation) in each child's attribute fork, which the
-  reader never parses and the mount never writes.
-- Accepted ro-compat features: `FINOBT` and `INOBTCNT` are maintained on
-  write; `RMAPBT` and `REFLINK` are read-only safe and refused for write.
+  `NREXT64`, `EXCHRANGE` (feature bit; the XMI/XMD operation is refused) and
+  `PARENT` (parent pointers).
+- `PARENT` is fully read/write: parent pointers are private attributes in each
+  child's attr fork, and the namespace core updates them in the same
+  transaction as the dirent.  `xfswin check` audits both directions; the
+  generic xattr path refuses the private namespace.
+- Accepted ro-compat features: `FINOBT`, `INOBTCNT`, `RMAPBT` and `REFLINK`
+  are all maintained on write (RW-6A/B/C).
 - Modern inode layouts: `SPINODES`, `BIGTIME` and `NREXT64` are readable and
   writable (RW-6A); see `MODERN_INODE_FEATURES.md`.
 - Rejected: `NEEDSREPAIR`, `METADIR`, `ZONED`, `ZONE_GAPS`,
@@ -303,7 +304,11 @@ insertion. The target is never freed inside that transaction; the caller either
 defers the free until the last handle closes or lets `FreeUnlinkedInode` do the
 rolling truncate + `xfs_ifree`. Symlinks are real `S_IFLNK` inodes: inline
 targets in the literal area, longer targets in v5 `xfs_dsymlink_hdr` blocks with
-one header per contiguous extent. See `docs/NAMESPACE.md`.
+one header per contiguous extent. RW-6E adds the child's reverse parent
+pointer to the same transaction for create, mkdir, symlink, link, unlink,
+rmdir, rename and rename-replace; `xfswin check` and a writable-mount preflight
+audit the two directions. See `docs/NAMESPACE.md` and
+`docs/PARENT_POINTERS.md`.
 
 **Write path.** `XfsFilesystem::WriteFileData` (`src/write/file_write.cpp`) is
 the single entry point for `pwrite`/WinFsp `Write`/append:

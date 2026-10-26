@@ -274,7 +274,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
           Status profile = CheckWritableProfile(
               fs->superblock_, fs->geometry_, options.recovery_only,
               options.allow_rmapbt_qualification, options.recovery_only,
-              options.allow_reflink_qualification);
+              options.allow_reflink_qualification,
+              options.allow_parent_qualification);
           if (!profile.ok()) {
             auto error = profile.error();
             error.message +=
@@ -348,13 +349,34 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
     Status profile = CheckWritableProfile(
         fs->superblock_, fs->geometry_, options.recovery_only,
         options.allow_rmapbt_qualification, options.recovery_only,
-        options.allow_reflink_qualification);
+        options.allow_reflink_qualification,
+        options.allow_parent_qualification);
     if (!profile.ok()) {
       auto error = profile.error();
       error.message +=
           " (read-only access is unaffected; mount without the read-write "
           "option)";
       return error;
+    }
+    // A writable mount must never proceed on a namespace whose forward
+    // dirents and reverse parent pointers already disagree.  Recovery has
+    // finished at this point, so this is a clean preflight over committed
+    // metadata, not a pre-replay snapshot.
+    // Recovery-only mounts complete surviving intents first; they are not a
+    // long-lived writable namespace and must be allowed to converge even when
+    // the pre-recovery view was inconsistent.  The follow-up check is the
+    // caller's gate before exposing such an image read-write.
+    if (fs->superblock_.features.parent && !options.recovery_only) {
+      auto audit = fs->VerifyParentPointers();
+      if (!audit.ok() || !audit.value().clean()) {
+        std::string detail =
+            audit.ok() ? audit.value().Summary() : audit.error().Format();
+        return XFS_ERR(XfsError::kNeedsRepair,
+                       "parent-pointer namespace is inconsistent (" + detail +
+                           "); run xfswin check, then repair or restore the "
+                           "image")
+            .Metadata("parent pointers");
+      }
     }
     fs->writable_ = true;
     XFS_SB_INFO("mounted read-write: " << WritableProfileSummary(fs->superblock_));
@@ -1066,6 +1088,82 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
 }
 
 }  // namespace
+
+Result<std::vector<uint64_t>> XfsFilesystem::ListAllocatedInodes() const {
+  std::vector<uint64_t> out;
+  const XfsGeometry& geo = geometry_;
+  BlockDevice& dev = *device_;
+  uint64_t sb_lsn = superblock_.lsn;
+  auto live_sb = ReadSuperblock(dev, 0, /*verify_crc=*/true);
+  if (live_sb.ok()) sb_lsn = live_sb.value().lsn;
+  for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
+    auto headers = ReadAgHeaders(dev, geo, agno);
+    if (!headers.ok()) return headers.error();
+    const XfsAgf& agf = headers.value().agf;
+    const XfsAgi& agi = headers.value().agi;
+
+    BtreeSpec inobt;
+    inobt.name = "inobt";
+    inobt.format = BtreeFormat::kShort;
+    inobt.block_size = geo.block_size;
+    inobt.key_size = bt::kInobtKeySize;
+    inobt.ptr_size = bt::kInobtPtrSize;
+    inobt.rec_size = bt::kInobtRecSize;
+    inobt.magic = ondisk::kIbtCrcMagic;
+    inobt.null_ptr = kNullAgBlock;
+    inobt.expected_owner = agno;
+    inobt.owner_size = 4;
+    inobt.uuid = geo.meta_uuid;
+    inobt.sb_lsn = sb_lsn;
+    inobt.ptr_to_daddr = [&](uint64_t agbno, uint64_t* daddr) {
+      if (agbno >= agf.length) return false;
+      *daddr = geo.FsbToByte(geo.AgFsb(agno, static_cast<uint32_t>(agbno))) /
+               512;
+      return true;
+    };
+    BtreeWalkCallbacks cb;
+    cb.read_block = [&](uint64_t agbno, std::vector<uint8_t>* buf) {
+      if (agbno >= agf.length) return false;
+      buf->resize(geo.block_size);
+      return dev.Read(
+          geo.FsbToByte(geo.AgFsb(agno, static_cast<uint32_t>(agbno))),
+          buf->data(), geo.block_size);
+    };
+    cb.ptr_in_range = [&](uint64_t ptr) { return ptr < agf.length; };
+    cb.visit = [&](uint64_t, const BtreeBlockMeta& meta,
+                   const uint8_t* buf) -> Status {
+      if (meta.level != 0) return OkStatus();
+      for (uint16_t i = 0; i < meta.numrecs; ++i) {
+        const uint8_t* rec = BtreeLeafRec(buf, meta, inobt, i);
+        InobtRecord r;
+        r.startino = GetBE32(rec);
+        r.free = GetBE64(rec + 8);
+        if (geo.features.spinodes) {
+          r.holemask = GetBE16(rec + 4);
+          r.count = GetU8(rec + 6);
+          r.freecount = GetU8(rec + 7);
+        } else {
+          r.holemask = 0;
+          r.count = ondisk::kInodesPerChunk;
+          r.freecount = GetBE32(rec + 4);
+        }
+        const uint64_t allocmask =
+            geo.features.spinodes ? InobtAllocMask(r.holemask) : ~0ULL;
+        for (uint32_t bit = 0; bit < ondisk::kInodesPerChunk; ++bit) {
+          if (!((allocmask >> bit) & 1ULL)) continue;
+          if ((r.free >> bit) & 1ULL) continue;
+          out.push_back(geo.AginoToIno(agno, r.startino + bit));
+        }
+      }
+      return OkStatus();
+    };
+    Status s = WalkBtree(inobt, agi.root, cb);
+    if (!s.ok()) return s.error();
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
 
 CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   CheckReport report;
@@ -1835,6 +1933,39 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
           }
         }
       }
+    }
+  }
+
+  // Parent-pointer namespace audit: every real dirent has exactly one reverse
+  // record and every reverse record has exactly one real dirent.  This is a
+  // second, independent view of the directory tree (the root_children check
+  // above only validates direct children).
+  if (options.parent_pointers && live_sb.features.parent) {
+    auto parents = VerifyParentPointers();
+    if (!parents.ok()) {
+      report.Add("parent pointers", CheckStatus::kCorrupt,
+                 parents.error().Format());
+    } else {
+      const ParentNamespaceReport& p = parents.value();
+      std::string detail = p.Summary();
+      if (!p.clean()) {
+        auto append = [&](const char* label,
+                          const std::vector<std::string>& v) {
+          if (!v.empty()) detail += std::string("; ") + label + ": " + v[0];
+        };
+        append("missing", p.missing);
+        append("unexpected", p.unexpected);
+        append("wrong generation", p.wrong_parent_generation);
+        append("wrong name", p.wrong_name);
+        append("duplicate", p.duplicate);
+        append("dangling parent", p.dangling_parent);
+        append("non-directory parent", p.non_directory_parent);
+        append("dotdot", p.wrong_dotdot);
+        append("nlink", p.link_count_mismatch);
+        append("malformed", p.malformed);
+      }
+      report.Add("parent pointers",
+                 p.clean() ? CheckStatus::kOk : CheckStatus::kCorrupt, detail);
     }
   }
 

@@ -15,9 +15,12 @@ link        hard links to regular files and symlinks, link-count lifecycle
 symlink     creation of real S_IFLNK inodes, inline and remote targets
 ```
 
-Explicitly **not** in scope: xattr/ACL mutation, reflink/clone, quotas, parent
-pointers, realtime, metadir, Windows-side dirty-log replay, and Windows
-reparse-point (symlink) semantics. See the end of this document.
+Explicitly **not** in scope for RW-4: xattr/ACL mutation, reflink/clone,
+quotas, parent pointers, realtime, metadir, Windows-side dirty-log replay, and
+Windows reparse-point (symlink) semantics. Later milestones add xattrs
+(RW-6D), reflink/CoW (RW-6C), recoverable namespace intents (RW-5) and parent
+pointers (RW-6E); see the end of this document and
+[PARENT_POINTERS.md](PARENT_POINTERS.md).
 
 ## Public API
 
@@ -284,9 +287,11 @@ atomicity wins over accepting an impossible rename.
 
 ## Current limitations
 
-* No ACL translation, quotas, parent pointers, realtime or metadir; native
-  xattr storage is implemented in RW-6D (`XATTR.md`), while ACL/security
-  semantics are not. Reflink/clone is implemented in RW-6C.
+* No ACL translation, quotas, realtime or metadir; native xattr storage is
+  implemented in RW-6D (`XATTR.md`), while ACL/security semantics are not.
+  Reflink/clone is implemented in RW-6C. Parent pointers and their
+  transactionally coupled namespace maintenance are implemented in RW-6E
+  (`PARENT_POINTERS.md`).
 * Windows symlinks stay the documented read-only view (the target is exposed
   as file content); no reparse-point tags are produced or consumed.
 * Windows-side journal replay is still out of scope: the Windows writer always

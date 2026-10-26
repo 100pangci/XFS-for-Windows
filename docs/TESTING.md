@@ -794,11 +794,67 @@ linux-verify-rw6d-crash          replay every crash archive and compare the mani
 
 `linux-record-mkfs-defaults` records `mkfs.xfs -V`, plain default `xfs_info`/
 `xfs_db` and the `-n parent=0` profile, which is the evidence behind
-[DEFAULT_PROFILE.md](DEFAULT_PROFILE.md). The RW-6D Linux fixtures explicitly
-disable parent pointers because the ordinary writable profile still refuses
-them.
+[DEFAULT_PROFILE.md](DEFAULT_PROFILE.md). The historical RW-6D fixtures
+explicitly disable parent pointers because that milestone predates RW-6E; new
+RW-6E fixtures use the plain modern default.
 
 The crash matrix contains 66 archived images (set shortform/remote, replace
 remote/local, remove local/remote, node split/shrink, BMBT growth, directory
 attr, unlink and rename, each at every applicable crash point). Linux mounts
 each recovered image and must see exactly the archived old or new manifest.
+
+## RW-6E: parent pointers
+
+```powershell
+build\tests\RelWithDebInfo\xfs_tests.exe --make-rw6e-fixture out\rw6e-windows.img
+python tests\tools\rw6e_parent_probe.py out\rw6e-windows.img --require-parent
+```
+
+`tests/unit/rw6e_tests.cpp` runs on real parent=1 images and ends each scenario
+with a clean unmount, `CheckConsistency` and `VerifyParentPointers`:
+
+- typed encode/decode/hash, name and value validation, self-parent refusal;
+- create/mkdir/symlink/link/unlink/rmdir parent records;
+- same-name hard links under different parents (the duplicate-key trap);
+- same-directory and cross-directory rename, replace, no-op same-inode rename;
+- directory move, `..` rewrite, parent link counts and inode reuse/generation;
+- 600 hard links on a 1 KiB filesystem: shortform → leaf → node → attr BMBT,
+  then unlink back to one record;
+- parent pointers coexisting with user/trusted/security/ACL and remote xattrs;
+- corruption detection: missing record and a stale generation produce a
+  `CheckConsistency` failure and a non-clean audit;
+- synthetic committed `ATTRI` PPTR_REMOVE without `ATTRD`: Windows recovery
+  completes it and the record disappears;
+- formatter feature bits and the ordinary writable policy.
+
+The independent oracle is `tests/tools/rw6e_parent_probe.py`. It walks the
+forward tree with the independent Python directory parser, enumerates allocated
+inodes through the sparse-aware inobt parser, decodes every raw attr fork and
+reimplements the parent hash. It prints the JSON fields consumed by CI:
+`directory_edges`, `parent_pointers`, `missing`, `unexpected`,
+`wrong_parent_generation`, `wrong_name`, `duplicate`, `dangling_parent`,
+`non_directory_parent`, `stale_generation`, `wrong_dotdot`,
+`link_count_mismatch`, `malformed`, `unreachable_with_parents`.
+
+Linux harness:
+
+```bash
+sudo bash tests/scripts/qualify_rw6e_host.sh rw6e-host
+SIZE_MB=1024 sudo bash tests/scripts/make_rw6e_linux.sh rw6e-linux
+sudo bash tests/scripts/verify_rw6e_linux.sh rw6e-linux/rw6e.img \
+    rw6e-linux/rw6e.manifest.json
+```
+
+`make_rw6e_linux.sh` runs plain `mkfs.xfs -f` (no parent=0), records the
+version/features, mounts it, and creates the deterministic workload with 1000
+hard links, same-name cross-parent links, renames, directory moves, symlinks,
+Unicode/max-length names, xattrs/ACL and reflink+CoW. The verify script runs the
+Python oracle, mounts through the real kernel, checks the manifest, and runs
+`xfs_scrub` where available and `xfs_repair -n`. A host that cannot create or
+mount `parent=1` is a hard failure, not a reason to weaken the evidence.
+
+The hosted real-kernel jobs use GitHub's `ubuntu-24.04` image (kernel
+6.17.0-1022-azure) and build xfsprogs 7.2.0 from kernel.org with
+`tests/scripts/install_xfsprogs_7_2_0.sh`. They are not opt-in and do not need
+a self-hosted or QEMU runner. See
+[PARENT_POINTERS.md](PARENT_POINTERS.md).

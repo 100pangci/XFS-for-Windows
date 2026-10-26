@@ -15,8 +15,10 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <tuple>
 
 #include "xfs/endian.h"
+#include "xfs/parent.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
 #include "xfs/verifier.h"
@@ -62,6 +64,33 @@ constexpr size_t kRmtLsn = 48;
 uint32_t Rol32(uint32_t v, unsigned n) {
   n &= 31;
   return n == 0 ? v : (v << n) | (v >> (32 - n));
+}
+
+bool IsParentNamespace(uint8_t flags) {
+  return (flags & kAttrNspOnDiskMask) == kAttrParent;
+}
+
+// The on-disk attribute hash.  Ordinary names use xfs_da_hashname; parent
+// pointers additionally mix the parent inode number (xfs_parent_hashval).
+// The value is part of the key, so a parent-pointer implementation must not
+// treat a bare name as unique.
+uint32_t ExpectedEntryHash(const XattrEntry& entry) {
+  if (IsParentNamespace(entry.flags) && !entry.remote &&
+      entry.value.size() == kParentRecSize) {
+    return ParentPointerHash(entry.name, GetBE64(entry.value.data(), 0));
+  }
+  return AttrHashName(entry.name);
+}
+
+bool ParentValueKey(const XattrEntry& entry, std::string* key) {
+  if (!IsParentNamespace(entry.flags)) {
+    key->clear();
+    return true;
+  }
+  if (entry.remote || entry.value.size() != kParentRecSize) return false;
+  key->assign(reinterpret_cast<const char*>(entry.value.data()),
+              entry.value.size());
+  return true;
 }
 
 struct LeafHeader {
@@ -1004,7 +1033,7 @@ Status ParseShortform(const XfsInode& inode, std::vector<XattrEntry>* out) {
                   namelen);
     e.value.assign(fork.begin() + static_cast<ptrdiff_t>(pos + 3 + namelen),
                    fork.begin() + static_cast<ptrdiff_t>(pos + size));
-    e.hash = AttrHashName(e.name);
+    e.hash = ExpectedEntryHash(e);
     e.remote = false;
     e.incomplete = false;
     Status s = ValidateXattrName(e.name, e.flags, false);
@@ -1209,9 +1238,11 @@ Status ValidateXattrName(std::string_view on_disk_name, uint8_t flags,
         .Metadata("xattr");
   }
   if (masked == kAttrParent) {
-    // Parent pointer names carry the dirent name and are private.  The generic
-    // name rules above still apply; the parent-pointer payload is opaque to
-    // this milestone.
+    // Parent pointer names are directory-entry names, so they must also obey
+    // xfs_dir2_namecheck and can never be a dot entry.  The 12-byte value is
+    // validated by DecodeParentPointer once the namespace is known.
+    Status name_ok = ValidateParentPointerName(on_disk_name);
+    if (!name_ok.ok()) return name_ok;
   }
   return OkStatus();
 }
@@ -1316,6 +1347,31 @@ Result<XattrFork> ReadXattrFork(BlockDevice& device, const XfsGeometry& geo,
         .Actual(inode.aformat);
   }
 
+  // Validate the hash of every complete entry.  For ordinary attributes the
+  // hash is derived from the name; parent pointers mix in the parent inode
+  // number, so the same name under two parents is not a duplicate key.
+  for (const XattrEntry& e : fork.entries) {
+    if (e.incomplete) continue;
+    if (IsParentNamespace(e.flags)) {
+      auto decoded = DecodeParentPointer(e, geo, inode.ino);
+      if (!decoded.ok()) {
+        auto error = decoded.error();
+        error.ino = inode.ino;
+        error.metadata = "attr fork";
+        return error;
+      }
+    }
+    const uint32_t expected = ExpectedEntryHash(e);
+    if (e.hash != expected) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "attr entry hash does not match its key")
+          .Ino(inode.ino)
+          .Expected(expected)
+          .Actual(e.hash)
+          .Metadata("attr fork");
+    }
+  }
+
   // Leaf entries are globally hash-ordered.  Per-leaf ordering is checked by
   // the leaf parser; the cross-leaf check catches a broken DA tree that would
   // make lookup-by-hash miss an entry.
@@ -1333,20 +1389,31 @@ Result<XattrFork> ReadXattrFork(BlockDevice& device, const XfsGeometry& geo,
     }
   }
 
-  // Namespace+name is the uniqueness key.  Linux cannot create duplicates;
-  // accepting them would make replace/remove ambiguous.
-  // A logged replace temporarily has a complete old entry and an INCOMPLETE
-  // new entry with the same namespace+name.  Only completed entries must be
-  // unique; incomplete entries are invisible to list/get and are repaired by
-  // log replay.
-  std::set<std::pair<uint8_t, std::string>> keys;
+  // The attribute key is (full 32-bit hash, name).  Parent pointers also
+  // compare the parent record value, because the hash mixes the parent inode:
+  // a same-name hard link under another parent is a distinct key, while an
+  // exact duplicate is corruption.  A logged replace temporarily has a
+  // complete old entry and an INCOMPLETE new entry; only completed entries
+  // must be unique.
+  std::set<std::tuple<uint8_t, uint32_t, std::string, std::string>> keys;
   for (const XattrEntry& e : fork.entries) {
     if (e.incomplete) continue;
-    const auto key = std::make_pair(
-        static_cast<uint8_t>(e.flags & kAttrNspOnDiskMask), e.name);
+    std::string value_key;
+    if (!ParentValueKey(e, &value_key)) {
+      return XFS_ERR(XfsError::kCorruptInode,
+                     "parent pointer has a non-local or malformed value")
+          .Ino(inode.ino)
+          .Metadata("attr fork");
+    }
+    // Namespace is part of the key: user.foo and trusted.foo share a name and
+    // hash but are different attributes.  The parent value is part of the
+    // key too, so same-name hard links under different parents are allowed.
+    const auto key = std::make_tuple(
+        static_cast<uint8_t>(e.flags & kAttrNspOnDiskMask), e.hash, e.name,
+        value_key);
     if (!keys.insert(key).second) {
       return XFS_ERR(XfsError::kCorruptInode,
-                     "duplicate attr namespace+name in fork")
+                     "duplicate attribute key in fork")
           .Ino(inode.ino)
           .Metadata("attr fork");
     }
@@ -1375,9 +1442,10 @@ Result<std::vector<XattrEntry>> ListXattrs(BlockDevice& device,
 }
 
 Result<XattrEntry> GetXattr(BlockDevice& device, const XfsGeometry& geo,
-                            const XfsInode& inode, std::string_view name) {
+                            const XfsInode& inode, std::string_view name,
+                            bool include_private) {
   std::string on_disk;
-  auto ns = XattrNamespace::ParseName(name, &on_disk, false);
+  auto ns = XattrNamespace::ParseName(name, &on_disk, include_private);
   if (!ns.ok()) return ns.error();
   auto fork = ReadXattrFork(device, geo, inode);
   if (!fork.ok()) return fork.error();

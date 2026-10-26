@@ -24,6 +24,7 @@ add_library(xfs_core STATIC
   core/refcount_intent.cpp
   core/inode.cpp
   core/xattr.cpp
+  core/parent.cpp
   core/extent.cpp
   core/directory.cpp
   core/symlink.cpp
@@ -50,6 +51,7 @@ add_library(xfs_core STATIC
   write/namespace.cpp
   write/file_write.cpp
   write/xattr_write.cpp
+  write/parent_write.cpp
   write/reflink.cpp
   write/flush.cpp
   recovery/log_scan.cpp

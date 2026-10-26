@@ -17,7 +17,18 @@ namespace xfs::mkfs {
 using internal::ComputeFormatGeometry;
 using internal::FormatGeometry;
 
-Result<FormatReport> Format(BlockDevice& device, const FormatOptions& options) {
+Result<FormatReport> Format(BlockDevice& device, const FormatOptions& input) {
+  FormatOptions options = input;
+  if (options.modern_default_profile) {
+    options.finobt = true;
+    options.inobtcount = true;
+    options.sparse_inodes = true;
+    options.bigtime = true;
+    options.nrext64 = true;
+    options.rmapbt = true;
+    options.reflink = true;
+    options.parent_pointers = true;
+  }
   if (!device.Info().writable) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "block device was opened read-only")

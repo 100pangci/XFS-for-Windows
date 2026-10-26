@@ -111,6 +111,8 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   if (geo.sparse_inodes) incompat |= ondisk::kIncompatSpinodes;
   if (geo.bigtime) incompat |= ondisk::kIncompatBigtime;
   if (geo.nrext64) incompat |= ondisk::kIncompatNrext64;
+  if (geo.exchrange) incompat |= ondisk::kIncompatExchrange;
+  if (geo.parent_pointers) incompat |= ondisk::kIncompatParent;
 
   PutBE32(p, sb::kFeaturesCompat, 0);
   PutBE32(p, sb::kFeaturesRoCompat, ro_compat);

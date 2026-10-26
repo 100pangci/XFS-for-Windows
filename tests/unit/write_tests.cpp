@@ -219,7 +219,16 @@ TEST(writable_profile_allow_list) {
                "': " + s.error().message);
     }
   };
-  refused(ondisk::kIncompatFtype | ondisk::kIncompatParent, 0, "parent");
+  // RW-6E: parent pointers and exchange-range are writable; a PARENT bit alone
+  // does not widen the refusal list.
+  {
+    XfsSuperblock parent = sb;
+    parent.features_incompat = ondisk::kIncompatFtype |
+                               ondisk::kIncompatParent |
+                               ondisk::kIncompatExchrange;
+    XfsGeometry g = MakeGeometry(parent);
+    CHECK(CheckWritableProfile(parent, g).ok());
+  }
   refused(ondisk::kIncompatFtype | ondisk::kIncompatMetadir, 0, "metadir");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatZoned, 0, "zoned");
 

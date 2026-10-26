@@ -1539,6 +1539,18 @@ constexpr ItemTypeEntry kItemTypes[] = {
     {lf::kItemCud, "XFS_LI_CUD", RecoveryItemClass::kIntentDone},
     {lf::kItemAttri, "XFS_LI_ATTRI", RecoveryItemClass::kIntent},
     {lf::kItemAttrd, "XFS_LI_ATTRD", RecoveryItemClass::kIntentDone},
+    // Exchange-range and realtime intents are intentionally refused before
+    // the first write.  The exchange-range feature bit is accepted because
+    // ordinary namespace/attr/reflink operations do not create XMI/XMD, but a
+    // log that actually contains one must never be replayed halfway.
+    {lf::kItemXmi, "XFS_LI_XMI", RecoveryItemClass::kRefused},
+    {lf::kItemXmd, "XFS_LI_XMD", RecoveryItemClass::kRefused},
+    {lf::kItemEfiRt, "XFS_LI_EFI_RT", RecoveryItemClass::kRefused},
+    {lf::kItemEfdRt, "XFS_LI_EFD_RT", RecoveryItemClass::kRefused},
+    {lf::kItemRuiRt, "XFS_LI_RUI_RT", RecoveryItemClass::kRefused},
+    {lf::kItemRudRt, "XFS_LI_RUD_RT", RecoveryItemClass::kRefused},
+    {lf::kItemCuiRt, "XFS_LI_CUI_RT", RecoveryItemClass::kRefused},
+    {lf::kItemCudRt, "XFS_LI_CUD_RT", RecoveryItemClass::kRefused},
 };
 
 }  // namespace

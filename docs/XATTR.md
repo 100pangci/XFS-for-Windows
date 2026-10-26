@@ -40,8 +40,9 @@ Out of scope, deliberately:
 * translating Windows security descriptors or POSIX ACL semantics; the ACL
   attribute payload is stored and returned as opaque bytes;
 * NTFS alternate data streams;
-* parent-pointer mutation. Parent-pointer filesystems remain read-only for
-  ordinary RW; parent entries are read and preserved, never created or edited;
+* user-visible parent-pointer mutation. Parent entries are filesystem-owned
+  metadata and are only created/edited by the namespace core, never by the
+  generic `xattr set/remove` path (see `docs/PARENT_POINTERS.md`);
 * quotas, realtime, external logs, metadir, zoned filesystems and online
   repair.
 
@@ -267,8 +268,10 @@ writes attributes in one atomic transaction (inode + free-space/tree buffers)
 and therefore does not emit ATTRI/ATTRD itself; it can replay Linux ones.
 
 `XFS_SB_FEAT_INCOMPAT_LOG_XATTRS` is accepted by the writable policy because
-the log now has a dedicated parser. Parent-pointer filesystems remain refused
-for ordinary RW even though their attribute entries are readable.
+the log now has a dedicated parser. Parent-pointer ATTRI operations are parsed
+and completed by the RW-6E recovery path; `XFS_ATTR_PARENT` entries are never
+exposed to the generic mutation API. Parent-pointer filesystems are part of the
+ordinary writable profile (see `docs/PARENT_POINTERS.md`).
 
 ## Policy and CLI
 
@@ -278,6 +281,7 @@ Reads (`list`, `get`) work on any readable v5 filesystem.
 ```text
 xfswin xattr list <image> <path> [--json]
 xfswin xattr get  <image> <path> <name> [--hex | --output=<file>]
+                  [--include-private]   # read a parent.* diagnostic value
 xfswin xattr set  <image> <path> <name> <value> --rw-experimental
                   [--value-file=<file> | --value-hex=<hex>]
                   [--create | --replace]
@@ -400,7 +404,7 @@ Local Windows results are support evidence, not Linux evidence.
 | 3 | Windows mutation: shortform/leaf/node/level-2/remote/BMBT, namespaces, dir/symlink, data, rename/link/unlink, reflink | local fixture pass | **verified**: `windows-rw6d-native` passed; Linux verified the re-mutated 1 KiB image (318 attributes/4 files) and the 4 KiB mutations (9485 attributes/11 files) |
 | 4 | DA node split/merge/borrow/root collapse and node → leaf → shortform reverse transitions | unit matrix pass | **verified**: `linux-verify-rw6d` and `windows-verify-rw6d-reverse` passed the level-2 tree on both profiles; `linux-verify-rw6d-final` passed the final image |
 | 5 | Remote value ordering, replace/free and crash consistency | unit + 66 crash images pass locally | **verified**: `windows-rw6d-crash` produced 66 old-or-new images; `linux-verify-rw6d-crash` accepted all 66 after Windows recovery |
-| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients | parser unit tests and log-scan test pass | pending: Linux emits these only in a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the distro runner is non-debug, so this needs a dedicated debug-kernel run |
+| 6 | ATTRI/ATTRD parsing and completion, including Linux-logged replace transients and parent-pointer PPTR operations | parser unit tests, synthetic PPTR completion and log-scan tests pass | **pending**: ordinary logged-xattr replace transients require a `CONFIG_XFS_DEBUG` kernel with `larp=1`; the hosted RW-6E clean-image round trip exercises parent updates but does not capture a surviving PPTR intent for Windows recovery |
 | 7 | Crash matrix: every injection point accepted by Linux with old-or-new state | 66/66 recovered locally | **verified**: `linux-verify-rw6d-crash` checked 66/66 restarted images with `xfs_repair -n`, the kernel xattr walk and the archived old-or-new manifest |
 | 8 | ENOSPC: failed writes leave the image equivalent; shortform still works | 335 MB fill, unchanged oracle | **verified**: `windows-rw6d-enospc` passed, then `linux-verify-rw6d-windows` accepted the 280-attribute ENOSPC image with `xfs_repair -n` and a kernel mount |
 | 9 | Linux → Windows → Linux churn and a final audit | local simulation pass | **verified**: both profiles completed `windows-rw6d-roundtrip` → Linux reverse → `windows-verify-rw6d-reverse` → `linux-verify-rw6d-final` |
@@ -415,16 +419,21 @@ Linux evidence.
 
 * ACL/security-descriptor translation and NTFS ADS are out of scope; bytes are
   preserved but not interpreted.
-* Parent-pointer entries are readable/preserved, but parent-pointer
-  filesystems are refused by the ordinary writable profile.
-* The Windows writer does not log ATTRI/ATTRD; it uses one atomic metadata
-  transaction with pre-flushed remote values. Linux's intents are replayed.
-  Non-debug Linux kernels do not emit attribute intents either:
-  `xfs_attr_want_log_assist()` returns false unless `CONFIG_XFS_DEBUG` is set,
-  and even then the sysfs `larp` knob must be enabled. The Ubuntu CI runner is
-  non-debug, so the parser has unit coverage and synthetic format tests but no
-  genuine Linux ATTRI log yet; that gate stays pending rather than being
-  claimed from Windows-generated data.
+* Parent-pointer entries are filesystem-owned; generic `xattr set/remove`
+  refuses the `parent.` namespace. The namespace core and recovery maintain
+  them (RW-6E).
+* The Windows writer does not log ATTRI/ATTRD for ordinary user attributes; it
+  uses one atomic metadata transaction with pre-flushed remote values. Linux's
+  intents are parsed and replayed. Non-debug Linux kernels do not emit ordinary
+  attribute intents either: `xfs_attr_want_log_assist()` returns false unless
+  `CONFIG_XFS_DEBUG` is set, and even then the sysfs `larp` knob must be
+  enabled. The Ubuntu CI runner is non-debug, so the parser has unit coverage
+  and synthetic format tests but no genuine ordinary ATTRI log yet; that gate
+  stays pending rather than being claimed from Windows-generated data. The
+  hosted RW-6E parent workload exercises the kernel's parent updates, but its
+  clean-image round trip does not capture a surviving **PPTR** ATTRI for
+  Windows recovery. That recovery gate remains pending, as does the `larp`
+  debug-kernel gate for ordinary user-attribute replace transients.
 * The Linux 4 KiB fixture needs 9000 long-name attributes to force a level-2
   DA node; the Windows 1 KiB fixture reaches it with 140 entries.
 * Attribute values larger than 64 KiB and realtime/external-log/zoned
