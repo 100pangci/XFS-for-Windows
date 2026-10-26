@@ -193,7 +193,7 @@ TEST(write_mapping_splits_at_extent_boundaries) {
 
 TEST(writable_profile_allow_list) {
   XfsSuperblock sb;
-  sb.versionnum = 5 | 0x8000;  // v5 with more bits
+  sb.versionnum = 5 | ondisk::kSbVersionAttrBit | 0x8000;  // v5, attr2
   sb.features2 = ondisk::kVersion2Crc | ondisk::kVersion2Ftype;
   sb.features_incompat = ondisk::kIncompatFtype;
   sb.features.ftype = true;
@@ -226,8 +226,15 @@ TEST(writable_profile_allow_list) {
     parent.features_incompat = ondisk::kIncompatFtype |
                                ondisk::kIncompatParent |
                                ondisk::kIncompatExchrange;
+    parent.features.parent = true;
     XfsGeometry g = MakeGeometry(parent);
     CHECK(CheckWritableProfile(parent, g).ok());
+    // Parent pointers require an attr fork, which in turn requires ATTRBIT.
+    XfsSuperblock parent_no_attr = parent;
+    parent_no_attr.versionnum &= ~ondisk::kSbVersionAttrBit;
+    CHECK(!CheckWritableProfile(parent_no_attr,
+                                MakeGeometry(parent_no_attr))
+               .ok());
   }
   refused(ondisk::kIncompatFtype | ondisk::kIncompatMetadir, 0, "metadir");
   refused(ondisk::kIncompatFtype | ondisk::kIncompatZoned, 0, "zoned");

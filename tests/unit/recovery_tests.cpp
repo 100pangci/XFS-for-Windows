@@ -69,7 +69,7 @@ class SyntheticLog {
       : log_blocks_(log_blocks), device_(4 * 1024 * 1024) {
     std::memcpy(sb_.uuid.data(), kUuid, 16);
     sb_.meta_uuid = sb_.uuid;
-    sb_.versionnum = 0xb4a5;  // v5 + XFS_SB_VERSION_LOGV2BIT
+    sb_.versionnum = 0xb4b5;  // v5 + ATTRBIT + LOGV2BIT
     sb_.blocksize = 4096;
     sb_.sectsize = 512;
     sb_.inodesize = 512;

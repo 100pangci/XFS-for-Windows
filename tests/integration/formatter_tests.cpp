@@ -10,6 +10,7 @@
 #include "xfs/formatter.h"
 #include "xfs/image_device.h"
 #include "xfs/log_checker.h"
+#include "xfs/ondisk.h"
 #include "xfs/superblock.h"
 
 using namespace xfs;
@@ -60,6 +61,10 @@ TEST(formatter_roundtrip) {
   CHECK_EQ(fs.value()->superblock().rsumino, 66u);
   CHECK_EQ(fs.value()->superblock().icount, 64u);
   CHECK_EQ(fs.value()->superblock().ifree, 61u);
+  // xfs_scrub requires ATTRBIT before any attr fork (parent pointers or user
+  // xattrs) can exist; the formatter's attr2 profile must set it.
+  CHECK((fs.value()->superblock().versionnum &
+         ondisk::kSbVersionAttrBit) != 0);
   {
     auto rtb = fs.value()->OpenInode(65);
     CHECK(rtb.ok());
@@ -97,6 +102,7 @@ TEST(formatter_roundtrip) {
     auto sb = ReadSuperblock(fs.value()->device(), offset, true);
     CHECK(sb.ok());
     CHECK_EQ(sb.value().rootino, 64u);
+    CHECK((sb.value().versionnum & ondisk::kSbVersionAttrBit) != 0);
   }
 
   // The formatter writes a clean log.

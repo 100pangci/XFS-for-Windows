@@ -57,7 +57,9 @@ refused before the first write.
 `CheckWritableProfile` accepts the following v5 geometry:
 
 * 512-byte sectors, 1 KiB–64 KiB filesystem blocks;
-* CRC on, ftype on, attr2;
+* CRC on, ftype on, attr2, and `XFS_SB_VERSION_ATTRBIT` (the formatter sets
+  it because it supports user xattrs and parent pointers; `xfs_scrub`
+  reports every attr fork as corrupt when the bit is clear);
 * finobt, inobtcount, sparse inodes, bigtime and NREXT64 (individually or as
   the `--modern-inode-profile` set);
 * rmapbt on or off;

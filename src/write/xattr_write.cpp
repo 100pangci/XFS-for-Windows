@@ -2083,6 +2083,33 @@ Result<PreparedInode> PrepareXattrMutation(
   return prepared;
 }
 
+Status XfsFilesystem::EnsureSuperblockAttrBit() {
+  if (superblock_.versionnum & ondisk::kSbVersionAttrBit) return OkStatus();
+
+  std::vector<uint8_t> sb_buf(geometry_.sector_size);
+  if (!device_->Read(0, sb_buf.data(), sb_buf.size())) {
+    return XFS_ERR(XfsError::kIoError, "failed to read the superblock")
+        .Offset(0)
+        .Metadata("superblock");
+  }
+  const uint16_t version = GetBE16(sb_buf.data(), ondisk::sb::kVersionnum);
+  if ((version & ondisk::kSbVersionAttrBit) == 0) {
+    PutBE16(sb_buf.data(), ondisk::sb::kVersionnum,
+            version | ondisk::kSbVersionAttrBit);
+    auto txn = BeginTransaction();
+    if (!txn.ok()) return txn.error();
+    Status s = txn.value().AddMetadataBuffer(
+        0, std::move(sb_buf), lf::kBlftSb, ondisk::sb::kLsn,
+        ondisk::sb::kCrc, "superblock");
+    if (!s.ok()) return s;
+    s = CommitTransaction(txn.value());
+    if (!s.ok()) return s;
+    XFS_SB_INFO("set XFS_SB_VERSION_ATTRBIT before creating the attr fork");
+  }
+  superblock_.versionnum |= ondisk::kSbVersionAttrBit;
+  return OkStatus();
+}
+
 Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrs(
     uint64_t ino, bool include_private) const {
   auto inode = OpenInode(ino);
@@ -2189,6 +2216,13 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
 
   auto raw = ReadRawInode(ino);
   if (!raw.ok()) return raw.error();
+  // An attr2 filesystem without ATTRBIT is valid only while it has no attr
+  // fork.  Linux's xfs_bmap_add_attrfork logs the bit before creating the
+  // first fork; do the same so xfs_scrub does not later treat every attr inode
+  // as corrupt.  The superblock write is conservative and idempotent if the
+  // following transaction fails.
+  Status attrbit = EnsureSuperblockAttrBit();
+  if (!attrbit.ok()) return attrbit.error();
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();
   BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);

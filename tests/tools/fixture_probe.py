@@ -144,6 +144,8 @@ def main(path: str) -> int:
     assert u32(sb, 0) == SB_MAGIC, "bad superblock magic"
     versionnum = u16(sb, 100)
     assert versionnum & 0xF == 5, f"not v5: {versionnum:#x}"
+    assert versionnum & 0x10, (
+        "ATTRBIT is clear; Linux xfs_scrub rejects any attr fork")
     blocksize = u32(sb, 4)
     dblocks = u64(sb, 8)
     uuid = sb[32:48]

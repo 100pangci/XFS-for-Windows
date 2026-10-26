@@ -121,6 +121,10 @@ constexpr size_t kMetaUuid = 248;            // 16 bytes
 // versionnum bit fields
 constexpr uint16_t kSbVersionNumbits = 0x000f;
 constexpr uint16_t kSbVersion5 = 5;
+// An attr fork may only exist when this bit is set (XFS_SB_VERSION_ATTRBIT).
+// xfs_scrub reports "attr block map: Repairs are required" for every inode
+// with an attr fork otherwise, even though xfs_repair accepts the image.
+constexpr uint16_t kSbVersionAttrBit = 0x0010;
 
 // features2 bits (v4 compatibility area; XFS_SB_VERSION2_*)
 constexpr uint32_t kVersion2LazySbCount = 0x00000002;

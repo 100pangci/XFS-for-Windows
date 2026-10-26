@@ -375,6 +375,11 @@ class XfsFilesystem {
   // they describe must store that LSN. Callers must serialize mutations (the
   // built-in paths do, through RunTransaction).
   Result<XfsTransaction> BeginTransaction();
+  // Sets XFS_SB_VERSION_ATTRBIT in a separate transaction before an inode's
+  // first attr fork is created, matching xfs_bmap_add_attrfork's xfs_log_sb().
+  // A no-op once the bit is set. Callers hold write_barrier_ exclusively and
+  // mutation_mutex_.
+  Status EnsureSuperblockAttrBit();
   // Commits a transaction: log record + flush, then metadata + flush, then
   // cache invalidation. A failed build (before commit) writes nothing.
   Status CommitTransaction(XfsTransaction& txn);

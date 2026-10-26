@@ -665,6 +665,46 @@ TEST(rw6d_attributes_follow_namespace_operations) {
   Finish(image);
 }
 
+TEST(rw6d_setxattr_sets_superblock_attrbit) {
+  // A Linux mkfs.xfs -n parent=0 image may legitimately have no attr forks
+  // and therefore no ATTRBIT.  The first attr fork must set the bit in the
+  // same way xfs_bmap_add_attrfork does; otherwise xfs_scrub reports every
+  // attr inode as corrupt.
+  Image image = MakeImage(false, false, 4096, false);
+  auto before = ReadSuperblock(*image.device, 0, true);
+  CHECK(before.ok());
+  CHECK((before.value().versionnum & ondisk::kSbVersionAttrBit) != 0);
+
+  std::vector<uint8_t> raw(image.geo.sector_size);
+  CHECK(image.device->Read(0, raw.data(), raw.size()));
+  PutBE16(raw.data(), ondisk::sb::kVersionnum,
+          GetBE16(raw.data(), ondisk::sb::kVersionnum) &
+              ~ondisk::kSbVersionAttrBit);
+  UpdateXfsChecksum(raw.data(), raw.size(), ondisk::sb::kCrc);
+  CHECK(image.device->Write(0, raw.data(), raw.size()));
+  CHECK(image.device->Flush());
+  auto cleared = ReadSuperblock(*image.device, 0, true);
+  CHECK(cleared.ok());
+  CHECK((cleared.value().versionnum & ondisk::kSbVersionAttrBit) == 0);
+
+  MountOptions options;
+  options.read_write = true;
+  auto borrowed =
+      std::make_unique<xfstest::BorrowedBlockDevice>(image.device.get());
+  auto mounted = XfsFilesystem::Mount(std::move(borrowed), options);
+  CHECK(mounted.ok());
+  if (!mounted.ok()) return;
+
+  const char value[] = "hello";
+  auto set = mounted.value()->SetXattr(
+      mounted.value()->RootInode(), "user.test", value, sizeof(value) - 1,
+      XfsFilesystem::XattrSetMode::kUpsert);
+  CHECK(set.ok());
+  auto after = ReadSuperblock(*image.device, 0, true);
+  CHECK(after.ok());
+  CHECK((after.value().versionnum & ondisk::kSbVersionAttrBit) != 0);
+}
+
 TEST(rw6d_attr_intent_parser) {
   Image image = MakeImage(false, false, 4096, false);
   const XfsGeometry& geo = image.geo;

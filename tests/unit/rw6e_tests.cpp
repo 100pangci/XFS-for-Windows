@@ -701,6 +701,11 @@ TEST(rw6e_policy_gate_and_formatter_profile) {
   CHECK(sb.ok());
   CHECK(sb.value().features.parent);
   CHECK(sb.value().features.exchrange);
+  // Linux xfs_scrub treats an attr fork on a filesystem without ATTRBIT as
+  // corruption ("attr block map: Repairs are required"), even though
+  // xfs_repair accepts it.  The formatter must set the bit for its attr2
+  // profile before any parent pointer or user xattr is written.
+  CHECK((sb.value().versionnum & ondisk::kSbVersionAttrBit) != 0);
   XfsGeometry geo = MakeGeometry(sb.value());
   // Parent pointers and exchange-range are part of the ordinary writable
   // profile now; the legacy qualification flag remains a no-op.

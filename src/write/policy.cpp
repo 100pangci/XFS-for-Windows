@@ -72,6 +72,18 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
         .Metadata("superblock")
         .Actual(geo.agblocks);
   }
+  // Parent pointers live in an attr fork.  A filesystem that claims them but
+  // does not declare XFS_SB_VERSION_ATTRBIT makes xfs_scrub reject every such
+  // inode ("attr block map: Repairs are required"), so refuse a writable mount
+  // instead of adding more metadata to an image that is already inconsistent.
+  if (sb.features.parent &&
+      (sb.versionnum & ondisk::kSbVersionAttrBit) == 0) {
+    return XFS_ERR(XfsError::kCorruptSuperblock,
+                   "parent pointers require XFS_SB_VERSION_ATTRBIT")
+        .Metadata("superblock")
+        .Offset(ondisk::sb::kVersionnum)
+        .Actual(sb.versionnum);
+  }
   if (sb.features.incompat_unknown) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "unknown incompatible features " +
