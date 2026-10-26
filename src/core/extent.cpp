@@ -413,10 +413,27 @@ Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
       std::memset(out + total, 0, chunk);
     } else {
       const uint64_t extent_offset_blocks = file_block - e->startoff;
-      const uint64_t extent_remaining_bytes =
-          (e->blockcount - extent_offset_blocks) * block_size - offset_in_block;
+      uint64_t run_end_block = e->EndBlock();
+      uint64_t run_end_fsb = e->startblock + e->blockcount;
+      // Merge following extents when both the file blocks and the physical
+      // blocks are contiguous. A fragmented file still gets one read per
+      // physical run; a file split into adjacent extents no longer pays one
+      // device read per extent.
+      size_t run_index = lo;
+      while (run_index < extents->size()) {
+        const XfsExtent& next = (*extents)[run_index];
+        if (next.startoff != run_end_block || next.unwritten ||
+            next.startblock != run_end_fsb) {
+          break;
+        }
+        run_end_block = next.EndBlock();
+        run_end_fsb += next.blockcount;
+        ++run_index;
+      }
+      const uint64_t run_remaining_bytes =
+          run_end_block * block_size - file_offset;
       chunk = static_cast<size_t>(
-          std::min<uint64_t>(want, extent_remaining_bytes));
+          std::min<uint64_t>(want, run_remaining_bytes));
       if (e->unwritten) {
         std::memset(out + total, 0, chunk);
       } else {

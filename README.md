@@ -33,6 +33,27 @@ driver passthrough. The parser, writer, journal engine and recovery path are
 Windows code in this repository. Linux kernels and xfsprogs are used as
 external oracles in CI, never as runtime dependencies.
 
+## Performance
+
+PERF-1 (image-file read-write mount) changes the I/O path from a correctness
+prototype into a usable driver:
+
+- large physically contiguous reads and writes are coalesced into positioned
+  I/O instead of one device operation per filesystem block;
+- different files perform ordinary data I/O concurrently (per-inode locking
+  plus independent `FILE_FLAG_OVERLAPPED` image I/O); `Flush` remains a real
+  durability barrier;
+- path/directory/extent/data caches are bounded and generation-checked, and
+  the adapter reparses an inode's BMT only when its extent generation changes;
+- sequential writers use unwritten preallocation (including the Windows
+  allocation-size hint) without moving EOF;
+- metadata write-back is flushed in batches while the WAL record itself is
+  still flushed before metadata, and deferred timestamps are published at
+  `FlushFileBuffers`/close/unmount.
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the baseline, A/B method,
+deterministic I/O-call gates and remaining bottlenecks, and
+[docs/LOCKING.md](docs/LOCKING.md) for the lock hierarchy.
 ## Current status
 
 Three terms are used consistently below:

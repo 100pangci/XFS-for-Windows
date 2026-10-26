@@ -20,6 +20,7 @@ void XfsFilesystem::InvalidateCaches(const CacheInvalidation& invalidation) cons
       inode_chunk_cache_.clear();
       info_cache_.clear();
       extent_cache_.clear();
+      for (auto& entry : extent_generation_) ++entry.second;
       dir_cache_.clear();
       dir_cache_entries_ = 0;
     }
@@ -51,6 +52,7 @@ void XfsFilesystem::InvalidateCaches(const CacheInvalidation& invalidation) cons
     }
     if (invalidation.Has(CacheInvalidation::kExtents)) {
       extent_cache_.erase(ino);
+      ++extent_generation_[ino];
     }
     if (invalidation.Has(CacheInvalidation::kDirectory)) {
       auto it = dir_cache_.find(ino);

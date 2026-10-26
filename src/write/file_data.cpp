@@ -17,6 +17,7 @@
 
 #include "xfs/crash.h"
 #include "xfs/log.h"
+#include "xfs/perf_stats.h"
 #include "xfs/write.h"
 
 namespace xfs {
@@ -43,9 +44,15 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
     return XFS_ERR(XfsError::kInvalidArgument, "null write buffer").Ino(ino);
   }
 
-  // One mutation at a time. This also orders the device write against the
-  // cache publication for concurrent readers.
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
+  if (perf_on) perf.write_calls.fetch_add(1, std::memory_order_relaxed);
+  // Independent files write concurrently; same inode writes serialize. The
+  // shared barrier excludes namespace changes/truncate/Flush for the duration
+  // of the data transfer.
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
+  PerfStats::WriteScope write_scope;
 
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -90,20 +97,26 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
 
   // Metadata transaction for mtime/ctime (ordered mode: the data write above
   // is not journalled, the inode change is). atime intentionally unchanged.
-  const XfsTimestamp now = CurrentTimestamp();
-  auto txn = BeginTransaction();
-  if (!txn.ok()) {
-    XFS_ERROR("data written, timestamp update failed: "
-              << txn.error().Format());
-    return txn.error();
+  {
+    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+    const XfsTimestamp now = CurrentTimestamp();
+    auto txn = BeginTransaction();
+    if (!txn.ok()) {
+      XFS_ERROR("data written, timestamp update failed: "
+                << txn.error().Format());
+      return txn.error();
+    }
+    Status status = UpdateTimesInTransaction(
+        txn.value(), ino, inode.value().atime, now, now);
+    if (status.ok()) status = CommitTransaction(txn.value());
+    if (!status.ok()) {
+      XFS_ERROR("data written, timestamp update failed: "
+                << status.error().Format());
+      return status.error();
+    }
   }
-  Status status = UpdateTimesInTransaction(
-      txn.value(), ino, inode.value().atime, now, now);
-  if (status.ok()) status = CommitTransaction(txn.value());
-  if (!status.ok()) {
-    XFS_ERROR("data written, timestamp update failed: "
-              << status.error().Format());
-    return status.error();
+  if (perf_on) {
+    perf.write_bytes.fetch_add(written, std::memory_order_relaxed);
   }
   return written;
 }

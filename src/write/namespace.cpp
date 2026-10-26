@@ -285,6 +285,7 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
                                            std::string_view name,
                                            uint16_t mode, uint32_t uid,
                                            uint32_t gid) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("create");
@@ -409,6 +410,7 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
 
 Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
                             uint16_t mode, uint32_t uid, uint32_t gid) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("mkdir");
@@ -531,6 +533,7 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
                                            bool directory_expected,
                                            bool defer_inode_free,
                                            uint64_t* removed_ino) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (name.empty() || name == "." || name == "..") {
     return XFS_ERR(XfsError::kInvalidArgument, "invalid unlink name")
         .Ino(parent_ino);
@@ -724,7 +727,7 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
   // during the emptiness check) is stale.
   InvalidateCaches(CacheInvalidation::Directory(ino));
   if (removed_ino != nullptr) *removed_ino = ino;
-  if (needs_free && !defer_inode_free) return FreeUnlinkedInode(ino);
+  if (needs_free && !defer_inode_free) return FreeUnlinkedInodeLocked(ino);
   return OkStatus();
 }
 
@@ -746,6 +749,11 @@ Status XfsFilesystem::RemoveEmptyDirectory(uint64_t parent_ino,
 // ---------------------------------------------------------------------------
 
 Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  return FreeUnlinkedInodeLocked(ino);
+}
+
+Status XfsFilesystem::FreeUnlinkedInodeLocked(uint64_t ino) {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Ino(ino)
@@ -762,7 +770,7 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
   const uint32_t bucket = agino % ondisk::kAgiUnlinkedBuckets;
   const XfsTimestamp now = CurrentTimestamp();
 
-  return RunTransaction([&](XfsTransaction& txn) -> Status {
+  Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
     auto inode = OpenInode(ino);
     if (!inode.ok()) return inode.error();
     if (inode.value().nlink != 0) {
@@ -877,6 +885,13 @@ Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
     if (!status.ok()) return status;
     return inodes.Commit();
   });
+  if (status.ok()) {
+    // A freed inode number can be reused with a new generation; do not carry
+    // the old deferred timestamp into the next incarnation.
+    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    deferred_times_.erase(ino);
+  }
+  return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1082,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
     uint64_t src_parent, std::string_view src_name, uint64_t dst_parent,
     std::string_view dst_name, bool replace_existing,
     bool defer_replaced_free) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("rename");
@@ -1466,7 +1482,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
                       << ":'" << dst_name << "' moved=" << outcome.moved_ino
                       << " replaced=" << outcome.replaced_ino);
   if (outcome.replaced_zero_link && !defer_replaced_free) {
-    Status freed = FreeUnlinkedInode(outcome.replaced_ino);
+    Status freed = FreeUnlinkedInodeLocked(outcome.replaced_ino);
     if (!freed.ok()) return freed.error();
   }
   return outcome;
@@ -1478,6 +1494,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
 
 Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
                            std::string_view dst_name) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("link");
@@ -1627,6 +1644,7 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
                                               std::string_view target,
                                               uint16_t mode, uint32_t uid,
                                               uint32_t gid) {
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("symlink");

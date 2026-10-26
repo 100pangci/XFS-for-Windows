@@ -9,13 +9,16 @@
 #include <system_error>
 #include <vector>
 
+#include "xfs/perf_stats.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #include <winioctl.h>
 #else
 #include <cerrno>
-#include <cstdio>
-#include <fstream>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace xfs {
@@ -45,6 +48,24 @@ std::string WinErrorString(DWORD code) {
   return " (error " + std::to_string(code) + ": " + message + ")";
 }
 
+// A per-thread manual-reset event, reused by positioned transfers. The image
+// handle is opened with FILE_FLAG_OVERLAPPED, so every request must carry its
+// own OVERLAPPED structure and event: this is what allows independent ranges to
+// be in flight at the same time instead of sharing the synchronous file
+// pointer.
+struct ThreadEvent {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ThreadEvent() { handle = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+  ~ThreadEvent() {
+    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+  }
+};
+
+HANDLE TransferEvent() {
+  static thread_local ThreadEvent event;
+  return event.handle;
+}
+
 // One raw positioned transfer. Returns the number of bytes transferred; on
 // failure returns 0 and fills `error`. A short transfer is not an error here:
 // the caller loops until the request is complete.
@@ -54,6 +75,11 @@ size_t PositionedTransfer(HANDLE handle, uint64_t offset, T buffer, size_t size,
   OVERLAPPED overlapped{};
   overlapped.Offset = static_cast<DWORD>(offset & 0xffffffffu);
   overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+  HANDLE event = TransferEvent();
+  if (event != INVALID_HANDLE_VALUE) {
+    ResetEvent(event);
+    overlapped.hEvent = event;
+  }
   constexpr size_t kMaxTransfer = 16u * 1024 * 1024;
   DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, kMaxTransfer));
   DWORD transferred = 0;
@@ -65,20 +91,37 @@ size_t PositionedTransfer(HANDLE handle, uint64_t offset, T buffer, size_t size,
   }
   if (!ok) {
     DWORD code = GetLastError();
-    // A read that runs into the end of the file reports ERROR_HANDLE_EOF
-    // instead of returning a short count; both mean "short transfer" to the
-    // caller, which then fails the request with an explicit message.
-    if constexpr (!kWrite) {
-      if (code == ERROR_HANDLE_EOF) return 0;
+    if (code == ERROR_IO_PENDING) {
+      if (!GetOverlappedResult(handle, &overlapped, &transferred, TRUE)) {
+        code = GetLastError();
+        if constexpr (!kWrite) {
+          if (code == ERROR_HANDLE_EOF) return 0;
+        }
+        if (error) *error = "image I/O failed" + WinErrorString(code);
+        return 0;
+      }
+    } else {
+      // A read that runs into the end of the file reports ERROR_HANDLE_EOF
+      // instead of returning a short count; both mean "short transfer" to the
+      // caller, which then fails the request with an explicit message.
+      if constexpr (!kWrite) {
+        if (code == ERROR_HANDLE_EOF) return 0;
+      }
+      if (error) *error = "image I/O failed" + WinErrorString(code);
+      return 0;
     }
-    if (error) *error = "image I/O failed" + WinErrorString(code);
-    return 0;
   }
   if (transferred == 0) {
     if (error) *error = "image I/O made no progress";
     return 0;
   }
   return transferred;
+}
+
+#else
+
+std::string ErrnoString(int code) {
+  return " (errno " + std::to_string(code) + ": " + std::strerror(code) + ")";
 }
 
 #endif  // _WIN32
@@ -89,7 +132,7 @@ struct ImageBlockDevice::Impl {
 #ifdef _WIN32
   HANDLE handle = INVALID_HANDLE_VALUE;
 #else
-  std::fstream file;
+  int fd = -1;
 #endif
 };
 
@@ -111,13 +154,15 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Open(
   dev->path_ = path;
 #ifdef _WIN32
   // Sharing rules: a writable image is opened with FILE_SHARE_READ only, so
-  // two read-write mounts can never race on the same file. Read-only opens
+  // two read-write mounts can never race on the same file and no external
+  // writer can modify it behind the mounted filesystem's back. Read-only opens
   // tolerate other readers and a writer.
   const DWORD share =
       writable ? FILE_SHARE_READ : (FILE_SHARE_READ | FILE_SHARE_WRITE);
-  dev->impl_->handle =
-      CreateFileW(path.c_str(), GENERIC_READ | (writable ? GENERIC_WRITE : 0),
-                  share, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  dev->impl_->handle = CreateFileW(
+      path.c_str(), GENERIC_READ | (writable ? GENERIC_WRITE : 0), share,
+      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+      nullptr);
   if (dev->impl_->handle == INVALID_HANDLE_VALUE) {
     if (error) {
       *error = "cannot open " + path.string() +
@@ -126,11 +171,10 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Open(
     return nullptr;
   }
 #else
-  std::ios::openmode mode = std::ios::binary | std::ios::in;
-  if (writable) mode |= std::ios::out;
-  dev->impl_->file.open(path, mode);
-  if (!dev->impl_->file.is_open()) {
-    if (error) *error = "cannot open " + path.string();
+  const int flags = writable ? O_RDWR : O_RDONLY;
+  dev->impl_->fd = ::open(path.c_str(), flags);
+  if (dev->impl_->fd < 0) {
+    if (error) *error = "cannot open " + path.string() + ErrnoString(errno);
     return nullptr;
   }
 #endif
@@ -165,10 +209,9 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Create(
   auto dev = std::unique_ptr<ImageBlockDevice>(new ImageBlockDevice());
   dev->path_ = path;
 #ifdef _WIN32
-  dev->impl_->handle =
-      CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                  FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  dev->impl_->handle = CreateFileW(
+      path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
   if (dev->impl_->handle == INVALID_HANDLE_VALUE) {
     if (error) {
       *error = "cannot create " + path.string() +
@@ -195,19 +238,16 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Create(
     return nullptr;
   }
 #else
-  dev->impl_->file.open(path, std::ios::binary | std::ios::in |
-                                  std::ios::out | std::ios::trunc);
-  if (!dev->impl_->file.is_open()) {
-    if (error) *error = "cannot create " + path.string();
+  dev->impl_->fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC,
+                          0644);
+  if (dev->impl_->fd < 0) {
+    if (error) *error = "cannot create " + path.string() + ErrnoString(errno);
     return nullptr;
   }
-  // Size the file by writing at the last byte (sparse where supported).
-  dev->impl_->file.seekp(static_cast<std::streamoff>(size_bytes - 1));
-  const char zero = 0;
-  dev->impl_->file.write(&zero, 1);
-  dev->impl_->file.flush();
-  if (!dev->impl_->file.good()) {
-    if (error) *error = "cannot size " + path.string();
+  if (::ftruncate(dev->impl_->fd, static_cast<off_t>(size_bytes)) != 0) {
+    if (error) {
+      *error = "cannot size " + path.string() + ErrnoString(errno);
+    }
     dev->Close();
     std::filesystem::remove(path, ec);
     return nullptr;
@@ -224,8 +264,10 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Create(
 }
 
 bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
-  std::shared_lock<std::shared_mutex> lock(io_mutex_);
   if (size == 0) return true;
+  PerfStats& stats = PerfStats::Get();
+  const bool perf = stats.enabled();
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
     last_error_ = "read out of bounds";
     return false;
@@ -247,16 +289,19 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
       return false;
     }
 #else
-    if (!impl_->file.is_open()) {
+    if (impl_->fd < 0) {
       last_error_ = "image not open";
       return false;
     }
-    impl_->file.clear();
-    impl_->file.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
-    impl_->file.read(reinterpret_cast<char*>(out),
-                     static_cast<std::streamsize>(remaining));
-    size_t got = static_cast<size_t>(impl_->file.gcount());
-    if (!impl_->file || got == 0) {
+    ssize_t got;
+    do {
+      got = ::pread(impl_->fd, out, remaining, static_cast<off_t>(pos));
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+      last_error_ = "image read failed" + ErrnoString(errno);
+      return false;
+    }
+    if (got == 0) {
       last_error_ = "image short read";
       return false;
     }
@@ -265,16 +310,23 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
     pos += got;
     remaining -= got;
   }
+  if (perf) {
+    stats.device_read_calls.fetch_add(1, std::memory_order_relaxed);
+    stats.device_read_bytes.fetch_add(size, std::memory_order_relaxed);
+  }
   return true;
 }
 
 bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
-  std::unique_lock<std::shared_mutex> lock(io_mutex_);
+  if (size == 0) return true;
+  PerfStats& stats = PerfStats::Get();
+  const bool perf = stats.enabled();
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::shared_lock<std::shared_mutex> barrier(flush_barrier_);
   if (!info_.writable) {
     last_error_ = "image opened read-only";
     return false;
   }
-  if (size == 0) return true;
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
     last_error_ = "write out of bounds";
     return false;
@@ -296,29 +348,41 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
       return false;
     }
 #else
-    if (!impl_->file.is_open()) {
+    if (impl_->fd < 0) {
       last_error_ = "image not open";
       return false;
     }
-    impl_->file.clear();
-    impl_->file.seekp(static_cast<std::streamoff>(pos), std::ios::beg);
-    impl_->file.write(reinterpret_cast<const char*>(in),
-                      static_cast<std::streamsize>(remaining));
-    if (!impl_->file) {
-      last_error_ = "image short write";
+    ssize_t put;
+    do {
+      put = ::pwrite(impl_->fd, in, remaining, static_cast<off_t>(pos));
+    } while (put < 0 && errno == EINTR);
+    if (put < 0) {
+      last_error_ = "image write failed" + ErrnoString(errno);
       return false;
     }
-    size_t put = remaining;
+    if (put == 0) {
+      last_error_ = "image write made no progress";
+      return false;
+    }
 #endif
     in += put;
     pos += put;
     remaining -= put;
   }
+  if (perf) {
+    stats.device_write_calls.fetch_add(1, std::memory_order_relaxed);
+    stats.device_write_bytes.fetch_add(size, std::memory_order_relaxed);
+  }
   return true;
 }
 
 bool ImageBlockDevice::Flush() {
-  std::unique_lock<std::shared_mutex> lock(io_mutex_);
+  PerfStats& stats = PerfStats::Get();
+  const bool perf = stats.enabled();
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  // A flush is a durability barrier: it waits for every write that started
+  // before it. Reads are not part of the barrier and may continue.
+  std::unique_lock<std::shared_mutex> barrier(flush_barrier_);
 #ifdef _WIN32
   if (impl_->handle == INVALID_HANDLE_VALUE) {
     last_error_ = "image not open";
@@ -326,36 +390,44 @@ bool ImageBlockDevice::Flush() {
   }
   // Nothing can be dirty on a read-only image; flushing it would fail with
   // ACCESS_DENIED and turn a successful read-only session into an error.
-  if (!info_.writable) return true;
-  if (!FlushFileBuffers(impl_->handle)) {
+  if (info_.writable && !FlushFileBuffers(impl_->handle)) {
     last_error_ = "FlushFileBuffers failed" + WinErrorString(GetLastError());
     return false;
   }
-  return true;
 #else
-  if (!impl_->file.is_open()) {
+  if (impl_->fd < 0) {
     last_error_ = "image not open";
     return false;
   }
-  if (!info_.writable) return true;
-  impl_->file.flush();
-  if (!impl_->file.good()) {
-    last_error_ = "image flush failed";
-    return false;
+  if (info_.writable) {
+    int rc;
+    do {
+      rc = ::fsync(impl_->fd);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+      last_error_ = "image flush failed" + ErrnoString(errno);
+      return false;
+    }
+  }
+#endif
+  if (perf) {
+    stats.device_flush_calls.fetch_add(1, std::memory_order_relaxed);
   }
   return true;
-#endif
 }
 
 void ImageBlockDevice::Close() {
-  std::unique_lock<std::shared_mutex> lock(io_mutex_);
+  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
 #ifdef _WIN32
   if (impl_ && impl_->handle != INVALID_HANDLE_VALUE) {
     CloseHandle(impl_->handle);
     impl_->handle = INVALID_HANDLE_VALUE;
   }
 #else
-  if (impl_ && impl_->file.is_open()) impl_->file.close();
+  if (impl_ && impl_->fd >= 0) {
+    ::close(impl_->fd);
+    impl_->fd = -1;
+  }
 #endif
 }
 

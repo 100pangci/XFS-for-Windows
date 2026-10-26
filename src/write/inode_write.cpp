@@ -292,6 +292,8 @@ Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
         .Ino(ino)
         .Metadata("inode");
   }
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();

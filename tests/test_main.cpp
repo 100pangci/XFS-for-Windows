@@ -1085,9 +1085,9 @@ int main(int argc, char** argv) {
     ++ran;
     try {
       test.fn();
-      std::cout << "  [ OK ] " << test.name << "\n";
+      std::cout << "  [ OK ] " << test.name << "\n" << std::flush;
     } catch (const std::exception& e) {
-      std::cout << "  [FAIL] " << test.name << ": " << e.what() << "\n";
+      std::cout << "  [FAIL] " << test.name << ": " << e.what() << "\n" << std::flush;
       ++failed;
     }
   }

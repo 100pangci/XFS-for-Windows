@@ -1,7 +1,7 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-// XFS for Windows - WinFsp native API adapter (read-only).
+// XFS for Windows - WinFsp native API adapter (read-only and image-file read-write).
 #pragma once
 
 #ifdef XFSWIN_HAS_WINFSP
@@ -23,6 +23,8 @@ struct MountConfig {
   // the Write/Flush callbacks, reports writable file attributes and asks
   // WinFsp to flush and purge its cache on cleanup.
   bool read_write = false;
+  // Enable the optional performance counters for this mount.
+  bool perf_stats = false;
 };
 
 // Creates a WinFsp file system object backed by `filesystem`, mounts it at

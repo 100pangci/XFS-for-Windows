@@ -16,6 +16,7 @@
 #include "xfs/ialloc.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/perf_stats.h"
 #include "xfs/refcount.h"
 #include "xfs/rmap.h"
 #include "xfs/symlink.h"
@@ -164,6 +165,7 @@ std::string CheckReport::Summary() const {
 
 Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
     std::unique_ptr<BlockDevice> device, const MountOptions& options) {
+  if (options.perf_stats) PerfStats::Get().SetEnabled(true);
   if (!device) {
     return XFS_ERR(XfsError::kInvalidArgument, "no block device supplied");
   }
@@ -424,6 +426,17 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
 }
 
 Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
+  if (perf_on) perf.inode_opens.fetch_add(1, std::memory_order_relaxed);
+  auto overlay_deferred = [&](XfsInode& inode) {
+    std::lock_guard<std::mutex> deferred_lock(deferred_mutex_);
+    auto it = deferred_times_.find(ino);
+    if (it != deferred_times_.end()) {
+      inode.mtime = it->second;
+      inode.ctime = it->second;
+    }
+  };
   auto finish = [&](XfsInode inode) -> Result<XfsInode> {
     if (inode.OnUnlinkedList() && !writable_) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -438,14 +451,21 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
       if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
       inode_cache_.emplace(ino, inode);
     }
+    overlay_deferred(inode);
     return inode;
   };
 
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = inode_cache_.find(ino);
-    if (it != inode_cache_.end()) return it->second;
+    if (it != inode_cache_.end()) {
+      if (perf_on) perf.inode_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      XfsInode cached = it->second;
+      overlay_deferred(cached);
+      return cached;
+    }
   }
+  if (perf_on) perf.inode_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
   if (!geometry_.InoValid(ino)) {
     return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
@@ -525,10 +545,23 @@ void XfsFilesystem::CacheDirectory(uint64_t ino,
   std::lock_guard<std::mutex> lock(cache_mutex_);
   constexpr size_t kMaxCachedDirs = 128;
   constexpr size_t kMaxCachedDirEntries = 262144;
-  if (dir_cache_.size() >= kMaxCachedDirs ||
-      dir_cache_entries_ + entries.size() > kMaxCachedDirEntries) {
-    dir_cache_.clear();
-    dir_cache_entries_ = 0;
+  if (entries.size() > kMaxCachedDirEntries) return;
+  auto existing = dir_cache_.find(ino);
+  if (existing != dir_cache_.end()) {
+    dir_cache_entries_ -= existing->second.entries.size();
+    dir_cache_.erase(existing);
+  }
+  // Bounded LRU (clock) eviction instead of the old cache-cliff clear: a
+  // workload that touches more than 128 directories keeps its hot entries.
+  while (!dir_cache_.empty() &&
+         (dir_cache_.size() >= kMaxCachedDirs ||
+          dir_cache_entries_ + entries.size() > kMaxCachedDirEntries)) {
+    auto victim = dir_cache_.begin();
+    for (auto it = dir_cache_.begin(); it != dir_cache_.end(); ++it) {
+      if (it->second.last_used < victim->second.last_used) victim = it;
+    }
+    dir_cache_entries_ -= victim->second.entries.size();
+    dir_cache_.erase(victim);
   }
   DirCache cache;
   cache.index.reserve(entries.size());
@@ -536,6 +569,7 @@ void XfsFilesystem::CacheDirectory(uint64_t ino,
     cache.index.emplace(entries[i].name, i);
   }
   cache.entries = std::move(entries);
+  cache.last_used = ++dir_cache_clock_;
   dir_cache_entries_ += cache.entries.size();
   dir_cache_.emplace(ino, std::move(cache));
 }
@@ -571,10 +605,21 @@ Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
 
 Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
     uint64_t ino) const {
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = dir_cache_.find(ino);
-    if (it != dir_cache_.end()) return it->second.entries;
+    if (it != dir_cache_.end()) {
+      it->second.last_used = ++dir_cache_clock_;
+      if (perf_on) {
+        perf.directory_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
+      return it->second.entries;
+    }
+  }
+  if (perf_on) {
+    perf.directory_cache_misses.fetch_add(1, std::memory_order_relaxed);
   }
 
   auto inode = OpenInode(ino);
@@ -597,10 +642,16 @@ Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
 
 Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
                                               std::string_view name) const {
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = dir_cache_.find(dir_ino);
     if (it != dir_cache_.end()) {
+      it->second.last_used = ++dir_cache_clock_;
+      if (perf_on) {
+        perf.directory_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
       auto indexed = it->second.index.find(std::string(name));
       if (indexed == it->second.index.end()) {
         return XFS_ERR(XfsError::kNotFound, "name not found in directory")
@@ -608,6 +659,9 @@ Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
       }
       return it->second.entries[indexed->second];
     }
+  }
+  if (perf_on) {
+    perf.directory_cache_misses.fetch_add(1, std::memory_order_relaxed);
   }
 
   auto inode = OpenInode(dir_ino);
@@ -625,6 +679,10 @@ Result<size_t> XfsFilesystem::ReadFile(uint64_t ino, uint64_t offset,
 Result<size_t> XfsFilesystem::ReadFile(
     const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
     uint64_t offset, void* buffer, size_t length) const {
+  PerfStats::ReadScope read_scope;
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
+  if (perf_on) perf.read_calls.fetch_add(1, std::memory_order_relaxed);
   if (inode.IsDir()) {
     return XFS_ERR(XfsError::kNotRegularFile, "cannot ReadFile a directory")
         .Ino(inode.ino);
@@ -646,8 +704,12 @@ Result<size_t> XfsFilesystem::ReadFile(
   // through the chunk cache would add a full memory copy per chunk and evict
   // cached thumbnail data.
   if (length >= kDataChunkBytes) {
-    return ReadFileData(*device_, geometry_, inode, offset, buffer, length,
-                        extents);
+    auto direct = ReadFileData(*device_, geometry_, inode, offset, buffer,
+                               length, extents);
+    if (direct.ok() && perf_on) {
+      perf.read_bytes.fetch_add(direct.value(), std::memory_order_relaxed);
+    }
+    return direct;
   }
 
   // Serve from the 256 KiB chunk cache: a thumbnail decoder issues many small
@@ -687,15 +749,28 @@ Result<size_t> XfsFilesystem::ReadFile(
     total += n;
     offset += n;
   }
+  if (perf_on) {
+    perf.read_bytes.fetch_add(total, std::memory_order_relaxed);
+  }
   return total;
 }
 
 Result<std::shared_ptr<const std::vector<XfsExtent>>>
 XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = extent_cache_.find(inode.ino);
-    if (it != extent_cache_.end()) return it->second;
+    if (it != extent_cache_.end()) {
+      if (perf_on) {
+        perf.extent_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
+      return it->second;
+    }
+  }
+  if (perf_on) {
+    perf.extent_cache_misses.fetch_add(1, std::memory_order_relaxed);
   }
   auto loaded = std::make_shared<std::vector<XfsExtent>>();
   Status s = LoadDataForkExtents(*device_, geometry_, inode, loaded.get());
@@ -713,6 +788,77 @@ XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
     extent_cache_.emplace(inode.ino, shared);
   }
   return shared;
+}
+
+void XfsFilesystem::MarkDeferredTimes(uint64_t ino,
+                                      const XfsTimestamp& now) const {
+  // Drop the cached XfsFileInfo first so GetFileInfo rebuilds it through the
+  // OpenInode overlay. (Cache lock before the deferred lock, matching OpenInode.)
+  {
+    std::lock_guard<std::mutex> cache_lock(cache_mutex_);
+    info_cache_.erase(ino);
+  }
+  std::lock_guard<std::mutex> lock(deferred_mutex_);
+  deferred_times_[ino] = now;
+}
+
+Status XfsFilesystem::CommitDeferredTimesUnderInodeLock(uint64_t ino) {
+  XfsTimestamp now;
+  {
+    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    auto it = deferred_times_.find(ino);
+    if (it == deferred_times_.end()) return OkStatus();
+    now = it->second;
+  }
+  auto inode = OpenInode(ino);
+  if (!inode.ok()) return inode.error();
+  auto txn = BeginTransaction();
+  if (!txn.ok()) return txn.error();
+  Status status = UpdateTimesInTransaction(txn.value(), ino,
+                                           inode.value().atime, now, now);
+  if (status.ok()) status = CommitTransaction(txn.value());
+  if (!status.ok()) return status;
+  {
+    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    deferred_times_.erase(ino);
+  }
+  return OkStatus();
+}
+
+Status XfsFilesystem::CommitDeferredMetadata(uint64_t ino) {
+  if (!writable_) return OkStatus();
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
+  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  return CommitDeferredTimesUnderInodeLock(ino);
+}
+
+Status XfsFilesystem::CommitAllDeferredTimesLocked() {
+  for (;;) {
+    uint64_t ino = 0;
+    {
+      std::lock_guard<std::mutex> lock(deferred_mutex_);
+      if (deferred_times_.empty()) break;
+      ino = deferred_times_.begin()->first;
+    }
+    std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
+    std::lock_guard<std::mutex> lock(mutation_mutex_);
+    Status status = CommitDeferredTimesUnderInodeLock(ino);
+    if (!status.ok()) return status;
+  }
+  return OkStatus();
+}
+
+Status XfsFilesystem::CommitAllDeferredMetadata() {
+  if (!writable_) return OkStatus();
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  return CommitAllDeferredTimesLocked();
+}
+
+uint64_t XfsFilesystem::ExtentGeneration(uint64_t ino) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto it = extent_generation_.find(ino);
+  return it == extent_generation_.end() ? 0 : it->second;
 }
 
 uint64_t XfsFilesystem::DataGeneration(uint64_t ino) const {

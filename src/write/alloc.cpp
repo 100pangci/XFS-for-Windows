@@ -42,6 +42,7 @@
 #include "xfs/log.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/perf_stats.h"
 #include "xfs/refcount_editor.h"
 
 namespace xfs {
@@ -1641,6 +1642,10 @@ Status Allocator::LoadRefcount(uint32_t agno) {
   Status s = LoadAg(agno, &ag);
   if (!s.ok()) return s;
   if (!ag->refcount_loaded) {
+    if (PerfStats::Get().enabled()) {
+      PerfStats::Get().refcount_tree_loads.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
     s = refcount_->Load(agno, ag->refcount_root, ag->refcount_level,
                         ag->refcount_blocks);
     if (!s.ok()) return s;

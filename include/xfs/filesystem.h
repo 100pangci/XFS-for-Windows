@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <array>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,9 @@ struct MountOptions {
   // pointers are part of the ordinary writable profile after the local and
   // external qualification ledgers in docs/PARENT_POINTERS.md.
   bool allow_parent_qualification = false;
+  // PERF-1: collect the optional performance counters for this mount. Also
+  // enabled by XFSWIN_PERF_STATS=1 or `xfswin --perf-stats`.
+  bool perf_stats = false;
 };
 
 struct XfsFileInfo {
@@ -183,6 +187,8 @@ class XfsFilesystem {
                           uint64_t offset, void* buffer, size_t length) const;
   Result<std::string> ReadSymlink(uint64_t ino) const;
   Result<XfsFileInfo> GetFileInfo(uint64_t ino) const;
+  // Monotonic extent-map generation (see ExtentGeneration in filesystem.cpp).
+  uint64_t ExtentGeneration(uint64_t ino) const;
 
   // ---- mutation API (read-write mounts only) ----
   // Overwrites bytes inside extents that are already allocated and written.
@@ -209,7 +215,8 @@ class XfsFilesystem {
   // mutation lock*, so concurrent appends cannot both compute the same EOF.
   Result<size_t> WriteFileData(uint64_t ino, uint64_t offset,
                                const void* buffer, size_t length,
-                               bool append = false);
+                               bool append = false,
+                               bool defer_timestamps = false);
 
   // SetFileSize (ftruncate semantics):
   //   - growing only moves the logical EOF; the new range is a hole and no
@@ -228,7 +235,8 @@ class XfsFilesystem {
   // This is the state a crash after the write-path's first transaction leaves
   // behind; `xfswin convert-unwritten` turns it back into written data.
   Result<XfsFileInfo> AllocateUnwritten(uint64_t ino, uint64_t offset,
-                                        uint64_t length);
+                                        uint64_t length,
+                                        bool keep_size = false);
 
   // Converts every unwritten extent overlapping [offset, offset + length) to
   // written.  Unwritten blocks the caller did not initialize are zero-filled
@@ -308,6 +316,9 @@ class XfsFilesystem {
   // xfs_ifree). This is the "last handle closed" step of an open-but-unlinked
   // file.
   Status FreeUnlinkedInode(uint64_t ino);
+  // Same, for a caller that already holds write_barrier_ exclusively
+  // (RemoveNamespaceEntry and Rename complete the deferred free in-place).
+  Status FreeUnlinkedInodeLocked(uint64_t ino);
 
   // ---- rename / hardlink / symlink (RW-4, read-write mounts only) ----
   struct RenameOutcome {
@@ -447,6 +458,11 @@ class XfsFilesystem {
   // flush fails: callers (WinFsp Flush, clean unmount) must not report
   // success after a failed flush.
   Status Flush();
+  // Commits a deferred mtime/ctime update produced by
+  // WriteFileData(..., defer_timestamps=true). Adapters call this at Cleanup or
+  // before a clean unmount; Flush commits every pending timestamp first.
+  Status CommitDeferredMetadata(uint64_t ino);
+  Status CommitAllDeferredMetadata();
 
   // Central invalidation entry point: every mutation reports what it changed
   // here instead of touching caches directly (see xfs/cache.h for the policy
@@ -478,6 +494,7 @@ class XfsFilesystem {
   struct DirCache {
     std::vector<XfsDirEntry> entries;
     std::unordered_map<std::string, size_t> index;
+    uint64_t last_used = 0;  // clock value for bounded LRU eviction
   };
   void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
 
@@ -578,6 +595,13 @@ class XfsFilesystem {
       uint64_t generation) const;
   // Current data generation of an inode (0 for never-written inodes).
   uint64_t DataGeneration(uint64_t ino) const;
+
+  // Deferred timestamp state. The caller holds the inode lock when marking;
+  // the commit helpers also acquire the inode lock (caller order:
+  // write_barrier_ -> inode -> mutation_mutex_).
+  void MarkDeferredTimes(uint64_t ino, const XfsTimestamp& now) const;
+  Status CommitDeferredTimesUnderInodeLock(uint64_t ino);
+  Status CommitAllDeferredTimesLocked();
   void DropDataChunks(uint64_t ino, uint64_t byte_offset, uint64_t byte_length,
                       bool drop_all) const;
 
@@ -588,9 +612,28 @@ class XfsFilesystem {
   std::vector<std::string> warnings_;
   bool writable_ = false;
 
-  // Serializes mutations (coarse by design: correctness first, then per-object
-  // locking once the writer is stable). Also orders "device write" against
-  // "cache publication" for concurrent readers.
+  // PERF-1 lock hierarchy (full description in docs/LOCKING.md):
+  //   write_barrier_ -> per-inode locks (inode-number order) -> mutation_mutex_
+  //   -> cache leaves.
+  //
+  // Ordinary data writes hold write_barrier_ shared and their inode lock, so
+  // different files run concurrently. Namespace changes, truncate/reflink and
+  // Flush hold write_barrier_ exclusively: they wait for in-flight file I/O
+  // and exclude new I/O while they change the namespace or establish a
+  // durability barrier. mutation_mutex_ still serializes journal state and
+  // metadata transactions; it is not held across ordinary data transfer.
+  mutable std::shared_mutex write_barrier_;
+  // A bounded sharded inode lock table. 4096 stripes keep independent files
+  // independent (a collision only serializes unrelated inodes) without an
+  // unbounded map of mutexes. Same inode always maps to the same stripe.
+  static constexpr size_t kInodeLockStripes = 4096;
+  std::mutex& InodeLock(uint64_t ino) const {
+    return inode_locks_[ino % kInodeLockStripes];
+  }
+  mutable std::array<std::mutex, kInodeLockStripes> inode_locks_;
+
+  // Serializes metadata/journal transactions and keeps log_position_,
+  // next_tid_ and superblock counters coherent.
   mutable std::mutex mutation_mutex_;
 
   // ---- journal state (read-write writer) ----
@@ -602,6 +645,12 @@ class XfsFilesystem {
   // True when this mount wrote at least one record that is not an unmount
   // record (i.e. the log needs a clean-unmount record before we let go).
   bool log_dirty_ = false;
+  // Delayed metadata write-back (XFS-style): the log record is durable before
+  // metadata is written, but the metadata flush is batched until a durability
+  // boundary or log wrap. Recovery replays the still-covered log records if
+  // the machine loses power before the metadata reaches stable storage.
+  bool metadata_flush_pending_ = false;
+  uint64_t metadata_dirty_lsn_ = 0;
   uint32_t next_tid_ = 1;
   // (RW-5) While unresolved intents from a recovered log are being completed,
   // every commit must keep h_tail_lsn pinned to the start of the replayed
@@ -640,6 +689,12 @@ class XfsFilesystem {
       extent_cache_;
   mutable std::unordered_map<uint64_t, DirCache> dir_cache_;
   mutable size_t dir_cache_entries_ = 0;
+  mutable uint64_t dir_cache_clock_ = 0;
+  // Extent-map generation, bumped only by extent changes. It lets the WinFsp
+  // adapter keep its parsed extent list across data-only overwrites.
+  mutable std::unordered_map<uint64_t, uint64_t> extent_generation_;
+  mutable std::mutex deferred_mutex_;
+  mutable std::unordered_map<uint64_t, XfsTimestamp> deferred_times_;
 
   static constexpr uint64_t kInodeChunkBytes = 16384;  // inode read-ahead chunk
   static constexpr uint64_t kDataChunkBytes = 512 * 1024;

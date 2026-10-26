@@ -21,18 +21,37 @@
 
 #include "xfs/crash.h"
 #include "xfs/log.h"
+#include "xfs/perf_stats.h"
 
 namespace xfs {
 
 Status XfsFilesystem::Flush() {
-  // Wait for in-flight mutations so a flush never returns before the writes it
-  // was asked to make durable.
+  PerfStats& perf = PerfStats::Get();
+  if (perf.enabled()) {
+    perf.flush_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+  // A flush is a durability barrier, not a global I/O lock: it waits for
+  // every file-data write that started before it, and for any metadata
+  // transaction, then issues one device flush. New writes wait at the barrier
+  // only for the duration of the flush itself.
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  // A durability boundary also publishes every deferred inode timestamp
+  // before the device flush, so FlushFileBuffers semantics stay intact.
+  Status committed = CommitAllDeferredTimesLocked();
+  if (!committed.ok()) return committed;
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   MaybeCrash(CrashPoint::kBeforeDeviceFlush, device_->Info().description);
   if (!device_->Flush()) {
     return XFS_ERR(XfsError::kIoError,
                    "device flush failed: " + device_->LastError())
         .Metadata("device");
+  }
+  if (metadata_flush_pending_) {
+    metadata_flush_pending_ = false;
+    if (log_position_valid_ && !recovery_tail_pin_.has_value()) {
+      log_position_.tail_lsn =
+          MakeLsn(log_position_.cycle, log_position_.next_block);
+    }
   }
   MaybeCrash(CrashPoint::kAfterDeviceFlush, device_->Info().description);
   return OkStatus();

@@ -20,6 +20,7 @@
 // which is what makes recovery replay the whole change atomically.
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "xfs/filesystem.h"
 #include "xfs/log.h"
 #include "xfs/ondisk.h"
+#include "xfs/perf_stats.h"
 #include "xfs/refcount.h"
 #include "xfs/write.h"
 
@@ -44,6 +46,133 @@ Status StoreModifiedTimes(uint8_t* raw, const XfsTimestamp& now) {
   Status s = StoreInodeTimestamp(raw, di::kMtime, now);
   if (!s.ok()) return s;
   return StoreInodeTimestamp(raw, di::kCtime, now);
+}
+
+// Writes the block range [offset, offset+length) through map, which returns
+// the physical filesystem block backing a file block. Fully covered blocks
+// that are physically contiguous are transferred with one device write
+// directly from the caller's buffer; only the first/last partial block needs a
+// read-modify-write scratch block. This is the PERF-1 fix for the old
+// block-by-block loop (a 1 MiB write used to issue 256 4 KiB WriteFiles).
+//
+// old_inode/old_extents/old_size describe the file before this write and
+// are used only to preserve bytes outside the caller's range in a partial
+// block. src == nullptr means a pure zero-fill (COW zero range).
+Status WriteBlockRange(
+    BlockDevice& device, const XfsGeometry& geo, uint64_t ino, uint64_t offset,
+    uint64_t length, const void* src, const XfsInode& old_inode,
+    const std::vector<XfsExtent>& old_extents, uint64_t old_size,
+    const std::function<bool(uint64_t, uint64_t*)>& map,
+    CrashPoint mid_point, const char* phase) {
+  const uint64_t block_size = geo.block_size;
+  const uint64_t end = offset + length;
+  const uint64_t first_block = offset >> geo.block_log;
+  const uint64_t last_block = (end - 1) >> geo.block_log;
+  const auto* input = static_cast<const uint8_t*>(src);
+
+  std::vector<uint8_t> partial;
+  std::vector<uint8_t> zeros;
+  bool wrote_any = false;
+
+  for (uint64_t block = first_block; block <= last_block;) {
+    const uint64_t block_start = block << geo.block_log;
+    const uint64_t block_end = block_start + block_size;
+    uint64_t fsb = 0;
+    if (!map(block, &fsb)) {
+      return XFS_ERR(XfsError::kInternal,
+                     "write block is not covered by an extent")
+          .Ino(ino)
+          .Actual(block)
+          .Metadata(phase);
+    }
+
+    const bool fully_covered =
+        block_start >= offset && block_end <= end;
+    if (!fully_covered) {
+      if (wrote_any) MaybeCrash(mid_point, phase);
+      partial.assign(static_cast<size_t>(block_size), 0);
+      if (block_start < old_size) {
+        const uint64_t want = std::min<uint64_t>(block_size,
+                                                 old_size - block_start);
+        auto read = ReadFileData(device, geo, old_inode, block_start,
+                                 partial.data(), static_cast<size_t>(want),
+                                 &old_extents);
+        if (!read.ok()) return read.error();
+      }
+      const uint64_t user_start = std::max(offset, block_start);
+      const uint64_t user_end = std::min(end, block_end);
+      if (user_end > user_start) {
+        auto* at = partial.data() + (user_start - block_start);
+        const size_t count = static_cast<size_t>(user_end - user_start);
+        if (input != nullptr) {
+          std::memcpy(at, input + (user_start - offset), count);
+        } else {
+          std::memset(at, 0, count);
+        }
+      }
+      const uint64_t device_offset = geo.FsbToByte(fsb);
+      if (!device.Write(device_offset, partial.data(), partial.size())) {
+        return XFS_ERR(XfsError::kIoError,
+                       "file data write failed: " + device.LastError())
+            .Ino(ino)
+            .Offset(device_offset)
+            .Metadata("device");
+      }
+      wrote_any = true;
+      ++block;
+      continue;
+    }
+
+    // Maximal run of full blocks whose physical blocks are contiguous.
+    uint64_t run_blocks = 1;
+    uint64_t next_fsb = fsb + 1;
+    while (block + run_blocks <= last_block) {
+      const uint64_t candidate = block + run_blocks;
+      const uint64_t candidate_start = candidate << geo.block_log;
+      const uint64_t candidate_end = candidate_start + block_size;
+      if (candidate_start < offset || candidate_end > end) break;
+      uint64_t candidate_fsb = 0;
+      if (!map(candidate, &candidate_fsb) || candidate_fsb != next_fsb) break;
+      ++run_blocks;
+      ++next_fsb;
+    }
+
+    if (wrote_any) MaybeCrash(mid_point, phase);
+    const uint64_t device_offset = geo.FsbToByte(fsb);
+    const uint64_t run_bytes = run_blocks * block_size;
+    if (input != nullptr) {
+      if (!device.Write(device_offset, input + (block_start - offset),
+                        static_cast<size_t>(run_bytes))) {
+        return XFS_ERR(XfsError::kIoError,
+                       "file data write failed: " + device.LastError())
+            .Ino(ino)
+            .Offset(device_offset)
+            .Metadata("device");
+      }
+    } else {
+      if (zeros.empty()) zeros.assign(static_cast<size_t>(std::min<uint64_t>(
+                                          block_size * 256, 1u << 20)),
+                                      0);
+      uint64_t pos = device_offset;
+      uint64_t remaining = run_bytes;
+      while (remaining > 0) {
+        const size_t chunk =
+            static_cast<size_t>(std::min<uint64_t>(remaining, zeros.size()));
+        if (!device.Write(pos, zeros.data(), chunk)) {
+          return XFS_ERR(XfsError::kIoError,
+                         "file data write failed: " + device.LastError())
+              .Ino(ino)
+              .Offset(pos)
+              .Metadata("device");
+        }
+        pos += chunk;
+        remaining -= chunk;
+      }
+    }
+    wrote_any = true;
+    block += run_blocks;
+  }
+  return OkStatus();
 }
 
 // The blocks a write touches.
@@ -149,6 +278,7 @@ Result<size_t> XfsFilesystem::CowReplaceRangeLocked(
   const uint64_t first_block = offset >> geometry_.block_log;
   const uint64_t last_block = (offset + length - 1) >> geometry_.block_log;
   const uint64_t block_count = last_block - first_block + 1;
+  const uint64_t end = offset + length;
   const uint64_t old_size = inode.size;
 
   std::vector<CowRun> runs;
@@ -192,60 +322,31 @@ Result<size_t> XfsFilesystem::CowReplaceRangeLocked(
   };
 
   const auto* src = static_cast<const uint8_t*>(buffer);
-  std::vector<uint8_t> block(static_cast<size_t>(block_size));
   MaybeCrash(CrashPoint::kBeforeCowDataWrite, "cow data");
   for (const CowRun& run : runs) {
-    for (uint32_t i = 0; i < run.len; ++i) {
-      const uint64_t b = run.file_block + i;
-      const uint64_t block_start = b << geometry_.block_log;
-      const uint64_t block_end = block_start + block_size;
-      const uint64_t user_start = std::max(offset, block_start);
-      const uint64_t user_end = std::min(offset + length, block_end);
-      const bool full_user =
-          user_start == block_start && user_end == block_end;
-      if (full_user) {
-        if (src != nullptr) {
-          std::memcpy(block.data(), src + (block_start - offset),
-                      static_cast<size_t>(block_size));
-        } else {
-          std::memset(block.data(), 0, block.size());
-        }
-      } else {
-        std::memset(block.data(), 0, block.size());
-        if (block_start < old_size) {
-          const uint64_t want =
-              std::min<uint64_t>(block_size, old_size - block_start);
-          auto read = ReadFileData(*device_, geometry_, inode, block_start,
-                                   block.data(), static_cast<size_t>(want),
-                                   &extents);
-          if (!read.ok()) {
-            cleanup();
-            return read.error();
-          }
-        }
-        if (user_end > user_start) {
-          if (src != nullptr) {
-            std::memcpy(block.data() + (user_start - block_start),
-                        src + (user_start - offset),
-                        static_cast<size_t>(user_end - user_start));
-          } else {
-            std::memset(block.data() + (user_start - block_start), 0,
-                        static_cast<size_t>(user_end - user_start));
-          }
-        }
+    auto map = [&](uint64_t block, uint64_t* fsb) -> bool {
+      if (block < run.file_block || block >= run.file_block + run.len) {
+        return false;
       }
-      if (i > 0) {
-        MaybeCrash(CrashPoint::kMidCowDataWrite, "cow data");
-      }
-      const uint64_t device_offset = geometry_.FsbToByte(run.fsb + i);
-      if (!device_->Write(device_offset, block.data(), block.size())) {
-        cleanup();
-        return XFS_ERR(XfsError::kIoError,
-                       "COW file data write failed: " + device_->LastError())
-            .Ino(ino)
-            .Offset(device_offset)
-            .Metadata("device");
-      }
+      *fsb = run.fsb + (block - run.file_block);
+      return true;
+    };
+    const uint64_t run_start_byte =
+        run.file_block << geometry_.block_log;
+    const uint64_t run_end_byte =
+        std::min(end, (run.file_block + run.len) << geometry_.block_log);
+    const uint64_t helper_start = std::max(offset, run_start_byte);
+    const uint64_t helper_end = std::min(end, run_end_byte);
+    if (helper_start >= helper_end) continue;
+    const uint8_t* helper_src =
+        src != nullptr ? src + (helper_start - offset) : nullptr;
+    Status write_status = WriteBlockRange(
+        *device_, geometry_, ino, helper_start, helper_end - helper_start,
+        helper_src, inode, extents, old_size, map,
+        CrashPoint::kMidCowDataWrite, "cow data");
+    if (!write_status.ok()) {
+      cleanup();
+      return write_status.error();
     }
   }
   MaybeCrash(CrashPoint::kAfterCowDataWrite, "cow data");
@@ -353,7 +454,8 @@ Result<size_t> XfsFilesystem::CowReplaceRangeLocked(
 
 Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
                                             const void* buffer, size_t length,
-                                            bool append) {
+                                            bool append,
+                                            bool defer_timestamps) {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -371,7 +473,20 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         .Metadata("write");
   }
 
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
+  if (perf_on) perf.write_calls.fetch_add(1, std::memory_order_relaxed);
+
+  // Ordinary file-data I/O is concurrent across files. The shared barrier lets
+  // independent writes proceed in parallel and excludes namespace changes,
+  // truncate/reflink and Flush while the data range is being transferred. The
+  // inode stripe serializes writes to the same file (including append EOF
+  // allocation). Metadata transactions still take mutation_mutex_ below, but
+  // only around the transaction, never across the data transfer.
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
+  // Count actual in-flight writes, not callers queued on the inode lock.
+  PerfStats::WriteScope write_scope;
 
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -422,14 +537,42 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       (end - 1) >> geometry_.block_log,
       std::max(old_size, end),
   };
+  // Sequential writers (Windows copy, archive extraction) issue many small
+  // appends. Allocate a bounded unwritten lookahead beyond EOF on the first
+  // large append so the following writes only convert the range they touch
+  // instead of paying an allocation transaction each time. The extra blocks
+  // remain unwritten and invisible: EOF does not move and reads return zero.
+  uint64_t alloc_last_block = plan.last_block;
+  if (offset >= old_size && length >= 64 * 1024) {
+    // Only start a new lookahead window when the existing unwritten
+    // preallocation no longer reaches past this write. Otherwise every 1 MiB
+    // append would extend the window by another 8 MiB and still pay an
+    // allocation transaction.
+    bool unwritten_ahead = false;
+    for (const XfsExtent& e : *extents.value()) {
+      if (e.unwritten && e.EndBlock() > plan.last_block + 1) {
+        unwritten_ahead = true;
+        break;
+      }
+    }
+    if (!unwritten_ahead) {
+      constexpr uint64_t kAllocationLookaheadBytes = 8ull << 20;
+      const uint64_t extra_blocks =
+          (kAllocationLookaheadBytes + block_size - 1) >> geometry_.block_log;
+      const uint64_t max_block = ((1ull << 54) >> geometry_.block_log) - 1;
+      alloc_last_block =
+          std::min<uint64_t>(plan.last_block + extra_blocks, max_block);
+    }
+  }
 
-  // Reflink sharing changes the write path entirely: a write to a shared
-  // physical extent must be out-of-place.  The preflight reads the typed
-  // refcount trees; an unreadable tree refuses before any data write.
   auto shared = RangeHasSharedData(*device_, geometry_, *extents.value(),
                                    plan.first_block, plan.last_block);
   if (!shared.ok()) return shared.error();
   if (shared.value()) {
+    // COW staging/remap is a multi-transaction operation with ordering
+    // dependencies; keep it serialized for now (the ordinary overwrite path is
+    // the one that must scale).
+    std::lock_guard<std::mutex> meta_lock(mutation_mutex_);
     constexpr uint64_t kCowChunkBlocks = 64;
     const auto* src = static_cast<const uint8_t*>(buffer);
     for (uint64_t b = plan.first_block; b <= plan.last_block;) {
@@ -451,6 +594,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       b = b_last + 1;
     }
     InvalidateCaches(CacheInvalidation::Extents(ino));
+    if (perf_on) perf.write_bytes.fetch_add(length, std::memory_order_relaxed);
     XFS_EXT_DEBUG("COW wrote " << length << " bytes at " << offset
                                << " in inode " << ino);
     return length;
@@ -482,13 +626,28 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       }
       MaybeCrash(CrashPoint::kAfterDataWrite, "write-path fast");
       InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
-      const XfsTimestamp now = CurrentTimestamp();
-      auto txn = BeginTransaction();
-      if (!txn.ok()) return txn.error();
-      Status status = UpdateTimesInTransaction(
-          txn.value(), ino, inode.value().atime, now, now);
-      if (status.ok()) status = CommitTransaction(txn.value());
-      if (!status.ok()) return status.error();
+      {
+        const XfsTimestamp now = CurrentTimestamp();
+        if (defer_timestamps) {
+          // Adapter fast path: publish the new mtime/ctime in the in-memory
+          // inode now, and let Flush/Cleanup write the metadata transaction.
+          // A crash before that boundary may lose the timestamp (the data is
+          // not durable before Flush either); the ordering of data before
+          // metadata is unchanged.
+          MarkDeferredTimes(ino, now);
+        } else {
+          // Only the timestamp transaction is serialized with metadata work;
+          // the data transfer above was concurrent across files.
+          std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+          auto txn = BeginTransaction();
+          if (!txn.ok()) return txn.error();
+          Status status = UpdateTimesInTransaction(
+              txn.value(), ino, inode.value().atime, now, now);
+          if (status.ok()) status = CommitTransaction(txn.value());
+          if (!status.ok()) return status.error();
+        }
+      }
+      if (perf_on) perf.write_bytes.fetch_add(length, std::memory_order_relaxed);
       return length;
     }
     if (mapped.error().code != XfsError::kWriteNeedsAllocation &&
@@ -506,6 +665,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
 
   // 1. Allocate the holes as unwritten extents, in one transaction.
   {
+    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
     auto txn = BeginTransaction();
     if (!txn.ok()) return txn.error();
     BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
@@ -515,7 +675,8 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
 
     const uint32_t preferred = geometry_.InoAgno(ino);
     uint64_t block = plan.first_block;
-    while (block <= plan.last_block) {
+    bool allocated_any = false;
+    while (block <= alloc_last_block) {
       const XfsExtent* cover = nullptr;
       // Skip blocks already backed by an extent (written or unwritten).
       if (IsWrittenExtentForBlock(*extents.value(), block, &cover)) {
@@ -535,7 +696,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       }
       // Maximal hole run.
       uint64_t run_end = block;
-      while (run_end <= plan.last_block) {
+      while (run_end <= alloc_last_block) {
         const XfsExtent* written = nullptr;
         if (IsWrittenExtentForBlock(*extents.value(), run_end, &written)) break;
         bool unwritten_here = false;
@@ -574,96 +735,64 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         s = editor.InsertExtent(extent);
         if (!s.ok()) return s.error();
         editor.AddNblocks(static_cast<int64_t>(allocation.len));
+        allocated_any = true;
         cursor += allocation.len;
         remaining -= allocation.len;
       }
       block = run_end;
     }
 
-    // Write the new fork into the inode (size unchanged in this transaction).
-    auto raw = ReadRawInode(ino);
-    if (!raw.ok()) return raw.error();
-    std::vector<uint8_t> raw_inode = std::move(raw.value());
-    XFS_DEBUG("write txn1: nblocks before "
-              << GetBE64(raw_inode.data(), di::kNblocks) << " delta "
-              << editor.nblocks_delta());
-    uint32_t ilog_fields = 0;
-    std::vector<uint8_t> fork_region;
-    s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
-    if (!s.ok()) return s.error();
-    const XfsTimestamp now = CurrentTimestamp();
-    s = StoreModifiedTimes(raw_inode.data(), now);
-    if (!s.ok()) return s.error();
-    s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
-                         fork_region);
-    if (!s.ok()) return s.error();
-    s = alloc.Commit();
-    if (!s.ok()) return s.error();
-    s = CommitTransaction(txn.value());
-    if (!s.ok()) return s.error();
+    if (allocated_any) {
+      // Write the new fork into the inode (size unchanged in this
+      // transaction). When the range was already covered by an unwritten
+      // lookahead extent there is nothing to log or flush here.
+      auto raw = ReadRawInode(ino);
+      if (!raw.ok()) return raw.error();
+      std::vector<uint8_t> raw_inode = std::move(raw.value());
+      XFS_DEBUG("write txn1: nblocks before "
+                << GetBE64(raw_inode.data(), di::kNblocks) << " delta "
+                << editor.nblocks_delta());
+      uint32_t ilog_fields = 0;
+      std::vector<uint8_t> fork_region;
+      s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
+      if (!s.ok()) return s.error();
+      const XfsTimestamp now = CurrentTimestamp();
+      s = StoreModifiedTimes(raw_inode.data(), now);
+      if (!s.ok()) return s.error();
+      s = LogPreparedInode(txn.value(), ino, std::move(raw_inode), ilog_fields,
+                           fork_region);
+      if (!s.ok()) return s.error();
+      s = alloc.Commit();
+      if (!s.ok()) return s.error();
+      s = CommitTransaction(txn.value());
+      if (!s.ok()) return s.error();
+    }
   }
-
-  // 2. The data itself, block by block, then a flush so the bytes are durable
-  //    before the conversion transaction can make them visible.
+  // 2. Data transfer. Physically contiguous full blocks are coalesced into
+  //    large positioned writes; only a partial head/tail block needs a
+  //    read-modify-write scratch buffer. Then one flush makes the bytes
+  //    durable before the conversion transaction can expose them.
   {
-    std::vector<uint8_t> block_buffer(static_cast<size_t>(block_size));
     auto fresh_inode = OpenInode(ino);
     if (!fresh_inode.ok()) return fresh_inode.error();
     auto fresh_extents = LoadExtentsCached(fresh_inode.value());
     if (!fresh_extents.ok()) return fresh_extents.error();
 
-    MaybeCrash(CrashPoint::kBeforeDataWrite, "write-path allocate");
-    for (uint64_t b = plan.first_block; b <= plan.last_block; ++b) {
-      const uint64_t block_start = b << geometry_.block_log;
-      const uint64_t user_start = std::max(offset, block_start);
-      const uint64_t user_end = std::min(end, block_start + block_size);
-      const bool user_covers_block =
-          user_start == block_start && user_end == block_start + block_size;
-      std::memset(block_buffer.data(), 0, block_buffer.size());
-      if (user_covers_block) {
-        std::memcpy(block_buffer.data(), src + (block_start - offset),
-                    static_cast<size_t>(block_size));
-      } else {
-        // Preserve what the file already shows in this block (zeros for holes
-        // and unwritten extents, the device bytes for written extents, and
-        // nothing past the old EOF).
-        if (block_start < old_size) {
-          const uint64_t want =
-              std::min<uint64_t>(block_size, old_size - block_start);
-          auto read = ReadFileData(*device_, geometry_, fresh_inode.value(),
-                                   block_start, block_buffer.data(),
-                                   static_cast<size_t>(want),
-                                   fresh_extents.value().get());
-          if (!read.ok()) return read.error();
-        }
-        if (user_end > user_start) {
-          std::memcpy(block_buffer.data() + (user_start - block_start),
-                      src + (user_start - offset),
-                      static_cast<size_t>(user_end - user_start));
-        }
-      }
-      if (b == plan.first_block + 1) {
-        MaybeCrash(CrashPoint::kMidDataWrite, "write-path general");
-      }
+    auto map = [&](uint64_t file_block, uint64_t* fsb) -> bool {
       const XfsExtent* extent = nullptr;
-      if (!FindExtentForBlock(*fresh_extents.value(), b, &extent)) {
-        return XFS_ERR(XfsError::kInternal,
-                       "allocated block is not covered by an extent")
-            .Ino(ino)
-            .Actual(b)
-            .Metadata("write");
+      if (!FindExtentForBlock(*fresh_extents.value(), file_block, &extent)) {
+        return false;
       }
-      const uint64_t fsb = extent->startblock + (b - extent->startoff);
-      const uint64_t device_offset = geometry_.FsbToByte(fsb);
-      if (!device_->Write(device_offset, block_buffer.data(),
-                          block_buffer.size())) {
-        return XFS_ERR(XfsError::kIoError,
-                       "file data write failed: " + device_->LastError())
-            .Ino(ino)
-            .Offset(device_offset)
-            .Metadata("device");
-      }
-    }
+      *fsb = extent->startblock + (file_block - extent->startoff);
+      return true;
+    };
+
+    MaybeCrash(CrashPoint::kBeforeDataWrite, "write-path allocate");
+    Status write_status = WriteBlockRange(
+        *device_, geometry_, ino, offset, length, src, fresh_inode.value(),
+        *fresh_extents.value(), old_size, map, CrashPoint::kMidDataWrite,
+        "write-path general");
+    if (!write_status.ok()) return write_status.error();
     MaybeCrash(CrashPoint::kAfterDataWrite, "write-path general");
     if (!device_->Flush()) {
       return XFS_ERR(XfsError::kIoError,
@@ -673,9 +802,9 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
     }
     InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
   }
-
   // 3. Convert the written range to written extents and set the new size.
   {
+    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
     auto txn = BeginTransaction();
     if (!txn.ok()) return txn.error();
     BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
@@ -727,6 +856,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
   }
 
   InvalidateCaches(CacheInvalidation::Extents(ino));
+  if (perf_on) perf.write_bytes.fetch_add(length, std::memory_order_relaxed);
   XFS_EXT_DEBUG("wrote " << length << " bytes at " << offset << " in inode "
                          << ino << " (size " << old_size << " -> "
                          << plan.new_size << ")");
@@ -735,7 +865,8 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
 
 Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
                                                    uint64_t offset,
-                                                   uint64_t length) {
+                                                   uint64_t length,
+                                                   bool keep_size) {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -751,6 +882,9 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
         .Metadata("fallocate");
   }
 
+  // Changing the extent map must not overlap a data transfer to this inode.
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -774,7 +908,9 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
   const uint64_t first_block = offset >> geometry_.block_log;
   const uint64_t last_block = (end - 1) >> geometry_.block_log;
   const uint64_t old_size = inode.value().size;
-  const uint64_t new_size = std::max(old_size, end);
+  // Windows SetAllocationSize wants allocation without moving EOF. Fallocate
+  // mode 0 (the CLI path) keeps the historical "grow the file" semantics.
+  const uint64_t new_size = keep_size ? old_size : std::max(old_size, end);
 
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();
@@ -837,7 +973,7 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
   std::vector<uint8_t> fork_region;
   s = editor.Finalize(&raw_inode, &ilog_fields, &fork_region);
   if (!s.ok()) return s.error();
-  if (new_size != old_size) {
+  if (!keep_size && new_size != old_size) {
     PutBE64(raw_inode.data(), di::kSize, new_size);
   }
   const XfsTimestamp now = CurrentTimestamp();
@@ -877,6 +1013,8 @@ Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
         .Metadata("convert-unwritten");
   }
 
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -1011,6 +1149,8 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
         .Actual(new_size)
         .Metadata("truncate");
   }
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  TimedLockGuard inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();

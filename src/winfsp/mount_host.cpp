@@ -55,7 +55,7 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
 
 int RunMountHost(const std::string& target, const std::string& drive,
                  bool force_unsafe_ro, bool verbose, bool read_write,
-                 bool allow_rmapbt_qualification,
+                 bool perf_stats, bool allow_rmapbt_qualification,
                  bool allow_reflink_qualification) {
   // Delay-loaded WinFsp runtime: fail cleanly if it is not available.
   HMODULE winfsp_dll = LoadLibraryW(L"winfsp-x64.dll");
@@ -81,6 +81,7 @@ int RunMountHost(const std::string& target, const std::string& drive,
   options.read_write = read_write;
   options.allow_rmapbt_qualification = allow_rmapbt_qualification;
   options.allow_reflink_qualification = allow_reflink_qualification;
+  options.perf_stats = perf_stats;
   auto filesystem = XfsFilesystem::Mount(std::move(device), options);
   if (!filesystem.ok()) {
     std::cerr << "error: " << filesystem.error().Format() << "\n";
@@ -92,6 +93,7 @@ int RunMountHost(const std::string& target, const std::string& drive,
   config.force_unsafe_ro = force_unsafe_ro;
   config.verbose = verbose;
   config.read_write = read_write;
+  config.perf_stats = perf_stats;
   Status status = RunMountedFilesystem(std::move(filesystem.value()), config);
   if (!status.ok()) {
     std::cerr << "error: " << status.error().Format() << "\n";
@@ -116,7 +118,7 @@ int StopMountHost(const std::string& drive) {
 
 namespace xfs::winfsp {
 int RunMountHost(const std::string&, const std::string&, bool, bool, bool,
-                 bool, bool) {
+                 bool, bool, bool) {
   return 1;
 }
 int StopMountHost(const std::string&) { return 1; }

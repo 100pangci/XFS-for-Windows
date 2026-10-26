@@ -858,3 +858,32 @@ The hosted real-kernel jobs use GitHub's `ubuntu-24.04` image (kernel
 `tests/scripts/install_xfsprogs_7_2_0.sh`. They are not opt-in and do not need
 a self-hosted or QEMU runner. See
 [PARENT_POINTERS.md](PARENT_POINTERS.md).
+
+## PERF-1 (I/O performance and lock model)
+
+PERF-1 adds deterministic performance gates next to the correctness matrix.
+They are not MB/s assertions and are safe on hosted runners:
+
+```powershell
+build\tests\RelWithDebInfo\xfs_tests.exe --filter=perf_
+pwsh tests/perf/run_core_perf.ps1 -SmallFiles 1000 -OutDir out/perf
+```
+
+The `perf_*` tests assert:
+
+- one 1 MiB read/write uses a small number of device calls, not one per 4 KiB
+  block;
+- four independent inodes overlap in the core and at the device, while the
+  same inode remains serialized;
+- preallocation keeps EOF unchanged and reads as zero;
+- deferred timestamps are visible immediately and are committed by `Flush`;
+- a warm directory enumeration is served from cache.
+
+`xfswin_perf` writes `perf.json`/`perf.txt`; `windows-perf-smoke` uploads them.
+The A/B runner and DiskSpd matrix are documented in `tests/perf/README.md`.
+The measured baseline, ratios and remaining bottlenecks are recorded in
+`docs/PERFORMANCE.md`; the lock hierarchy is in `docs/LOCKING.md`.
+
+All existing RW-0..RW-6E crash, recovery and Linux-oracle jobs remain hard
+gates. A performance change that weakens them is rejected even if the
+deterministic counters improve.

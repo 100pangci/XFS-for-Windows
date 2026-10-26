@@ -17,6 +17,8 @@
 // ancestors' low/high keys are therefore recomputed along the modified path.
 #include "xfs/rmap_editor.h"
 
+#include "xfs/perf_stats.h"
+
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -1679,6 +1681,9 @@ RmapEditor::~RmapEditor() = default;
 
 Status RmapEditor::Load(uint32_t agno, uint32_t root, uint32_t level,
                         uint32_t blocks) {
+  if (!impl_->IsLoaded(agno) && PerfStats::Get().enabled()) {
+    PerfStats::Get().rmap_tree_loads.fetch_add(1, std::memory_order_relaxed);
+  }
   return impl_->Load(agno, root, level, blocks);
 }
 bool RmapEditor::IsLoaded(uint32_t agno) const {

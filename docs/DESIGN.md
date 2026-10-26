@@ -211,18 +211,18 @@ errors as `error: <kind> [<metadata>]: <detail> AG=.. fsb=0x..`.
 
 ## Threading
 
-The core has no global mutable state. `XfsFilesystem` reads are const and all
-caches are mutex-protected. `WindowsRawBlockDevice` allows concurrent reads
-(shared mutex; `ReadFile` with explicit `OVERLAPPED` offsets is thread-safe)
-and serializes writes (formatting) exclusively; `ImageBlockDevice` serializes
-its stream accesses. The WinFsp host installs WinFsp's built-in operation guard
+`XfsFilesystem` reads are const; its caches are mutex-protected. PERF-1 adds a
+write barrier plus per-inode stripes for ordinary file I/O and keeps the
+metadata/journal mutex only around transactions (see `docs/LOCKING.md`).
+`WindowsRawBlockDevice` allows concurrent reads and serializes writes
+(formatting) exclusively; `ImageBlockDevice` uses positioned overlapped I/O so
+independent ranges run concurrently, with `Flush` as a durability barrier.
+The WinFsp host installs WinFsp's built-in operation guard
 (`FspFileSystemSetOperationGuard` with `FspFileSystemOpEnter/OpLeave`) using
-the **FINE** strategy: namespace operations take a shared lock while reads,
-writes, `GetFileInfo` and security queries run fully in parallel, so
-multithreaded readers (Explorer thumbnails, media players, copies) do not queue
-behind one global lock. Setting only the strategy is not enough: without the
-guard callbacks the FSD does not lock at all.
-
+the **FINE** strategy: namespace operations take an exclusive lock while reads,
+writes, `GetFileInfo` and security queries run for different files in
+parallel. Setting only the strategy is not enough: without the guard callbacks
+the FSD does not lock at all.
 ## Read-only caches
 
 A read-only mount never writes, so inode parsing, directory contents and file
@@ -232,7 +232,9 @@ file data) to keep them coherent.
 
 - `XfsFilesystem` caches up to 32k parsed inodes, up to 32k `XfsFileInfo`
   records, up to 8192 per-inode extent lists, and up to 128 directory listings
-  (256k entries total; caches are cleared wholesale when a cap is exceeded).
+  (256k entries total). Directory entries are evicted with a bounded LRU clock
+  rather than cleared wholesale; the adapter's path and directory memos use the
+  same bounded policy.
   Inodes are read in 16 KiB chunks (32 inodes at a time), so a directory with
   tens of thousands of files costs hundreds of device reads instead of tens of
   thousands.
@@ -390,16 +392,18 @@ CommitTransaction
   1. frame the items (start op, transaction header, items, commit op) and
      build the record: src/write/log_record.cpp
   2. write the record header block and its data blocks, then flush
-  3. write the metadata buffers, then flush
+  3. write the metadata buffers (device flush batched until a durability
+     boundary or log wrap)
   4. advance the write position, mark the log dirty, invalidate caches
 WriteCleanUnmountRecord -> one unmount op at the head, then flush
 ```
 
 The record format is the kernel's (see `docs/JOURNAL.md`): cycle-stamped data,
 CRC over the header plus the stamped data, `h_len` rounded to the log sector,
-`h_lsn` = (cycle, block), `h_tail_lsn` = the record's own LSN (every commit
-flushes its metadata before the next transaction, so nothing older can still
-need replaying), `h_prev_block` = the previous record's header block.
+`h_lsn` = (cycle, block), `h_tail_lsn` = the oldest transaction whose
+metadata is not yet flushed (its own LSN when everything older is durable),
+`h_prev_block` = the previous record's header block. The metadata flush is
+batched; the log record is always durable before metadata is written.
 
 The first mutation is `SetFileTimes` (`src/write/inode_write.cpp`): a single
 inode item, `xfs_inode_log_format` + `xfs_log_dinode` in host byte order,

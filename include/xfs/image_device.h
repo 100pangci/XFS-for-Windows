@@ -52,10 +52,13 @@ class ImageBlockDevice final : public BlockDevice {
 
   struct Impl;
   std::unique_ptr<Impl> impl_;
-  // Reads share the lock; writes and flushes are exclusive. Every request
-  // carries its own offset, so a reader can never observe a half-updated file
-  // position.
-  mutable std::shared_mutex io_mutex_;
+  // Positioned I/O runs concurrently: Read and Write take the lifecycle lock
+  // shared and the flush barrier shared, so independent ranges do not serialize
+  // behind each other. Flush takes the barrier exclusively (a durability
+  // barrier waits for every earlier write), Close takes the lifecycle lock
+  // exclusively (no I/O may outlive the handle).
+  mutable std::shared_mutex lifecycle_mutex_;
+  mutable std::shared_mutex flush_barrier_;
   DeviceInfo info_;
   std::filesystem::path path_;
 };

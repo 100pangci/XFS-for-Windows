@@ -35,6 +35,7 @@
 #include "xfs/rmap.h"
 #include "xfs/superblock.h"
 #include "xfs/win_name_map.h"
+#include "xfs/perf_stats.h"
 #include "xfs/windows_raw_device.h"
 
 #ifdef XFSWIN_HAS_WINFSP
@@ -62,9 +63,9 @@ void PrintUsage() {
       "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
       "  refcount <device|image> [--ag=N]  typed refcountbt records\n"
       "  reflink <image> <src> <dst> <off> <len>  shared-extent clone\n"
-      "      --rw-experimental        (len 0 clones to source EOF)\n"
-      "  recover <image>               replay the journal (RW-5)\n"
-      "      --yes-i-really-mean-it    required: recovery writes metadata\n"
+      "      --rw-experimental         writable mount (images only; create,\n"
+      "                                overwrite, extend, truncate, delete, rename,\n"
+      "                                links, symlinks, xattrs and reflinks)\n"
       "  journal <device|image>        dump the internal log structure\n"
       "      --json                    machine-readable (recovery differential)\n"
       "  mkimage <file> <size>         create a sparse test image (e.g. 300M)\n"
@@ -117,14 +118,15 @@ void PrintUsage() {
       "      [--parent]                parent pointers (implies exchange-range)\n"
       "      [--modern-default-profile] the xfsprogs 7.2 default feature set\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
-      "      --rw-experimental         writable mount (images only; files can be\n"
-      "                                created, overwritten, extended, truncated,\n"
-      "                                removed, renamed and hard-linked)\n"
+      "      --rw-experimental         writable mount (images only; create,\n"
+      "                                overwrite, extend, truncate, delete, rename,\n"
+      "                                links, symlinks, xattrs and reflinks)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
       "  --verbose                     informational output\n"
       "  --debug                       detailed parser traversal output\n"
+      "  --perf-stats                  collect I/O, journal, cache and lock counters\n"
       "  --force-unsafe-ro             allow mounting a dirty/unknown log\n"
       "  --yes-i-really-mean-it        required for destructive format\n"
       "  --help                        this message\n"
@@ -1211,7 +1213,7 @@ int CommandMount(const std::string& target, const std::string& drive,
 #ifdef XFSWIN_HAS_WINFSP
   return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
                               options.verbose || options.debug,
-                              options.rw_experimental,
+                              options.rw_experimental, options.perf_stats,
                               options.rmapbt_qualification,
                               options.reflink_qualification);
 #else
@@ -1260,6 +1262,7 @@ bool ParseU64(const std::string& text, uint64_t* out) {
 MountOptions WritableMountOptions(const Options& options) {
   MountOptions mount_options;
   mount_options.read_write = true;
+  mount_options.perf_stats = options.perf_stats;
   mount_options.allow_rmapbt_qualification =
       options.rmapbt_qualification;
   mount_options.allow_reflink_qualification =
@@ -1274,9 +1277,7 @@ int CommandPwrite(const std::string& target, const std::string& path,
                   const std::string& offset_text, const std::string& text,
                   const std::string& from_file, const Options& options) {
   if (!options.rw_experimental) {
-    std::cerr << "error: pwrite modifies the image; pass --rw-experimental to "
-                 "confirm (this build only supports overwriting existing "
-                 "allocated data, images only)\n";
+    std::cerr << "error: pwrite modifies the image; pass --rw-experimental to confirm (image files only)\n";
     return 3;
   }
   if (IsRawDevicePath(target)) {
@@ -1831,7 +1832,8 @@ int CommandRecover(const std::string& target, const Options& options) {
     return 1;
   }
   MountOptions mount_options;
-  mount_options.read_write = true;  // scans, replays and finishes the log
+  mount_options.read_write = true;
+  mount_options.perf_stats = options.perf_stats;
   // The standalone shape ends with a clean unmount record so every later
   // mount (Linux or this build) starts from a recovered, clean log.
   mount_options.clean_log_after_recovery = true;
@@ -2335,6 +2337,8 @@ int Run(const std::vector<std::string>& args) {
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
+    } else if (arg == "--perf-stats") {
+      options.perf_stats = true;
     } else if (arg == "--debug" || arg == "-d") {
       options.debug = true;
       options.verbose = true;
@@ -2435,19 +2439,14 @@ int Run(const std::vector<std::string>& args) {
     }
   }
 
-  // --rw is the eventual name for ordinary read-write mounting. It stays
-  // refused until the writer can also allocate, extend and delete: a
-  // half-working --rw would silently produce filesystems Linux rejects.
+  // --rw is the eventual stable alias. The qualified writer is still opt-in
+  // as --rw-experimental; real disks stay read-only regardless.
   if (explicit_rw) {
-    std::cerr << "error: --rw is not enabled yet. Read-write support is "
-                 "experimental and limited to in-place overwrites of existing "
-                 "data; use\n"
-                 "       xfswin mount <image> <drive> --rw-experimental\n"
-                 "       (image files only; real devices stay read-only in "
-                 "this version)\n";
+    std::cerr << "error: --rw is not enabled yet as a stable alias. Use --rw-experimental for the qualified image-file writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices stay read-only in this version.\n";
     return 3;
   }
 
+  if (options.perf_stats) xfs::PerfStats::Get().SetEnabled(true);
   log::SetLevel(options.debug ? log::Level::kDebug
                               : (options.verbose ? log::Level::kInfo
                                                  : log::Level::kWarn));
