@@ -37,9 +37,9 @@ Three layers are measured separately:
 2. **Deterministic gates** — `xfswin_perf` plus the `perf_*` unit tests. These
    assert device call counts, overlap counters, cache hits and Flush barriers,
    never absolute MB/s.
-3. **WinFsp mounted volume** — `DiskSpd` matrix and real copy/extract/delete
-   workloads from `tests/perf/README.md`. These are run in the Windows mount
-   job / locally; the core A/B numbers below do not include WinFsp IPC.
+3. **WinFsp mounted volume** — `tests/perf/run_mounted_perf.ps1` (sequential,
+   concurrent, mmap, small-file and large-directory workloads; optional DiskSpd
+   matrix). The core A/B numbers below do not include WinFsp IPC.
 
 Enable counters with `--perf-stats` or `XFSWIN_PERF_STATS=1`. The mount
 adapter prints them on unmount; `xfswin_perf --json` writes the same data as
@@ -57,14 +57,15 @@ Workload definitions are in `tests/perf/ab_benchmark.cpp`:
 
 | Workload | Baseline | PERF-1 | Ratio |
 |---|---:|---:|---:|
-| sequential new write | 248.2 MiB/s | 502.4 MiB/s | **2.02×** |
-| sequential read | 4585.8 MiB/s | 5564.1 MiB/s | 1.21× (host-cache bound) |
-| sequential overwrite | 560.9 MiB/s | 4672.1 MiB/s | **8.33×** |
-| four-file concurrent write | 561.2 MiB/s | 4999.7 MiB/s | **8.91×** |
-| small-file create/write/read/delete | 0.518 MiB/s | 0.837 MiB/s | **1.61×** |
+| sequential new write | 241.1 MiB/s | 467.7 MiB/s | **1.94×** |
+| sequential read | 3019.2 MiB/s | 3370.6 MiB/s | 1.12× (host-cache bound) |
+| sequential overwrite | 515.6 MiB/s | 3277.8 MiB/s | **6.36×** |
+| four-file concurrent write | 515.3 MiB/s | 5940.7 MiB/s | **11.53×** |
+| small-file create/write/read/delete | 0.472 MiB/s | 0.749 MiB/s | **1.59×** |
 
 Raw run-to-run spread is large for the host-cache workloads (especially read);
-the table uses medians. The deterministic counters are the reliable result:
+the table uses the median of the five runs in `out/perf-ab-final5/ab.json`.
+The deterministic counters are the reliable result:
 
 | Counter | Baseline | PERF-1 |
 |---|---:|---:|
@@ -75,7 +76,8 @@ the table uses medians. The deterministic counters are the reliable result:
 | four-file workload: max concurrent device writes | 1 | 4 |
 | four-file workload: max concurrent core writes | 1 | 4 |
 | 1000 small files: device writes | 36000 | 36000 |
-| 1000 small files: wall time | 7.6 s | 4.6 s |
+| 1000 small files: wall time | 8.28 s | 5.22 s |
+| 1000 small files: directory-cache misses | one full parse per operation | 2 total |
 
 Interpretation:
 
@@ -93,12 +95,65 @@ Interpretation:
   at the block device. Baseline showed `max_concurrent_writes = 1`; PERF-1
   shows 4.
 - Small files remain metadata/transaction bound: device I/O counts are
-  unchanged. The win is batched metadata write-back (one metadata flush at a
-  durability boundary instead of one per transaction) and the adapter no
-  longer flushes/purges the whole cache on every close by default.
+  unchanged. The win is batched metadata write-back, incremental directory
+  cache updates (a create/unlink loop no longer re-reads the whole directory),
+  and the adapter no longer flushing/purging the whole cache on every close by
+  default.
 - Sequential read already read one run per extent and needed no rescaling;
   PERF-1 added cross-extent coalescing for adjacent physical runs and keeps
   the data cache. No regression.
+
+## WinFsp mounted-volume result
+
+`tests/perf/run_mounted_perf.ps1` mounts a fresh 1 GiB image on WinFsp 2.1 and
+runs the ordinary callbacks (cached I/O, not the core API). This is a single
+local run on the machine above, not a hosted-runner hard gate; `perf.json`,
+`perf.txt` and the mount logs are the artifact. The values are representative
+of the driver path, not a promise for another SSD.
+
+| Workload | Result |
+|---|---:|
+| 8 MiB sequential write (one `WriteAllBytes`) | 598.3 MiB/s, 13.4 ms |
+| 8 MiB sequential read | 1186.3 MiB/s, 6.7 ms |
+| 8 MiB sequential overwrite (1 MiB writes) | 497.1 MiB/s, 16.1 ms |
+| 4 × 4 MiB concurrent writes | 576.2 MiB/s aggregate, 27.8 ms |
+| 1000 × create + 4 KiB write | 4.10 s (4.10 ms/file, p95 4.92 ms) |
+| 1000 × 4 KiB read | 173 ms (p95 0.24 ms) |
+| 1000 × `Remove-Item -Force` | 3.00 s (3.00 ms/file, p95 3.66 ms) |
+| 5000 empty creates in one directory | 14.6 s (2.91 ms/file) |
+| 5000-entry directory, cold / warm list | 5.1 ms / 3.2 ms |
+| 5000 × delete in one directory | 18.2 s (3.63 ms/file) |
+| 64 MiB host-to-volume copy | 295 MiB/s, 217 ms |
+| mmap 4 KiB write / 1 MiB read | 14.6 ms / 285 MiB/s |
+
+The mounted run reported `max_concurrent_writes = 2` and
+`max_concurrent_device_writes = 2` for four writer threads on this host;
+the core A/B run (which excludes WinFsp's queue) reported 4. The difference is
+the Windows I/O manager/cache path, not a global filesystem lock: the core and
+device counters both exceed one. `xfswin check` after the run reported
+17 ok / 0 warnings / 0 corrupt / 0 unsupported.
+
+Driver-experience fixes verified through the mounted volume:
+
+- `SupportsPosixUnlinkRename = 1`: PowerShell 7's POSIX-style delete reaches the
+  adapter's open-but-unlinked path instead of returning `STATUS_NOT_SUPPORTED`.
+- `SetBasicInfo` applies timestamp transactions and maps the Windows read-only
+  attribute to the POSIX write bits (type bits are preserved), so
+  `Remove-Item -Force` and Explorer's read-only toggle reach a real on-disk
+  mode update instead of returning `STATUS_NOT_SUPPORTED`.
+- Close-time purge remains off by default, and the mounted copy/small-file
+  results confirm that cached I/O stays coherent without it.
+
+The 5000-entry create loop is a regression test for a real cache cliff: before
+the incremental directory-cache fix, the same local create loop took 79 s
+(15.8 ms/file) and delete took 100 s; after the fix it took 14.6 s and 18.2 s
+on the same host. The deterministic test only requires that the loop does not
+miss the directory cache once per create; the absolute times are diagnostics.
+
+`DiskSpd` was not installed on this machine, so the DiskSpd matrix in
+`tests/perf/README.md` is not claimed as measured here. The mounted script runs
+the same matrix automatically when `-DiskSpd <path>` or `diskspd.exe` on
+`PATH` is supplied and records each raw output file.
 
 ## Deterministic gates in CI/tests
 
@@ -106,12 +161,19 @@ Interpretation:
 
 - a 1 MiB contiguous read uses at most 4 device reads (not 256);
 - a 1 MiB overwrite issues at most 2 large device writes;
+- adjacent physical extents on the in-place fast path become one mapping;
+- a misaligned overwrite preserves the bytes outside the requested range;
 - independent inodes overlap (`max_concurrent_writes >= 2`, device overlap
   `>= 2`), while two writers to the same inode stay at `1`;
+- concurrent appends to one inode resolve EOF under the inode lock and do not
+  lose bytes or produce a torn size;
 - allocation-size preallocation creates unwritten extents with
   `FileSize == 0`, reads return zero and EOF does not move;
 - a deferred timestamp is visible immediately and is committed by `Flush`;
-- a warm directory enumeration hits the directory cache with no device read.
+- a warm directory enumeration hits the directory cache with no device read;
+- a 2000-file create/unlink loop does not miss the directory cache per create;
+- a real `ImageBlockDevice` performs concurrent positioned writes, flushes and
+  reads back every thread's range.
 
 `tests/perf/perf_main.cpp` adds:
 
@@ -129,18 +191,22 @@ gates.
 
 See `docs/LOCKING.md` for the full hierarchy. Summary:
 
-- `write_barrier_`: shared for ordinary data writes, exclusive for namespace,
-  truncate/reflink, Flush and deferred-metadata commit.
+- `write_barrier_`: shared for ordinary data writes, `SetFileTimes` and deferred
+  timestamp commits; exclusive for namespace, truncate/reflink and Flush.
 - 4096 inode mutex stripes: same inode serializes; different inodes write in
   parallel.
 - `mutation_mutex_`: journal position, log/metadata transaction state and
   superblock counters; never held across a data transfer.
 - `ImageBlockDevice`: `FILE_FLAG_OVERLAPPED` positioned I/O; independent ranges
   run concurrently. `Flush` is a barrier (waits for earlier writes, excludes
-  new ones during the durable flush), not a global write lock.
+  new ones during the durable flush), not a global write lock. `LastError()` is
+  copied under a lock because failures can occur on several I/O threads.
 - Adapter: bounded LRU path memo and directory-children memo, targeted
-  invalidation, immutable `FileNode` snapshots, extent reparse only when
-  `ExtentGeneration(ino)` changes.
+  invalidation, lock-guarded `FileNode` snapshots copied under `node_mutex`,
+  extent reparse only when `ExtentGeneration(ino)` changes.
+- Core directory cache: one full parse per cold directory, then incremental
+  add/remove for one-name namespace operations; a create/unlink loop no longer
+  re-reads the whole directory per entry.
 
 ## Windows cache integration
 
@@ -156,15 +222,20 @@ See `docs/LOCKING.md` for the full hierarchy. Summary:
 - `FlushFileBuffers` still reaches the `Flush` callback and remains a real
   durability barrier: pending timestamps are committed, then the device is
   flushed. A failed flush is reported, never swallowed.
+- `SupportsPosixUnlinkRename` is enabled because the adapter already supports
+  open-but-unlinked files and open-handle rename. This lets Windows/PowerShell
+  POSIX-style deletes reach the normal Cleanup path.
+- `SetBasicInfo` now applies atime/mtime/ctime transactions and accepts the
+  read-only attribute no-op used by `Remove-Item -Force` (the POSIX mode remains
+  authoritative; changing mode itself is not part of PERF-1).
 - `FspFileSystemStartDispatcher(winfsp, 0)` is unchanged; WinFsp chooses its
   worker count from the I/O queues. Do not hardcode 64 threads without a
   measured need.
 
-Because this machine does not have the WinFsp driver installed, the
-close-time policy change is verified by code path and by the mount job's copy
-workload, not by the core A/B numbers above. The old and new values are both
-one environment variable away, so the mount job can A/B them on the same
-runner.
+The mounted measurements above were made with the WinFsp 2.1 runtime installed;
+`tests/perf/run_mounted_perf.ps1` refuses to mount over an existing drive and
+uses a fresh image every run. The close-time policy and POSIX-delete behavior
+are exercised by that script's real `Remove-Item -Force`/copy workload.
 
 ## Durability model (unchanged, now batched)
 
@@ -192,14 +263,15 @@ rmap/refcount/parent oracles remain the correctness gate.
    unlink still each commit a log record. Metadata flushing is now batched,
    but one log fsync per transaction remains. A future transaction-coalescing
    layer (or combining allocation + conversion for small extensions) is the
-   next win.
+   next win. The mounted 5000-create run also showed roughly 115 device reads
+   per empty create, so metadata-block caching is the other large lever.
 2. **Metadata block cache.** A cold inode/AG/btree read still crosses the
-   block-device abstraction (the host NTFS cache helps). Add a bounded,
-   generation-invalidated metadata block cache before considering
-   read-ahead.
+   block-device abstraction (the host NTFS cache helps). A bounded,
+   generation-invalidated metadata block cache is the next measured step.
 3. **Namespace writer parallelism.** Create/unlink/rename remain behind the
    exclusive write barrier. That is intentional for PERF-1; parallel
-   namespace writers need a separate lock-order proof.
+   namespace writers need a separate lock-order proof. The incremental
+   directory cache removed the quadratic re-read, not the global serialization.
 4. **AG allocation concurrency.** Allocator state is transaction-local and
    all metadata transactions share `mutation_mutex_`. Different-AG allocation
    could build in parallel, but journal append/commit must stay ordered.
@@ -211,14 +283,19 @@ rmap/refcount/parent oracles remain the correctness gate.
    sleep window.
 7. **Adaptive COW chunk size / preallocation policy.** `kCowChunkBlocks=64`
    and the 8 MiB sequential lookahead are measured defaults, not tuned per
-   block size or extent layout. Profile before changing.
+   block size or extent layout. `SetAllocationSize` hints are now applied in
+   256 MiB transactions with a free-space reserve; profile the policy on a
+   larger image before increasing the chunk.
 8. **CRC / CPU.** CRC32c is still the portable implementation. Profile with
    WPR/ETW before adding SSE4.2/ARM64 instructions; the image workloads here
    are not CPU-bound enough to justify the complexity yet.
 9. **WinFsp read-directory / Explorer amplification.** Path and directory
-   caches are bounded LRU now, but the mounted-volume `GetFileInfo` /
-   `ReadDirectory` callback counts still need a WPR trace against a 50k-entry
-   directory and Explorer refresh.
+   caches are bounded LRU now, and a 5000-entry warm list is ~5 ms, but the
+   mounted-volume `GetFileInfo` / `ReadDirectory` callback counts still need a
+   WPR trace against a 50k-entry directory and Explorer refresh.
+10. **DiskSpd matrix not measured here.** The optional matrix is implemented
+    in `run_mounted_perf.ps1`, but DiskSpd was not installed on this machine.
+    The A/B medians and deterministic counters above are unaffected.
 
 ## Reproducing
 
@@ -228,6 +305,11 @@ pwsh tests/perf/run_core_perf.ps1 -SmallFiles 1000 -OutDir out/perf
 
 # A/B (baseline-compatible runner built against origin/main)
 pwsh tests/perf/run_ab.ps1 -BaselineExe ... -PerfExe ... -Xfswin ... -Runs 3
+
+# mounted WinFsp layer (requires the WinFsp runtime; optional DiskSpd)
+pwsh tests/perf/run_mounted_perf.ps1 `
+  -Xfswin build/src/RelWithDebInfo/xfswin.exe `
+  -OutDir out/perf-mounted -SmallFiles 1000 -LargeDirFiles 5000
 
 # unit/perf gates
 build\tests\RelWithDebInfo\xfs_tests.exe --filter=perf_

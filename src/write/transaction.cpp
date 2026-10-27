@@ -672,8 +672,10 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         std::memory_order_relaxed);
     perf.metadata_write_bytes.fetch_add(metadata_bytes,
                                         std::memory_order_relaxed);
-    perf.journal_flushes.fetch_add(txn.writes_.empty() ? 1 : 2,
-                                   std::memory_order_relaxed);
+    // One durable log flush per commit. Metadata write-back is deliberately
+    // batched until Flush/log-wrap/clean-unmount, so it is not a second log
+    // barrier; device_flush_calls records the actual barriers.
+    perf.journal_flushes.fetch_add(1, std::memory_order_relaxed);
   }
 
   for (const TransactionWrite& write : txn.writes_) {

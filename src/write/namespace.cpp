@@ -396,7 +396,7 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
     return inodes.Commit();
   });
   if (!status.ok()) return status.error();
-  InvalidateCaches(CacheInvalidation::Directory(parent_ino));
+  CacheDirectoryAdd(parent_ino, name, child_ino, d::kFtRegFile);
   InvalidateCaches(CacheInvalidation::Inode(parent_ino));
   InvalidateCaches(CacheInvalidation::Inode(child_ino));
   XFS_DEBUG("created '" << name << "' in " << parent_ino << " -> "
@@ -517,7 +517,7 @@ Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
     return inodes.Commit();
   });
   if (!status.ok()) return status;
-  InvalidateCaches(CacheInvalidation::Directory(parent_ino));
+  CacheDirectoryAdd(parent_ino, name, child_ino, d::kFtDir);
   InvalidateCaches(CacheInvalidation::Inode(parent_ino));
   InvalidateCaches(CacheInvalidation::Inode(child_ino));
   XFS_DEBUG("mkdir '" << name << "' in " << parent_ino << " -> " << child_ino);
@@ -720,7 +720,7 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
     return OkStatus();
   });
   if (!status.ok()) return status;
-  InvalidateCaches(CacheInvalidation::Directory(parent_ino));
+  CacheDirectoryRemove(parent_ino, name);
   InvalidateCaches(CacheInvalidation::Inode(parent_ino));
   InvalidateCaches(CacheInvalidation::Extents(ino));
   // An unlinked directory's ".." was repointed; its own cached listing (read
@@ -1615,7 +1615,13 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
   });
   if (!status.ok()) return status;
 
-  InvalidateCaches(CacheInvalidation::Directory(dst_parent));
+  auto linked = OpenInode(ino);
+  if (linked.ok()) {
+    CacheDirectoryAdd(dst_parent, dst_name, ino,
+                      FtypeForMode(linked.value().mode));
+  } else {
+    InvalidateCaches(CacheInvalidation::Directory(dst_parent));
+  }
   InvalidateCaches(CacheInvalidation::Inode(dst_parent));
   InvalidateCaches(CacheInvalidation::Inode(ino));
   XFS_DEBUG("link " << ino << " -> " << dst_parent << ":'" << dst_name << "'");
@@ -1836,7 +1842,7 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
   });
   if (!status.ok()) return status.error();
 
-  InvalidateCaches(CacheInvalidation::Directory(parent_ino));
+  CacheDirectoryAdd(parent_ino, name, child_ino, d::kFtSymlink);
   InvalidateCaches(CacheInvalidation::Inode(parent_ino));
   InvalidateCaches(CacheInvalidation::Inode(child_ino));
   XFS_DEBUG("symlink '" << name << "' in " << parent_ino << " -> " << child_ino

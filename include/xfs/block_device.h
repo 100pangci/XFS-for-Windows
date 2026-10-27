@@ -15,7 +15,9 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <utility>
 
 namespace xfs {
 
@@ -54,10 +56,22 @@ class BlockDevice {
   // Releases the underlying handle. Safe to call multiple times.
   virtual void Close() = 0;
 
-  // Last backend error, for diagnostics.
-  const std::string& LastError() const { return last_error_; }
+  // Last backend error, for diagnostics. The value is copied under a lock:
+  // positioned I/O may fail on several threads at once, and callers must never
+  // observe a torn std::string. Diagnostics are inherently "last error wins";
+  // successful I/O does not clear it.
+  std::string LastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    return last_error_;
+  }
 
  protected:
+  void SetError(std::string message) const {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    last_error_ = std::move(message);
+  }
+
+  mutable std::mutex error_mutex_;
   mutable std::string last_error_;
 };
 

@@ -49,7 +49,10 @@ prototype into a usable driver:
   allocation-size hint) without moving EOF;
 - metadata write-back is flushed in batches while the WAL record itself is
   still flushed before metadata, and deferred timestamps are published at
-  `FlushFileBuffers`/close/unmount.
+  `FlushFileBuffers`/close/unmount;
+- WinFsp POSIX unlink/rename semantics are enabled, and Windows read-only
+  attribute/timestamp changes go through normal metadata transactions, so
+  Explorer and PowerShell delete/replace work without a special path.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the baseline, A/B method,
 deterministic I/O-call gates and remaining bottlenecks, and
@@ -322,11 +325,13 @@ Platform-independent XFS core (C++20, no WinFsp dependency)
 Block device abstraction: image file, Windows raw device, memory (tests)
 ```
 
-Every metadata mutation goes through a transaction that emits a log record,
-flushes it, then writes and flushes the metadata buffers it describes. Large
-transactions are split at 32 KiB record boundaries with `CONTINUE`/`WAS_CONT`
-up to `XLOG_MAX_RECORD_BSIZE`. The on-disk LSN stamp lets replay skip newer
-buffers.
+Every metadata mutation goes through a transaction that emits a log record and
+flushes it before writing the metadata buffers it describes. Metadata
+write-back is batched until a durability boundary (Flush, clean unmount or log
+wrap), with the log tail pinned to the oldest unflushed transaction; the WAL
+record itself is never deferred. Large transactions are split at 32 KiB record
+boundaries with `CONTINUE`/`WAS_CONT` up to `XLOG_MAX_RECORD_BSIZE`. The
+on-disk LSN stamp lets replay skip newer buffers.
 
 ## Current limitations
 

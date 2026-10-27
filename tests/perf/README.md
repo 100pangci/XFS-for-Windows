@@ -6,7 +6,7 @@ Three layers, deliberately measured separately:
 |---|---|---|
 | core block device | `xfswin_perf` (device counters) | positioned I/O is coalesced and concurrent |
 | core filesystem | `ab_benchmark.cpp` | allocation, extents, journal and cache behaviour |
-| WinFsp mounted filesystem | `DiskSpd` + real workload scripts | end-to-end Windows driver experience |
+| WinFsp mounted filesystem | `run_mounted_perf.ps1` (+ optional DiskSpd) | end-to-end Windows driver experience |
 
 Absolute MB/s is only meaningful on the same machine, in the same power
 state, with the same image on the same filesystem. The deterministic gates
@@ -62,7 +62,34 @@ pwsh tests/perf/run_ab.ps1 `
 
 `out/perf-ab/ab.json` contains `baseline`, `perf1` and `ratio` maps.
 
-## DiskSpd matrix (mounted WinFsp volume)
+## Mounted WinFsp layer
+
+Install the WinFsp runtime first. The script refuses to mount over an existing
+drive letter, formats a fresh image, runs through the real callbacks, unmounts,
+and finishes with `xfswin check`:
+
+```powershell
+pwsh tests/perf/run_mounted_perf.ps1 `
+  -Xfswin build\src\RelWithDebInfo\xfswin.exe `
+  -OutDir out\perf-mounted -SmallFiles 1000 -LargeDirFiles 5000 `
+  -SequentialMiB 8 -ConcurrentFiles 4 -ConcurrentMiB 4
+```
+
+It records sequential write/read/overwrite, four concurrent files, 4 KiB
+create/read/delete with p50/p95/p99, cold/warm enumeration of a 5000-entry
+directory, a 64 MiB host-to-volume copy, and mmap read/write. Artifacts:
+`perf.json`, `perf.txt`, `mount-stderr.log` (the `--perf-stats` report),
+`mount-stdout.log`, and the per-command DiskSpd text when enabled. Absolute
+MB/s is diagnostic; the deterministic counters and the final `xfswin check`
+are the gate.
+
+If DiskSpd is on `PATH`, or `-DiskSpd C:\tools\diskspd.exe` is supplied, the
+script also runs the sequential/random mixed matrix below (10 seconds per row
+by default) and saves each raw output. A 4-thread result equal to 1 thread is
+still a failure even if MB/s looks good; `perf_stats.max_concurrent_writes`
+must exceed one.
+
+## DiskSpd matrix (manual form)
 
 Install DiskSpd separately. The matrix is intentionally run against files on
 the mounted X: volume, not the image:

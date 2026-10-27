@@ -73,6 +73,10 @@ void PerfStats::Reset() {
   zero(inode_lock_waits);
   zero(max_concurrent_reads);
   zero(max_concurrent_writes);
+  zero(device_active_reads);
+  zero(device_active_writes);
+  zero(max_concurrent_device_reads);
+  zero(max_concurrent_device_writes);
   zero(fs_open_calls);
   zero(fs_read_calls);
   zero(fs_write_calls);
@@ -97,15 +101,19 @@ void PerfStats::UpdatePeak(std::atomic<uint64_t>& peak, uint64_t value) {
 
 TimedLockGuard::TimedLockGuard(std::mutex& mutex)
     : lock_(mutex, std::defer_lock) {
+  // Do not pay two clock reads for every file-data write when instrumentation
+  // is off. The lock itself is unchanged.
+  if (!PerfStats::Get().enabled()) {
+    lock_.lock();
+    return;
+  }
   const uint64_t start = PerfStats::NowNanos();
   lock_.lock();
+  const uint64_t elapsed = PerfStats::NowNanos() - start;
   PerfStats& stats = PerfStats::Get();
-  if (stats.enabled()) {
-    const uint64_t elapsed = PerfStats::NowNanos() - start;
-    stats.lock_wait_count.fetch_add(1, std::memory_order_relaxed);
-    stats.lock_wait_ns.fetch_add(elapsed, std::memory_order_relaxed);
-    stats.inode_lock_waits.fetch_add(1, std::memory_order_relaxed);
-  }
+  stats.lock_wait_count.fetch_add(1, std::memory_order_relaxed);
+  stats.lock_wait_ns.fetch_add(elapsed, std::memory_order_relaxed);
+  stats.inode_lock_waits.fetch_add(1, std::memory_order_relaxed);
 }
 
 PerfStats::ReadScope::ReadScope() {
@@ -130,6 +138,30 @@ PerfStats::WriteScope::WriteScope() {
 
 PerfStats::WriteScope::~WriteScope() {
   if (active_) Get().active_writes.fetch_sub(1);
+}
+
+PerfStats::DeviceReadScope::DeviceReadScope() {
+  PerfStats& stats = Get();
+  if (!stats.enabled()) return;
+  active_ = true;
+  const uint64_t now = stats.device_active_reads.fetch_add(1) + 1;
+  stats.UpdatePeak(stats.max_concurrent_device_reads, now);
+}
+
+PerfStats::DeviceReadScope::~DeviceReadScope() {
+  if (active_) Get().device_active_reads.fetch_sub(1);
+}
+
+PerfStats::DeviceWriteScope::DeviceWriteScope() {
+  PerfStats& stats = Get();
+  if (!stats.enabled()) return;
+  active_ = true;
+  const uint64_t now = stats.device_active_writes.fetch_add(1) + 1;
+  stats.UpdatePeak(stats.max_concurrent_device_writes, now);
+}
+
+PerfStats::DeviceWriteScope::~DeviceWriteScope() {
+  if (active_) Get().device_active_writes.fetch_sub(1);
 }
 
 namespace {
@@ -169,7 +201,8 @@ std::string PerfStats::Text() const {
       << " flushes\n";
   out << "  metadata write    : " << metadata_write_calls.load()
       << " calls, " << metadata_write_bytes.load() << " bytes\n";
-  out << "  inode cache       : " << inode_cache_hits.load() << " hits, "
+  out << "  inode cache       : " << inode_opens.load() << " opens, "
+      << inode_cache_hits.load() << " hits, "
       << inode_cache_misses.load() << " misses\n";
   out << "  extent cache      : " << extent_cache_hits.load() << " hits, "
       << extent_cache_misses.load() << " misses\n";
@@ -183,7 +216,10 @@ std::string PerfStats::Text() const {
       << lock_wait_ns.load() << " ns, inode waits "
       << inode_lock_waits.load() << "\n";
   out << "  concurrency       : max reads " << max_concurrent_reads.load()
-      << ", max writes " << max_concurrent_writes.load() << "\n";
+      << ", max writes " << max_concurrent_writes.load()
+      << ", max device reads " << max_concurrent_device_reads.load()
+      << ", max device writes " << max_concurrent_device_writes.load()
+      << "\n";
   out << "  WinFsp callbacks  : Open " << fs_open_calls.load() << ", Read "
       << fs_read_calls.load() << ", Write " << fs_write_calls.load()
       << ", Flush " << fs_flush_calls.load() << ", GetFileInfo "
@@ -226,6 +262,7 @@ std::string PerfStats::Json() const {
       << "\"metadata_write_calls\":" << q(metadata_write_calls.load()) << ","
       << "\"metadata_write_bytes\":" << q(metadata_write_bytes.load()) << "},";
   out << "\"caches\":{"
+      << "\"inode_opens\":" << q(inode_opens.load()) << ","
       << "\"inode_hits\":" << q(inode_cache_hits.load()) << ","
       << "\"inode_misses\":" << q(inode_cache_misses.load()) << ","
       << "\"extent_hits\":" << q(extent_cache_hits.load()) << ","
@@ -240,7 +277,11 @@ std::string PerfStats::Json() const {
       << "\"inode_waits\":" << q(inode_lock_waits.load()) << "},";
   out << "\"concurrency\":{"
       << "\"max_reads\":" << q(max_concurrent_reads.load()) << ","
-      << "\"max_writes\":" << q(max_concurrent_writes.load()) << "},";
+      << "\"max_writes\":" << q(max_concurrent_writes.load()) << ","
+      << "\"max_device_reads\":" << q(max_concurrent_device_reads.load())
+      << ","
+      << "\"max_device_writes\":" << q(max_concurrent_device_writes.load())
+      << "},";
   out << "\"winfsp\":{"
       << "\"open\":" << q(fs_open_calls.load()) << ","
       << "\"read\":" << q(fs_read_calls.load()) << ","

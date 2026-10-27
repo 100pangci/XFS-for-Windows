@@ -109,7 +109,9 @@ XFS delayed logging, not a weaker contract.
 ### Cache leaves
 
 - `cache_mutex_`: parsed inodes, inode chunk images, `XfsFileInfo`, extent
-  lists, directory cache and extent generations.
+  lists, directory cache and extent generations. The directory cache is
+  updated incrementally after create/unlink/link/symlink when it is warm; one
+  cold `LookupName` populates the full bounded list before the hash lookup.
 - `data_mutex_`: file-data chunk cache, LRU and per-inode data generations.
 - `deferred_mutex_`: inode number → pending mtime/ctime.
 
@@ -120,11 +122,17 @@ before a mutation cannot publish a stale chunk.
 
 ### Adapter (`winfsp_adapter.cpp`)
 
-- `node_mutex`: node table, path memo, directory-children memo. It is held
-  only for hash/list operations. Inode/btree reads and writes happen after
-  releasing it (`RefreshNode`, `TakeNode`, `ResolvePathCached`).
-- `FileNode` inode/extent snapshots are immutable and published together;
-  readers hold a `shared_ptr`, so no per-node lock is needed.
+- `node_mutex`: node table, path memo, directory-children memo and the mutable
+  fields of a `FileNode` (name, parent, delete-pending). It is held only for
+  hash/list operations or for copying a small snapshot; inode/btree reads and
+  writes happen after releasing it (`RefreshNode`, `TakeNode`,
+  `ResolvePathCached`).
+- `LookupNode` copies the current inode/extent shared_ptrs and extent
+  generation under `node_mutex`; callbacks use this snapshot. This prevents a
+  concurrent `RefreshNode`/`Cleanup`/`Rename` from racing with a Read/Write/
+  GetFileInfo that borrowed the old pointers.
+- `RefreshNode` reloads the inode/extents outside `node_mutex` and only
+  publishes the result if the same node is still alive.
 - Extent reparse is avoided unless `ExtentGeneration(ino)` changed.
 
 ### Block device
@@ -140,6 +148,9 @@ before a mutation cannot publish a stale chunk.
   and excludes new writes while the barrier is held.
 - `Close` holds `lifecycle_mutex_` exclusively, so no in-flight request can
   outlive the handle.
+- Backend error text is copied under the base `BlockDevice` error lock;
+  concurrent failures can never tear `LastError()` and successful I/O does not
+  clear the last diagnostic.
 
 POSIX uses `pread`/`pwrite`/`fsync` on a file descriptor with the same lock
 semantics. The host NTFS cache is not bypassed.

@@ -873,14 +873,23 @@ The `perf_*` tests assert:
 
 - one 1 MiB read/write uses a small number of device calls, not one per 4 KiB
   block;
+- adjacent physical extents coalesce on the in-place fast path and a misaligned
+  overwrite preserves the bytes outside the requested range;
 - four independent inodes overlap in the core and at the device, while the
-  same inode remains serialized;
+  same inode remains serialized; concurrent appends resolve EOF correctly;
 - preallocation keeps EOF unchanged and reads as zero;
 - deferred timestamps are visible immediately and are committed by `Flush`;
-- a warm directory enumeration is served from cache.
+- a warm directory enumeration is served from cache and a 2000-file
+  create/unlink loop does not miss the directory cache per operation;
+- a real `ImageBlockDevice` performs concurrent positioned I/O and reads back
+  every range.
 
 `xfswin_perf` writes `perf.json`/`perf.txt`; `windows-perf-smoke` uploads them.
-The A/B runner and DiskSpd matrix are documented in `tests/perf/README.md`.
+The A/B runner and the mounted WinFsp layer are documented in
+`tests/perf/README.md`; `run_mounted_perf.ps1` needs the WinFsp runtime and
+optionally DiskSpd. It exercises ordinary `Remove-Item -Force` (POSIX-delete
+plus the read-only attribute transition), mmap, 5000-entry directories and
+concurrent writers, then runs `xfswin check`.
 The measured baseline, ratios and remaining bottlenecks are recorded in
 `docs/PERFORMANCE.md`; the lock hierarchy is in `docs/LOCKING.md`.
 

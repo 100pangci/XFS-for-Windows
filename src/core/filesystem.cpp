@@ -455,15 +455,22 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
     return inode;
   };
 
+  bool cache_hit = false;
+  XfsInode cached;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     auto it = inode_cache_.find(ino);
     if (it != inode_cache_.end()) {
-      if (perf_on) perf.inode_cache_hits.fetch_add(1, std::memory_order_relaxed);
-      XfsInode cached = it->second;
-      overlay_deferred(cached);
-      return cached;
+      cached = it->second;
+      cache_hit = true;
     }
+  }
+  if (cache_hit) {
+    if (perf_on) perf.inode_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    // Overlay after dropping cache_mutex_: deferred_mutex_ is a leaf and must
+    // not extend the inode-cache critical section.
+    overlay_deferred(cached);
+    return cached;
   }
   if (perf_on) perf.inode_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
@@ -574,6 +581,57 @@ void XfsFilesystem::CacheDirectory(uint64_t ino,
   dir_cache_.emplace(ino, std::move(cache));
 }
 
+void XfsFilesystem::CacheDirectoryAdd(uint64_t ino, std::string_view name,
+                                      uint64_t child_ino,
+                                      uint8_t ftype) const {
+  constexpr size_t kMaxCachedDirEntries = 262144;
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto it = dir_cache_.find(ino);
+  if (it == dir_cache_.end()) return;  // cold: the next lookup loads it
+  auto indexed = it->second.index.find(std::string(name));
+  if (indexed != it->second.index.end()) {
+    XfsDirEntry& entry = it->second.entries[indexed->second];
+    entry.ino = child_ino;
+    entry.ftype = ftype;
+    it->second.last_used = ++dir_cache_clock_;
+    return;
+  }
+  if (it->second.entries.size() >= kMaxCachedDirEntries ||
+      dir_cache_entries_ + 1 > kMaxCachedDirEntries) {
+    // Cannot represent the added entry without exceeding the budget. Drop the
+    // cache entry rather than leaving a false negative in the lookup index.
+    dir_cache_entries_ -= it->second.entries.size();
+    dir_cache_.erase(it);
+    return;
+  }
+  it->second.entries.push_back(
+      XfsDirEntry{std::string(name), child_ino, ftype});
+  it->second.index.emplace(std::string(name), it->second.entries.size() - 1);
+  it->second.last_used = ++dir_cache_clock_;
+  ++dir_cache_entries_;
+}
+
+void XfsFilesystem::CacheDirectoryRemove(uint64_t ino,
+                                         std::string_view name) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto it = dir_cache_.find(ino);
+  if (it == dir_cache_.end()) return;
+  auto indexed = it->second.index.find(std::string(name));
+  if (indexed == it->second.index.end()) return;
+  const size_t position = indexed->second;
+  it->second.entries.erase(it->second.entries.begin() + position);
+  // Positions after the removed entry shift down. A directory with 50k
+  // entries makes this O(n) CPU work, but it avoids the much more expensive
+  // O(n) device re-read and keeps the cache authoritative.
+  it->second.index.clear();
+  it->second.index.reserve(it->second.entries.size());
+  for (size_t i = 0; i < it->second.entries.size(); ++i) {
+    it->second.index.emplace(it->second.entries[i].name, i);
+  }
+  it->second.last_used = ++dir_cache_clock_;
+  --dir_cache_entries_;
+}
+
 Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
   uint64_t ino = geometry_.rootino;
   auto inode = OpenInode(ino);
@@ -664,6 +722,36 @@ Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
     perf.directory_cache_misses.fetch_add(1, std::memory_order_relaxed);
   }
 
+  // Populate the full directory cache (bounded by CacheDirectory) instead of
+  // doing a one-off targeted lookup. The common caller pattern is a namespace
+  // loop -- create/unlink/stat repeatedly in the same directory -- and a
+  // targeted lookup leaves the cache cold, making every iteration re-read the
+  // directory and turning a large-directory create loop quadratic. A single
+  // random lookup on a huge directory pays one bounded parse here and all
+  // following lookups are hash hits.
+  auto listed = ListDirectory(dir_ino);
+  if (!listed.ok()) return listed.error();
+  bool cache_complete = false;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = dir_cache_.find(dir_ino);
+    if (it != dir_cache_.end()) {
+      cache_complete = true;
+      auto indexed = it->second.index.find(std::string(name));
+      if (indexed != it->second.index.end()) {
+        if (perf_on) {
+          perf.directory_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return it->second.entries[indexed->second];
+      }
+    }
+  }
+  if (cache_complete) {
+    return XFS_ERR(XfsError::kNotFound, "name not found in directory")
+        .Ino(dir_ino);
+  }
+  // The directory is larger than the bounded cache budget. Fall back to the
+  // targeted on-disk lookup instead of reporting a false negative.
   auto inode = OpenInode(dir_ino);
   if (!inode.ok()) return inode.error();
   return xfs::LookupName(*device_, geometry_, inode.value(), name);
@@ -827,6 +915,15 @@ Status XfsFilesystem::CommitDeferredTimesUnderInodeLock(uint64_t ino) {
 
 Status XfsFilesystem::CommitDeferredMetadata(uint64_t ino) {
   if (!writable_) return OkStatus();
+  // Close is on the small-file hot path. Most closes have no deferred
+  // timestamp; check before taking the barrier and inode stripe. A concurrent
+  // write on another handle will publish its own timestamp at its boundary.
+  {
+    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    if (deferred_times_.find(ino) == deferred_times_.end()) {
+      return OkStatus();
+    }
+  }
   std::shared_lock<std::shared_mutex> barrier(write_barrier_);
   TimedLockGuard inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);

@@ -14,6 +14,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -21,7 +23,10 @@
 #include "support/fixture_image.h"
 #include "test_util.h"
 #include "xfs/filesystem.h"
+#include "xfs/image_device.h"
+#include "xfs/ondisk.h"
 #include "xfs/perf_stats.h"
+#include "xfs/write.h"
 
 namespace {
 
@@ -353,4 +358,191 @@ TEST(perf_warm_directory_enumeration_hits_cache) {
   CHECK_EQ(first.value().size(), second.value().size());
   CHECK(xfs::PerfStats::Get().directory_cache_hits.load() >= 1);
   CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 0u);
+}
+
+TEST(perf_create_loop_keeps_directory_cache_warm) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto made = fs.value()->Mkdir(fs.value()->RootInode(), "many", 0755, 0, 0);
+  CHECK(made.ok());
+  auto entry = fs.value()->LookupName(fs.value()->RootInode(), "many");
+  CHECK(entry.ok());
+  const uint64_t dir_ino = entry.value().ino;
+  constexpr int kFiles = 2000;
+  EnablePerf();
+  for (int i = 0; i < kFiles; ++i) {
+    auto created = fs.value()->CreateRegularFile(
+        dir_ino, "f" + std::to_string(i), 0644, 0, 0);
+    CHECK(created.ok());
+  }
+  // One initial parse, then the incremental add path keeps the same cached
+  // directory list. A miss per create would make this workload quadratic.
+  CHECK_MESSAGE(xfs::PerfStats::Get().directory_cache_misses.load() <= 2,
+                "create loop re-read the directory " +
+                    std::to_string(xfs::PerfStats::Get()
+                                       .directory_cache_misses.load()) +
+                    " times");
+  auto listing = fs.value()->ListDirectory(dir_ino);
+  CHECK(listing.ok());
+  CHECK_EQ(listing.value().size(), static_cast<size_t>(kFiles + 2));
+  for (int i = 0; i < kFiles; ++i) {
+    CHECK(fs.value()
+              ->Unlink(dir_ino, "f" + std::to_string(i),
+                       /*defer_inode_free=*/false)
+              .ok());
+  }
+  auto empty = fs.value()->ListDirectory(dir_ino);
+  CHECK(empty.ok());
+  CHECK_EQ(empty.value().size(), 2u);
+}
+
+TEST(perf_map_adjacent_extents_coalesces_fast_path) {
+  xfs::XfsGeometry geo;
+  geo.block_size = 4096;
+  geo.block_log = 12;
+  xfs::XfsInode inode;
+  inode.ino = 128;
+  inode.mode = 0100644;
+  inode.format = xfs::ondisk::inode::kFormatExtents;
+  inode.size = 32 * 1024;
+  std::vector<xfs::XfsExtent> extents;
+  extents.push_back(xfs::XfsExtent{0, 100, 4, false});
+  extents.push_back(xfs::XfsExtent{4, 104, 4, false});
+  std::vector<xfs::WriteMapping> mappings;
+  auto status = xfs::MapWrittenRange(geo, inode, extents, 0, inode.size,
+                                     &mappings);
+  CHECK(status.ok());
+  CHECK_EQ(mappings.size(), 1u);
+  CHECK_EQ(mappings[0].file_offset, 0u);
+  CHECK_EQ(mappings[0].fs_block, 100u);
+  CHECK_EQ(mappings[0].byte_count, inode.size);
+}
+
+TEST(perf_file_mode_roundtrip_preserves_type) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto created = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                               "mode.bin", 0644, 0, 0);
+  CHECK(created.ok());
+  auto readonly = fs.value()->SetFileMode(created.value(), 0444);
+  CHECK(readonly.ok());
+  CHECK_EQ(readonly.value().mode & 0777, static_cast<uint16_t>(0444));
+  CHECK_EQ(readonly.value().mode & 0170000, static_cast<uint16_t>(0100000));
+  auto writable = fs.value()->SetFileMode(created.value(), 0644);
+  CHECK(writable.ok());
+  CHECK_EQ(writable.value().mode & 0777, static_cast<uint16_t>(0644));
+  CHECK_EQ(writable.value().mode & 0170000, static_cast<uint16_t>(0100000));
+  CHECK(!fs.value()->SetFileMode(created.value(), 0040755).ok());
+}
+
+TEST(perf_misaligned_overwrite_preserves_neighbors) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto created = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                               "misaligned.bin", 0644, 0, 0);
+  CHECK(created.ok());
+  const uint64_t ino = created.value();
+  auto original = Pattern(64 * 1024, 0x11);
+  CHECK(fs.value()->WriteFileData(ino, 0, original.data(), original.size())
+            .ok());
+  auto patch = Pattern(16 * 1024, 0x77);
+  constexpr uint64_t kOffset = 100;
+  CHECK(fs.value()
+            ->WriteFileData(ino, kOffset, patch.data(), patch.size())
+            .ok());
+  std::vector<uint8_t> expected = original;
+  std::memcpy(expected.data() + kOffset, patch.data(), patch.size());
+  std::vector<uint8_t> actual(original.size());
+  auto read = fs.value()->ReadFile(ino, 0, actual.data(), actual.size());
+  CHECK(read.ok());
+  CHECK_EQ(read.value(), actual.size());
+  CHECK(actual == expected);
+}
+
+TEST(perf_same_inode_concurrent_append_serializes_eof) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto created = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                               "append.bin", 0644, 0, 0);
+  CHECK(created.ok());
+  const uint64_t ino = created.value();
+  auto a = Pattern(4096, 0x21);
+  auto b = Pattern(4096, 0x42);
+  std::atomic<int> ready{0};
+  std::atomic<bool> go{false};
+  auto append = [&](const std::vector<uint8_t>& data) {
+    ready.fetch_add(1);
+    while (!go.load()) std::this_thread::yield();
+    CHECK(fs.value()
+              ->WriteFileData(ino, 0, data.data(), data.size(),
+                              /*append=*/true)
+              .ok());
+  };
+  std::thread ta(append, std::ref(a));
+  std::thread tb(append, std::ref(b));
+  while (ready.load() < 2) std::this_thread::yield();
+  go.store(true);
+  ta.join();
+  tb.join();
+
+  auto info = fs.value()->GetFileInfo(ino);
+  CHECK(info.ok());
+  CHECK_EQ(info.value().size, a.size() + b.size());
+  std::vector<uint8_t> actual(a.size() + b.size());
+  auto read = fs.value()->ReadFile(ino, 0, actual.data(), actual.size());
+  CHECK(read.ok());
+  CHECK_EQ(read.value(), actual.size());
+  const bool ab = std::equal(a.begin(), a.end(), actual.begin()) &&
+                  std::equal(b.begin(), b.end(), actual.begin() + a.size());
+  const bool ba = std::equal(b.begin(), b.end(), actual.begin()) &&
+                  std::equal(a.begin(), a.end(), actual.begin() + b.size());
+  CHECK(ab || ba);
+}
+
+TEST(perf_image_device_concurrent_positioned_io) {
+  namespace fsys = std::filesystem;
+  const fsys::path path =
+      fsys::temp_directory_path() /
+      ("xfswin-perf-image-" +
+       std::to_string(static_cast<unsigned long long>(
+           std::chrono::steady_clock::now().time_since_epoch().count())) +
+       ".img");
+  std::string error;
+  auto device = xfs::ImageBlockDevice::Create(path, 16u << 20, 4096, &error);
+  CHECK_MESSAGE(device != nullptr, error);
+  if (!device) return;
+  constexpr int kThreads = 4;
+  constexpr size_t kBytes = 1u << 20;
+  std::vector<std::vector<uint8_t>> payload(kThreads);
+  for (int i = 0; i < kThreads; ++i) {
+    payload[i] = Pattern(kBytes, static_cast<uint8_t>(0x30 + i));
+  }
+  EnablePerf();
+  std::atomic<int> failures{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      if (!device->Write(static_cast<uint64_t>(i) * kBytes,
+                         payload[i].data(), payload[i].size())) {
+        failures.fetch_add(1);
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  CHECK_EQ(failures.load(), 0);
+  CHECK(device->Flush());
+  CHECK(xfs::PerfStats::Get().device_write_calls.load() >= kThreads);
+  std::vector<uint8_t> readback(kBytes);
+  for (int i = 0; i < kThreads; ++i) {
+    CHECK(device->Read(static_cast<uint64_t>(i) * kBytes, readback.data(),
+                       readback.size()));
+    CHECK(readback == payload[i]);
+  }
+  device->Close();
+  std::error_code ec;
+  fsys::remove(path, ec);
 }

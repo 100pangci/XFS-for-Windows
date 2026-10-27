@@ -79,6 +79,10 @@ class PerfStats {
   std::atomic<uint64_t> active_writes{0};
   std::atomic<uint64_t> max_concurrent_reads{0};
   std::atomic<uint64_t> max_concurrent_writes{0};
+  std::atomic<uint64_t> device_active_reads{0};
+  std::atomic<uint64_t> device_active_writes{0};
+  std::atomic<uint64_t> max_concurrent_device_reads{0};
+  std::atomic<uint64_t> max_concurrent_device_writes{0};
 
   // ---- WinFsp callbacks ----
   std::atomic<uint64_t> fs_open_calls{0};
@@ -120,13 +124,36 @@ class PerfStats {
    private:
     bool active_ = false;
   };
+  // Block-device level overlap. These are deliberately separate from the
+  // filesystem scopes above: a filesystem read can hit the data cache and
+  // never reach the device, and the device can be busy for metadata work.
+  class DeviceReadScope {
+   public:
+    DeviceReadScope();
+    ~DeviceReadScope();
+    DeviceReadScope(const DeviceReadScope&) = delete;
+    DeviceReadScope& operator=(const DeviceReadScope&) = delete;
+
+   private:
+    bool active_ = false;
+  };
+  class DeviceWriteScope {
+   public:
+    DeviceWriteScope();
+    ~DeviceWriteScope();
+    DeviceWriteScope(const DeviceWriteScope&) = delete;
+    DeviceWriteScope& operator=(const DeviceWriteScope&) = delete;
+
+   private:
+    bool active_ = false;
+  };
 
  private:
   PerfStats();
   void UpdatePeak(std::atomic<uint64_t>& peak, uint64_t value);
 
   std::atomic<bool> enabled_{false};
-  uint64_t started_ns_ = 0;
+  std::atomic<uint64_t> started_ns_{0};
 };
 
 // A mutex guard that records how long the caller waited for the lock. Used for

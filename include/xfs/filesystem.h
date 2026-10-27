@@ -388,6 +388,9 @@ class XfsFilesystem {
   Result<XfsFileInfo> SetFileTimes(uint64_t ino, const XfsTimestamp& atime,
                                    const XfsTimestamp& mtime,
                                    const XfsTimestamp& ctime);
+  // Changes the POSIX permission bits, preserving the file type, and updates
+  // ctime. Used by the WinFsp read-only attribute transition.
+  Result<XfsFileInfo> SetFileMode(uint64_t ino, uint16_t mode);
 
   // Writes the clean-unmount log record. Must be called before an unmount so
   // the next mount (Linux or this build) finds a clean log; it is a no-op on a
@@ -497,6 +500,13 @@ class XfsFilesystem {
     uint64_t last_used = 0;  // clock value for bounded LRU eviction
   };
   void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
+  // Incremental updates for the common one-entry namespace operations. They
+  // keep a warm directory cache current instead of dropping it after every
+  // create/unlink; dropping it makes a large-directory create loop re-read the
+  // whole directory for each entry (quadratic).
+  void CacheDirectoryAdd(uint64_t ino, std::string_view name, uint64_t child_ino,
+                         uint8_t ftype) const;
+  void CacheDirectoryRemove(uint64_t ino, std::string_view name) const;
 
   // Parsed data-fork extent list, from the extent cache or freshly loaded.
   // Shared between reads and writes so both see the same extents.

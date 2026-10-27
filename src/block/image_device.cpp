@@ -269,28 +269,29 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
   const bool perf = stats.enabled();
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
-    last_error_ = "read out of bounds";
+    SetError("read out of bounds");
     return false;
   }
+  PerfStats::DeviceReadScope device_scope;
   auto* out = static_cast<uint8_t*>(buffer);
   uint64_t pos = offset;
   size_t remaining = size;
   while (remaining > 0) {
 #ifdef _WIN32
     if (impl_->handle == INVALID_HANDLE_VALUE) {
-      last_error_ = "image not open";
+      SetError("image not open");
       return false;
     }
     std::string error;
     size_t got = PositionedTransfer<false>(impl_->handle, pos, out, remaining,
                                            &error);
     if (got == 0) {
-      last_error_ = error.empty() ? "image read made no progress" : error;
+      SetError(error.empty() ? "image read made no progress" : error);
       return false;
     }
 #else
     if (impl_->fd < 0) {
-      last_error_ = "image not open";
+      SetError("image not open");
       return false;
     }
     ssize_t got;
@@ -298,11 +299,11 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
       got = ::pread(impl_->fd, out, remaining, static_cast<off_t>(pos));
     } while (got < 0 && errno == EINTR);
     if (got < 0) {
-      last_error_ = "image read failed" + ErrnoString(errno);
+      SetError("image read failed" + ErrnoString(errno));
       return false;
     }
     if (got == 0) {
-      last_error_ = "image short read";
+      SetError("image short read");
       return false;
     }
 #endif
@@ -324,32 +325,33 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   std::shared_lock<std::shared_mutex> barrier(flush_barrier_);
   if (!info_.writable) {
-    last_error_ = "image opened read-only";
+    SetError("image opened read-only");
     return false;
   }
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
-    last_error_ = "write out of bounds";
+    SetError("write out of bounds");
     return false;
   }
+  PerfStats::DeviceWriteScope device_scope;
   const auto* in = static_cast<const uint8_t*>(buffer);
   uint64_t pos = offset;
   size_t remaining = size;
   while (remaining > 0) {
 #ifdef _WIN32
     if (impl_->handle == INVALID_HANDLE_VALUE) {
-      last_error_ = "image not open";
+      SetError("image not open");
       return false;
     }
     std::string error;
     size_t put = PositionedTransfer<true>(impl_->handle, pos, in, remaining,
                                           &error);
     if (put == 0) {
-      last_error_ = error.empty() ? "image write made no progress" : error;
+      SetError(error.empty() ? "image write made no progress" : error);
       return false;
     }
 #else
     if (impl_->fd < 0) {
-      last_error_ = "image not open";
+      SetError("image not open");
       return false;
     }
     ssize_t put;
@@ -357,11 +359,11 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
       put = ::pwrite(impl_->fd, in, remaining, static_cast<off_t>(pos));
     } while (put < 0 && errno == EINTR);
     if (put < 0) {
-      last_error_ = "image write failed" + ErrnoString(errno);
+      SetError("image write failed" + ErrnoString(errno));
       return false;
     }
     if (put == 0) {
-      last_error_ = "image write made no progress";
+      SetError("image write made no progress");
       return false;
     }
 #endif
@@ -385,18 +387,18 @@ bool ImageBlockDevice::Flush() {
   std::unique_lock<std::shared_mutex> barrier(flush_barrier_);
 #ifdef _WIN32
   if (impl_->handle == INVALID_HANDLE_VALUE) {
-    last_error_ = "image not open";
+    SetError("image not open");
     return false;
   }
   // Nothing can be dirty on a read-only image; flushing it would fail with
   // ACCESS_DENIED and turn a successful read-only session into an error.
   if (info_.writable && !FlushFileBuffers(impl_->handle)) {
-    last_error_ = "FlushFileBuffers failed" + WinErrorString(GetLastError());
+    SetError("FlushFileBuffers failed" + WinErrorString(GetLastError()));
     return false;
   }
 #else
   if (impl_->fd < 0) {
-    last_error_ = "image not open";
+    SetError("image not open");
     return false;
   }
   if (info_.writable) {
@@ -405,7 +407,7 @@ bool ImageBlockDevice::Flush() {
       rc = ::fsync(impl_->fd);
     } while (rc != 0 && errno == EINTR);
     if (rc != 0) {
-      last_error_ = "image flush failed" + ErrnoString(errno);
+      SetError("image flush failed" + ErrnoString(errno));
       return false;
     }
   }
