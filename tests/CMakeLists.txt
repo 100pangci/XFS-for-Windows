@@ -16,12 +16,15 @@ add_executable(xfs_tests
   unit/rw6c_tests.cpp
   unit/rw6d_tests.cpp
   unit/rw6e_tests.cpp
+  unit/perf_tests.cpp
   unit/recovery_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )
 
-target_link_libraries(xfs_tests PRIVATE xfs_core)
+find_package(Threads REQUIRED)
+
+target_link_libraries(xfs_tests PRIVATE xfs_core Threads::Threads)
 target_include_directories(xfs_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/..")
@@ -29,6 +32,35 @@ target_include_directories(xfs_tests PRIVATE
 if(MSVC)
   target_compile_options(xfs_tests PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
   target_compile_definitions(xfs_tests PRIVATE
+    _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# ---------------------------------------------------------------------------
+# PERF-1 core benchmark runner (no WinFsp driver required).
+# ---------------------------------------------------------------------------
+add_executable(xfswin_perf
+  perf/perf_main.cpp
+)
+target_link_libraries(xfswin_perf PRIVATE xfs_core Threads::Threads)
+target_include_directories(xfswin_perf PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(MSVC)
+  target_compile_options(xfswin_perf PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+  target_compile_definitions(xfswin_perf PRIVATE
+    _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+add_executable(xfswin_perf_ab
+  perf/ab_benchmark.cpp
+)
+target_link_libraries(xfswin_perf_ab PRIVATE xfs_core Threads::Threads)
+target_compile_definitions(xfswin_perf_ab PRIVATE XFSWIN_HAVE_DEFERRED_TIMESTAMPS=1)
+target_include_directories(xfswin_perf_ab PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(MSVC)
+  target_compile_options(xfswin_perf_ab PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+  target_compile_definitions(xfswin_perf_ab PRIVATE
     _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 

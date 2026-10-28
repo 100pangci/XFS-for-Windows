@@ -110,9 +110,28 @@ Status MapWrittenRange(const XfsGeometry& geo, const XfsInode& inode,
     // Bytes from `pos` to the end of this extent (bounded by what is left).
     const uint64_t extent_end_byte = extent->EndBlock() * block_size;
     const uint64_t run = std::min<uint64_t>(remaining, extent_end_byte - pos);
+    const uint64_t fsb = extent->startblock + (file_block - extent->startoff);
+    // Merge adjacent extents when both the file range and the physical range
+    // are contiguous. A conversion or allocation can leave several physically
+    // adjacent bmbt records; those are still one positioned write.
+    if (!out->empty()) {
+      WriteMapping& last = out->back();
+      const uint64_t last_file_end = last.file_offset + last.byte_count;
+      const uint64_t last_device_end =
+          last.fs_block * block_size +
+          (last.file_offset & (block_size - 1)) + last.byte_count;
+      const uint64_t this_device_start =
+          fsb * block_size + (pos & (block_size - 1));
+      if (last_file_end == pos && last_device_end == this_device_start) {
+        last.byte_count += run;
+        pos += run;
+        remaining -= run;
+        continue;
+      }
+    }
     WriteMapping mapping;
     mapping.file_offset = pos;
-    mapping.fs_block = extent->startblock + (file_block - extent->startoff);
+    mapping.fs_block = fsb;
     mapping.byte_count = run;
     out->push_back(mapping);
     pos += run;

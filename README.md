@@ -33,6 +33,30 @@ driver passthrough. The parser, writer, journal engine and recovery path are
 Windows code in this repository. Linux kernels and xfsprogs are used as
 external oracles in CI, never as runtime dependencies.
 
+## Performance
+
+PERF-1 (image-file read-write mount) changes the I/O path from a correctness
+prototype into a usable driver:
+
+- large physically contiguous reads and writes are coalesced into positioned
+  I/O instead of one device operation per filesystem block;
+- different files perform ordinary data I/O concurrently (per-inode locking
+  plus independent `FILE_FLAG_OVERLAPPED` image I/O); `Flush` remains a real
+  durability barrier;
+- path/directory/extent/data caches are bounded and generation-checked, and
+  the adapter reparses an inode's BMT only when its extent generation changes;
+- sequential writers use unwritten preallocation (including the Windows
+  allocation-size hint) without moving EOF;
+- metadata write-back is flushed in batches while the WAL record itself is
+  still flushed before metadata, and deferred timestamps are published at
+  `FlushFileBuffers`/close/unmount;
+- WinFsp POSIX unlink/rename semantics are enabled, and Windows read-only
+  attribute/timestamp changes go through normal metadata transactions, so
+  Explorer and PowerShell delete/replace work without a special path.
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the baseline, A/B method,
+deterministic I/O-call gates and remaining bottlenecks, and
+[docs/LOCKING.md](docs/LOCKING.md) for the lock hierarchy.
 ## Current status
 
 Three terms are used consistently below:
@@ -301,11 +325,13 @@ Platform-independent XFS core (C++20, no WinFsp dependency)
 Block device abstraction: image file, Windows raw device, memory (tests)
 ```
 
-Every metadata mutation goes through a transaction that emits a log record,
-flushes it, then writes and flushes the metadata buffers it describes. Large
-transactions are split at 32 KiB record boundaries with `CONTINUE`/`WAS_CONT`
-up to `XLOG_MAX_RECORD_BSIZE`. The on-disk LSN stamp lets replay skip newer
-buffers.
+Every metadata mutation goes through a transaction that emits a log record and
+flushes it before writing the metadata buffers it describes. Metadata
+write-back is batched until a durability boundary (Flush, clean unmount or log
+wrap), with the log tail pinned to the oldest unflushed transaction; the WAL
+record itself is never deferred. Large transactions are split at 32 KiB record
+boundaries with `CONTINUE`/`WAS_CONT` up to `XLOG_MAX_RECORD_BSIZE`. The
+on-disk LSN stamp lets replay skip newer buffers.
 
 ## Current limitations
 

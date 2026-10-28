@@ -194,7 +194,7 @@ include/xfs/log_format.h    on-disk record/op/transaction/item constants
 include/xfs/log_record.h    LogOp/LogRecordParams + BuildLogRecord (used by
 src/write/log_record.cpp    the writer *and* mkfs's clean record)
 include/xfs/transaction.h   log items + the metadata buffers they protect
-src/write/transaction.cpp   commit: record -> flush -> metadata -> flush
+src/write/transaction.cpp   commit: record -> flush -> metadata write (flush batched)
 src/write/inode_write.cpp   SetFileTimes: one inode item, one record
 src/core/log_checker.cpp    ReadLogPosition: the state a clean mount leaves
                             behind (cycle, next block, prev link, tail LSN)
@@ -209,8 +209,13 @@ Commit ordering (ordered data, then metadata, then the log tail):
 2. build the item list, stamp every metadata buffer with the LSN;
 3. write the record header block, then the data blocks, then flush - the record
    must be durable before the metadata it describes;
-4. write the metadata buffers, then flush;
-5. advance the write position, mark the log dirty, invalidate the caches.
+4. write the metadata buffers; the metadata device flush is batched until a
+   durability boundary (`Flush`, clean unmount) or log wrap;
+5. advance the write position, mark the log dirty, invalidate the caches. The
+   tail LSN stays at the oldest transaction whose metadata is not yet flushed.
+   This is XFS delayed logging: recovery replays the still-covered records if
+   power fails before the metadata flush. The log record itself is always
+   flushed before metadata is written.
 
 Every step has an injection point (`before_log_write`, `mid_log_record`,
 `after_log_commit`, `before_metadata_write`, `mid_metadata_write`,
@@ -219,9 +224,10 @@ existed. `WriteCleanUnmountRecord` closes the log at the current head with one
 unmount op; the CLI and the WinFsp unmount path both call it, so the next mount
 (Linux or this build) finds a clean log.
 
-The tail LSN of a record is the record's own LSN: every commit writes and
-flushes its metadata before the next transaction starts, so nothing older than
-the newest record can still need replaying.
+The tail LSN of a record is its own LSN unless an older transaction's
+metadata is still unflushed; then it points at the oldest such transaction.
+The tail is only advanced past a record after its metadata flush, and is
+forced forward before the log wraps or a clean unmount record is written.
 
 ## 7. Open questions, answered
 

@@ -22,6 +22,7 @@
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/log.h"
+#include "xfs/perf_stats.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
 #include "xfs/transaction.h"
@@ -437,6 +438,20 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
             .Metadata("log");
       }
     }
+    // Do not overwrite the records that still protect unflushed metadata.
+    if (metadata_flush_pending_) {
+      if (!device_->Flush()) {
+        return XFS_ERR(XfsError::kIoError,
+                       "failed to flush metadata before log wrap: " +
+                           device_->LastError())
+            .Metadata("log");
+      }
+      metadata_flush_pending_ = false;
+      if (!recovery_tail_pin_.has_value()) {
+        log_position_.tail_lsn =
+            MakeLsn(log_position_.cycle, log_position_.next_block);
+      }
+    }
     XFS_DEBUG("log: wrapping to block 0 (cycle "
               << log_position_.cycle << " -> " << log_position_.cycle + 1
               << ")");
@@ -447,6 +462,10 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
     }
   }
 
+  PerfStats& perf = PerfStats::Get();
+  if (perf.enabled()) {
+    perf.journal_transactions.fetch_add(1, std::memory_order_relaxed);
+  }
   XfsTransaction txn;
   txn.tid_ = next_tid_++;
   if (next_tid_ == 0) next_tid_ = 1;
@@ -502,9 +521,10 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     // Every piece points at the oldest record still needed. During intent
     // completion that is the pinned original recovery window, not the first
     // completion piece: a crash before COMMIT must re-replay the RUI too.
-    params.tail_lsn = recovery_tail_pin_.has_value()
-                          ? *recovery_tail_pin_
-                          : txn.lsn_;
+    params.tail_lsn =
+        recovery_tail_pin_.has_value()
+            ? *recovery_tail_pin_
+            : (metadata_flush_pending_ ? metadata_dirty_lsn_ : txn.lsn_);
     params.log_blocks = log_position_.log_blocks;
     params.record_size = lf::kDefaultRecordSize;
     params.uuid = geometry_.meta_uuid;
@@ -607,19 +627,21 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     }
   }
   if (!txn.writes_.empty()) {
-    if (!device_->Flush()) {
-      return XFS_ERR(XfsError::kIoError,
-                     "failed to flush metadata: " + device_->LastError())
-          .Metadata("transaction");
+    // Metadata is written after the durable log record. The flush is delayed
+    // until a durability boundary or log wrap: recovery replays the still
+    // protected log records if power fails before this write-back reaches
+    // stable storage. This is the XFS delayed-logging ordering, not a weaker
+    // one.
+    if (!metadata_flush_pending_) {
+      metadata_flush_pending_ = true;
+      metadata_dirty_lsn_ = txn.lsn_;
     }
     MaybeCrash(CrashPoint::kAfterMetadataWrite, TxnText(txn, "metadata"));
   }
 
-  // The transaction is durable; advance the write position. The next record's
-  // tail is its own LSN because every buffer this one logged is now on disk -
-  // unless a recovered intent is still unresolved: then the tail stays pinned
-  // to the replayed window so a crash here re-replays it (and the done item
-  // this transaction logged releases the intent).
+  // The transaction is durable (its log record was flushed above). Advance the
+  // write position. The tail stays at the oldest transaction whose metadata is
+  // not yet on stable storage, so the log cannot be reused past it.
   log_position_.next_block = block;
   log_position_.cycle = cycle;
   if (log_position_.next_block >= log_position_.log_blocks) {
@@ -627,18 +649,44 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     ++log_position_.cycle;
   }
   log_position_.prev_block = records.back().params.block;
-  log_position_.tail_lsn = recovery_tail_pin_.has_value()
-                               ? *recovery_tail_pin_
-                               : MakeLsn(log_position_.cycle,
-                                         log_position_.next_block);
+  log_position_.tail_lsn =
+      recovery_tail_pin_.has_value()
+          ? *recovery_tail_pin_
+          : (metadata_flush_pending_
+                 ? metadata_dirty_lsn_
+                 : MakeLsn(log_position_.cycle, log_position_.next_block));
   log_dirty_ = true;
   txn.started_ = false;
+
+  if (PerfStats::Get().enabled()) {
+    PerfStats& perf = PerfStats::Get();
+    perf.journal_commits.fetch_add(1, std::memory_order_relaxed);
+    perf.journal_bytes.fetch_add(txn.log_bytes(),
+                                 std::memory_order_relaxed);
+    uint64_t metadata_bytes = 0;
+    for (const TransactionWrite& write : txn.writes_) {
+      metadata_bytes += write.data.size();
+    }
+    perf.metadata_write_calls.fetch_add(
+        static_cast<uint64_t>(txn.writes_.size()),
+        std::memory_order_relaxed);
+    perf.metadata_write_bytes.fetch_add(metadata_bytes,
+                                        std::memory_order_relaxed);
+    // One durable log flush per commit. Metadata write-back is deliberately
+    // batched until Flush/log-wrap/clean-unmount, so it is not a second log
+    // barrier; device_flush_calls records the actual barriers.
+    perf.journal_flushes.fetch_add(1, std::memory_order_relaxed);
+  }
 
   for (const TransactionWrite& write : txn.writes_) {
     if (write.inode_metadata && write.ino != 0) {
       InvalidateCaches(write.data_fork_changed
                            ? CacheInvalidation::Extents(write.ino)
                            : CacheInvalidation::Inode(write.ino));
+      // Any committed inode metadata carries a timestamp of its own; an older
+      // deferred update must not overwrite it later.
+      std::lock_guard<std::mutex> deferred_lock(deferred_mutex_);
+      deferred_times_.erase(write.ino);
     }
   }
   XFS_TRACE("transaction committed: tid=" << txn.tid() << " lsn=0x" << std::hex
@@ -666,6 +714,10 @@ Status XfsFilesystem::RunTransaction(
 
 Status XfsFilesystem::WriteCleanUnmountRecord() {
   if (!writable_) return OkStatus();
+  // A clean log must not be followed by pending timestamp transactions.
+  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  Status deferred = CommitAllDeferredTimesLocked();
+  if (!deferred.ok()) return deferred;
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   if (!log_dirty_ && log_position_valid_) {
     return OkStatus();  // the log already ends with an unmount record
@@ -682,6 +734,20 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
     }
     log_position_ = position.value();
     log_position_valid_ = true;
+  }
+
+  if (metadata_flush_pending_) {
+    if (!device_->Flush()) {
+      return XFS_ERR(XfsError::kIoError,
+                     "failed to flush metadata before clean unmount: " +
+                         device_->LastError())
+          .Metadata("transaction");
+    }
+    metadata_flush_pending_ = false;
+    if (!recovery_tail_pin_.has_value()) {
+      log_position_.tail_lsn =
+          MakeLsn(log_position_.cycle, log_position_.next_block);
+    }
   }
 
   std::vector<LogOp> ops;

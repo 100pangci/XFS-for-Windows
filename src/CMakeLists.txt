@@ -8,6 +8,7 @@ add_library(xfs_core STATIC
   core/log.cpp
   core/log_checker.cpp
   core/crash.cpp
+  core/perf_stats.cpp
   core/endian.cpp
   core/crc32c.cpp
   core/verifier.cpp

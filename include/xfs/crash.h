@@ -93,6 +93,10 @@ void ReloadCrashConfig();
 // Decides whether this occurrence of `point` should crash, and counts hits.
 // Never terminates the process: unit tests use this.
 bool ShouldCrash(CrashPoint point);
+// True when the configured crash point is `point` (regardless of hit), without
+// consuming a hit. Used by coalescing code to preserve the old block-level
+// crash semantics while keeping normal I/O batched.
+bool CrashPointArmed(CrashPoint point);
 // Terminates the process when `point` is configured (see ShouldCrash). Writes
 // one line to stderr first so the harness knows where the crash happened.
 void MaybeCrash(CrashPoint point, const std::string& detail);

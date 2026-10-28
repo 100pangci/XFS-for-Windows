@@ -21,10 +21,12 @@ typedef NTSTATUS* PNTSTATUS;
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -33,6 +35,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <vector>
 
 #include "xfs/log.h"
+#include "xfs/perf_stats.h"
 #include "xfs/ondisk.h"
 #include "xfs/extent.h"
 #include "xfs/win_name_map.h"
@@ -83,9 +86,13 @@ struct AdapterState {
     // Data-fork extent list, parsed once at open for regular files so reads
     // never re-walk the BMBT.
     std::shared_ptr<const std::vector<XfsExtent>> extents;
+    // Extent-map generation the cached extent list belongs to (PERF-1). A
+    // data-only overwrite bumps the data cache generation but not this one, so
+    // Write does not reparse the BMBT after every callback.
+    uint64_t extent_generation = 0;
     uint32_t refcount = 0;
-    // Where the name lives (no rename yet, so it stays valid for the node's
-    // lifetime). Cleanup needs it for delete-on-close.
+    // Where the name lives. Rename refreshes it while the node stays open.
+    // Cleanup needs it for delete-on-close.
     uint64_t parent_ino = 0;
     std::string xfs_name;
     // Delete-on-close: Cleanup removed the namespace entry and put the inode
@@ -100,8 +107,14 @@ struct AdapterState {
 
   // Resolved WinFsp path -> inode number. Explorer queries security and then
   // opens the same file, and revisits files across refreshes; this turns the
-  // repeated path walk into one hash lookup.
-  std::unordered_map<std::wstring, uint64_t> path_inode_cache;
+  // repeated path walk into one hash lookup. Bounded LRU rather than the old
+  // "clear the whole map at 32768 entries" cache cliff.
+  struct PathCacheEntry {
+    uint64_t ino = 0;
+    std::list<std::wstring>::iterator lru;
+  };
+  std::unordered_map<std::wstring, PathCacheEntry> path_inode_cache;
+  std::list<std::wstring> path_cache_lru;  // front = most recently used
 
   // Sorted (Windows name, inode) children per directory. On a read-only mount
   // directory contents never change, so this is built once per directory and
@@ -112,16 +125,39 @@ struct AdapterState {
   // XfsFilesystem::InvalidateCaches.
   std::unordered_map<uint64_t, std::shared_ptr<const std::vector<DirChild>>>
       dir_children;
+  std::list<uint64_t> dir_children_lru;  // front = most recently used
   size_t dir_children_entries = 0;
+};
+
+// A snapshot of the immutable parts of a live file node. All fields are copied
+// while node_mutex is held, so a concurrent RefreshNode/Rename/Cleanup cannot
+// race with a Read, Write or GetFileInfo callback. The shared_ptrs keep the
+// old inode/extent image alive until the callback is done with it.
+struct NodeSnapshot {
+  std::shared_ptr<const XfsInode> inode;
+  std::shared_ptr<const std::vector<XfsExtent>> extents;
+  uint64_t extent_generation = 0;
 };
 
 uint64_t NodeId(PVOID context) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
 }
 
-// Copies the inode behind a live file node. Returns false for stale nodes.
-std::shared_ptr<AdapterState::FileNode> LookupNode(AdapterState& state,
-                                                   PVOID context) {
+// Returns the current immutable inode/extent image of a live file node.
+std::optional<NodeSnapshot> LookupNode(AdapterState& state, PVOID context) {
+  if (!context) return std::nullopt;
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  auto it = state.nodes.find(NodeId(context));
+  if (it == state.nodes.end()) return std::nullopt;
+  return NodeSnapshot{it->second->inode, it->second->extents,
+                      it->second->extent_generation};
+}
+
+// Returns the mutable node record for the few callbacks that own a mutation
+// (RefreshNode, Cleanup and Rename). Callers must not read its unguarded
+// fields without holding node_mutex.
+std::shared_ptr<AdapterState::FileNode> LookupNodeState(AdapterState& state,
+                                                        PVOID context) {
   if (!context) return nullptr;
   std::lock_guard<std::mutex> lock(state.node_mutex);
   auto it = state.nodes.find(NodeId(context));
@@ -135,6 +171,11 @@ std::shared_ptr<AdapterState::FileNode> LookupNode(AdapterState& state,
 
 AdapterState* State(FSP_FILE_SYSTEM* fs) {
   return static_cast<AdapterState*>(fs->UserContext);
+}
+
+void CountCallback(std::atomic<uint64_t>& counter) {
+  PerfStats& perf = PerfStats::Get();
+  if (perf.enabled()) counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 NTSTATUS NtFromError(XfsError code) {
@@ -238,22 +279,54 @@ Result<XfsInode> ResolvePath(XfsFilesystem& fs, PWSTR file_name) {
 // repeated opens of the same file skip the component walk.
 Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   const std::wstring key = file_name ? file_name : L"";
+  PerfStats& perf = PerfStats::Get();
+  const bool perf_on = perf.enabled();
+  uint64_t cached_ino = 0;
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
     auto it = state.path_inode_cache.find(key);
     if (it != state.path_inode_cache.end()) {
-      auto inode = state.fs->OpenInode(it->second);
-      if (inode.ok()) return inode;
+      cached_ino = it->second.ino;
+      state.path_cache_lru.splice(state.path_cache_lru.begin(),
+                                  state.path_cache_lru, it->second.lru);
+      it->second.lru = state.path_cache_lru.begin();
     }
   }
+  if (cached_ino != 0) {
+    auto inode = state.fs->OpenInode(cached_ino);
+    if (inode.ok()) {
+      if (perf_on) {
+        perf.path_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
+      return inode;
+    }
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto it = state.path_inode_cache.find(key);
+    if (it != state.path_inode_cache.end()) {
+      state.path_cache_lru.erase(it->second.lru);
+      state.path_inode_cache.erase(it);
+    }
+  }
+  if (perf_on) perf.path_cache_misses.fetch_add(1, std::memory_order_relaxed);
   auto inode = ResolvePath(*state.fs, file_name);
   if (inode.ok()) {
     std::lock_guard<std::mutex> lock(state.node_mutex);
     constexpr size_t kMaxPathCacheEntries = 32768;
-    if (state.path_inode_cache.size() >= kMaxPathCacheEntries) {
-      state.path_inode_cache.clear();
+    auto existing = state.path_inode_cache.find(key);
+    if (existing != state.path_inode_cache.end()) {
+      state.path_cache_lru.erase(existing->second.lru);
+      state.path_inode_cache.erase(existing);
     }
-    state.path_inode_cache.emplace(key, inode.value().ino);
+    while (state.path_inode_cache.size() >= kMaxPathCacheEntries &&
+           !state.path_cache_lru.empty()) {
+      const std::wstring victim = state.path_cache_lru.back();
+      state.path_cache_lru.pop_back();
+      state.path_inode_cache.erase(victim);
+    }
+    state.path_cache_lru.push_front(key);
+    state.path_inode_cache.emplace(
+        key, AdapterState::PathCacheEntry{inode.value().ino,
+                                          state.path_cache_lru.begin()});
   }
   return inode;
 }
@@ -274,34 +347,52 @@ Result<std::pair<uint64_t, std::string>> ResolveParentAndName(
         .Metadata("namespace");
   }
   parts.pop_back();
-  uint64_t parent = state.fs->RootInode();
-  auto current = state.fs->OpenInode(parent);
-  if (!current.ok()) return current.error();
-  for (const auto& part : parts) {
-    if (part == L".") continue;
-    if (!current.value().IsDir()) {
-      return XFS_ERR(XfsError::kNotDirectory,
-                     "path component is not a directory")
-          .Ino(current.value().ino);
-    }
-    auto xfs_name = WindowsNameToXfs(ToU16(part));
-    if (!xfs_name) {
-      return XFS_ERR(XfsError::kNotFound, "name is not representable")
-          .Ino(current.value().ino);
-    }
-    auto entry = state.fs->LookupName(current.value().ino, *xfs_name);
-    if (!entry.ok()) return entry.error();
-    auto next = state.fs->OpenInode(entry.value().ino);
-    if (!next.ok()) return next.error();
-    current = std::move(next);
+  // Reuse the same path memo as Open/GetSecurity: Explorer and copy loops
+  // resolve the same parent directory for every child. Building the parent
+  // path once turns the component walk into one cache hit.
+  std::wstring parent_path;
+  for (const std::wstring& part : parts) {
+    parent_path.push_back(L'\\');
+    parent_path += part;
   }
-  return std::make_pair(current.value().ino, *name);
+  if (parent_path.empty()) parent_path = L"\\";
+  auto parent = ResolvePathCached(state, parent_path.data());
+  if (!parent.ok()) return parent.error();
+  return std::make_pair(parent.value().ino, *name);
+}
+// Targeted path-memo invalidation. prefix removes every entry below a
+// directory (used when a directory is created, deleted or renamed); otherwise
+// only the exact path is removed. This replaces the old "clear every path on
+// every namespace mutation" policy.
+void DropPathCache(AdapterState& state, const std::wstring& path,
+                   bool prefix = false) {
+  if (path.empty()) return;
+  std::lock_guard<std::mutex> lock(state.node_mutex);
+  if (!prefix) {
+    auto it = state.path_inode_cache.find(path);
+    if (it != state.path_inode_cache.end()) {
+      state.path_cache_lru.erase(it->second.lru);
+      state.path_inode_cache.erase(it);
+    }
+    return;
+  }
+  const std::wstring needle =
+      (!path.empty() && path.back() == L'\\') ? path : path + L"\\";
+  for (auto it = state.path_inode_cache.begin();
+       it != state.path_inode_cache.end();) {
+    if (it->first == path || it->first.compare(0, needle.size(), needle) == 0) {
+      state.path_cache_lru.erase(it->second.lru);
+      it = state.path_inode_cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 // A namespace mutation changed the directory listing: drop the adapter's
-// per-directory listings (and the path memo, which may point at deleted or
-// renamed names). The core invalidated its own caches when the transaction
-// committed. `parent_ino` == 0 only drops the path memo.
+// per-directory listings. The path memo is invalidated separately and
+// precisely at each call site. parent_ino == 0 drops the whole path memo
+// (last-close of an unlinked inode).
 void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino,
                          uint64_t second_parent_ino = 0) {
   std::lock_guard<std::mutex> lock(state.node_mutex);
@@ -312,10 +403,13 @@ void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino,
       state.dir_children_entries -= it->second->size();
       state.dir_children.erase(it);
     }
+    state.dir_children_lru.remove(dir);
   }
-  state.path_inode_cache.clear();
+  if (parent_ino == 0 && second_parent_ino == 0) {
+    state.path_inode_cache.clear();
+    state.path_cache_lru.clear();
+  }
 }
-
 // Read-only delete validation shared by SetDelete and CanDelete: can this
 // inode be removed right now? Mirrors the checks XfsFilesystem's namespace
 // layer makes before it would modify anything.
@@ -380,6 +474,14 @@ uint64_t ToFileTime(const XfsTimestamp& ts) {
   return static_cast<uint64_t>(sec) * 10000000ULL + ts.nsec / 100;
 }
 
+XfsTimestamp FromFileTime(uint64_t file_time) {
+  constexpr int64_t kEpochOffset = 11644473600LL;  // 1601 -> 1970 seconds
+  XfsTimestamp ts;
+  ts.sec = static_cast<int64_t>(file_time / 10000000ULL) - kEpochOffset;
+  ts.nsec = static_cast<uint32_t>((file_time % 10000000ULL) * 100);
+  return ts;
+}
+
 uint32_t FileAttributesFor(const AdapterState& state, uint16_t mode) {
   uint32_t attributes = 0;
   if ((mode & 0170000) == 0040000) attributes |= FILE_ATTRIBUTE_DIRECTORY;
@@ -390,6 +492,7 @@ uint32_t FileAttributesFor(const AdapterState& state, uint16_t mode) {
   if (!state.read_write || (mode & 0222) == 0) {
     attributes |= FILE_ATTRIBUTE_READONLY;
   }
+  if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
   return attributes;
 }
 
@@ -440,17 +543,29 @@ void FillFileInfo(AdapterState& state, const XfsFileInfo& inode,
 // invalidated its caches when the transaction committed; re-reading here gives
 // WinFsp the new size, timestamp and extent map.
 void RefreshNode(AdapterState& state, uint64_t node_id) {
-  std::lock_guard<std::mutex> lock(state.node_mutex);
-  auto it = state.nodes.find(node_id);
-  if (it == state.nodes.end()) return;
-  auto inode = state.fs->OpenInode(it->second->inode->ino);
+  auto node = LookupNodeState(state, reinterpret_cast<PVOID>(
+                                        static_cast<uintptr_t>(node_id)));
+  if (!node) return;
+  uint64_t ino = 0;
+  std::shared_ptr<const std::vector<XfsExtent>> old_extents;
+  uint64_t old_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    ino = node->inode->ino;
+    old_extents = node->extents;
+    old_generation = node->extent_generation;
+  }
+  // Reload outside node_mutex: a read of the inode/btree must not block every
+  // other open/close/read-directory callback in the adapter.
+  auto inode = state.fs->OpenInode(ino);
   if (!inode.ok()) {
     XFS_ERROR("RefreshNode: cannot reload inode: " << inode.error().Format());
     return;
   }
   auto fresh = std::make_shared<const XfsInode>(std::move(inode.value()));
-  it->second->inode = fresh;
-  if (fresh->IsRegular()) {
+  std::shared_ptr<const std::vector<XfsExtent>> fresh_extents = old_extents;
+  const uint64_t generation = state.fs->ExtentGeneration(ino);
+  if (fresh->IsRegular() && generation != old_generation) {
     auto extents = std::make_shared<std::vector<XfsExtent>>();
     Status s = LoadDataForkExtents(state.fs->device(), state.fs->geometry(),
                                    *fresh, extents.get());
@@ -458,11 +573,43 @@ void RefreshNode(AdapterState& state, uint64_t node_id) {
       XFS_ERROR("RefreshNode: cannot reload extents: " << s.error().Format());
       return;
     }
-    it->second->extents =
-        std::shared_ptr<const std::vector<XfsExtent>>(std::move(extents));
-  } else {
-    it->second->extents.reset();
+    fresh_extents = std::shared_ptr<const std::vector<XfsExtent>>(
+        std::move(extents));
   }
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    auto it = state.nodes.find(node_id);
+    if (it == state.nodes.end() || it->second != node) return;
+    node->inode = std::move(fresh);
+    node->extents = std::move(fresh_extents);
+    node->extent_generation = generation;
+  }
+}
+// Windows sends SetAllocationSize/AllocationSize hints for the copy path. Honor
+// them with bounded transactions so a multi-gigabyte hint does not create one
+// enormous log record. Preallocation is an optimization: ENOSPC or an IO error
+// stops the hint but does not fail the create/write, which can still allocate
+// on demand. The reserved eighth keeps normal writes from being starved.
+Status PreallocateHint(XfsFilesystem& fs, uint64_t ino, uint64_t size) {
+  if (size == 0) return OkStatus();
+  constexpr uint64_t kChunkBytes = 256ull << 20;
+  const uint64_t block_size = fs.geometry().block_size;
+  const uint64_t free_blocks = fs.superblock().fdblocks;
+  uint64_t limit = size;
+  if (free_blocks > 0 && block_size > 0 &&
+      free_blocks <= (UINT64_MAX / block_size)) {
+    const uint64_t free_bytes = free_blocks * block_size;
+    const uint64_t usable = free_bytes - free_bytes / 8;
+    if (usable < limit) limit = usable;
+  }
+  for (uint64_t offset = 0; offset < limit; offset += kChunkBytes) {
+    const uint64_t length =
+        std::min<uint64_t>(kChunkBytes, limit - offset);
+    auto pre =
+        fs.AllocateUnwritten(ino, offset, length, /*keep_size=*/true);
+    if (!pre.ok()) return pre.error();
+  }
+  return OkStatus();
 }
 
 // Registers an open file node for `inode` (the WinFsp file-context model:
@@ -494,6 +641,7 @@ Result<PVOID> TakeNode(AdapterState& state, XfsInode inode, uint64_t parent_ino,
       auto entry = std::make_shared<AdapterState::FileNode>();
       entry->inode = node;
       entry->extents = std::move(extents);
+      entry->extent_generation = state.fs->ExtentGeneration(node->ino);
       entry->refcount = 1;
       entry->parent_ino = parent_ino;
       entry->xfs_name = std::move(xfs_name);
@@ -597,8 +745,9 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
 NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
                 UINT32 create_options, UINT32 /*granted_access*/,
                 UINT32 /*file_attributes*/, PSECURITY_DESCRIPTOR /*security*/,
-                UINT64 /*allocation_size*/, PVOID* file_context,
+                UINT64 allocation_size, PVOID* file_context,
                 FSP_FSCTL_FILE_INFO* file_info) {
+  CountCallback(PerfStats::Get().fs_create_calls);
   AdapterState& state = *State(file_system);
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
   // The FSD only calls Create when the target must be created: FILE_CREATE
@@ -621,6 +770,18 @@ NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
     auto created = state.fs->CreateRegularFile(parent_ino, name, 0644, 0, 0);
     if (!created.ok()) return NtFromError(created.error().code);
     ino = created.value();
+    // AllocationSize is a real hint from the Windows copy path. Preallocate
+    // unwritten extents without moving EOF; a later write converts only the
+    // blocks it actually writes. Failure to preallocate is not fatal (the
+    // write path can still allocate on demand), so log and continue.
+    if (allocation_size > 0) {
+      Status pre = PreallocateHint(*state.fs, ino, allocation_size);
+      if (!pre.ok()) {
+        XFS_WARN("Create: preallocation of " << allocation_size
+                                             << " bytes failed: "
+                                             << pre.error().Format());
+      }
+    }
   }
   auto inode = state.fs->OpenInode(ino);
   if (!inode.ok()) return NtFromError(inode.error().code);
@@ -631,12 +792,15 @@ NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   if (!info.ok()) return NtFromError(info.error().code);
   FillFileInfo(state, info.value(), file_info);
   DropNamespaceCaches(state, parent_ino);
+  DropPathCache(state, file_name ? std::wstring(file_name) : std::wstring(),
+                directory);
   return STATUS_SUCCESS;
 }
 
 NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
               UINT32 create_options, UINT32 /*granted_access*/,
               PVOID* file_context, FSP_FSCTL_FILE_INFO* file_info) {
+  CountCallback(PerfStats::Get().fs_open_calls);
   AdapterState& state = *State(file_system);
   if (SplitPath(file_name).empty()) {
     // The root directory itself: no parent, never deletable.
@@ -700,7 +864,8 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
 }
 
 NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32,
-                   BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO* file_info) {
+                   BOOLEAN, UINT64 allocation_size,
+                   FSP_FSCTL_FILE_INFO* file_info) {
   AdapterState& state = *State(file_system);
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
   auto node = LookupNode(state, file_context);
@@ -709,6 +874,14 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32,
   if (!node->inode->IsRegular()) return STATUS_NOT_SUPPORTED;
   auto info = state.fs->SetFileSize(node->inode->ino, 0);
   if (!info.ok()) return NtFromError(info.error().code);
+  if (allocation_size > 0) {
+    Status pre = PreallocateHint(*state.fs, node->inode->ino, allocation_size);
+    if (!pre.ok()) {
+      XFS_WARN("Overwrite: preallocation of " << allocation_size
+                                              << " bytes failed: "
+                                              << pre.error().Format());
+    }
+  }
   RefreshNode(state, NodeId(file_context));
   auto refreshed = LookupNode(state, file_context);
   if (refreshed) FillFileInfo(state, *refreshed->inode, file_info);
@@ -717,15 +890,39 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32,
 
 VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
              ULONG flags) {
+  CountCallback(PerfStats::Get().fs_cleanup_calls);
   AdapterState& state = *State(file_system);
-  if (0 == (flags & FspCleanupDelete) || !state.read_write) return;
-  auto node = LookupNode(state, file_context);
-  if (!node || node->delete_pending) return;
+  if (!state.read_write) return;
+  auto node = LookupNodeState(state, file_context);
+  if (!node) return;
+  uint64_t ino = 0;
+  bool is_dir = false;
+  bool delete_pending = false;
+  uint64_t parent_ino = 0;
+  std::string name;
+  {
+    std::lock_guard<std::mutex> lock(state.node_mutex);
+    ino = node->inode->ino;
+    is_dir = node->inode->IsDir();
+    delete_pending = node->delete_pending;
+    parent_ino = node->parent_ino;
+    name = node->xfs_name;
+  }
+  if (0 == (flags & FspCleanupDelete)) {
+    // Normal close: publish the deferred mtime/ctime. The timestamp is
+    // already visible through the cached inode since the write; this is the
+    // transaction that makes it durable at the ordinary close boundary.
+    Status published = state.fs->CommitDeferredMetadata(ino);
+    if (!published.ok()) {
+      XFS_ERROR("Cleanup: deferred timestamp commit failed: "
+                << published.error().Format());
+    }
+    return;
+  }
+  if (delete_pending) return;
   // The FSD sends FileName with a delete request. The namespace removal is
   // one transaction; the inode stays on the AGI unlinked list until the last
   // Close, so open handles keep working (xfs_remove + xfs_inactive).
-  uint64_t parent_ino = node->parent_ino;
-  std::string name = node->xfs_name;
   if (file_name != nullptr && *file_name != L'\0') {
     auto resolved = ResolveParentAndName(state, file_name);
     if (resolved.ok()) {
@@ -734,7 +931,7 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
     }
   }
   Status status;
-  if (node->inode->IsDir()) {
+  if (is_dir) {
     status = state.fs->RemoveEmptyDirectory(parent_ino, name,
                                             /*defer_inode_free=*/false);
   } else {
@@ -743,7 +940,7 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
   if (!status.ok()) {
     // CanDelete / SetDelete validated this beforehand; a failure here cannot
     // be reported through the WinFsp interface.
-    XFS_ERROR("Cleanup(delete, ino=" << node->inode->ino
+    XFS_ERROR("Cleanup(delete, ino=" << ino
                                      << ") failed: " << status.error().Format());
     return;
   }
@@ -751,22 +948,27 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
   // other hard links the inode stays fully reachable and nothing is yours to
   // release here.
   bool deferred = false;
-  if (!node->inode->IsDir()) {
-    auto fresh = state.fs->OpenInode(node->inode->ino);
+  if (!is_dir) {
+    auto fresh = state.fs->OpenInode(ino);
     deferred = fresh.ok() && fresh.value().nlink == 0;
   }
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
-    node->delete_pending = deferred;
+    auto it = state.nodes.find(NodeId(file_context));
+    if (it != state.nodes.end() && it->second == node) {
+      node->delete_pending = deferred;
+    }
   }
   DropNamespaceCaches(state, parent_ino);
+  DropPathCache(state, file_name ? std::wstring(file_name) : std::wstring(),
+                is_dir);
   XFS_DEBUG("deleted " << name << " in " << parent_ino
-                       << (node->inode->IsDir() ? " (directory)" : "")
-                       << "; inode " << node->inode->ino
+                       << (is_dir ? " (directory)" : "") << "; inode " << ino
                        << (deferred ? " freed at last close" : " freed"));
 }
 
 VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
+  CountCallback(PerfStats::Get().fs_close_calls);
   AdapterState& state = *State(file_system);
   if (!file_context) return;
   // One reference per Open. The node is destroyed when the last one goes away
@@ -797,6 +999,7 @@ VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
 NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
               PVOID buffer, UINT64 offset, ULONG length,
               PULONG bytes_transferred) {
+  CountCallback(PerfStats::Get().fs_read_calls);
   AdapterState& state = *State(file_system);
   auto node = LookupNode(state, file_context);
   if (!node) {
@@ -815,6 +1018,7 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
                UINT64 offset, ULONG length, BOOLEAN write_to_end,
                BOOLEAN /*constrained_io*/, PULONG bytes_transferred,
                FSP_FSCTL_FILE_INFO* file_info) {
+  CountCallback(PerfStats::Get().fs_write_calls);
   AdapterState& state = *State(file_system);
   auto node = LookupNode(state, file_context);
   if (!node) {
@@ -839,7 +1043,8 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
   // inside the core under its mutation lock, so concurrent appends cannot lose
   // bytes.
   auto written = state.fs->WriteFileData(node->inode->ino, offset, buffer,
-                                         length, write_to_end != FALSE);
+                                         length, write_to_end != FALSE,
+                                         /*defer_timestamps=*/true);
   if (!written.ok()) {
     XFS_DEBUG("Write(ino=" << node->inode->ino << ", offset=" << offset
                            << ", length=" << length
@@ -856,10 +1061,11 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
 }
 
 NTSTATUS Flush(FSP_FILE_SYSTEM* file_system, PVOID, FSP_FSCTL_FILE_INFO*) {
+  CountCallback(PerfStats::Get().fs_flush_calls);
   AdapterState& state = *State(file_system);
-  // Flush means "make what we have written durable". With only in-place data
-  // writes there is no pending transaction and no dirty metadata, so this is
-  // a device flush; a failure must be reported, never swallowed.
+  // Flush means "make what we have written durable": commit every deferred
+  // timestamp, wait for in-flight writes, then issue the device barrier. A
+  // failure must be reported, never swallowed.
   Status status = state.fs->Flush();
   if (!status.ok()) {
     XFS_ERROR("flush failed: " << status.error().Format());
@@ -870,6 +1076,7 @@ NTSTATUS Flush(FSP_FILE_SYSTEM* file_system, PVOID, FSP_FSCTL_FILE_INFO*) {
 
 NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                      FSP_FSCTL_FILE_INFO* file_info) {
+  CountCallback(PerfStats::Get().fs_get_file_info_calls);
   AdapterState& state = *State(file_system);
   auto node = LookupNode(state, file_context);
   if (!node) {
@@ -880,11 +1087,71 @@ NTSTATUS GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   return STATUS_SUCCESS;
 }
 
-NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID, UINT32, UINT64,
-                      UINT64, UINT64, UINT64, FSP_FSCTL_FILE_INFO*) {
-  // Timestamps and Windows attributes are not stored on disk yet: on XFS they
-  // live in the inode and changing them needs a metadata transaction (RW-1).
-  return NotImplementedWrite(*State(file_system));
+NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
+                      UINT32 file_attributes, UINT64 creation_time,
+                      UINT64 last_access_time, UINT64 last_write_time,
+                      UINT64 change_time, FSP_FSCTL_FILE_INFO* file_info) {
+  AdapterState& state = *State(file_system);
+  auto node = LookupNode(state, file_context);
+  if (!node) return STATUS_INVALID_HANDLE;
+  if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
+
+  auto current = state.fs->GetFileInfo(node->inode->ino);
+  if (!current.ok()) return NtFromError(current.error().code);
+
+  if (file_attributes != INVALID_FILE_ATTRIBUTES) {
+    // POSIX mode is the authority on this volume. Windows' read-only bit maps
+    // to the write bits; clearing it adds owner write, setting it removes all
+    // write bits. Other DOS attributes (hidden/system/archive) are not stored
+    // on XFS and are accepted as no-ops.
+    const bool want_readonly =
+        (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    const bool is_readonly = (current.value().mode & 0222) == 0;
+    if (want_readonly != is_readonly) {
+      uint16_t mode = current.value().mode;
+      if (want_readonly) {
+        mode = static_cast<uint16_t>(mode & ~0222);
+      } else {
+        mode = static_cast<uint16_t>(mode | 0200);
+      }
+      auto changed_mode = state.fs->SetFileMode(node->inode->ino, mode);
+      if (!changed_mode.ok()) return NtFromError(changed_mode.error().code);
+      current = changed_mode;
+    }
+  }
+
+  XfsTimestamp atime = current.value().atime;
+  XfsTimestamp mtime = current.value().mtime;
+  XfsTimestamp ctime = current.value().ctime;
+  bool changed = false;
+  if (creation_time != 0) {
+    // Windows creation time maps to the XFS crtime. Updating it would add a
+    // fourth timestamp field to the transaction helper; keep the original
+    // value rather than silently moving ctime.
+    XFS_DEBUG("SetBasicInfo: creation time change ignored for ino "
+              << current.value().ino);
+  }
+  if (last_access_time != 0) {
+    atime = FromFileTime(last_access_time);
+    changed = true;
+  }
+  if (last_write_time != 0) {
+    mtime = FromFileTime(last_write_time);
+    changed = true;
+  }
+  if (change_time != 0) {
+    ctime = FromFileTime(change_time);
+    changed = true;
+  }
+  if (changed) {
+    auto updated = state.fs->SetFileTimes(node->inode->ino, atime, mtime,
+                                          ctime);
+    if (!updated.ok()) return NtFromError(updated.error().code);
+  }
+  RefreshNode(state, NodeId(file_context));
+  auto refreshed = LookupNode(state, file_context);
+  if (refreshed) FillFileInfo(state, *refreshed->inode, file_info);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
@@ -896,10 +1163,29 @@ NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
   if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
   if (set_allocation_size) {
-    // No preallocation: the allocation size is advisory on this volume, so a
-    // larger request is accepted as-is and the on-disk size is untouched
-    // (Windows falls back to SetFileSize for SetEndOfFile).
-    FillFileInfo(state, *node->inode, file_info);
+    // Windows maintains allocation size separately from EOF. The WinFsp
+    // contract says an allocation size below EOF truncates the file; a larger
+    // one extends allocation without moving EOF (unwritten extents).
+    if (new_size < node->inode->size) {
+      auto truncated = state.fs->SetFileSize(node->inode->ino, new_size);
+      if (!truncated.ok()) return NtFromError(truncated.error().code);
+    } else {
+      const uint64_t block_size = state.fs->geometry().block_size;
+      const uint64_t allocated =
+          block_size == 0 ? 0 : node->inode->nblocks * block_size;
+      if (new_size > allocated) {
+        Status pre = PreallocateHint(*state.fs, node->inode->ino, new_size);
+        if (!pre.ok()) {
+          XFS_DEBUG("SetAllocationSize(ino=" << node->inode->ino
+                                             << ", size=" << new_size
+                                             << ") incomplete: "
+                                             << pre.error().Format());
+        }
+      }
+    }
+    RefreshNode(state, NodeId(file_context));
+    auto updated = LookupNode(state, file_context);
+    if (updated) FillFileInfo(state, *updated->inode, file_info);
     return STATUS_SUCCESS;
   }
   auto info = state.fs->SetFileSize(node->inode->ino, new_size);
@@ -937,6 +1223,7 @@ NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR) {
 
 NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
                 PWSTR new_file_name, BOOLEAN replace_if_exists) {
+  CountCallback(PerfStats::Get().fs_rename_calls);
   AdapterState& state = *State(file_system);
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
   // The FSD hands over both names; the core owns the whole atomic operation
@@ -992,6 +1279,14 @@ NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_nam
     }
   }
   DropNamespaceCaches(state, src.value().first, dst.value().first);
+  auto moved_inode = state.fs->OpenInode(outcome.value().moved_ino);
+  const bool moved_directory =
+      moved_inode.ok() && moved_inode.value().IsDir();
+  DropPathCache(state, file_name ? std::wstring(file_name) : std::wstring(),
+                moved_directory);
+  DropPathCache(state, new_file_name ? std::wstring(new_file_name)
+                                     : std::wstring(),
+                moved_directory);
   XFS_DEBUG("renamed '" << WideToUtf8(file_name) << "' -> '"
                         << WideToUtf8(new_file_name) << "' (moved ino "
                         << outcome.value().moved_ino << ", replaced ino "
@@ -1040,6 +1335,7 @@ bool AddOneDirectoryEntry(FSP_FILE_SYSTEM* file_system,
 NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                        PWSTR /*pattern*/, PWSTR marker, PVOID buffer,
                        ULONG length, PULONG bytes_transferred) {
+  CountCallback(PerfStats::Get().fs_read_directory_calls);
   AdapterState& state = *State(file_system);
   auto context = LookupNode(state, file_context);
   if (!context) {
@@ -1056,7 +1352,11 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   {
     std::lock_guard<std::mutex> lock(state.node_mutex);
     auto it = state.dir_children.find(context->inode->ino);
-    if (it != state.dir_children.end()) children = it->second;
+    if (it != state.dir_children.end()) {
+      children = it->second;
+      state.dir_children_lru.remove(context->inode->ino);
+      state.dir_children_lru.push_front(context->inode->ino);
+    }
   }
   if (!children) {
     auto entries = state.fs->ListDirectory(context->inode->ino);
@@ -1081,13 +1381,29 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
       std::lock_guard<std::mutex> lock(state.node_mutex);
       constexpr size_t kMaxCachedDirs = 64;
       constexpr size_t kMaxCachedEntries = 262144;
-      if (state.dir_children.size() >= kMaxCachedDirs ||
-          state.dir_children_entries + built->size() > kMaxCachedEntries) {
-        state.dir_children.clear();
-        state.dir_children_entries = 0;
+      if (built->size() <= kMaxCachedEntries) {
+        while (!state.dir_children.empty() &&
+               (state.dir_children.size() >= kMaxCachedDirs ||
+                state.dir_children_entries + built->size() >
+                    kMaxCachedEntries)) {
+          const uint64_t victim = state.dir_children_lru.back();
+          state.dir_children_lru.pop_back();
+          auto victim_it = state.dir_children.find(victim);
+          if (victim_it != state.dir_children.end()) {
+            state.dir_children_entries -= victim_it->second->size();
+            state.dir_children.erase(victim_it);
+          }
+        }
+        auto existing = state.dir_children.find(context->inode->ino);
+        if (existing != state.dir_children.end()) {
+          state.dir_children_entries -= existing->second->size();
+          state.dir_children.erase(existing);
+          state.dir_children_lru.remove(context->inode->ino);
+        }
+        state.dir_children_entries += built->size();
+        state.dir_children.emplace(context->inode->ino, built);
+        state.dir_children_lru.push_front(context->inode->ino);
       }
-      state.dir_children_entries += built->size();
-      state.dir_children.emplace(context->inode->ino, built);
     }
     children = std::move(built);
   }
@@ -1901,6 +2217,7 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
     }
   }
 
+  if (config.perf_stats) PerfStats::Get().SetEnabled(true);
   auto state = std::make_unique<AdapterState>();
   state->fs = std::move(filesystem);
   state->read_write = config.read_write;
@@ -1942,20 +2259,44 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
                             (sb.uuid[2] << 16) | (sb.uuid[3] << 24));
   // Caching policy. Read-only data never changes, so file info can be cached
   // for a second. On a writable volume file info must not go stale in
-  // Windows' cache after our own writes, so it is not cached at all.
-  params.FileInfoTimeout = state->read_write ? 0 : 1000;
+  // Windows' cache after our own writes, so the default stays 0. The timeout
+  // is overridable for A/B measurement (docs/PERFORMANCE.md); it is not a
+  // durability knob.
+  uint32_t file_info_timeout = state->read_write ? 0 : 1000;
+  if (const char* env = std::getenv("XFSWIN_FILE_INFO_TIMEOUT_MS")) {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end != env && parsed <= 60000) {
+      file_info_timeout = static_cast<uint32_t>(parsed);
+    }
+  }
+  params.FileInfoTimeout = file_info_timeout;
   params.CaseSensitiveSearch = 1;
   params.CasePreservedNames = 1;
   params.UnicodeOnDisk = 1;
   params.ReadOnlyVolume = state->read_write ? 0 : 1;
   params.PersistentAcls = 0;
   params.PostCleanupWhenModifiedOnly = 1;
-  // FlushAndPurgeOnCleanup makes the FSD flush and purge the file's cached
-  // pages on every close. A read-only volume never has dirty data, so it was
-  // off (it only penalizes memory-mapped access). A writable volume needs it:
-  // without it Windows can serve stale cached pages after our own write and
-  // after an external modification of the same image.
-  params.FlushAndPurgeOnCleanup = state->read_write ? 1 : 0;
+  // The adapter supports open-but-unlinked files and open-handle rename
+  // (Cleanup removes the namespace entry and the last Close frees the inode),
+  // so let the FSD use POSIX-style delete/rename. Without this flag Windows
+  // applications that use FileDispositionInformationEx (PowerShell 7
+  // Remove-Item, some installers) get STATUS_NOT_SUPPORTED before the
+  // adapter's SetDelete/Cleanup path is reached.
+  params.SupportsPosixUnlinkRename = 1;
+  // FlushAndPurgeOnCleanup forces a flush (and a device durability barrier)
+  // on every close. That is not required for coherence on this volume: a
+  // writable image is opened with FILE_SHARE_READ only, so no external writer
+  // can modify it, and Windows' cache is kept coherent through the FSD for
+  // ordinary cached I/O. Keep it off by default so open/write/close loops do
+  // not pay one FlushFileBuffers per file. Explicit FlushFileBuffers still
+  // reaches the Flush callback and the durability contract. Set
+  // XFSWIN_FLUSH_PURGE_ON_CLEANUP=1 to restore the old behavior.
+  bool flush_and_purge = false;
+  if (const char* env = std::getenv("XFSWIN_FLUSH_PURGE_ON_CLEANUP")) {
+    flush_and_purge = std::strcmp(env, "1") == 0;
+  }
+  params.FlushAndPurgeOnCleanup = flush_and_purge ? 1 : 0;
   wcscpy_s(params.FileSystemName,
            sizeof(params.FileSystemName) / sizeof(WCHAR), L"XFS");
 
@@ -1995,11 +2336,10 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
                        std::to_string(static_cast<uint32_t>(status)) + ")");
   }
   winfsp->UserContext = state.get();
-  // Install WinFsp's built-in operation guard with the fine-grained strategy:
-  // namespace operations take a shared lock, while reads/writes/getinfo run
-  // fully in parallel. The core caches are mutex-protected and block-device
-  // I/O is serialized inside the device objects, so concurrent reads scale to
-  // multiple threads instead of queueing behind one global lock.
+  // WinFsp's fine-grained guard: namespace operations take an exclusive lock,
+  // while reads/writes/getinfo for different files run in parallel. The core
+  // uses a write barrier plus per-inode stripes, and the image device now
+  // allows concurrent positioned I/O, so this actually reaches the storage.
   FspFileSystemSetOperationGuard(winfsp, FspFileSystemOpEnter,
                                  FspFileSystemOpLeave);
   FspFileSystemSetOperationGuardStrategy(
@@ -2031,8 +2371,10 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
                           << " at " << WideToUtf8(config.mount_point)
                           << " (uuid " << FormatUuid(sb.uuid) << ")");
   if (config.read_write) {
-    XFS_WARN("read-write mount: experimental; in-place overwrites of existing "
-             "allocated data only (no create, delete, rename or size change)");
+    XFS_WARN("read-write mount: experimental image-file writer; create, "
+             "overwrite, extend, truncate, delete, rename, hard links, "
+             "symlinks, xattrs and reflinks are enabled (real disks remain "
+             "read-only)");
   }
   if (stop_event) {
     WaitForSingleObject(stop_event, INFINITE);
@@ -2049,6 +2391,13 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   // disappears. A failure is reported (the filesystem itself stays consistent;
   // only durability is at risk).
   if (config.read_write) {
+    // Publish deferred timestamps before the unmount record: a clean log must
+    // not be followed by new transactions.
+    Status published = state->fs->CommitAllDeferredMetadata();
+    if (!published.ok()) {
+      XFS_ERROR("unmount deferred metadata commit failed: "
+                << published.error().Format());
+    }
     Status closed = state->fs->WriteCleanUnmountRecord();
     if (!closed.ok()) {
       XFS_ERROR("unmount journal close failed: " << closed.error().Format());
@@ -2062,6 +2411,9 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   FspFileSystemDelete(winfsp);
   if (stop_event) CloseHandle(stop_event);
   LocalFree(state->security_descriptor);
+  if (PerfStats::Get().enabled()) {
+    std::fputs(PerfStats::Get().Text().c_str(), stderr);
+  }
   XFS_INFO("unmounted");
   return OkStatus();
 }

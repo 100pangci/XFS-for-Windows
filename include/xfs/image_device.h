@@ -3,14 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - image file block device (*.img / *.raw).
 //
-// Write semantics:
-//   - Read/Write are positioned I/O: there is no shared file position, so
-//     concurrent reads do not serialize behind each other.
+// I/O semantics:
+//   - Read/Write are positioned I/O (FILE_FLAG_OVERLAPPED on Windows,
+//     pread/pwrite on POSIX): independent ranges can be in flight at once.
 //   - Write never tears a caller's buffer and never silently short-writes;
 //     a short transfer is retried and then reported as a failure.
-//   - Flush is a durable flush (FlushFileBuffers on Windows): it returns only
-//     after the data has been handed to stable storage, and reports failure
-//     instead of pretending success.
+//   - Flush is a durability barrier: it waits for earlier writes, excludes
+//     new writes during the durable flush, and reports failure instead of
+//     pretending success.
 #pragma once
 
 #include <filesystem>
@@ -52,10 +52,13 @@ class ImageBlockDevice final : public BlockDevice {
 
   struct Impl;
   std::unique_ptr<Impl> impl_;
-  // Reads share the lock; writes and flushes are exclusive. Every request
-  // carries its own offset, so a reader can never observe a half-updated file
-  // position.
-  mutable std::shared_mutex io_mutex_;
+  // Positioned I/O runs concurrently: Read and Write take the lifecycle lock
+  // shared and the flush barrier shared, so independent ranges do not serialize
+  // behind each other. Flush takes the barrier exclusively (a durability
+  // barrier waits for every earlier write), Close takes the lifecycle lock
+  // exclusively (no I/O may outlive the handle).
+  mutable std::shared_mutex lifecycle_mutex_;
+  mutable std::shared_mutex flush_barrier_;
   DeviceInfo info_;
   std::filesystem::path path_;
 };

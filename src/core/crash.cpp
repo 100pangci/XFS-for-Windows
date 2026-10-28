@@ -65,6 +65,7 @@ constexpr PointName kPointNames[] = {
 
 std::mutex g_config_mutex;
 bool g_loaded = false;
+std::atomic<bool> g_config_ready{false};
 CrashConfig g_config;
 std::unordered_map<int, uint32_t> g_hits;
 
@@ -104,6 +105,7 @@ void LoadConfigLocked() {
   if (const char* env = std::getenv("XFSWIN_CRASH_AT")) raw = env;
   if (raw.empty()) {
     g_config = config;
+    g_config_ready.store(true, std::memory_order_release);
     return;
   }
   config.raw = raw;
@@ -113,11 +115,13 @@ void LoadConfigLocked() {
                  "point[:hit]; crash injection disabled\n",
                  raw.c_str());
     g_config = CrashConfig{};
+    g_config_ready.store(true, std::memory_order_release);
     return;
   }
   g_config = config;
   std::fprintf(stderr, "xfswin: crash injection armed at %s (hit %u)\n",
                ToString(config.point), config.hit);
+  g_config_ready.store(true, std::memory_order_release);
 }
 
 bool ShouldCrashLocked(CrashPoint point) {
@@ -152,9 +156,20 @@ CrashConfig GetCrashConfig() {
   return g_config;
 }
 
+bool CrashPointArmed(CrashPoint point) {
+  if (!g_config_ready.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+    LoadConfigLocked();
+  }
+  // g_config is immutable after the release-store above (ReloadCrashConfig is
+  // only used by single-threaded tests).
+  return g_config.enabled && g_config.point == point;
+}
+
 void ReloadCrashConfig() {
   std::lock_guard<std::mutex> lock(g_config_mutex);
   g_loaded = false;
+  g_config_ready.store(false, std::memory_order_release);
   g_config = CrashConfig{};
   g_hits.clear();
 }

@@ -2104,6 +2104,9 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
                                            const void* value,
                                            size_t value_len,
                                            XattrSetMode mode) {
+  // Serialize with namespace/data writes: xattr changes publish an inode
+  // metadata transaction and must not interleave with a file-data mutation.
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -2208,6 +2211,9 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
 }
 
 Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
+  // Serialize with namespace/data writes: xattr changes publish an inode
+  // metadata transaction and must not interleave with a file-data mutation.
+  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")

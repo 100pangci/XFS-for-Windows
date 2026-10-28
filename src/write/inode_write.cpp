@@ -292,6 +292,8 @@ Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
         .Ino(ino)
         .Metadata("inode");
   }
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
   std::lock_guard<std::mutex> lock(mutation_mutex_);
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();
@@ -300,6 +302,43 @@ Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
   if (!status.ok()) return status.error();
   status = CommitTransaction(txn.value());
   if (!status.ok()) return status.error();
+  return GetFileInfo(ino);
+}
+
+Result<XfsFileInfo> XfsFilesystem::SetFileMode(uint64_t ino, uint16_t mode) {
+  if (!writable_) {
+    return XFS_ERR(XfsError::kReadOnlyVolume,
+                   "filesystem is mounted read-only")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
+  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  auto inode = OpenInode(ino);
+  if (!inode.ok()) return inode.error();
+  const uint16_t type = inode.value().mode & kSIfmt;
+  if ((mode & kSIfmt) != 0 && (mode & kSIfmt) != type) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "mode change would alter the inode type")
+        .Ino(ino)
+        .Metadata("inode");
+  }
+  // Callers may supply permission bits only; the type always comes from the
+  // existing inode.
+  mode = static_cast<uint16_t>((mode & ~kSIfmt) | type);
+  auto txn = BeginTransaction();
+  if (!txn.ok()) return txn.error();
+  const XfsTimestamp now = CurrentTimestamp();
+  Status status = UpdateInodeInTransaction(
+      txn.value(), ino, 0, {},
+      [&](uint8_t* raw) -> Status {
+        PutBE16(raw, di::kMode, mode);
+        return StoreInodeTimestamp(raw, di::kCtime, now);
+      });
+  if (status.ok()) status = CommitTransaction(txn.value());
+  if (!status.ok()) return status.error();
+  InvalidateCaches(CacheInvalidation::Inode(ino));
   return GetFileInfo(ino);
 }
 

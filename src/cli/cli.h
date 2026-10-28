@@ -12,6 +12,8 @@ namespace xfs::cli {
 struct Options {
   bool verbose = false;
   bool debug = false;
+  // PERF-1: collect and print the optional I/O/lock/cache counters.
+  bool perf_stats = false;
   bool force_unsafe_ro = false;
   bool yes_i_really_mean_it = false;
   // Machine-readable output for `journal` (the recovery differential).

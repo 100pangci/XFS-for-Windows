@@ -585,6 +585,15 @@ TEST(transaction_writes_log_before_metadata) {
   CHECK_EQ(log_data, log_header + 1);
   CHECK(log_flush > log_data);
   CHECK(inode_write > log_flush);
-  CHECK(inode_flush > inode_write);
+  // PERF-1 delayed metadata write-back: the metadata buffer is written after
+  // the durable log record, but its flush waits for a durability boundary.
+  CHECK_EQ(inode_flush, -1);
+  const size_t before_flush = ops.size();
+  CHECK(fs.value()->Flush().ok());
+  bool boundary_flush_after_inode = false;
+  for (size_t i = before_flush; i < ops.size(); ++i) {
+    if (ops[i].flush) boundary_flush_after_inode = true;
+  }
+  CHECK(boundary_flush_after_inode);
   fixture.Reset();
 }
