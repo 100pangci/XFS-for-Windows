@@ -69,6 +69,10 @@ Status WriteBlockRange(
   const uint64_t first_block = offset >> geo.block_log;
   const uint64_t last_block = (end - 1) >> geo.block_log;
   const auto* input = static_cast<const uint8_t*>(src);
+  // Crash tests historically observed a "mid data write" point after the
+  // first block. A coalesced multi-block run would skip that occurrence, so
+  // cap the first run to one block only while that injection point is armed.
+  const bool crash_mid = CrashPointArmed(mid_point);
 
   std::vector<uint8_t> partial;
   std::vector<uint8_t> zeros;
@@ -138,6 +142,7 @@ Status WriteBlockRange(
     }
 
     if (wrote_any) MaybeCrash(mid_point, phase);
+    if (crash_mid && !wrote_any && run_blocks > 1) run_blocks = 1;
     const uint64_t device_offset = geo.FsbToByte(fsb);
     const uint64_t run_bytes = run_blocks * block_size;
     if (input != nullptr) {

@@ -152,6 +152,12 @@ CrashConfig GetCrashConfig() {
   return g_config;
 }
 
+bool CrashPointArmed(CrashPoint point) {
+  std::lock_guard<std::mutex> lock(g_config_mutex);
+  LoadConfigLocked();
+  return g_config.enabled && g_config.point == point;
+}
+
 void ReloadCrashConfig() {
   std::lock_guard<std::mutex> lock(g_config_mutex);
   g_loaded = false;
