@@ -416,19 +416,21 @@ Result<size_t> ReadFileData(BlockDevice& dev, const XfsGeometry& geo,
       uint64_t run_end_block = e->EndBlock();
       uint64_t run_end_fsb = e->startblock + e->blockcount;
       // Merge following extents when both the file blocks and the physical
-      // blocks are contiguous. A fragmented file still gets one read per
-      // physical run; a file split into adjacent extents no longer pays one
-      // device read per extent.
-      size_t run_index = lo;
-      while (run_index < extents->size()) {
-        const XfsExtent& next = (*extents)[run_index];
-        if (next.startoff != run_end_block || next.unwritten ||
-            next.startblock != run_end_fsb) {
-          break;
+      // blocks are contiguous. Never merge a written extent into an unwritten
+      // run: the zero-fill below would erase real data. A fragmented file
+      // still gets one read per physical written run.
+      if (!e->unwritten) {
+        size_t run_index = lo;
+        while (run_index < extents->size()) {
+          const XfsExtent& next = (*extents)[run_index];
+          if (next.startoff != run_end_block || next.unwritten ||
+              next.startblock != run_end_fsb) {
+            break;
+          }
+          run_end_block = next.EndBlock();
+          run_end_fsb += next.blockcount;
+          ++run_index;
         }
-        run_end_block = next.EndBlock();
-        run_end_fsb += next.blockcount;
-        ++run_index;
       }
       const uint64_t run_remaining_bytes =
           run_end_block * block_size - file_offset;

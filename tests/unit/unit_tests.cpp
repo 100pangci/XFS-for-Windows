@@ -179,6 +179,28 @@ TEST(read_file_across_extents_holes_and_unwritten) {
   CHECK(mapped.value().is_hole);
 }
 
+TEST(read_file_unwritten_before_contiguous_written) {
+  const uint64_t kBlock = 4096;
+  auto dev = std::make_unique<xfstest::MemoryBlockDevice>(kBlock * 64, 512);
+  std::memset(dev->bytes().data() + kBlock * 21, 'X', kBlock);
+  XfsGeometry geo = MakeTestGeometry();
+  XfsInode inode;
+  inode.ino = 64;
+  inode.mode = 0x81A4;
+  inode.format = ondisk::inode::kFormatExtents;
+  inode.size = kBlock * 2;
+  // The physical blocks are adjacent, but the first is unwritten. The reader
+  // must not coalesce the written block into the zero-fill run.
+  AddExtent(&inode, {0, 20, 1, true});
+  AddExtent(&inode, {1, 21, 1, false});
+  std::vector<uint8_t> out(inode.size, 0xEE);
+  auto read = ReadFileData(*dev, geo, inode, 0, out.data(), out.size());
+  CHECK(read.ok());
+  CHECK_EQ(read.value(), out.size());
+  for (size_t i = 0; i < kBlock; ++i) CHECK_EQ(out[i], 0);
+  for (size_t i = kBlock; i < kBlock * 2; ++i) CHECK_EQ(out[i], 'X');
+}
+
 TEST(extent_addresses_in_non_power_of_two_allocation_groups) {
   XfsGeometry geo = MakeTestGeometry();
   geo.agcount = 4;
