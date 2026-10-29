@@ -232,7 +232,6 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
   return finish(std::move(inode.value()));
 }
 
-
 Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
   uint64_t ino = geometry_.rootino;
   auto inode = OpenInode(ino);
@@ -479,7 +478,6 @@ XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
   return shared;
 }
 
-
 Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -488,7 +486,6 @@ Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
   }
   return ReadSymlinkTarget(*device_, geometry_, inode.value());
 }
-
 
 Result<XfsFileInfo> XfsFilesystem::GetFileInfo(uint64_t ino) const {
   {

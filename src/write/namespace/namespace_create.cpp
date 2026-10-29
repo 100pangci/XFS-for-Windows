@@ -1,9 +1,9 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-// Namespace mutation: create, mkdir, symlink.
+// Namespace mutation: create and mkdir.
 //
-// Owner: inode allocation and the create-side namespace transaction.
+// Owner: inode allocation and the create/mkdir namespace transaction.
 // The child inode, forward dirent, reverse parent pointer, parent timestamps
 // and (for mkdir) the parent link count commit in one record.
 
@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
 #include "xfs/bmap.h"

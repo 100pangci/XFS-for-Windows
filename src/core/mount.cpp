@@ -8,6 +8,7 @@
 // transaction writer or cache invalidation.
 #include "xfs/filesystem.h"
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,17 +23,9 @@ namespace xfs {
 namespace {
 
 std::string Hex(uint64_t v) {
-  static const char kDigits[] = "0123456789abcdef";
-  std::string out = "0x";
-  bool started = false;
-  for (int shift = 60; shift >= 0; shift -= 4) {
-    const uint32_t digit = static_cast<uint32_t>((v >> shift) & 0xf);
-    if (digit != 0 || started || shift == 0) {
-      out.push_back(kDigits[digit]);
-      started = true;
-    }
-  }
-  return out;
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
+  return buf;
 }
 
 }  // namespace

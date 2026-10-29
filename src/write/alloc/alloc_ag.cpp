@@ -8,6 +8,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+
 #include "xfs/ag.h"
 #include "xfs/btree.h"
 #include "xfs/endian.h"
@@ -553,7 +554,6 @@ Status AgState::AllocateAligned(uint32_t want, uint32_t align,
 // ---------------------------------------------------------------------------
 // Allocator
 // ---------------------------------------------------------------------------
-
 
 }  // namespace alloc_detail
 }  // namespace xfs

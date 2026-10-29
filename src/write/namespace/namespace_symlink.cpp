@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "xfs/ag.h"
 #include "xfs/alloc.h"
 #include "xfs/bmap.h"
@@ -262,6 +263,5 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
                         << " target=" << target.size() << " bytes");
   return child_ino;
 }
-
 
 }  // namespace xfs

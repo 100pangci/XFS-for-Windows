@@ -280,5 +280,4 @@ void XfsFilesystem::DropDataChunks(uint64_t ino, uint64_t byte_offset,
   }
 }
 
-
 }  // namespace xfs

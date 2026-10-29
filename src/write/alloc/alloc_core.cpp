@@ -8,6 +8,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+
 #include "xfs/ag.h"
 #include "xfs/btree.h"
 #include "xfs/endian.h"
@@ -93,7 +94,6 @@ Status Allocator::LoadAg(uint32_t agno, AgState** out) {
   }
   return OkStatus();
 }
-
 
 Status Allocator::FreeBlocksInternal(uint64_t fsb, uint32_t len,
                                      const RmapOwner* owner,
@@ -241,7 +241,6 @@ Status Allocator::FreeRaw(uint32_t agno, uint32_t agbno, uint32_t len) {
   ag->agf_dirty = true;
   return OkStatus();
 }
-
 
 Status Allocator::AddBuffer(uint64_t offset, std::vector<uint8_t> data,
                             uint16_t type, size_t lsn_offset,

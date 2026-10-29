@@ -36,7 +36,6 @@ namespace di = ondisk::inode;
 namespace sym = ondisk::symlink;
 namespace lf = logfmt;
 
-
 const char* ToString(CheckStatus status) {
   switch (status) {
     case CheckStatus::kOk: return "OK";

@@ -8,6 +8,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+
 #include "xfs/ag.h"
 #include "xfs/btree.h"
 #include "xfs/endian.h"
@@ -256,7 +257,6 @@ Status Allocator::ReserveForRmap(uint32_t agno) {
   return EnsureAgflInternal(agno, rmap_->ReserveBlocks(agno) + 2);
 }
 
-
 Status Allocator::RefcountFreeCallback(uint32_t agno, uint32_t agbno,
                                        uint32_t len) {
   if (refcount_free_unknown_) {
@@ -410,7 +410,6 @@ Status Allocator::ListCowStaging(uint32_t agno,
   }
   return OkStatus();
 }
-
 
 }  // namespace alloc_detail
 }  // namespace xfs
