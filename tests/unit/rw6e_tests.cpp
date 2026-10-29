@@ -254,6 +254,25 @@ TEST(rw6e_create_mkdir_symlink_have_parents) {
   CHECK_EQ(p.size(), 1u);
   CHECK_STR_EQ(p[0].name, "sym");
 
+  // A parent pointer reserves literal space in the child inode.  A target that
+  // no longer fits the reduced local fork must be stored remotely; returning
+  // ENOSPC for a legal target length is not acceptable.
+  std::string long_target(298, 'a');
+  auto remote = image.fs->CreateSymlink(root, "sym-remote", long_target, 0777,
+                                        0, 0);
+  CHECK(remote.ok());
+  if (!remote.ok()) {
+    std::printf("remote symlink error: %s\n",
+                remote.error().Format().c_str());
+    return;
+  }
+  auto read_target = image.fs->ReadSymlink(remote.value());
+  CHECK(read_target.ok());
+  CHECK_STR_EQ(read_target.value(), long_target);
+  p = Parents(image, remote.value());
+  CHECK_EQ(p.size(), 1u);
+  CHECK_STR_EQ(p[0].name, "sym-remote");
+
   Finish(image);
 }
 

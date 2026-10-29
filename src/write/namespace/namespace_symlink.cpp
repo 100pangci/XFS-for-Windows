@@ -164,7 +164,21 @@ Result<uint64_t> XfsFilesystem::CreateSymlink(uint64_t parent_ino,
 
     const size_t local_capacity =
         static_cast<size_t>(geometry_.inode_size) - di::kCoreSizeV3;
-    if (target.size() <= local_capacity) {
+    // With parent pointers the child carries a shortform parent attribute.  The
+    // attribute engine reserves the maximum literal-area split for that fork,
+    // so a target that still fits the raw literal area may not fit the reduced
+    // data fork.  xfs_symlink chooses the remote representation in that case;
+    // returning ENOSPC for a legal target would be wrong.
+    size_t local_limit = local_capacity;
+    if (geometry_.features.parent) {
+      const size_t litino = local_capacity;
+      const size_t reserved_for_bmdr = 4 + 2 * 16;
+      if (litino > reserved_for_bmdr) {
+        const size_t max_forkoff = (litino - reserved_for_bmdr) >> 3;
+        local_limit = litino - max_forkoff * 8;
+      }
+    }
+    if (target.size() <= local_limit) {
       // xfs_symlink_write_target: inline in the literal area (LOCAL fork).
       child[di::kFormat] = di::kFormatLocal;
       PutBE64(child.data(), di::kSize, target.size());
