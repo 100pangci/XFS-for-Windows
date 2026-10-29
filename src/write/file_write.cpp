@@ -279,7 +279,6 @@ Result<size_t> XfsFilesystem::CowReplaceRangeLocked(
         .Actual(length)
         .Metadata("reflink");
   }
-  const uint64_t block_size = geometry_.block_size;
   const uint64_t first_block = offset >> geometry_.block_log;
   const uint64_t last_block = (offset + length - 1) >> geometry_.block_log;
   const uint64_t block_count = last_block - first_block + 1;

@@ -15,6 +15,29 @@ endif()
 option(XFSWIN_BUILD_WINFSP "Build the WinFsp adapter (mount support)" ON)
 option(XFSWIN_BUILD_TESTS "Build unit and integration tests" ON)
 option(XFSWIN_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(XFSWIN_BUILD_FUZZERS "Build the libFuzzer parser harnesses (Clang only)" OFF)
+
+# The canonical CI builds turn warnings into errors. MSVC applies /WX to
+# xfs_core in src/CMakeLists.txt (the product library); GCC/Clang get the same
+# policy for every target here so the Linux build gates hold the whole tree to
+# the same standard.
+if(XFSWIN_WARNINGS_AS_ERRORS AND NOT MSVC)
+  add_compile_options(-Wall -Wextra -Werror)
+endif()
+
+# The fuzz harnesses must instrument the core library, not just the entry
+# point. Apply the sanitizer flags to every target in this configuration; the
+# fuzz executables add the libFuzzer main at link time.
+if(XFSWIN_BUILD_FUZZERS)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+        "XFSWIN_BUILD_FUZZERS requires Clang (libFuzzer); configure with "
+        "-DCMAKE_CXX_COMPILER=clang++ and a separate build directory.")
+  endif()
+  add_compile_options(-fsanitize=fuzzer-no-link,address,undefined)
+  add_compile_options(-fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+endif()
 
 # ---------------------------------------------------------------------------
 # Locate the WinFsp SDK (headers + import library).
@@ -65,4 +88,8 @@ add_subdirectory(src)
 if(XFSWIN_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(XFSWIN_BUILD_FUZZERS)
+  add_subdirectory(tests/fuzz)
 endif()

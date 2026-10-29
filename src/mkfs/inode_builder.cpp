@@ -18,8 +18,6 @@ namespace d = ondisk::dir;
 namespace bt = ondisk::btree;
 
 constexpr uint32_t kNullAgino = 0xffffffffu;
-constexpr uint32_t kInodesPerChunk = 64;
-constexpr uint64_t kBigClusterBytes = 8192;
 
 XfsTimestamp FormatterNow() {
   XfsTimestamp ts;

@@ -18,6 +18,118 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Linux: the portable core must build and pass the same unit/integration
+  # suite as Windows. These jobs never build WinFsp or the Windows CLI.
+  # ---------------------------------------------------------------------------
+  linux-build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the compiler
+        run: ${{ matrix.cxx }} --version
+
+      - name: Configure (warnings are errors)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Unit and integration tests
+        run: ctest --test-dir build --output-on-failure
+
+  # ASan/UBSan exercise the parser, writer, recovery and crash paths without
+  # the driver. This is the job that would have caught the xattr tree UAF.
+  linux-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Clang, ASan + UBSan)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Unit and integration tests under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  # Bounded libFuzzer smoke for every parser harness. Seeds come from a real
+  # mkfs.xfs image generated in the job; no binary corpus is committed.
+  linux-fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - name: Configure fuzz harnesses
+        run: >
+          cmake -S . -B build-fuzz -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=OFF
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_BUILD_FUZZERS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build fuzz harnesses
+        run: cmake --build build-fuzz -j "$(nproc)"
+
+      - name: Generate the seed image and corpus
+        run: |
+          truncate -s 512M seed.img
+          mkfs.xfs -f -b size=4096 -s size=512 -i size=512 seed.img
+          python3 tests/fuzz/make_corpus.py seed.img build-fuzz/corpus
+
+      - name: Run every harness (bounded)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-artifacts
+          for target in fuzz_superblock fuzz_ag fuzz_inode fuzz_btree \
+                        fuzz_directory fuzz_xattr fuzz_log_item; do
+            echo "=== $target"
+            ./build-fuzz/tests/fuzz/$target \
+              build-fuzz/corpus/$target \
+              -runs=20000 -max_len=8192 -timeout=15 \
+              -artifact_prefix="fuzz-artifacts/$target-"
+          done
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
   # Windows: build, unit/integration tests, formatter round-trip, structural
   # probe, and artifacts for the Linux verification job.
   # ---------------------------------------------------------------------------
@@ -27,11 +139,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure (no WinFsp SDK needed here)
+      - name: Configure (no WinFsp SDK needed here; warnings are errors)
         shell: pwsh
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
 
       - name: Build
         shell: pwsh

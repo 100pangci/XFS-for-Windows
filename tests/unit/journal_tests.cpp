@@ -9,6 +9,7 @@
 // commit. tests/tools/log_probe.py is the independent oracle that reimplements
 // the same format from the kernel sources and runs over real images in CI.
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,9 +36,9 @@ using xfs::GetLE32;
 using xfs::LogOp;
 using xfs::LogRecordParams;
 
-constexpr char kUuid[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-                            0x47, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-                            0xdd, 0xee, 0xff, 0x00};
+constexpr uint8_t kUuid[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                               0x47, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                               0xdd, 0xee, 0xff, 0x00};
 
 // Recomputes the record CRC the way xlog_cksum does (header with the CRC field
 // zeroed, then the data area as it lies on disk), independently of the code

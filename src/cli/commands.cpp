@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "cli/cli.h"
 
+#include <memory>
 #include <windows.h>
 
 #include <fcntl.h>

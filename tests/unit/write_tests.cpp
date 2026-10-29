@@ -10,6 +10,7 @@
 //     device writes, cache invalidation, mount policy, crash injection config.
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 

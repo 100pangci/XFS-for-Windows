@@ -493,8 +493,7 @@ Status ParseLeafEntries(const uint8_t* block, uint32_t block_size,
 // Reads and verifies one remote value; `entry` is completed in place.
 Status ReadRemoteValue(BlockDevice& device, const XfsGeometry& geo,
                        const XfsInode& inode, const std::vector<XfsExtent>& extents,
-                       const XattrEntry& leaf_entry, uint64_t sb_lsn,
-                       XattrEntry* entry) {
+                       const XattrEntry& leaf_entry, XattrEntry* entry) {
   if (leaf_entry.remote_blocks == 0) {
     if (leaf_entry.remote_value_len != 0) {
       return XFS_ERR(XfsError::kCorruptInode,
@@ -1333,7 +1332,7 @@ Result<XattrFork> ReadXattrFork(BlockDevice& device, const XfsGeometry& geo,
         }
         XattrEntry complete;
         s = ReadRemoteValue(device, geo, inode, fork.extents, leaf_entry,
-                            sb_lsn, &complete);
+                            &complete);
         if (!s.ok()) return s.error();
         fork.remote_blocks += complete.remote_blocks;
         fork.entries.push_back(std::move(complete));

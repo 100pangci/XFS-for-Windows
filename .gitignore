@@ -11,6 +11,8 @@ reference/
 tests/images/*.img
 tests/images/*.bin
 *.log
+crash-*
+fuzz-artifacts/
 
 # Editor / OS
 .vs/

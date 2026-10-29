@@ -11,6 +11,7 @@
 // hide behind them.
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,9 +58,9 @@ void PutLE64At(uint8_t* p, size_t off, uint64_t value) {
   StoreLE32(p + off + 4, static_cast<uint32_t>(value >> 32));
 }
 
-constexpr char kUuid[16] = {0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
-                            0x41, 0x99, 0x88, 0x77, 0x66, 0x55,
-                            0x44, 0x33, 0x22, 0x11};
+constexpr uint8_t kUuid[16] = {0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                               0x41, 0x99, 0x88, 0x77, 0x66, 0x55,
+                               0x44, 0x33, 0x22, 0x11};
 
 // A synthetic internal log on a 4 MiB device: 1 MiB into the image, a small
 // ring (64 blocks by default), everything else zeroed - the mkfs state.

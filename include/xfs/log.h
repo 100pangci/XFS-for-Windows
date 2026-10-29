@@ -37,7 +37,15 @@ class Line {
       : level_(level), component_(component) {}
 
   ~Line() {
-    if (Enabled(level_)) WriteLine(level_, os_.str());
+    if (!Enabled(level_)) return;
+    // The component tag is part of the logging contract documented above; the
+    // previous implementation collected it but emitted only the message.
+    std::string text;
+    if (component_) {
+      text = std::string("[") + component_ + "] ";
+    }
+    text += os_.str();
+    WriteLine(level_, text);
   }
 
   template <typename T>

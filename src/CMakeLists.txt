@@ -75,21 +75,28 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# xfswin - command line tool: list / info / check / ls / cat / mount / format
+# xfswin - command line tool: list / info / check / ls / cat / mount / format.
+#
+# The CLI and the WinFsp adapter are Windows-only product surfaces. The core,
+# the formatter, the writer, the recovery engine and the tests are portable and
+# are built on Linux for the GCC/Clang, sanitizer and fuzz jobs; the Linux
+# build intentionally does not synthesize a second CLI.
 # ---------------------------------------------------------------------------
-add_executable(xfswin
-  cli/main.cpp
-  cli/commands.cpp
-)
+if(WIN32)
+  add_executable(xfswin
+    cli/main.cpp
+    cli/commands.cpp
+  )
 
-target_link_libraries(xfswin PRIVATE xfs_core)
+  target_link_libraries(xfswin PRIVATE xfs_core)
 
-target_include_directories(xfswin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_include_directories(xfswin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-if(MSVC)
-  target_compile_options(xfswin PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
-  target_compile_definitions(xfswin PRIVATE
-    _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(MSVC)
+    target_compile_options(xfswin PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+    target_compile_definitions(xfswin PRIVATE
+      _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

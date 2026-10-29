@@ -7,10 +7,15 @@
 
 #include "xfs/endian.h"
 
-#if defined(_M_X64) || defined(__x86_64__)
+// The SSE4.2 path is an MSVC build optimization. The portable GCC/Clang
+// build (Linux CI builds the core for the external oracles and sanitizers)
+// uses the same slicing-by-8 software implementation instead of requiring
+// -msse4.2 or per-function target attributes; both paths produce identical
+// CRC32c values, and the Windows build verifies them against the test vector.
+#if defined(_MSC_VER) && defined(_M_X64)
 #define XFSWIN_CRC32C_X64 1
 #include <intrin.h>
-#elif defined(_M_IX86) || defined(__i386__)
+#elif defined(_MSC_VER) && defined(_M_IX86)
 #define XFSWIN_CRC32C_X86 1
 #include <intrin.h>
 #endif
@@ -46,10 +51,13 @@ constexpr Tables kTables{};
 uint32_t Crc32cSoftware(uint32_t crc, const uint8_t* p, size_t len) {
   // Slicing-by-8.
   while (len >= 8) {
-    uint32_t lo = crc ^ static_cast<uint32_t>(p[0]) |
-                  (static_cast<uint32_t>(p[1]) << 8) |
-                  (static_cast<uint32_t>(p[2]) << 16) |
-                  (static_cast<uint32_t>(p[3]) << 24);
+    // The XOR must apply to the whole loaded word. Written without the
+    // parentheses, `^` binds tighter than `|` and only p[0] is folded into
+    // the CRC, which silently corrupts every checksum on the software path.
+    uint32_t lo = crc ^ (static_cast<uint32_t>(p[0]) |
+                         (static_cast<uint32_t>(p[1]) << 8) |
+                         (static_cast<uint32_t>(p[2]) << 16) |
+                         (static_cast<uint32_t>(p[3]) << 24));
     uint32_t hi = static_cast<uint32_t>(p[4]) |
                   (static_cast<uint32_t>(p[5]) << 8) |
                   (static_cast<uint32_t>(p[6]) << 16) |
@@ -76,6 +84,7 @@ bool HaveSse42() {
 }
 #endif
 
+#if defined(XFSWIN_CRC32C_X64) || defined(XFSWIN_CRC32C_X86)
 uint32_t Crc32cHardware(uint32_t crc, const uint8_t* p, size_t len) {
 #if defined(XFSWIN_CRC32C_X64)
   uint64_t state = crc;
@@ -108,6 +117,7 @@ uint32_t Crc32cHardware(uint32_t crc, const uint8_t* p, size_t len) {
   return Crc32cSoftware(crc, p, len);
 #endif
 }
+#endif  // XFSWIN_CRC32C_X64 || XFSWIN_CRC32C_X86
 
 }  // namespace
 

@@ -274,6 +274,8 @@ itself:
 | **`xfs_scrub`** | Online structural checks where the host supports them, including the parent-pointer checker on modern kernels. |
 | **Independent Python oracles** | Re-parse raw inodes, directories, btrees, attr forks, rmap, refcount and parent records without the C++ parser. |
 | **Crash injection** | Kill every relevant transaction write phase; after replay, only old-or-new states are legal. |
+| **ASan / UBSan** | The full unit/integration suite runs under Clang sanitizers on every push. |
+| **libFuzzer** | Superblock, AG headers, inode/fork, btree, directory, xattr and log-item parsers are fuzzed from real `mkfs.xfs` seeds. |
 | **Cross-OS churn** | Linux → Windows → Linux → Windows mutations with a final Linux mount/repair. |
 
 The main end-to-end shapes are:
@@ -378,6 +380,17 @@ on-disk LSN stamp lets replay skip newer buffers.
 Requirements: Windows 10/11, Visual Studio 2022 (C++20), CMake ≥ 3.24.
 WinFsp SDK is optional; without it the CLI still builds and only the `mount`
 command is unavailable.
+
+The portable core and test suite also build on Linux (the Windows CLI and
+WinFsp adapter are not built there):
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_WARNINGS_AS_ERRORS=ON
+cmake --build build -j "$(nproc)"
+ctest --test-dir build --output-on-failure
+```
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `

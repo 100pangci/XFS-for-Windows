@@ -24,6 +24,7 @@
 // second phase: the caller keeps the zero-link inode and calls
 // FreeUnlinkedInode when the last handle closes.
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -1589,13 +1590,14 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
       uint32_t attr_ilog = 0;
       std::vector<uint8_t> attr_region;
       if (geometry_.features.parent) {
-        auto fork = ReadChildAttrFork(*device_, geometry_, source.value());
-        if (!fork.ok()) return fork.error();
+        auto attr_fork =
+            ReadChildAttrFork(*device_, geometry_, source.value());
+        if (!attr_fork.ok()) return attr_fork.error();
         ParentChange change;
         change.add = ParentPointer{dst_parent, parent.value().gen,
                                    std::string(dst_name)};
         auto prepared = ApplyParentChange(
-            txn, blocks, *device_, geometry_, source.value(), fork.value(),
+            txn, blocks, *device_, geometry_, source.value(), attr_fork.value(),
             std::move(image), change);
         if (!prepared.ok()) return prepared.error();
         image = std::move(prepared.value().image);

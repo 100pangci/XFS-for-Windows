@@ -281,9 +281,6 @@ class Allocator {
   bool reflink_enabled() const { return geo_->features.reflink; }
   bool rmap_editing() const { return rmap_editing_; }
   uint32_t RmapBlocks(uint32_t agno) const;
-  uint32_t RefcountBlocks(uint32_t agno) const;
-  uint32_t RefcountRoot(uint32_t agno) const;
-  uint32_t RefcountLevel(uint32_t agno) const;
   Status MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
                   const RmapOwner& owner);
   Status UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
@@ -795,21 +792,23 @@ Status AllocTree::Insert(const FreeRec& rec) {
       SetNumRecs(parent, pn + 1);
       return OkStatus();
     }
-    std::vector<Entry> entries;
-    entries.reserve(pn + 1);
+    std::vector<Entry> parent_entries;
+    parent_entries.reserve(pn + 1);
     for (size_t i = 0; i < insert_pos; ++i) {
-      entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
+      parent_entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
     }
-    entries.push_back({child_key, child_block});
+    parent_entries.push_back({child_key, child_block});
     for (size_t i = insert_pos; i < pn; ++i) {
-      entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
+      parent_entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
     }
-    uint32_t right = kNullAgBlock;
-    FreeRec right_key;
-    Status s = SplitEntries(frame.block, level, entries, &right, &right_key);
-    if (!s.ok()) return s;
-    child_block = right;
-    child_key = right_key;
+    uint32_t parent_right = kNullAgBlock;
+    FreeRec parent_right_key;
+    const Status split_status =
+        SplitEntries(frame.block, level, parent_entries, &parent_right,
+                     &parent_right_key);
+    if (!split_status.ok()) return split_status;
+    child_block = parent_right;
+    child_key = parent_right_key;
   }
 }
 
@@ -1494,8 +1493,9 @@ Status AgState::AllocateBestFit(uint32_t want, const RmapOwner* rmap_owner,
   RecomputeLongest();
   agf_dirty = true;
   if (rmap_owner != nullptr) {
-    Status s = this->owner->MapOwned(agno, old.start, want, *rmap_owner);
-    if (!s.ok()) return s;
+    const Status map_status =
+        this->owner->MapOwned(agno, old.start, want, *rmap_owner);
+    if (!map_status.ok()) return map_status;
   }
   out->fsb = this->owner->geo()->AgFsb(agno, old.start);
   out->len = want;
@@ -1614,21 +1614,6 @@ Status Allocator::LoadAg(uint32_t agno, AgState** out) {
 uint32_t Allocator::RmapBlocks(uint32_t agno) const {
   if (!rmap_) return 0;
   return rmap_->Blocks(agno);
-}
-
-uint32_t Allocator::RefcountBlocks(uint32_t agno) const {
-  if (!refcount_) return 0;
-  return refcount_->Blocks(agno);
-}
-
-uint32_t Allocator::RefcountRoot(uint32_t agno) const {
-  if (!refcount_) return kNullAgBlock;
-  return refcount_->Root(agno);
-}
-
-uint32_t Allocator::RefcountLevel(uint32_t agno) const {
-  if (!refcount_) return 0;
-  return refcount_->Level(agno);
 }
 
 Status Allocator::LoadRefcount(uint32_t agno) {
@@ -2716,8 +2701,6 @@ Status BlockAllocator::FindShared(uint64_t fsb, uint32_t len,
         .Metadata("refcountbt");
   }
   const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
-  const uint32_t agbno =
-      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
   Status s = impl_->alloc->LoadRefcount(agno);
   if (!s.ok()) return s;
   *found = impl_->alloc->FindSharedExtent(fsb, len, out);

@@ -10,6 +10,7 @@
 // so ntstatus.h can provide the STATUS_* constants, provide PNTSTATUS, and
 // only then include the WinFsp header (whose own includes become no-ops).
 #define WIN32_NO_STATUS
+#include <memory>
 #include <windows.h>
 #undef WIN32_NO_STATUS
 #include <winternl.h>

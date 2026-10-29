@@ -3,6 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <sstream>
 
 #include "test_util.h"
 #include "xfs/crc32c.h"
@@ -10,6 +12,7 @@
 #include "xfs/endian.h"
 #include "xfs/extent.h"
 #include "xfs/inode.h"
+#include "xfs/log.h"
 #include "xfs/ondisk.h"
 #include "xfs/superblock.h"
 #include "xfs/symlink.h"
@@ -22,6 +25,17 @@ TEST(crc32c_known_vector) {
   CHECK_EQ(Crc32c(data, 9), 0xE3069283u);
   // Raw accumulator with ~0 seed gives the inverted value.
   CHECK_EQ(Crc32cUpdate(0xFFFFFFFFu, data, 9), 0x1CF96D7Cu);
+}
+
+TEST(log_component_tag_is_emitted) {
+  std::ostringstream out;
+  const auto old_level = xfs::log::GetLevel();
+  xfs::log::SetLevel(xfs::log::Level::kInfo);
+  xfs::log::SetOutputStream(&out);
+  { XFS_SB_INFO("tag-check"); }
+  xfs::log::SetOutputStream(nullptr);
+  xfs::log::SetLevel(old_level);
+  CHECK(out.str().find("[SB] tag-check") != std::string::npos);
 }
 
 TEST(crc32c_xfs_checksum_roundtrip) {

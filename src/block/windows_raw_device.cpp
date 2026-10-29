@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 
+#include <memory>
 #include <windows.h>
 #include <winioctl.h>
 

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <utility>
 #include <vector>
