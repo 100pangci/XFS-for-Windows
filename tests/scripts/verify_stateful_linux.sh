@@ -123,6 +123,11 @@ if [ "$KERNEL_REPLAY" -eq 1 ]; then
       --json "$WORK/parent-oracle.json" --quiet
   fi
 fi
-python3 "$ROOT/tests/tools/log_probe.py" "$IMG" --expect clean \
-  >"$WORK/log_probe.txt"
+if command -v xfs_logprint >/dev/null 2>&1; then
+  xfs_logprint -t "$IMG" >"$WORK/xfs_logprint.txt" 2>&1
+  grep -q 'state: <CLEAN>' "$WORK/xfs_logprint.txt"
+else
+  python3 "$ROOT/tests/tools/log_probe.py" "$IMG" --expect clean \
+    >"$WORK/log_probe.txt"
+fi
 echo "fuzz2: Linux verification passed ($(basename "$IMG"))"

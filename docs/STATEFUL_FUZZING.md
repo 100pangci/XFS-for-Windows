@@ -215,7 +215,8 @@ probe is run only after the kernel has replayed the log.  Both forms require:
    symlinks and hard-link identities match the manifest
    (`stateful_mount_check.py`);
 5. `xfs_scrub -n` where the running kernel exposes the metadata scrub ioctl;
-6. a clean log and silent `xfs_repair -n` after unmount.
+6. a clean log (`xfs_logprint -t` reports `state: <CLEAN>`) and silent
+   `xfs_repair -n` after unmount.
 
 `xfs_repair` is never allowed to modify an image and then call it a pass;
 `-n` is the only repair mode used here.  A kernel journal replay is not a
