@@ -307,7 +307,7 @@ model or weakening an oracle.
 
 * Reproducer: `seed=0x4444444444444444`, 400-operation xattr workload,
   `seed=0x3333333333333333` directory workload is not involved; operation 345
-  replaces an attribute after a data extent was added at operation 343.
+  sets a new attribute after a data extent was added at operation 343.
 * Violated invariant: a data fork must use extents format whenever its extent
   count fits the literal area; `xfs_repair` reports
   `extent count for ino 137 data fork too low (6) for file format`.
