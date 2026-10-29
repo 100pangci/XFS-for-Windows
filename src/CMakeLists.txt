@@ -30,6 +30,9 @@ add_library(xfs_core STATIC
   core/directory.cpp
   core/symlink.cpp
   core/filesystem.cpp
+  core/mount.cpp
+  core/cache.cpp
+  core/check.cpp
   core/invalidation.cpp
   block/image_device.cpp
   block/windows_raw_device.cpp
