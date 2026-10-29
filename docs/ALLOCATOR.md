@@ -58,7 +58,7 @@ sb_fdblocks = sum over AGs of (agf_freeblks + agf_flcount + agf_btreeblks)
 `tests/tools/rw2_probe.py` recomputes all of this from the on-disk structures
 without using the C++ code, so a shared bug cannot hide behind the writer.
 
-## 2. Allocating and freeing (`src/write/alloc.cpp`)
+## 2. Allocating and freeing (`src/write/alloc/`)
 
 Allocation is deliberately a conservative subset of the kernel's policy, but
 every case it produces is a legal state that Linux can continue from:

@@ -282,7 +282,7 @@ namespace transactions, and `docs/NAMESPACE.md` for rename, hard links and
 symlinks.
 
 **Namespace path (RW-3, extended in RW-4).** `XfsFilesystem::CreateRegularFile` /
-`Mkdir` / `Unlink` / `RemoveEmptyDirectory` (`src/write/namespace.cpp`) follow
+`Mkdir` / `Unlink` / `RemoveEmptyDirectory` (`src/write/namespace/`) follow
 the Linux transaction shapes: create and mkdir commit inode allocation, inode
 initialisation, the parent's dirent insertion, the parent timestamps/counters
 and the AGI/inobt/superblock updates in one record, so a crash leaves either no

@@ -30,6 +30,9 @@ add_library(xfs_core STATIC
   core/directory.cpp
   core/symlink.cpp
   core/filesystem.cpp
+  core/mount.cpp
+  core/cache.cpp
+  core/check.cpp
   core/invalidation.cpp
   block/image_device.cpp
   block/windows_raw_device.cpp
@@ -45,11 +48,20 @@ add_library(xfs_core STATIC
   write/log_record.cpp
   write/transaction.cpp
   write/inode_write.cpp
-  write/alloc.cpp
+  write/alloc/alloc_tree.cpp
+  write/alloc/alloc_ag.cpp
+  write/alloc/alloc_ownership.cpp
+  write/alloc/alloc_core.cpp
+  write/alloc/alloc.cpp
   write/bmap.cpp
   write/ialloc.cpp
   write/dir_write.cpp
-  write/namespace.cpp
+  write/namespace/namespace_common.cpp
+  write/namespace/namespace_create.cpp
+  write/namespace/namespace_remove.cpp
+  write/namespace/namespace_rename.cpp
+  write/namespace/namespace_link.cpp
+  write/namespace/namespace_symlink.cpp
   write/file_write.cpp
   write/xattr_write.cpp
   write/parent_write.cpp

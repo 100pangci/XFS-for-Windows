@@ -54,8 +54,8 @@ Out of scope, deliberately:
 | Writer, tree editor, fork transitions | `src/write/xattr_write.cpp` |
 | Data-fork forkoff conversion | `include/xfs/bmap.h`, `src/write/bmap.cpp` |
 | Inode log item (data + attr regions) | `src/write/inode_write.cpp` |
-| Inode deletion / attribute free | `src/write/namespace.cpp` |
-| `check` integration / rmap ownership | `src/core/filesystem.cpp` |
+| Inode deletion / attribute free | `src/write/namespace/namespace_remove.cpp` |
+| `check` integration / rmap ownership | `src/core/check.cpp` |
 | ATTRI/ATTRD format | `include/xfs/xattr_intent.h`, `src/core/xattr_intent.cpp` |
 | Intent scan and lifetime | `src/recovery/log_scan.cpp` |
 | Intent completion | `src/write/recovery_host.cpp` |

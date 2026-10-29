@@ -335,6 +335,9 @@ record itself is never deferred. Large transactions are split at 32 KiB record
 boundaries with `CONTINUE`/`WAS_CONT` up to `XLOG_MAX_RECORD_BSIZE`. The
 on-disk LSN stamp lets replay skip newer buffers.
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map and the
+single owner of each filesystem invariant.
+
 ## Current limitations
 
 * **Experimental / image files only.** PhysicalDrive mounted read-write is not
@@ -362,6 +365,7 @@ on-disk LSN stamp lets replay skip newer buffers.
 | Document | Contents |
 |---|---|
 | [docs/DESIGN.md](docs/DESIGN.md) | layering and invariants |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | module map and invariant ownership |
 | [docs/JOURNAL.md](docs/JOURNAL.md) | log format, transactions, recovery boundaries |
 | [docs/ALLOCATOR.md](docs/ALLOCATOR.md) | free-space and AGFL rules |
 | [docs/INODE_ALLOCATOR.md](docs/INODE_ALLOCATOR.md) | inobt/finobt/AGI chunk lifecycle |

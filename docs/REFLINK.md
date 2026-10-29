@@ -37,7 +37,7 @@ untouched.
 |---|---|
 | Typed reader / verifier | `include/xfs/refcount.h`, `src/core/refcount.cpp` |
 | Writable refcount B+tree and logical adjustments | `include/xfs/refcount_editor.h`, `src/core/refcount_editor.cpp` |
-| Allocator/rmap/refcount integration | `include/xfs/alloc.h`, `src/write/alloc.cpp` |
+| Allocator/rmap/refcount integration | `include/xfs/alloc.h`, `src/write/alloc/alloc_ownership.cpp` |
 | Native clone | `src/write/reflink.cpp` |
 | CoW write and shared-aware size changes | `src/write/file_write.cpp` |
 | Data-fork release hook | `src/write/bmap.cpp` |
