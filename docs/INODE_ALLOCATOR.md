@@ -1,7 +1,7 @@
 # Inode allocator and inode lifecycle (RW-3)
 
 Status: implemented. `src/write/ialloc.cpp` is the allocator (inobt, AGI,
-icreate, free, unlinked buckets), `src/write/namespace.cpp` the namespace layer
+icreate, free, unlinked buckets), `src/write/namespace/` the namespace layer
 that uses it (`CreateRegularFile`, `Mkdir`, `Unlink`, `RemoveEmptyDirectory`,
 `FreeUnlinkedInode`), and the WinFsp adapter drives the same operations from
 `Create`/`Cleanup`/`SetDelete`. Everything here was verified against the
@@ -255,7 +255,7 @@ cached data can never be served for a reused inode number.
 | piece | file |
 |---|---|
 | inobt/AGI/icreate, chunk lifetime, unlinked buckets | `src/write/ialloc.cpp` |
-| namespace transactions (create, mkdir, unlink, rmdir, ifree) | `src/write/namespace.cpp` |
+| namespace transactions (create, mkdir, unlink, rmdir, ifree) | `src/write/namespace/` |
 | directory formats and conversions | `src/write/dir_write.cpp` |
 | two-phase chunk allocation before a create | `XfsFilesystem::EnsureInodeCapacity` |
 | WinFsp `Create`/`Cleanup`/`SetDelete`/`CanDelete` | `src/winfsp/winfsp_adapter.cpp` |

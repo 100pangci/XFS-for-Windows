@@ -271,12 +271,12 @@ Required Windows integration sites identified in the RW-0..6A code:
 
 | file / path | ownership work still required |
 |---|---|
-| `src/write/alloc.cpp` | common per-AG rmap state, owner-aware allocation/free, AGFL refill/drain, include rmap nonroots in counters, reserve before structural edits |
+| `src/write/alloc/` | common per-AG rmap state, owner-aware allocation/free, AGFL refill/drain, include rmap nonroots in counters, reserve before structural edits |
 | `src/write/bmap.cpp` `InsertExtent/RemoveRange` | map/unmap inode extents, not record-normalization edits; BMBT flags for `AllocBmbtBlock/FreeBmbtBlock` |
 | `src/write/file_write.cpp` | unwritten allocation transaction and written conversion transaction both update rmap; in-place overwrite does not remap |
 | `src/write/ialloc.cpp` | `OWN_INOBT` for both trees; `OWN_INODES` for actual full/sparse backing allocation/free |
 | `src/write/dir_write.cpp` | inode-owned logical ranges across every directory format conversion/allocation/free |
-| `src/write/namespace.cpp` | remote symlink creation, last-link truncate/free, replace lifecycle, shared transaction/editor state |
+| `src/write/namespace/` | remote symlink creation, last-link truncate/free, replace lifecycle, shared transaction/editor state |
 | `src/write/recovery_host.cpp` | RUI completion, EFI unknown-owner unmap, unlinked-inode paths using the same ledger |
 | `src/recovery/log_scan.cpp`, `replay.cpp` | typed RUI/RUD preflight and ordered lifetime; RMB3 buffer verifier/LSN protection |
 
@@ -375,7 +375,7 @@ qualification in section 12:
   becomes the AGF root and the old root block returns to the AGFL), overlapping
   low/high-key propagation, and publishes only after a full in-memory
   structural verification.
-* `src/write/alloc.cpp`: owner-aware allocation/free/convert (`AllocateOwned`,
+* `src/write/alloc/`: owner-aware allocation/free/convert (`AllocateOwned`,
   `AllocateFromAgOwned`, `AllocateFromAgRangeOwned`, `FreeOwned`,
   `FreeUnknown`, `ConvertOwned`, `RmapMap/Unmap/Convert` for intent
   completion). AGFL refill records OWN_AG after the blocks are on the ring, so

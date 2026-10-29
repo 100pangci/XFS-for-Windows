@@ -18,7 +18,7 @@ wins.
 |---|---|
 | Typed model, encode/decode, list/find | `include/xfs/parent.h`, `src/core/parent.cpp` |
 | Namespace ↔ reverse audit | `src/core/parent.cpp` (`XfsFilesystem::VerifyParentPointers`) |
-| Namespace mutation | `src/write/namespace.cpp` |
+| Namespace mutation | `src/write/namespace/` |
 | Parent mutations through the attr engine | `src/write/parent_write.cpp`, `src/write/xattr_write_internal.h` |
 | `ATTRI`/`ATTRD` parser | `src/core/xattr_intent.cpp` |
 | Intent completion | `src/write/recovery_host.cpp` |
