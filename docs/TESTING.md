@@ -493,6 +493,51 @@ crash, sanitizer report or hang fails the job and uploads the reproducer. The
 harnesses are not a substitute for the Linux kernel / `xfs_repair` oracles:
 they prove rejection safety, not on-disk correctness.
 
+## FUZZ-2: stateful operation and crash fuzzing
+
+The parser harnesses above are byte-level and stateless.  FUZZ-2 adds a
+model-based, stateful layer: a deterministic generator emits legal mutations,
+an independent abstract filesystem predicts the result, the real writer
+mutates a formatted image, and Linux/xfsprogs judge the bytes.  Crash runs use
+the existing `XFSWIN_CRASH_AT` points and recover either through the project
+engine or through the kernel's own journal replay.
+
+See [STATEFUL_FUZZING.md](STATEFUL_FUZZING.md) for the architecture,
+operation list, model, crash contract, ENOSPC policy, failure minimization and
+the three real bugs found by the first campaign.
+
+Local smoke:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_WARNINGS_AS_ERRORS=ON
+cmake --build build -j "$(nproc)"
+ctest --test-dir build --output-on-failure
+
+# A longer deterministic mixed sequence with a manifest:
+./build/tests/stateful_fuzz --seed 0x73a8175d0c41a9e3 --steps 500 \
+  --image out/stateful.img --trace out/stateful.trace.txt \
+  --manifest out/stateful.manifest.json \
+  --profile modern --workload mixed
+
+# Linux qualification (root; xfsprogs/kernel):
+sudo tests/scripts/verify_stateful_linux.sh out/stateful.img \
+  out/stateful.manifest.json
+
+# Crash matrix (project recovery + kernel replay):
+sudo EXE=build/tests/stateful_fuzz tests/scripts/fuzz2_crash_matrix.sh
+```
+
+A failing run prints the seed, operation, crash point and an exact command;
+`--ops-out`/`--ops-file` and `tests/scripts/reduce_stateful_trace.py` turn it
+into a small textual operation reproducer.
+
+CI adds `linux-stateful-fuzz`, `linux-stateful-fuzz-sanitizer`,
+Windows-generated stateful images and `linux-verify-stateful-windows`, while
+all existing RW-0..RW-6E crash, recovery and Linux-oracle jobs remain hard
+gates.
+
 ## Regression rule
 
 Any bug found in the wild must first become a failing test (unit, synthetic

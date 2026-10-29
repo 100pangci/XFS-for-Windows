@@ -130,6 +130,164 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # FUZZ-2: model-based stateful mutation sequences.  The harness writes the
+  # sequence, a semantic manifest and (optionally) crash images.  Linux then
+  # judges the bytes with the independent Python oracle, xfs_repair, a kernel
+  # mount and the parent-pointer audit.
+  # ---------------------------------------------------------------------------
+  linux-stateful-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the reference xfsprogs (parent pointers)
+        run: sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Stateful sequences (mixed, directory, xattr, allocator, ENOSPC)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz2
+          exe=build/tests/stateful_fuzz
+          run_sequence() {
+            name=$1; seed=$2; steps=$3; profile=$4; workload=$5; size=$6
+            img="fuzz2/$name.img"
+            echo "=== $name seed=$seed steps=$steps $profile/$workload"
+            "$exe" --seed "$seed" --steps "$steps" --image "$img" \
+              --trace "$img.trace.txt" --manifest "$img.manifest.json" \
+              --profile "$profile" --workload "$workload" \
+              --image-size-mb "$size" --check-every 20 \
+              --consistency-every 0 --quiet | tee "fuzz2/$name.log"
+            sudo bash tests/scripts/verify_stateful_linux.sh \
+              "$img" "$img.manifest.json" "fuzz2/$name.work"
+          }
+          run_sequence mixed-regression 0x2222222222222222 250 modern mixed 512
+          run_sequence mixed-1 0x1111111111111111 250 modern mixed 512
+          run_sequence dir-1 0x3333333333333333 600 modern dir 512
+          run_sequence xattr-1 0x4444444444444444 300 modern xattr 512
+          run_sequence alloc-1 0x5555555555555555 500 modern alloc 512
+          run_sequence default-1 0x7777777777777777 250 default mixed 320
+          "$exe" --seed 0xabcdefabcdefabcd --steps 400 \
+            --image fuzz2/enospc.img --trace fuzz2/enospc.img.trace.txt \
+            --manifest fuzz2/enospc.img.manifest.json --profile modern \
+            --workload enospc --image-size-mb 300 --require-enospc \
+            --check-every 100 --consistency-every 0 | tee fuzz2/enospc.log
+          grep -Eq 'enospc=[1-9][0-9]*' fuzz2/enospc.log
+          sudo bash tests/scripts/verify_stateful_linux.sh \
+            fuzz2/enospc.img fuzz2/enospc.img.manifest.json fuzz2/enospc.work
+
+      - name: Crash matrix (project recovery and kernel replay)
+        run: |
+          set -euo pipefail
+          sudo EXE="$PWD/build/tests/stateful_fuzz" WORK="$PWD/fuzz2/crash" \
+            SIZE_MB=300 bash tests/scripts/fuzz2_crash_matrix.sh
+
+      - name: Upload FUZZ-2 artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-linux-failure
+          path: fuzz2/
+          if-no-files-found: ignore
+
+  linux-stateful-fuzz-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Clang, ASan + UBSan)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Bounded stateful coverage under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure
+          mkdir -p fuzz2-san
+          ./build/tests/stateful_fuzz --seed 0x2222222222222222 --steps 300 \
+            --image fuzz2-san/asan.img \
+            --trace fuzz2-san/asan.trace.txt \
+            --manifest fuzz2-san/asan.manifest.json \
+            --profile modern --workload mixed --check-every 15 \
+            --consistency-every 0 --quiet
+
+      - name: Upload sanitizer artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-sanitizer-failure
+          path: fuzz2-san/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # The Windows MSVC writer generates the same stateful workloads; Linux judges
+  # the resulting bytes and the recovered crash image.
+  # ---------------------------------------------------------------------------
+  linux-verify-stateful-windows:
+    needs: windows-build-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the reference xfsprogs (parent pointers)
+        run: sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stateful-windows
+          path: fuzz2
+
+      - name: Verify Windows-generated stateful images
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/verify_stateful_linux.sh \
+            fuzz2/stateful-windows.img \
+            fuzz2/stateful-windows.img.manifest.json fuzz2/windows-mixed.work
+          sudo bash tests/scripts/verify_stateful_linux.sh \
+            fuzz2/stateful-enospc.img \
+            fuzz2/stateful-enospc.img.manifest.json fuzz2/windows-enospc.work
+          sudo bash tests/scripts/verify_stateful_linux.sh \
+            fuzz2/stateful-crash.pre.img \
+            fuzz2/stateful-crash.pre.manifest.json \
+            fuzz2/windows-crash-pre.work --kernel-replay
+          sudo bash tests/scripts/verify_stateful_linux.sh \
+            fuzz2/stateful-crash.img \
+            fuzz2/stateful-crash.img.manifest.json fuzz2/windows-crash.work
+
+      - name: Upload FUZZ-2 Windows verification artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-windows-verify-failure
+          path: fuzz2/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
   # Windows: build, unit/integration tests, formatter round-trip, structural
   # probe, and artifacts for the Linux verification job.
   # ---------------------------------------------------------------------------
@@ -153,6 +311,49 @@ jobs:
       - name: Unit and integration tests
         shell: pwsh
         run: ctest --test-dir build -C $env:BUILD_CONFIG --output-on-failure
+
+      - name: FUZZ-2 stateful sequences (Windows writer)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fuzz = "build\tests\$env:BUILD_CONFIG\stateful_fuzz.exe"
+          New-Item -ItemType Directory -Force out | Out-Null
+          & $fuzz --seed 0x2222222222222222 --steps 150 `
+            --image out\stateful-windows.img `
+            --trace out\stateful-windows.img.trace.txt `
+            --manifest out\stateful-windows.img.manifest.json `
+            --profile modern --workload mixed --image-size-mb 300 `
+            --check-every 20 `
+            --consistency-every 0 --quiet
+          if ($LASTEXITCODE -ne 0) { throw "stateful mixed sequence failed" }
+          & $fuzz --seed 0x6666666666666666 --steps 120 `
+            --image out\stateful-enospc.img `
+            --trace out\stateful-enospc.img.trace.txt `
+            --manifest out\stateful-enospc.img.manifest.json `
+            --profile modern --workload enospc --image-size-mb 300 `
+            --check-every 20 --consistency-every 0 --quiet
+          if ($LASTEXITCODE -ne 0) { throw "stateful ENOSPC sequence failed" }
+          & $fuzz --seed 0x123456789abcdef --steps 30 `
+            --image out\stateful-crash.img `
+            --trace out\stateful-crash.img.trace.txt `
+            --manifest out\stateful-crash.img.manifest.json `
+            --profile modern --workload mixed --image-size-mb 300 `
+            --crash-op 30 --crash-point after_log_commit --check-every 10 `
+            --consistency-every 0
+          $crashExit = $LASTEXITCODE
+          if ($crashExit -ne 0x58435348) {
+            throw "stateful crash point returned 0x$('{0:x}' -f $crashExit), expected 0x58435348"
+          }
+          Copy-Item out\stateful-crash.img out\stateful-crash.pre.img
+          Copy-Item out\stateful-crash.img.manifest.json `
+            out\stateful-crash.pre.manifest.json
+          & $fuzz --seed 0x123456789abcdef --steps 30 `
+            --image out\stateful-crash.img `
+            --trace out\stateful-crash.img.trace.txt `
+            --manifest out\stateful-crash.img.manifest.json `
+            --profile modern --workload mixed --image-size-mb 300 `
+            --crash-op 30 --crash-point after_log_commit --recover
+          if ($LASTEXITCODE -ne 0) { throw "stateful crash recovery failed" }
 
       - name: Format an image and validate it
         shell: pwsh
@@ -524,6 +725,13 @@ jobs:
         with:
           name: windows-image
           path: out/windows.img
+          if-no-files-found: error
+
+      - name: Upload stateful Windows images
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateful-windows
+          path: out/stateful-*
           if-no-files-found: error
 
       - name: Upload fixture image
