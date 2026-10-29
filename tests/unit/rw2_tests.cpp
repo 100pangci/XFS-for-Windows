@@ -492,6 +492,55 @@ TEST(rw2_truncate_grows_sparsely) {
   fixture.Reset();
 }
 
+// Regression for FUZZ-2 seed 0x73a8175d0c41a9e3: a cached 512 KiB data chunk
+// was sized to the old EOF.  Growing the file through the no-zero-range path
+// (the new range is a pure hole) did not invalidate that chunk, so a read at
+// the old EOF returned a short count even though di_size had grown.
+TEST(rw2_truncate_grow_invalidates_cached_tail) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  const uint64_t ino = fixture.info().file_ino;
+  const uint64_t old_size = fixture.info().file_size;
+  CHECK(old_size < 512 * 1024);  // the chunk cache path, not the direct read
+
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) return;
+    // Populate the data chunk cache at the current EOF.
+    std::vector<uint8_t> before(old_size, 0);
+    auto read = fs.value()->ReadFile(ino, 0, before.data(), before.size());
+    CHECK(read.ok());
+    CHECK_EQ(read.value(), old_size);
+
+    const uint64_t new_size = old_size + 10 * kBlock;
+    auto grown = fs.value()->SetFileSize(ino, new_size);
+    CHECK(grown.ok());
+    if (!grown.ok()) return;
+
+    std::vector<uint8_t> tail(kBlock, 0xAA);
+    auto tail_read =
+        fs.value()->ReadFile(ino, old_size, tail.data(), tail.size());
+    CHECK(tail_read.ok());
+    CHECK_EQ(tail_read.value(), tail.size());
+    for (uint8_t b : tail) CHECK_EQ(b, 0);
+
+    // The prefix must still be the cached content.
+    std::vector<uint8_t> prefix(kBlock, 0xAA);
+    auto prefix_read = fs.value()->ReadFile(ino, 0, prefix.data(), prefix.size());
+    CHECK(prefix_read.ok());
+    CHECK_EQ(prefix_read.value(), prefix.size());
+    for (size_t i = 0; i < prefix.size(); ++i) {
+      CHECK_EQ(prefix[i], xfstest::FixturePatternByte(i));
+    }
+
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    CHECK(fs.value()->Flush().ok());
+  }
+  CheckConsistent(fixture);
+  fixture.Reset();
+}
+
 TEST(rw2_truncate_to_zero_frees_everything) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
