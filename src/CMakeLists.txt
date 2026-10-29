@@ -45,7 +45,11 @@ add_library(xfs_core STATIC
   write/log_record.cpp
   write/transaction.cpp
   write/inode_write.cpp
-  write/alloc.cpp
+  write/alloc/alloc_tree.cpp
+  write/alloc/alloc_ag.cpp
+  write/alloc/alloc_ownership.cpp
+  write/alloc/alloc_core.cpp
+  write/alloc/alloc.cpp
   write/bmap.cpp
   write/ialloc.cpp
   write/dir_write.cpp
