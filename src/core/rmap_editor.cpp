@@ -369,10 +369,6 @@ class RmapEditor::Impl {
           .Metadata("rmapbt");
     }
 
-    const size_t pos = LowerBound(*ag, rec.key);
-    const RmapRecord* left = pos > 0 ? &ag->records[pos - 1] : nullptr;
-    const RmapRecord* right =
-        pos < ag->records.size() ? &ag->records[pos] : nullptr;
     bool overlaps = false;
     for (const RmapRecord& other : ag->records) {
       if (other.key.startblock < rec.EndBlock() &&
@@ -393,16 +389,58 @@ class RmapEditor::Impl {
       return InsertExact(agno, rec);
     }
 
-    const bool have_left =
-        left != nullptr && left->EndBlock() == rec.key.startblock &&
-        Mergeable(*left, rec.key.owner, rec.key.flags) &&
-        LogicalAdjacent(*left, rec.key.owner, rec.key.flags, rec.key.offset,
-                        rec.blockcount, true);
-    const bool have_right =
-        right != nullptr && rec.EndBlock() == right->key.startblock &&
-        Mergeable(*right, rec.key.owner, rec.key.flags) &&
-        LogicalAdjacent(*right, rec.key.owner, rec.key.flags, rec.key.offset,
-                        rec.blockcount, false);
+    // A different owner may occupy blocks *inside* the physical range between
+    // two pieces of this extent (reflink sharing).  The immediate key
+    // neighbours are then the other owner's record, but the pieces are still
+    // physically and logically contiguous and must normalize to one rmap
+    // record.  Search the whole AG instead of only the insertion neighbours.
+    const RmapRecord* left = nullptr;
+    const RmapRecord* right = nullptr;
+    for (const RmapRecord& other : ag->records) {
+      if (other.EndBlock() == rec.key.startblock &&
+          Mergeable(other, rec.key.owner, rec.key.flags) &&
+          LogicalAdjacent(other, rec.key.owner, rec.key.flags,
+                          rec.key.offset, rec.blockcount, true)) {
+        left = &other;
+      }
+      if (other.key.startblock == rec.EndBlock() &&
+          Mergeable(other, rec.key.owner, rec.key.flags) &&
+          LogicalAdjacent(other, rec.key.owner, rec.key.flags,
+                          rec.key.offset, rec.blockcount, false)) {
+        right = &other;
+      }
+    }
+
+    // Merging grows the record over any interleaved owner.  That is legal
+    // only for sharing-capable (data) owners; metadata ownership can never be
+    // overlapped.  Drop a candidate whose merged range would cover a
+    // non-sharing record.
+    auto merge_overlaps_non_sharing = [&](const RmapRecord* a,
+                                          const RmapRecord* b) {
+      const uint64_t start = a ? a->key.startblock : rec.key.startblock;
+      const uint64_t end = b ? b->EndBlock() : rec.EndBlock();
+      for (const RmapRecord& other : ag->records) {
+        if (&other == a || &other == b) continue;
+        if (other.key.startblock >= end || start >= other.EndBlock()) {
+          continue;
+        }
+        if (!SharingCapable(other)) return true;
+      }
+      return false;
+    };
+    if (left != nullptr && merge_overlaps_non_sharing(left, nullptr)) {
+      left = nullptr;
+    }
+    if (right != nullptr && merge_overlaps_non_sharing(nullptr, right)) {
+      right = nullptr;
+    }
+    if (left != nullptr && right != nullptr &&
+        merge_overlaps_non_sharing(left, right)) {
+      right = nullptr;
+    }
+
+    const bool have_left = left != nullptr;
+    const bool have_right = right != nullptr;
 
     if (have_left && have_right) {
       const uint64_t total = static_cast<uint64_t>(left->blockcount) +

@@ -523,6 +523,42 @@ TEST(rw6b_rmap_editor_map_merge_matrix) {
   CHECK_EQ(record.value().blockcount, 30u);
 }
 
+// Regression for FUZZ-2 seed 0x2222222222222222: a shared extent owned by
+// another inode sits between two physically and logically contiguous pieces
+// of one owner's extent.  The merge must look across the interleaved owner;
+// otherwise the bmap extent is one run while rmap keeps two fragments, which
+// xfs_repair rejects and which made a later unlink fail.
+TEST(rw6b_rmap_editor_merges_across_interleaved_owner) {
+  WritableRmap image = BuildWritableRmap();
+  auto editor = LoadEditor(&image);
+  const uint64_t ino = image.rootino;
+  const uint64_t shared = ino + 1;
+
+  CHECK(editor->MapExtent(0, DataRec(ino, 28, 28, 0)).ok());
+  // A clone of blocks [42, 45) by another inode overlaps the first record.
+  CHECK(editor->MapExtent(0, DataRec(shared, 42, 3, 0)).ok());
+  // Extend the first owner's extent by seven physically/logically contiguous
+  // blocks.  The two owners overlap only on the shared middle range.
+  CHECK(editor->MapExtent(0, DataRec(ino, 56, 7, 28)).ok());
+
+  auto merged = editor->LookupEq(0, RmapKey{28, ino, 0, 0});
+  CHECK(merged.ok());
+  CHECK_EQ(merged.value().blockcount, 35u);
+  CHECK(!editor->LookupEq(0, RmapKey{56, ino, 28, 0}).ok());
+  // The shared owner's record is still exactly where it was.
+  auto shared_rec = editor->LookupEq(0, RmapKey{42, shared, 0, 0});
+  CHECK(shared_rec.ok());
+  CHECK_EQ(shared_rec.value().blockcount, 3u);
+
+  Republish(&image, editor.get());
+  auto tree = LoadRmapTree(*image.device, image.geo, 0);
+  CHECK(tree.ok());
+  auto persisted = tree.value().LookupEq(RmapKey{28, ino, 0, 0});
+  CHECK(persisted.ok());
+  CHECK_EQ(persisted.value().blockcount, 35u);
+  CHECK(tree.value().LookupEq(RmapKey{42, shared, 0, 0}).ok());
+}
+
 TEST(rw6b_rmap_editor_unmap_and_convert_matrix) {
   WritableRmap image = BuildWritableRmap();
   auto editor = LoadEditor(&image);
