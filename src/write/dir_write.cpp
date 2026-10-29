@@ -411,7 +411,7 @@ Status DirectoryEditor::LoadLeaf() {
 Status DirectoryEditor::LoadNode() {
   fmt_ = XfsDirFormat::kNode;
   std::vector<std::pair<uint32_t, uint16_t>> stack;  // dablk, expected level
-  stack.push_back({root_dablk_, 0});
+  stack.push_back({root_dablk_, uint16_t{0}});
   std::set<uint32_t> seen;
   while (!stack.empty()) {
     const auto item = stack.back();

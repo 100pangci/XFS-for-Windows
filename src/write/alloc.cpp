@@ -792,21 +792,23 @@ Status AllocTree::Insert(const FreeRec& rec) {
       SetNumRecs(parent, pn + 1);
       return OkStatus();
     }
-    std::vector<Entry> entries;
-    entries.reserve(pn + 1);
+    std::vector<Entry> parent_entries;
+    parent_entries.reserve(pn + 1);
     for (size_t i = 0; i < insert_pos; ++i) {
-      entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
+      parent_entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
     }
-    entries.push_back({child_key, child_block});
+    parent_entries.push_back({child_key, child_block});
     for (size_t i = insert_pos; i < pn; ++i) {
-      entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
+      parent_entries.push_back({KeyAt(parent, i), PtrAt(parent, i)});
     }
-    uint32_t right = kNullAgBlock;
-    FreeRec right_key;
-    Status s = SplitEntries(frame.block, level, entries, &right, &right_key);
-    if (!s.ok()) return s;
-    child_block = right;
-    child_key = right_key;
+    uint32_t parent_right = kNullAgBlock;
+    FreeRec parent_right_key;
+    const Status split_status =
+        SplitEntries(frame.block, level, parent_entries, &parent_right,
+                     &parent_right_key);
+    if (!split_status.ok()) return split_status;
+    child_block = parent_right;
+    child_key = parent_right_key;
   }
 }
 
@@ -1491,8 +1493,9 @@ Status AgState::AllocateBestFit(uint32_t want, const RmapOwner* rmap_owner,
   RecomputeLongest();
   agf_dirty = true;
   if (rmap_owner != nullptr) {
-    Status s = this->owner->MapOwned(agno, old.start, want, *rmap_owner);
-    if (!s.ok()) return s;
+    const Status map_status =
+        this->owner->MapOwned(agno, old.start, want, *rmap_owner);
+    if (!map_status.ok()) return map_status;
   }
   out->fsb = this->owner->geo()->AgFsb(agno, old.start);
   out->len = want;
