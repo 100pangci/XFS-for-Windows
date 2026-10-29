@@ -108,7 +108,7 @@ Workloads select different pressure patterns:
 | Workload | Emphasis |
 |---|---|
 | `mixed` | all operations, random legal sequence |
-| `dir` | 600+ entries in one directory, churn, rename, shortform → block → leaf → node |
+| `dir` | up to 950 entries in one directory, churn, rename, shortform → block → leaf → node |
 | `xattr` | small/large/replace/remove, remote values, leaf/node and forkoff relayout |
 | `alloc` | sequential and fragmented writes, sparse holes, truncate, btree growth/collapse, reflink/CoW |
 | `enospc` | large preallocations, xattr growth and creates until `kNoSpace`, then continued operations |

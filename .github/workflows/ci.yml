@@ -180,8 +180,8 @@ jobs:
           }
           run_sequence mixed-regression 0x2222222222222222 250 modern mixed 512
           run_sequence mixed-1 0x1111111111111111 250 modern mixed 512
-          run_sequence dir-1 0x3333333333333333 600 modern dir 512
-          run_sequence xattr-1 0x4444444444444444 300 modern xattr 512
+          run_sequence dir-1 0x3333333333333333 1200 modern dir 512
+          run_sequence xattr-1 0x4444444444444444 400 modern xattr 512
           run_sequence alloc-1 0x5555555555555555 500 modern alloc 512
           run_sequence default-1 0x7777777777777777 250 default mixed 320
           "$exe" --seed 0xabcdefabcdefabcd --steps 400 \

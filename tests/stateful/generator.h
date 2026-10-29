@@ -65,6 +65,9 @@ class Generator {
   uint64_t name_counter_ = 1;
   uint64_t pressure_dir_ = 0;
   uint64_t xattr_target_ = 0;
+  uint64_t xattr_node_target_ = 0;
+  uint64_t xattr_leaf_target_ = 0;
+  uint32_t xattr_leaf_entries_ = 0;
 
   OpType ChooseType(uint64_t op_index);
   uint64_t NewNodeId() { return next_node_id_++; }

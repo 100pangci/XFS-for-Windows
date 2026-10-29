@@ -117,12 +117,18 @@ OpType Generator::ChooseType(uint64_t op_index) {
   const uint32_t roll = static_cast<uint32_t>(rng_.Range(0, 99));
   switch (options_.workload) {
     case Workload::kDirectory:
-      if (roll < 30) return OpType::kCreate;
-      if (roll < 50) return OpType::kMkdir;
-      if (roll < 68) return OpType::kRename;
-      if (roll < 82) return OpType::kUnlink;
-      if (roll < 87) return OpType::kRmdir;
-      if (roll < 93) return OpType::kHardlink;
+      // Grow one directory to well over a thousand entries first so the
+      // shortform -> block -> leaf -> node transitions are actually reached;
+      // then churn the same tree with rename/unlink/rmdir.
+      if (op_index <= 950) {
+        return pressure_dir_ == 0 ? OpType::kMkdir : OpType::kCreate;
+      }
+      if (roll < 20) return OpType::kCreate;
+      if (roll < 35) return OpType::kRename;
+      if (roll < 55) return OpType::kUnlink;
+      if (roll < 65) return OpType::kRmdir;
+      if (roll < 80) return OpType::kHardlink;
+      if (roll < 90) return OpType::kMkdir;
       return OpType::kSetXattr;
     case Workload::kXattr:
       if (roll < 35) return OpType::kSetXattr;
@@ -133,6 +139,7 @@ OpType Generator::ChooseType(uint64_t op_index) {
       if (roll < 95) return OpType::kPreallocate;
       return OpType::kMkdir;
     case Workload::kAlloc:
+      if (op_index <= 120) return OpType::kSparseWrite;
       if (roll < 22) return OpType::kWrite;
       if (roll < 36) return OpType::kExtend;
       if (roll < 45) return OpType::kOverwrite;
@@ -191,7 +198,7 @@ Operation Generator::MakeCreateOp(uint64_t op_index, OpType type) {
       op.parent = parent;
       return op;
     }
-    if (rng_.Chance(80)) parent = pressure_dir_;
+    parent = pressure_dir_;
   } else {
     const std::vector<uint64_t> dirs = CandidateDirs();
     parent = Pick(dirs, model_.root());
@@ -263,7 +270,6 @@ Operation Generator::MakeRenameOp(uint64_t op_index) {
 }
 
 Operation Generator::MakeDataOp(uint64_t op_index, OpType type) {
-  (void)op_index;
   const std::vector<uint64_t> files = CandidateFiles();
   uint64_t node = Pick(files, 0);
   if (node == 0) return FallbackCreate(0);
@@ -298,6 +304,15 @@ Operation Generator::MakeDataOp(uint64_t op_index, OpType type) {
       break;
     case OpType::kSparseWrite: {
       if (size >= max_bytes) return MakeDataOp(op_index, OpType::kTruncateSmaller);
+      if (options_.workload == Workload::kAlloc && op_index <= 120) {
+        // Build a deliberately fragmented file: one written block followed by
+        // one hole, 120 times.  This crosses the inline extent limit and the
+        // bmbt leaf/node growth thresholds.
+        op.offset = (op_index - 2) * 2 * kBlock;
+        if (op_index < 2) op.offset = 0;
+        op.length = kBlock;
+        break;
+      }
       const uint64_t gap_blocks = rng_.Range(1, 64);
       op.offset = size + gap_blocks * kBlock;
       if (op.offset >= max_bytes) op.offset = size;
@@ -373,14 +388,33 @@ Operation Generator::MakeDataOp(uint64_t op_index, OpType type) {
 }
 
 Operation Generator::MakeXattrOp(uint64_t op_index, OpType type) {
-  (void)op_index;
-  uint64_t node = xattr_target_;
-  if (node == 0 || !model_.Find(node)) {
+  const bool node_mode = (op_index % 60) < 30;
+  uint64_t node = node_mode ? xattr_node_target_ : xattr_leaf_target_;
+  if (node_mode && (node == 0 || !model_.Find(node))) {
     const std::vector<uint64_t> files = CandidateFiles();
     node = Pick(files, 0);
     if (node == 0) return FallbackCreate(0);
-    xattr_target_ = node;
+    xattr_node_target_ = node;
+  } else if (!node_mode &&
+             (node == 0 || !model_.Find(node) || xattr_leaf_entries_ >= 8)) {
+    const std::vector<uint64_t> files = CandidateFiles();
+    node = 0;
+    for (uint64_t candidate : files) {
+      if (candidate == xattr_node_target_) continue;
+      const ModelNode* file = model_.Find(candidate);
+      if (file && file->xattrs.size() < 5) {
+        node = candidate;
+        break;
+      }
+    }
+    if (node == 0) node = Pick(files, 0);
+    if (node == 0) return FallbackCreate(0);
+    xattr_leaf_target_ = node;
+    xattr_leaf_entries_ = 0;
+  } else if (!node_mode) {
+    ++xattr_leaf_entries_;
   }
+  xattr_target_ = node;
   const ModelNode* target = model_.Find(node);
   Operation op;
   op.type = type;
