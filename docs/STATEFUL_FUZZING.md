@@ -243,7 +243,7 @@ forced into every PR.
 
 ## 9. Bugs found by FUZZ-2
 
-The first campaign found three real invariant violations.  Each has a
+The first campaign found four real invariant violations.  Each has a
 regression test and a separate fix commit; none was fixed by changing the
 model or weakening an oracle.
 
@@ -302,6 +302,27 @@ model or weakening an oracle.
   sharing-capable (`src/core/rmap_editor.cpp`).
 * Regression: `rw6b_rmap_editor_merges_across_interleaved_owner`
   (`tests/unit/rw6b_tests.cpp`).
+
+### 9.4 Data-fork btree stays after the attribute fork shrinks
+
+* Reproducer: `seed=0x4444444444444444`, 400-operation xattr workload,
+  `seed=0x3333333333333333` directory workload is not involved; operation 345
+  replaces an attribute after a data extent was added at operation 343.
+* Violated invariant: a data fork must use extents format whenever its extent
+  count fits the literal area; `xfs_repair` reports
+  `extent count for ino 137 data fork too low (6) for file format`.
+* Root cause: the xattr forkoff relayout called `DataForkEditor` with
+  `SetAllowCollapse(false)`.  When the attribute fork shrank and the data fork
+  grew from 88 to 192 literal bytes, the existing btree became unnecessary but
+  was kept.
+* Fix: allow collapse when the data fork grows
+  (`src/write/xattr_write.cpp`); shrinking still keeps the btree or moves its
+  in-fork root.
+* Regression: CTest `stateful_fuzz_xattr_regression` (seed `0x4444...`,
+  400 xattr operations).  The harness also gained the optional
+  `CheckOptions::all_allocated_inodes` walk so the invariant is checked for
+  nested inodes, not only root children; the independent xfs_repair oracle
+  remains the final gate.
 
 ## 10. Remaining blind spots
 

@@ -110,3 +110,14 @@ add_test(NAME stateful_fuzz_enospc
     --profile modern --workload enospc --image-size-mb 300
     --require-enospc --check-every 100 --consistency-every 0 --quiet)
 set_tests_properties(stateful_fuzz_enospc PROPERTIES TIMEOUT 900)
+
+add_test(NAME stateful_fuzz_xattr_regression
+  COMMAND stateful_fuzz
+    --seed 0x4444444444444444
+    --steps 400
+    --image "${CMAKE_CURRENT_BINARY_DIR}/stateful-xattr.img"
+    --trace "${CMAKE_CURRENT_BINARY_DIR}/stateful-xattr.trace.txt"
+    --manifest "${CMAKE_CURRENT_BINARY_DIR}/stateful-xattr.manifest.json"
+    --profile modern --workload xattr
+    --check-every 100 --consistency-every 0 --quiet)
+set_tests_properties(stateful_fuzz_xattr_regression PROPERTIES TIMEOUT 600)

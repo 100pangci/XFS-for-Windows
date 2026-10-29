@@ -336,7 +336,9 @@ std::string DescribeCheck(const xfs::CheckReport& report) {
 
 void CheckConsistency(xfs::XfsFilesystem& fs, bool allow_warnings,
                       std::string* error) {
-  xfs::CheckReport report = fs.CheckConsistency(xfs::CheckOptions{});
+  xfs::CheckOptions check_options;
+  check_options.all_allocated_inodes = true;
+  xfs::CheckReport report = fs.CheckConsistency(check_options);
   const xfs::CheckStatus status = report.Overall();
   if (status == xfs::CheckStatus::kOk) return;
   if (allow_warnings && status == xfs::CheckStatus::kWarning) return;

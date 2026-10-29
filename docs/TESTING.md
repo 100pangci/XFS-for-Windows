@@ -504,7 +504,7 @@ engine or through the kernel's own journal replay.
 
 See [STATEFUL_FUZZING.md](STATEFUL_FUZZING.md) for the architecture,
 operation list, model, crash contract, ENOSPC policy, failure minimization and
-the three real bugs found by the first campaign.
+the four real bugs found by the first campaign.
 
 Local smoke:
 

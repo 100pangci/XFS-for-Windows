@@ -1973,7 +1973,11 @@ class XattrWriter {
     if (!need_editor) return OkStatus();
 
     DataForkEditor data_editor(txn_, alloc_, device_, geo_, false);
-    data_editor.SetAllowCollapse(false);
+    // Growing the data fork can make an existing btree unnecessary.  xfs_repair
+    // rejects a btree whose extent count fits the literal area, so allow the
+    // editor to collapse in that direction; shrinking still keeps the btree
+    // (or moves its root) because the extents no longer fit.
+    data_editor.SetAllowCollapse(new_size > old_size);
     Status s = data_editor.Load(inode_);
     if (!s.ok()) return s;
     // Load() takes fork_bytes_ from the inode being edited; resize only after
