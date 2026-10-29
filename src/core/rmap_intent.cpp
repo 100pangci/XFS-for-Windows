@@ -4,8 +4,6 @@
 // RUI/RUD parser and preflight validation.  See include/xfs/rmap_intent.h.
 #include "xfs/rmap_intent.h"
 
-#include <limits>
-
 #include "xfs/endian.h"
 #include "xfs/log_format.h"
 #include "xfs/rmap.h"
@@ -60,16 +58,11 @@ Result<RmapIntent> ParseRui(const std::vector<uint8_t>& format,
     return XFS_ERR(XfsError::kCorruptBtree, "RUI has no extents")
         .Metadata("RUI");
   }
-  const uint64_t max_extents =
-      (std::numeric_limits<size_t>::max() - lf::kRuiFormatSize) /
-      lf::kRuiExtentSize;
-  if (nextents > max_extents) {
-    return XFS_ERR(XfsError::kCorruptBtree, "RUI extent count overflows")
-        .Actual(nextents)
-        .Metadata("RUI");
-  }
-  const size_t expected = lf::kRuiFormatSize +
-                          static_cast<size_t>(nextents) * lf::kRuiExtentSize;
+  // Compute in 64 bits: on a 32-bit size_t build the multiplication below
+  // would otherwise wrap for a corrupted 32-bit extent count.
+  const uint64_t expected =
+      static_cast<uint64_t>(lf::kRuiFormatSize) +
+      static_cast<uint64_t>(nextents) * lf::kRuiExtentSize;
   if (format.size() != expected) {
     return XFS_ERR(XfsError::kCorruptBtree,
                    "RUI size does not match its extent count")

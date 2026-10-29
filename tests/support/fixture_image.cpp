@@ -28,7 +28,6 @@ namespace d = ondisk::dir;
 namespace di = ondisk::inode;
 namespace sb = ondisk::sb;
 
-constexpr uint32_t kNullAgBlock = 0xffffffffu;
 constexpr uint32_t kNullAgino = 0xffffffffu;
 // xfs_dir2_data_first_offset for 4 KiB dir3 blocks: data header (64) plus the
 // notional "." and ".." entries (16 bytes each). Linux's xfs_dir2_sf_verify

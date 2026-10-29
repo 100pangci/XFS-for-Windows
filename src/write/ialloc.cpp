@@ -122,7 +122,6 @@ class InobtTree {
   // The record with the largest startino <= `startino`.
   Result<InobtRecord> FindLE(uint32_t startino) const;
   // The record with the smallest startino >= `startino`.
-  Result<InobtRecord> FindGE(uint32_t startino) const;
   // Inserts a new record (startino must not exist yet). Handles leaf/interior
   // splits and root growth.
   Status Insert(const InobtRecord& rec);
@@ -743,39 +742,6 @@ Status InobtTree::Update(const InobtRecord& rec) {
       .Ag(agno_)
       .Metadata("inobt")
       .Actual(rec.startino);
-}
-
-Result<InobtRecord> InobtTree::FindGE(uint32_t startino) const {
-  uint32_t cur = root_;
-  while (LevelOf(cur) > 0) {
-    const uint8_t* b = Block(cur);
-    const uint32_t n = NumRecs(b);
-    size_t chosen = n == 0 ? 0 : n - 1;
-    for (size_t i = 0; i < n; ++i) {
-      if (KeyAt(b, i) >= startino) {
-        chosen = i;
-        break;
-      }
-    }
-    cur = PtrAt(b, chosen);
-    if (cur == kNullAgBlock || Block(cur) == nullptr) {
-      return XFS_ERR(XfsError::kCorruptBtree, "inobt pointer not loaded")
-          .Ag(agno_)
-          .Metadata(name_)
-          .Actual(cur);
-    }
-  }
-  const uint8_t* b = Block(cur);
-  const uint32_t n = NumRecs(b);
-  for (uint32_t i = 0; i < n; ++i) {
-    const InobtRecord r = RecAt(b, i);
-    if (r.startino >= startino) return r;
-  }
-  return XFS_ERR(XfsError::kNotFound, "no inode btree record at or above the "
-                                      "inode")
-      .Ag(agno_)
-      .Metadata(name_)
-      .Actual(startino);
 }
 
 Result<InobtRecord> InobtTree::FindLE(uint32_t startino) const {

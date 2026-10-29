@@ -281,9 +281,6 @@ class Allocator {
   bool reflink_enabled() const { return geo_->features.reflink; }
   bool rmap_editing() const { return rmap_editing_; }
   uint32_t RmapBlocks(uint32_t agno) const;
-  uint32_t RefcountBlocks(uint32_t agno) const;
-  uint32_t RefcountRoot(uint32_t agno) const;
-  uint32_t RefcountLevel(uint32_t agno) const;
   Status MapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
                   const RmapOwner& owner);
   Status UnmapOwned(uint32_t agno, uint32_t agbno, uint32_t len,
@@ -1616,21 +1613,6 @@ uint32_t Allocator::RmapBlocks(uint32_t agno) const {
   return rmap_->Blocks(agno);
 }
 
-uint32_t Allocator::RefcountBlocks(uint32_t agno) const {
-  if (!refcount_) return 0;
-  return refcount_->Blocks(agno);
-}
-
-uint32_t Allocator::RefcountRoot(uint32_t agno) const {
-  if (!refcount_) return kNullAgBlock;
-  return refcount_->Root(agno);
-}
-
-uint32_t Allocator::RefcountLevel(uint32_t agno) const {
-  if (!refcount_) return 0;
-  return refcount_->Level(agno);
-}
-
 Status Allocator::LoadRefcount(uint32_t agno) {
   if (!reflink_enabled()) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -2716,8 +2698,6 @@ Status BlockAllocator::FindShared(uint64_t fsb, uint32_t len,
         .Metadata("refcountbt");
   }
   const uint32_t agno = static_cast<uint32_t>(fsb >> geo->agblklog);
-  const uint32_t agbno =
-      static_cast<uint32_t>(fsb & ((1ULL << geo->agblklog) - 1));
   Status s = impl_->alloc->LoadRefcount(agno);
   if (!s.ok()) return s;
   *found = impl_->alloc->FindSharedExtent(fsb, len, out);

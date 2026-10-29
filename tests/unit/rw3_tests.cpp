@@ -329,6 +329,8 @@ TEST(rw3_fully_freed_chunk_is_removed_and_blocks_returned) {
   });
   CHECK_EQ(new_chunk_ino & 63, 0ull);
   const SuperblockCounters after_alloc = ReadSuperblockCounters(fixture);
+  CHECK_EQ(after_alloc.icount, 128u);
+  CHECK_EQ(after_alloc.ifree, 63u);
   CHECK_EQ(ReadAg0Agi(fixture).count, 128u);
 
   // Freeing that single inode makes the new chunk completely free: the chunk

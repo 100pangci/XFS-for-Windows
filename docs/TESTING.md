@@ -10,6 +10,22 @@ Correctness for a filesystem is not "Explorer shows a file". The strategy is:
    - Windows-formatted images must pass `xfs_repair -n` and mount on Linux,
 5. differential checks against `xfs_db`.
 
+## Local tests (Linux)
+
+The core, formatter, writer, recovery engine and test harness are portable.
+The Linux build intentionally omits the Windows CLI and WinFsp adapter:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_WARNINGS_AS_ERRORS=ON
+cmake --build build -j "$(nproc)"
+ctest --test-dir build --output-on-failure
+```
+
+This is also the configuration used by the Linux GCC/Clang and sanitizer CI
+jobs.
+
 ## Local tests (Windows)
 
 ```powershell
@@ -22,7 +38,9 @@ $cmake = 'D:\SDK\CMake\cmake-4.4.4-windows-x86_64\bin\cmake.exe'
 
 Covered today:
 
-- CRC32c known vector and XFS checksum round-trip
+- CRC32c known vector and XFS checksum round-trip; the known vector runs on
+  both the Windows SSE4.2 path and the portable software path used by the
+  Linux build
 - endian helpers
 - extent record encode/decode and edge values
 - directory name hash basics
@@ -431,18 +449,49 @@ xfs_db -r -c 'inode <ino>' -c 'bmap' img
 Our `xfswin stat` / `xfswin ls` output must match: inode number, size, mode,
 extent list, block counts, timestamps.
 
-## Corruption / fuzzing roadmap
+## Corruption / fuzzing
 
-The parser is designed to fail safely; extend the existing corruption tests
-to:
+The parser is designed to fail safely. `tests/integration/corruption_tests.cpp`
+flips metadata bytes and requires an error or a clean parse, never a crash,
+hang or out-of-range read. The libFuzzer harnesses in `tests/fuzz/` extend that
+to the untrusted-input paths:
 
-- flip every byte of a superblock / AGF / AGI / inode / dir block and assert
-  an error or a clean parse (never a crash, hang or out-of-range read),
-- fuzz the superblock, inode, directory and B+tree parsers with libFuzzer
-  once a Linux/CI fuzz harness is available (the core has no Windows
-  dependency),
-- verify that btree traversal stops on cycles, sibling loops, wrong levels,
-  impossible record counts and cross-AG pointers.
+| Harness | Parser boundary |
+|---|---|
+| `fuzz_superblock` | superblock identity, feature masks, geometry, mount policy |
+| `fuzz_ag` | AGF / AGI / AGFL headers and AGFL entries |
+| `fuzz_inode` | v3 inode, data/attr forks, bmbt root, symlink targets |
+| `fuzz_btree` | btree block verification and bounded tree walking (cycles, levels) |
+| `fuzz_directory` | shortform directory entries, hashes and lookup |
+| `fuzz_xattr` | shortform attribute fork and name/value accounting |
+| `fuzz_log_item` | log scan, transaction reconstruction, item decode and replay |
+
+Each harness has a raw pass (every check must reject arbitrary bytes safely)
+and a normalized pass that repairs only identity fields and checksums, so the
+value parsers are reached instead of stopping at the first magic/CRC check.
+They link `xfs_core` only: no WinFsp, CLI or Windows dependency.
+
+Build and run locally (Linux, Clang):
+
+```bash
+cmake -S . -B build-fuzz -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_BUILD_FUZZERS=ON -DXFSWIN_WARNINGS_AS_ERRORS=ON
+cmake --build build-fuzz -j "$(nproc)"
+
+# Structurally valid seeds from a real image.
+truncate -s 512M seed.img
+mkfs.xfs -f -b size=4096 -s size=512 -i size=512 seed.img
+python3 tests/fuzz/make_corpus.py seed.img build-fuzz/corpus
+
+./build-fuzz/tests/fuzz/fuzz_inode build-fuzz/corpus/fuzz_inode \
+  -runs=100000 -max_len=8192 -timeout=15
+```
+
+CI runs every harness for a bounded 20,000 inputs with the seed corpus. A
+crash, sanitizer report or hang fails the job and uploads the reproducer. The
+harnesses are not a substitute for the Linux kernel / `xfs_repair` oracles:
+they prove rejection safety, not on-disk correctness.
 
 ## Regression rule
 
@@ -450,9 +499,24 @@ Any bug found in the wild must first become a failing test (unit, synthetic
 image, or golden image), then be fixed. Do not "fix" metadata by guessing.
 ## CI (GitHub Actions, `.github/workflows/ci.yml`)
 
-Every push runs the full job set described below:
+Every push runs the portable build gates first:
 
-1. **windows-build-test** (windows-2022): builds with MSVC, runs the full test
+* **linux-build-test** (ubuntu-24.04, GCC and Clang matrix): configures the
+  portable core and tests with `XFSWIN_WARNINGS_AS_ERRORS=ON`, builds, and runs
+  the complete unit/integration suite. No WinFsp, Windows CLI or raw device is
+  involved.
+* **linux-sanitizer** (ubuntu-24.04, Clang): the same suite with ASan and UBSan.
+  Leak detection is disabled because the tests intentionally keep process-wide
+  fixtures alive; any use-after-free, out-of-bounds access or undefined
+  behaviour still aborts the job.
+* **linux-fuzz-smoke** (ubuntu-24.04): builds every `tests/fuzz/` harness with
+  libFuzzer, generates seeds from a real `mkfs.xfs` image and runs each harness
+  for a bounded number of inputs. Failures upload the reproducer.
+
+Then the product-specific matrix runs:
+
+1. **windows-build-test** (windows-2022): builds with MSVC, with the core
+   library held to warnings-as-errors (`/W4 /WX`), runs the full test
    suite (including the journal, allocator, namespace and RW-4 tests), formats a
    300 MiB image, runs `xfswin check`, cross-checks the image with the
    independent Python probe, builds the fixture image (one allocated file) and

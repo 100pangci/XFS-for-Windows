@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <memory>
 
 #include "xfs/ag.h"
 #include "xfs/btree.h"

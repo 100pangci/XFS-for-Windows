@@ -231,8 +231,7 @@ int64_t OnDiskMetadataLsn(const uint8_t* buf, size_t len, const Uuid& meta_uuid,
 // ---------------------------------------------------------------------------
 class ReplayBuffers {
  public:
-  ReplayBuffers(BlockDevice& dev, const Uuid& meta_uuid)
-      : dev_(dev), meta_uuid_(meta_uuid) {}
+  explicit ReplayBuffers(BlockDevice& dev) : dev_(dev) {}
 
   struct Key {
     uint64_t daddr = 0;  // 512-byte units
@@ -349,7 +348,6 @@ class ReplayBuffers {
   }
 
   BlockDevice& dev_;
-  Uuid meta_uuid_;
   std::map<Key, PendingBuffer> pending_;
   bool have_lsn_ = false;
   uint64_t lsn_ = 0;
@@ -749,7 +747,7 @@ class Replayer {
         sb_(sb),
         geo_(geo),
         scan_(scan),
-        buffers_(dev, sb.meta_uuid) {}
+        buffers_(dev) {}
 
   Result<ReplayStats> Run(const LogScan& scan, RecoveredLogState* state);
 
@@ -968,8 +966,9 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
                             : 0;
   const uint8_t forkoff = dip[di::kForkoff];
   const size_t dfork_size = forkoff ? static_cast<size_t>(forkoff) << 3 : litino;
-  const size_t afork_size = litino > (forkoff << 3)
-                                ? litino - (static_cast<size_t>(forkoff) << 3)
+  const size_t afork_offset = static_cast<size_t>(forkoff) << 3;
+  const size_t afork_size = litino > afork_offset
+                                ? litino - afork_offset
                                 : 0;
   uint8_t* dfork = dip + core_size;
 

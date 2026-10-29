@@ -24,6 +24,7 @@
 // second phase: the caller keeps the zero-link inode and calls
 // FreeUnlinkedInode when the last handle closes.
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>

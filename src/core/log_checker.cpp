@@ -23,18 +23,11 @@ constexpr size_t kOffCycle = 4;      // be32
 constexpr size_t kOffVersion = 8;    // be32
 constexpr size_t kOffLen = 12;       // be32 (data bytes after header blocks)
 constexpr size_t kOffLsn = 16;       // be64
-constexpr size_t kOffTailLsn = 24;   // be64
-constexpr size_t kOffCrc = 32;       // le32
 constexpr size_t kOffPrevBlock = 36; // be32
 constexpr size_t kOffNumLogops = 40;
 constexpr size_t kOffCycleData = 44; // be32[64]
-constexpr size_t kOffFmt = 300;      // be32
 constexpr size_t kOffUuid = 304;     // 16 bytes
 constexpr size_t kOffSize = 320;     // be32
-
-// Op header: oh_tid be32, oh_len be32, oh_clientid u8, oh_flags u8,
-// oh_res2 be16.
-constexpr size_t kOpHeaderSize = 12;
 
 struct RecordCandidate {
   uint64_t offset = 0;  // byte offset in device

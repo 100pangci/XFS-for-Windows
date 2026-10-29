@@ -4,6 +4,7 @@
 #include "support/fixture_device.h"
 
 #include <cstring>
+#include <memory>
 
 namespace xfstest {
 

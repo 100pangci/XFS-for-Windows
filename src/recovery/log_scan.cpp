@@ -73,21 +73,6 @@ std::string LsnText(uint64_t lsn) {
          std::to_string(static_cast<uint32_t>(lsn & 0xffffffffu)) + ")";
 }
 
-// XFS_LSN_CMP: compare cycle first, then block.
-int CompareLsn(uint64_t a, uint64_t b) {
-  const uint32_t ca = static_cast<uint32_t>(a >> 32);
-  const uint32_t cb = static_cast<uint32_t>(b >> 32);
-  if (ca != cb) return ca < cb ? -1 : 1;
-  const uint32_t ba = static_cast<uint32_t>(a & 0xffffffffu);
-  const uint32_t bb = static_cast<uint32_t>(b & 0xffffffffu);
-  if (ba != bb) return ba < bb ? -1 : 1;
-  return 0;
-}
-
-uint64_t MakeLsn(uint32_t cycle, uint32_t block) {
-  return (static_cast<uint64_t>(cycle) << 32) | block;
-}
-
 // The log item format headers (EFI/EFD/BUI/BUD, ...) are host byte order.
 uint64_t LoadLE64(const uint8_t* p) {
   return static_cast<uint64_t>(LoadLE32(p)) |
@@ -224,53 +209,6 @@ RecordHeader ParseHeader(const uint8_t* block) {
   h.num_ops = GetBE32(block, lf::kRecNumLogOps);
   h.hsize = GetBE32(block, lf::kRecSize);
   return h;
-}
-
-// Reads and parses a full record header (including any extension blocks) at
-// `block`, wrapping the physical end like xlog_do_recovery_pass does.
-struct RecordRead {
-  RecordHeader header;
-  std::vector<uint8_t> header_bytes;  // all header blocks, as read
-  std::vector<std::string> warnings;  // mkfs quirk fix
-};
-
-Result<RecordRead> ReadRecordHeader(LogImage& img, uint32_t block,
-                                    bool logv2, uint32_t logbsize) {
-  RecordRead out;
-  uint8_t first[512];
-  if (!img.ReadBlock(block, first)) {
-    return XFS_ERR(XfsError::kIoError, "failed to read a log record header")
-        .Offset(img.geometry().BlockOffset(img.geometry().Wrap(block)))
-        .Metadata("log");
-  }
-  out.header = ParseHeader(first);
-  if (!out.header.magic) {
-    return XFS_ERR(XfsError::kCorruptBtree, "log block is not a record header")
-        .Offset(img.geometry().BlockOffset(img.geometry().Wrap(block)))
-        .Metadata("log")
-        .Actual(GetBE32(first));
-  }
-  // The xfsprogs bug workaround (xlog_do_recovery_pass): a single-op record
-  // whose length exceeds its stored iclog size is a mkfs record; use the
-  // configured log buffer size instead.
-  if (logv2 && out.header.len > out.header.hsize &&
-      out.header.len <= logbsize && out.header.num_ops == 1) {
-    out.warnings.push_back(
-        "invalid iclog size " + std::to_string(out.header.hsize) +
-        " bytes, using log buffer size " + std::to_string(logbsize));
-    out.header.hsize = logbsize;
-  }
-  out.header.header_blocks = HeaderBlocks(out.header, logv2);
-  const uint32_t hblks = out.header.header_blocks;
-  out.header_bytes.resize(static_cast<size_t>(hblks) * 512);
-  if (hblks == 1) {
-    std::memcpy(out.header_bytes.data(), first, 512);
-  } else if (!img.ReadRange(block, hblks, out.header_bytes.data())) {
-    return XFS_ERR(XfsError::kIoError, "failed to read log record headers")
-        .Offset(img.geometry().BlockOffset(img.geometry().Wrap(block)))
-        .Metadata("log");
-  }
-  return out;
 }
 
 // xlog_valid_rec_header() with the iclog size determined by the pass.
@@ -1216,8 +1154,7 @@ struct TransBuilder {
 
 class ReconstructionState {
  public:
-  ReconstructionState(const XfsSuperblock& sb, const XfsGeometry& geo)
-      : sb_(sb), geo_(geo) {}
+  ReconstructionState() = default;
 
   // Feeds one record's worth of operations. Committed transactions are
   // appended to transactions().
@@ -1241,8 +1178,6 @@ class ReconstructionState {
   Status ProcessOphdr(uint32_t tid, uint8_t flags, const uint8_t* dp,
                       uint32_t len, const LogRecordInfo& info);
 
-  const XfsSuperblock& sb_;
-  const XfsGeometry& geo_;
   std::unordered_map<uint32_t, TransBuilder> open_;
   std::vector<RecoveredTransaction> transactions_;
   std::vector<std::string> unsupported_;
@@ -1674,7 +1609,7 @@ Result<LogScan> ScanLog(BlockDevice& dev, const XfsSuperblock& sb,
   }
 
   // Validate the whole window, then reconstruct the committed transactions.
-  ReconstructionState reconstruction(sb, geo);
+  ReconstructionState reconstruction;
   auto handler = [&](const LogRecordInfo& info,
                      const std::vector<uint8_t>& data) -> Status {
     scan.records.push_back(info);

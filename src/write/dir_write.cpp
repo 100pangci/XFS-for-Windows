@@ -686,39 +686,6 @@ struct ImageRec {
   uint8_t ftype;
 };
 
-void LayOutDataArea(const std::vector<ImageRec>& input, uint32_t end,
-                    uint8_t* out) {
-  std::vector<ImageRec> recs = input;
-  std::sort(recs.begin(), recs.end(),
-            [](const ImageRec& a, const ImageRec& b) {
-              return a.offset < b.offset;
-            });
-  uint32_t cursor = ondisk::dir::kData3HeaderSize;
-  for (const ImageRec& r : recs) {
-    if (r.offset > cursor) {
-      const uint32_t len = r.offset - cursor;
-      PutBE16(out, cursor, ondisk::dir::kDataFreeTag);
-      PutBE16(out, cursor + 2, static_cast<uint16_t>(len));
-      PutBE16(out, r.offset - 2, static_cast<uint16_t>(cursor));
-    }
-    const size_t entsize =
-        ondisk::dir::DataEntrySize(r.name.size(), true);
-    uint8_t* b = out + r.offset;
-    PutBE64(b, 0, r.ino);
-    b[8] = static_cast<uint8_t>(r.name.size());
-    std::memcpy(b + 9, r.name.data(), r.name.size());
-    b[9 + r.name.size()] = r.ftype;
-    PutBE16(b, entsize - 2, static_cast<uint16_t>(r.offset));
-    cursor = r.offset + static_cast<uint32_t>(entsize);
-  }
-  if (cursor < end) {
-    const uint32_t len = end - cursor;
-    PutBE16(out, cursor, ondisk::dir::kDataFreeTag);
-    PutBE16(out, cursor + 2, static_cast<uint16_t>(len));
-    PutBE16(out, end - 2, static_cast<uint16_t>(cursor));
-  }
-}
-
 }  // namespace
 
 void DirectoryEditor::BuildShortformImage(std::vector<uint8_t>* image) const {
@@ -759,9 +726,9 @@ void DirectoryEditor::BuildBlockImage(std::vector<uint8_t>* image) const {
   const uint32_t count = static_cast<uint32_t>(placed_.size()) + 2;
   const uint32_t leaf_start = dir_block_size_ - kBlockTail - count * 8;
   std::vector<ImageRec> recs;
-  recs.push_back({d::kData3HeaderSize, ".", ino_, d::kFtDir});
-  recs.push_back({d::kData3HeaderSize + static_cast<uint32_t>(
-                                         DataEntrySize(1)),
+  recs.push_back({static_cast<uint32_t>(d::kData3HeaderSize), ".", ino_,
+                  d::kFtDir});
+  recs.push_back({static_cast<uint32_t>(d::kData3HeaderSize + DataEntrySize(1)),
                   "..", sf_parent_, d::kFtDir});
   for (const PlacedEntry& p : placed_) {
     recs.push_back({p.offset, p.e.name, p.e.ino, p.e.ftype});
@@ -826,9 +793,9 @@ void DirectoryEditor::BuildDataBlockFromPlaced(std::vector<uint8_t>* image,
   std::memcpy(b + kBlkUuid, geo_->meta_uuid.data(), 16);
   PutBE64(b, kBlkOwner, ino_);
   std::vector<ImageRec> recs;
-  recs.push_back({d::kData3HeaderSize, ".", ino_, d::kFtDir});
-  recs.push_back({d::kData3HeaderSize + static_cast<uint32_t>(
-                                         DataEntrySize(1)),
+  recs.push_back({static_cast<uint32_t>(d::kData3HeaderSize), ".", ino_,
+                  d::kFtDir});
+  recs.push_back({static_cast<uint32_t>(d::kData3HeaderSize + DataEntrySize(1)),
                   "..", sf_parent_, d::kFtDir});
   for (const PlacedEntry& p : placed_) {
     recs.push_back({p.offset, p.e.name, p.e.ino, p.e.ftype});

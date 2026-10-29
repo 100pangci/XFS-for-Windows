@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -43,9 +44,8 @@ std::filesystem::path MakeTempImage(uint64_t size_bytes) {
   // Create the file first; some standard library implementations refuse to
   // resize a file that does not exist.
   {
-    std::FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return {};
-    std::fclose(f);
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) return {};
   }
   std::filesystem::resize_file(path, size_bytes, ec);
   if (ec) {
@@ -388,16 +388,6 @@ int MakeRw6cFixture(const std::string& path_string) {
                    status.error().Format().c_str());
       return false;
     }
-    return true;
-  };
-  auto create = [&](const std::string& name, uint64_t* ino) -> bool {
-    auto file = fs.CreateRegularFile(root, name, 0644, 0, 0);
-    if (!file.ok()) {
-      std::fprintf(stderr, "rw6c create %s failed: %s\n", name.c_str(),
-                   file.error().Format().c_str());
-      return false;
-    }
-    *ino = file.value();
     return true;
   };
   if (!fs.Mkdir(root, "base", 0755, 0, 0).ok() ||

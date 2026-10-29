@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -56,22 +57,20 @@ size_t NodeMaxRecs(uint32_t block_size) {
   return (block_size - kNodeHeader) / kAttrNodeEntrySize;
 }
 
-size_t EntrySize(const XattrEntry& e, uint32_t block_size) {
+size_t EntrySize(const XattrEntry& e) {
   if (e.remote) return AttrRemoteEntrySize(e.name.size());
   return AttrLocalEntrySize(e.name.size(), e.value.size());
 }
 
-size_t LeafBytes(const std::vector<XattrEntry>& entries, uint32_t block_size) {
+size_t LeafBytes(const std::vector<XattrEntry>& entries) {
   size_t used = 0;
-  for (const XattrEntry& e : entries) used += EntrySize(e, block_size);
+  for (const XattrEntry& e : entries) used += EntrySize(e);
   return kLeafHeader + entries.size() * kAttrLeafEntrySize + used;
 }
 
 bool LeafFits(const std::vector<XattrEntry>& entries, uint32_t block_size) {
-  return LeafBytes(entries, block_size) <= block_size;
+  return LeafBytes(entries) <= block_size;
 }
-
-bool LeafEmpty(const std::vector<XattrEntry>& entries) { return entries.empty(); }
 
 uint32_t LastHash(const std::vector<XattrEntry>& entries) {
   return entries.empty() ? 0 : entries.back().hash;
@@ -269,7 +268,7 @@ std::vector<uint8_t> BuildLeaf(const XfsGeometry& geo, uint64_t ino,
   size_t usedbytes = 0;
   for (size_t i = 0; i < entries.size(); ++i) {
     XattrEntry& e = entries[i];
-    const size_t size = EntrySize(e, geo.block_size);
+    const size_t size = EntrySize(e);
     cursor -= static_cast<uint32_t>(size);
     uint8_t* rec = block.data() + cursor;
     if (e.remote) {
@@ -591,7 +590,7 @@ class TreeEditor {
     }
     Status s = UpdateKeys(target);
     if (!s.ok()) return s;
-    if (LeafBytes(leaves_.at(target).entries, geo_.block_size) <=
+    if (LeafBytes(leaves_.at(target).entries) <=
         geo_.block_size / 2) {
       s = RebalanceLeaf(target);
       if (!s.ok()) return s;
@@ -744,8 +743,8 @@ class TreeEditor {
           !LeafFits(upper, geo_.block_size)) {
         continue;
       }
-      const size_t lb = LeafBytes(lower, geo_.block_size);
-      const size_t ub = LeafBytes(upper, geo_.block_size);
+      const size_t lb = LeafBytes(lower);
+      const size_t ub = LeafBytes(upper);
       const size_t imbalance =
           lb > ub ? lb - ub : ub - lb;
       if (!found || imbalance < best_imbalance) {
@@ -813,6 +812,10 @@ class TreeEditor {
   Status SplitNode(uint32_t logical) {
     WorkingNode& node = nodes_.at(logical);
     const std::vector<NodeEditEntry> all = node.entries;
+    // The root split below erases this map node; keep every scalar we need
+    // afterwards in a local instead of reading through the dangling
+    // reference.
+    const uint16_t node_level = node.level;
     const size_t max = NodeMaxRecs(geo_.block_size);
     if (all.size() <= max) return OkStatus();
     uint32_t parent = 0;
@@ -843,14 +846,14 @@ class TreeEditor {
       if (!s.ok()) return s;
       WorkingNode lower_node;
       lower_node.logical = lower_logical;
-      lower_node.level = node.level;
+      lower_node.level = node_level;
       lower_node.entries = std::move(lower);
       lower_node.forw = upper_logical;
       lower_node.back = 0;
       lower_node.dirty = true;
       WorkingNode upper_node;
       upper_node.logical = upper_logical;
-      upper_node.level = node.level;
+      upper_node.level = node_level;
       upper_node.entries = std::move(upper);
       upper_node.forw = 0;
       upper_node.back = lower_logical;
@@ -862,7 +865,7 @@ class TreeEditor {
       nodes_.emplace(upper_logical, std::move(upper_node));
       WorkingNode root;
       root.logical = 0;
-      root.level = static_cast<uint16_t>(node.level + 1);
+      root.level = static_cast<uint16_t>(node_level + 1);
       root.entries = {{lower_hash, lower_logical},
                       {upper_hash, upper_logical}};
       root.dirty = true;
@@ -995,7 +998,7 @@ class TreeEditor {
         combined.insert(combined.end(), sit->second.entries.begin(),
                         sit->second.entries.end());
       }
-      const size_t combined_bytes = LeafBytes(combined, geo_.block_size);
+      const size_t combined_bytes = LeafBytes(combined);
       if (combined_bytes > geo_.block_size - geo_.block_size / 4) {
         continue;  // cannot join with 25% free space
       }
@@ -1087,8 +1090,8 @@ class TreeEditor {
           !LeafFits(upper, geo_.block_size)) {
         continue;
       }
-      const size_t lb = LeafBytes(lower, geo_.block_size);
-      const size_t ub = LeafBytes(upper, geo_.block_size);
+      const size_t lb = LeafBytes(lower);
+      const size_t ub = LeafBytes(upper);
       const size_t imbalance = lb > ub ? lb - ub : ub - lb;
       if (imbalance < best_imbalance) {
         best_imbalance = imbalance;
@@ -1617,7 +1620,7 @@ class XattrWriter {
     }
     s = FreeOldExcept(keep);
     if (!s.ok()) return s;
-    s = PublishLeaf(0, root_fsb, 0, 0, sorted);
+    s = PublishLeaf(root_fsb, 0, 0, sorted);
     if (!s.ok()) return s;
     target_aformat_ = di::kFormatExtents;
     target_anextents_ = editor_->nextents();
@@ -1641,8 +1644,8 @@ class XattrWriter {
     size_t current_bytes = kLeafHeader;
     for (XattrEntry& e : sorted) {
       const size_t bytes =
-          EntrySize(e, geo_->block_size) + kAttrLeafEntrySize;
-      if (EntrySize(e, geo_->block_size) + kLeafHeader > geo_->block_size) {
+          EntrySize(e) + kAttrLeafEntrySize;
+      if (EntrySize(e) + kLeafHeader > geo_->block_size) {
         return XFS_ERR(XfsError::kNoSpace,
                        "a single xattr entry does not fit a leaf block")
             .Ino(inode_.ino)
@@ -1682,7 +1685,7 @@ class XattrWriter {
       }
       s = FreeOldExcept(keep);
       if (!s.ok()) return s;
-      s = PublishLeaf(0, root_fsb, 0, 0, leaf_groups[0]);
+      s = PublishLeaf(root_fsb, 0, 0, leaf_groups[0]);
       if (!s.ok()) return s;
       target_leaf_count_ = 1;
     } else {
@@ -1723,7 +1726,7 @@ class XattrWriter {
               .Ino(inode_.ino)
               .Metadata("attr leaf");
         }
-        s = PublishLeaf(leaf.logical, fsb, leaf.forw, leaf.back,
+        s = PublishLeaf(fsb, leaf.forw, leaf.back,
                         leaf.entries);
         if (!s.ok()) return s;
         children.push_back({LastHash(leaf.entries), leaf.logical});
@@ -1767,7 +1770,7 @@ class XattrWriter {
                 .Ino(inode_.ino)
                 .Metadata("attr node");
           }
-          s = PublishNode(node.logical, fsb, node.forw, node.back, node.level,
+          s = PublishNode(fsb, node.forw, node.back, node.level,
                           node.entries);
           if (!s.ok()) return s;
         }
@@ -1779,7 +1782,7 @@ class XattrWriter {
       for (const ChildRef& child : children) {
         root_entries.push_back({child.hash, child.logical});
       }
-      s = PublishNode(0, root_fsb, 0, 0, level, root_entries);
+      s = PublishNode(root_fsb, 0, 0, level, root_entries);
       if (!s.ok()) return s;
       target_leaf_count_ = static_cast<uint32_t>(leaves.size());
     }
@@ -1797,8 +1800,8 @@ class XattrWriter {
     return OkStatus();
   }
 
-  Status PublishLeaf(uint32_t logical, uint64_t fsb, uint32_t forw,
-                     uint32_t back, const std::vector<XattrEntry>& entries) {
+  Status PublishLeaf(uint64_t fsb, uint32_t forw, uint32_t back,
+                     const std::vector<XattrEntry>& entries) {
     std::vector<uint8_t> block =
         BuildLeaf(*geo_, inode_.ino, forw, back, entries);
     PutBE64(block.data(), 16, geo_->FsbToByte(fsb) / 512);
@@ -1807,8 +1810,8 @@ class XattrWriter {
                                    "attr leaf");
   }
 
-  Status PublishNode(uint32_t logical, uint64_t fsb, uint32_t forw,
-                     uint32_t back, uint16_t level,
+  Status PublishNode(uint64_t fsb, uint32_t forw, uint32_t back,
+                     uint16_t level,
                      const std::vector<NodeEditEntry>& entries) {
     std::vector<uint8_t> block =
         BuildNode(*geo_, inode_.ino, forw, back, level, entries);

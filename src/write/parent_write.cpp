@@ -26,23 +26,6 @@
 namespace xfs {
 namespace {
 
-Result<std::vector<uint8_t>> ReadRawImage(BlockDevice& device,
-                                          const XfsGeometry& geo,
-                                          uint64_t ino) {
-  if (!geo.InoValid(ino)) {
-    return XFS_ERR(XfsError::kOutOfRange, "inode number out of range")
-        .Ino(ino)
-        .Metadata("parent pointer");
-  }
-  std::vector<uint8_t> image(geo.inode_size, 0);
-  if (!device.Read(geo.InoToByteOffset(ino), image.data(), image.size())) {
-    return XFS_ERR(XfsError::kIoError, "failed to read inode")
-        .Ino(ino)
-        .Metadata("parent pointer");
-  }
-  return image;
-}
-
 Status ValidatePointer(const XfsGeometry& geo, const XfsInode& child,
                        const ParentPointer& pointer) {
   if (!geo.features.parent) {
