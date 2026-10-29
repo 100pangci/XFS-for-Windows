@@ -142,7 +142,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install the reference xfsprogs (parent pointers)
-        run: sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
 
       - name: Configure
         run: >
@@ -255,7 +261,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install the reference xfsprogs (parent pointers)
-        run: sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
 
       - uses: actions/download-artifact@v4
         with:
