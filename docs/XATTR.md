@@ -224,10 +224,11 @@ extent list no longer fits, it is converted to btree format in the same
 transaction (and the bmdr root is logged with `XLOG_ABROOT`); if the data fork
 is already a btree and its in-fork root no longer fits, the root is moved into
 a new bmbt block and becomes a level+1 node over it (the kernel's
-`xfs_btree_new_iroot` path). Shrinking can convert extents back, but an
-existing btree stays a btree while an attribute fork is removed. A local data
-fork (shortform directory/symlink) is preserved or the operation is refused
-with `kNoSpace` rather than truncating it.
+`xfs_btree_new_iroot` path). Shrinking the data fork keeps the btree (or moves
+its in-fork root); growing it back through a smaller attribute fork collapses
+to extents when the extent list fits, as xfs_repair requires. A local data fork
+(shortform directory/symlink) is preserved or the operation is refused with
+`kNoSpace` rather than truncating it.
 
 The inode log item carries both the data-fork and attr-fork regions and their
 field masks (`XFS_ILOG_*`), so replay updates them atomically.

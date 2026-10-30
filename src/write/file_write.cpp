@@ -1262,9 +1262,12 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
             .Ino(ino)
             .Metadata("device");
       }
-      InvalidateCaches(CacheInvalidation::DataRange(
-          ino, old_size, new_size - old_size));
     }
+    // A cached data chunk was sized to the old EOF.  Growing the file can make
+    // that chunk short even when no written extent had to be zeroed, so the
+    // invalidation belongs outside the zero-range branch.
+    InvalidateCaches(CacheInvalidation::DataRange(
+        ino, old_size, new_size - old_size));
     auto txn = BeginTransaction();
     if (!txn.ok()) return txn.error();
     const XfsTimestamp now = CurrentTimestamp();

@@ -267,6 +267,30 @@ Status CheckAttrRmap(BlockDevice& dev, const XfsGeometry& geo,
 // xfs_repair checks.
 Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
                            const XfsInode& inode, uint64_t* out) {
+  // The fork representation must agree with the extent count, exactly the
+  // rule xfs_repair's inode verifier enforces.  A btree with too few extents
+  // (or an extent fork with too many) is corruption even when every record
+  // itself decodes.
+  const size_t data_fork_bytes = inode.data_fork.size();
+  if (inode.format == di::kFormatBtree &&
+      data_fork_bytes / bt::kBmbtRecSize >= inode.nextents) {
+    return XFS_ERR(XfsError::kCorruptInode,
+                   "btree data fork has too few extents")
+        .Ino(inode.ino)
+        .Metadata("inode")
+        .Expected(inode.nextents)
+        .Actual(data_fork_bytes / bt::kBmbtRecSize);
+  }
+  if (inode.format == di::kFormatExtents &&
+      static_cast<size_t>(inode.nextents) * bt::kBmbtRecSize >
+          data_fork_bytes) {
+    return XFS_ERR(XfsError::kCorruptInode,
+                   "extent data fork does not fit the literal area")
+        .Ino(inode.ino)
+        .Metadata("inode")
+        .Expected(inode.nextents)
+        .Actual(data_fork_bytes / bt::kBmbtRecSize);
+  }
   uint64_t blocks = 0;
   if (inode.format != di::kFormatLocal && inode.format != di::kFormatDev &&
       inode.format != di::kFormatUuid) {
@@ -1160,6 +1184,47 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
 
   // Parent-pointer namespace audit: every real dirent has exactly one reverse
   // record and every reverse record has exactly one real dirent.  This is a
+  if (options.all_allocated_inodes) {
+    auto inodes = ListAllocatedInodes();
+    if (!inodes.ok()) {
+      report.Add("allocated inodes", CheckStatus::kCorrupt,
+                 inodes.error().Format());
+    } else {
+      uint32_t bad = 0;
+      uint64_t checked = 0;
+      for (uint64_t ino : inodes.value()) {
+        auto inode = OpenInode(ino);
+        if (!inode.ok()) {
+          report.Add("allocated inode " + std::to_string(ino),
+                     CheckStatus::kCorrupt, inode.error().Format());
+          if (++bad > 8) break;
+          continue;
+        }
+        uint64_t expected_blocks = 0;
+        Status blocks = ExpectedInodeBlocks(dev, geo, inode.value(),
+                                            &expected_blocks);
+        if (!blocks.ok()) {
+          report.Add("allocated inode " + std::to_string(ino),
+                     CheckStatus::kCorrupt, blocks.error().Format());
+          if (++bad > 8) break;
+        } else if (inode.value().nblocks != expected_blocks) {
+          report.Add("allocated inode " + std::to_string(ino),
+                     CheckStatus::kCorrupt,
+                     "di_nblocks " + std::to_string(inode.value().nblocks) +
+                         " != data extents + bmbt blocks " +
+                         std::to_string(expected_blocks));
+          if (++bad > 8) break;
+        }
+        ++checked;
+      }
+      if (bad == 0) {
+        report.Add("allocated inodes", CheckStatus::kOk,
+                   std::to_string(checked) +
+                       " inode fork representations and block counts verified");
+      }
+    }
+  }
+
   // second, independent view of the directory tree (the root_children check
   // above only validates direct children).
   if (options.parent_pointers && live_sb.features.parent) {

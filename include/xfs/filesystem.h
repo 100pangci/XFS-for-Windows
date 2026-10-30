@@ -150,6 +150,10 @@ struct CheckOptions {
   bool root_children = true;
   // Bidirectional dirent <-> parent-pointer audit on parent=1 filesystems.
   bool parent_pointers = true;
+  // Walk every inode marked allocated by the inobt and verify its fork
+  // representation and di_nblocks.  Off by default because a CLI check of a
+  // huge filesystem should stay bounded; stateful fuzzing turns it on.
+  bool all_allocated_inodes = false;
 };
 
 class XfsFilesystem {

@@ -276,6 +276,7 @@ itself:
 | **Crash injection** | Kill every relevant transaction write phase; after replay, only old-or-new states are legal. |
 | **ASan / UBSan** | The full unit/integration suite runs under Clang sanitizers on every push. |
 | **libFuzzer** | Superblock, AG headers, inode/fork, btree, directory, xattr and log-item parsers are fuzzed from real `mkfs.xfs` seeds. |
+| **Stateful fuzzing (FUZZ-2)** | A model-driven generator runs long legal mutation sequences, applies space/directory/xattr pressure, crashes at the writer's injection points and has Linux/xfsprogs recover and judge the result. |
 | **Cross-OS churn** | Linux → Windows → Linux → Windows mutations with a final Linux mount/repair. |
 
 The main end-to-end shapes are:
@@ -291,6 +292,7 @@ modern mkfs.xfs      -> Windows mutate -> Linux mount/repair/scrub
 Details and the qualification ledgers:
 
 * [docs/TESTING.md](docs/TESTING.md)
+* [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md)
 * [docs/RECOVERY.md](docs/RECOVERY.md)
 * [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md)
 * [docs/MODERN_INODE_FEATURES.md](docs/MODERN_INODE_FEATURES.md)
@@ -378,6 +380,7 @@ single owner of each filesystem invariant.
 | [docs/PARENT_POINTERS.md](docs/PARENT_POINTERS.md) | parent-pointer format, lifecycles, oracle, ledger |
 | [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md) | measured modern `mkfs.xfs` profile |
 | [docs/TESTING.md](docs/TESTING.md) | fixtures, crash matrices, external oracles |
+| [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 
 ## Development
 
