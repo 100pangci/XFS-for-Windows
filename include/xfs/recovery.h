@@ -164,6 +164,13 @@ struct ReplayStats {
   uint64_t items_replayed = 0;
   uint64_t buffers_replayed = 0;
   uint64_t buffers_skipped_newer = 0;   // on-disk metadata was newer
+  // Buffer cancellation accounting (xlog_recover_buf_commit_pass1/2).
+  uint64_t cancels_seen = 0;            // cancel items in the replay window
+  uint64_t cancels_consumed = 0;        // cancel references released
+  uint64_t cancel_refs_unconsumed = 0;  // left over after pass 2
+  uint64_t buffers_cancelled = 0;       // BUF items suppressed by a cancel
+  uint64_t inode_items_cancelled = 0;   // INODE items suppressed
+  uint64_t icreate_items_cancelled = 0; // ICREATE items suppressed
   uint64_t inodes_replayed = 0;
   uint64_t icreate_chunks_replayed = 0;
   uint64_t intents_pending = 0;         // unresolved EFI/BUI after replay

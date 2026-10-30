@@ -1306,6 +1306,8 @@ Status ReconstructionState::CommitTrans(TransBuilder* trans) {
 
   // xlog_recover_reorder_trans(): buffer items first, then non-buffer items,
   // then inode buffers, then cancelled buffers (which are dropped in pass 2).
+  // Cancels use list_move() to the head of cancel_list, so they end up in
+  // reverse log order when that list is spliced at the tail.
   std::vector<RecoveredItem> buffers;
   std::vector<RecoveredItem> items;
   std::vector<RecoveredItem> inode_buffers;
@@ -1355,7 +1357,9 @@ Status ReconstructionState::CommitTrans(TransBuilder* trans) {
   for (auto& item : buffers) out.items.push_back(std::move(item));
   for (auto& item : items) out.items.push_back(std::move(item));
   for (auto& item : inode_buffers) out.items.push_back(std::move(item));
-  for (auto& item : cancelled) out.items.push_back(std::move(item));
+  for (auto it = cancelled.rbegin(); it != cancelled.rend(); ++it) {
+    out.items.push_back(std::move(*it));
+  }
   transactions_.push_back(std::move(out));
   return OkStatus();
 }

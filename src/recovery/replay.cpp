@@ -402,10 +402,9 @@ Result<BufLogFormat> ParseBufFormat(const std::vector<uint8_t>& region) {
   out.size = LoadLE16(region.data() + 2);
   out.flags = LoadLE16(region.data() + 4);
   out.len = LoadLE16(region.data() + 6);
-  out.blkno = static_cast<int64_t>(LoadLE32(region.data() + 8)) |
-              (static_cast<int64_t>(static_cast<uint32_t>(
-                   LoadLE32(region.data() + 12)))
-               << 32);
+  out.blkno = static_cast<int64_t>(
+      static_cast<uint64_t>(LoadLE32(region.data() + 8)) |
+      (static_cast<uint64_t>(LoadLE32(region.data() + 12)) << 32));
   out.map_size = LoadLE32(region.data() + 16);
   out.map = region.data() + lf::kBufMapOffset;
   if (out.len == 0 || out.blkno < 0) {
@@ -413,12 +412,6 @@ Result<BufLogFormat> ParseBufFormat(const std::vector<uint8_t>& region) {
         .Expected(out.len)
         .Actual(out.blkno)
         .Metadata("log item");
-  }
-  if (out.flags & lf::kBlfCancel) {
-    // Recovery uses only the buffer geometry from a cancel item. Its exact
-    // stale-format map and region encoding have not been verified from trusted
-    // local source or a Linux-produced cancel log, so do not interpret them.
-    return out;
   }
   if (out.map_size == 0 || out.map_size > 64 ||
       lf::kBufMapOffset + static_cast<size_t>(out.map_size) * 4 >
@@ -428,6 +421,83 @@ Result<BufLogFormat> ParseBufFormat(const std::vector<uint8_t>& region) {
         .Metadata("log item");
   }
   return out;
+}
+
+// xfs_buf_item_format_segment() for a stale (XFS_BLI_STALE) buffer:
+//
+//   blf_size = 1, exactly one BFORMAT iovec with no payload,
+//   format length = offsetof(blf_data_map) + blf_map_size * 4,
+//   blf_map_size = DIV_ROUND_UP(DIV_ROUND_UP(BBTOB(blf_len), 128), 32).
+//
+// xfs_trans_binval() zeroes the whole data map, clears XFS_BLF_INODE_BUF and
+// the XFS_BLFT_* buffer type bits, and sets XFS_BLF_CANCEL.  Flags 5..10 are
+// not defined on disk at all.  Anything else is not an encoding the Linux
+// writer can produce, so recovery refuses it before the first write instead
+// of guessing which older buffer the item was meant to cancel.
+Status ValidateCancelFormat(const RecoveredItem& item,
+                            const BufLogFormat& format) {
+  if (item.regions.size() != 1) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item carries a payload region")
+        .Expected(1)
+        .Actual(item.regions.size())
+        .Metadata("log item");
+  }
+  if (format.size != 1) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item declares more than one log region")
+        .Expected(1)
+        .Actual(format.size)
+        .Metadata("log item");
+  }
+  constexpr uint16_t kLowFlags = 0x1f;   // INODE_BUF/CANCEL/quota flags
+  constexpr uint16_t kUnknownFlags = 0x07e0;  // bits 5..10
+  if ((format.flags & kLowFlags) != lf::kBlfCancel) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item carries unexpected low buffer flags")
+        .Expected(lf::kBlfCancel)
+        .Actual(format.flags & kLowFlags)
+        .Metadata("log item");
+  }
+  if (((format.flags >> lf::kBlftShift) & lf::kBlftMask) != 0) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item carries a buffer type")
+        .Actual((format.flags >> lf::kBlftShift) & lf::kBlftMask)
+        .Metadata("log item");
+  }
+  if ((format.flags & kUnknownFlags) != 0) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item carries undefined buffer flags")
+        .Actual(format.flags & kUnknownFlags)
+        .Metadata("log item");
+  }
+  const uint32_t expected_map_size =
+      (static_cast<uint32_t>(format.len) + 7u) / 8u;
+  if (format.map_size != expected_map_size) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item bitmap size does not match its geometry")
+        .Expected(expected_map_size)
+        .Actual(format.map_size)
+        .Metadata("log item");
+  }
+  const size_t expected_bytes = lf::kBufMapOffset +
+                                static_cast<size_t>(format.map_size) * 4;
+  if (item.regions[0].size() != expected_bytes) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "cancel item format region has the wrong length")
+        .Expected(expected_bytes)
+        .Actual(item.regions[0].size())
+        .Metadata("log item");
+  }
+  for (size_t i = 0; i < static_cast<size_t>(format.map_size) * 4; ++i) {
+    if (format.map[i] != 0) {
+      return XFS_ERR(XfsError::kCorruptBtree,
+                     "cancel item has a non-zero data map")
+          .Actual(i)
+          .Metadata("log item");
+    }
+  }
+  return OkStatus();
 }
 
 // Counts contiguous runs of set bits, one per logged region (what the writer
@@ -727,10 +797,10 @@ Result<InodeLogFormat> ParseInodeFormat(const std::vector<uint8_t>& region) {
   out.ino = static_cast<uint64_t>(LoadLE32(region.data() + lf::kIlfIno)) |
             (static_cast<uint64_t>(LoadLE32(region.data() + lf::kIlfIno + 4))
              << 32);
-  out.blkno = static_cast<int64_t>(LoadLE32(region.data() + lf::kIlfBlkno)) |
-              (static_cast<int64_t>(static_cast<uint32_t>(
-                   LoadLE32(region.data() + lf::kIlfBlkno + 4)))
-               << 32);
+  out.blkno = static_cast<int64_t>(
+      static_cast<uint64_t>(LoadLE32(region.data() + lf::kIlfBlkno)) |
+      (static_cast<uint64_t>(LoadLE32(region.data() + lf::kIlfBlkno + 4))
+       << 32));
   out.len = LoadLE32(region.data() + lf::kIlfLen);
   out.boffset = LoadLE32(region.data() + lf::kIlfBoffset);
   if ((out.fields & lf::kILogCore) == 0 || out.blkno < 0 || out.len == 0) {
@@ -781,13 +851,45 @@ class Replayer {
 
 Status Replayer::Pass1() {
   for (const RecoveredTransaction& trans : scan_.transactions) {
+    // The buffer cache cannot own two partially overlapping buffers at the
+    // same time, so a transaction that both cancels [X,len] and logs a
+    // different geometry overlapping X cannot come from the Linux kernel.
+    // Across transactions, however, exact-key cancellation is deliberate:
+    // an older buffer item for a different geometry is *not* suppressed and
+    // Linux replays it, so that sequence must remain legal here as well.
+    std::map<std::pair<uint64_t, uint32_t>, uint32_t> geometries;
+    std::vector<std::pair<uint64_t, uint32_t>> cancels;
     for (const RecoveredItem& item : trans.items) {
       if (ClassifyLogItem(item.type) != RecoveryItemClass::kBuffer) continue;
       auto format = ParseBufFormat(item.regions[0]);
       if (!format.ok()) return format.error();
-      if (format.value().flags & lf::kBlfCancel) {
-        cancel_.Add(static_cast<uint64_t>(format.value().blkno),
-                    format.value().len);
+      const BufLogFormat& f = format.value();
+      const uint64_t start = static_cast<uint64_t>(f.blkno);
+      ++geometries[std::make_pair(start, f.len)];
+      if (f.flags & lf::kBlfCancel) {
+        Status valid = ValidateCancelFormat(item, f);
+        if (!valid.ok()) return valid;
+        ++stats_.cancels_seen;
+        cancels.emplace_back(start, f.len);
+        cancel_.Add(start, f.len);
+      }
+    }
+    for (const auto& cancel : cancels) {
+      const uint64_t end = cancel.first + cancel.second;
+      for (const auto& geometry : geometries) {
+        const uint64_t start = geometry.first.first;
+        const uint64_t other_end =
+            start + static_cast<uint64_t>(geometry.first.second);
+        if (start == cancel.first && other_end == end) continue;
+        if (start < end && cancel.first < other_end) {
+          return XFS_ERR(
+                     XfsError::kCorruptBtree,
+                     "buffer cancellation partially overlaps a buffer logged "
+                     "in the same transaction")
+              .Offset(cancel.first * 512)
+              .Actual(cancel.second)
+              .Metadata("log item");
+        }
       }
     }
   }
@@ -803,6 +905,9 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
   const uint32_t len = format.len;
 
   if (format.flags & lf::kBlfCancel) {
+    Status valid = ValidateCancelFormat(item, format);
+    if (!valid.ok()) return valid;
+    ++stats_.cancels_consumed;
     cancel_.Release(blkno, len);  // last occurrence consumed
     return OkStatus();
   }
@@ -816,7 +921,7 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
         .Metadata("log item");
   }
   if (cancel_.IsCancelled(blkno, len)) {
-    stats_.buffers_skipped_newer++;  // counts as "not replayed"
+    stats_.buffers_cancelled++;
     return OkStatus();
   }
 
@@ -874,6 +979,7 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
   if (!parsed.ok()) return parsed.error();
   const InodeLogFormat& in_f = parsed.value();
   if (cancel_.IsCancelled(static_cast<uint64_t>(in_f.blkno), in_f.len)) {
+    stats_.inode_items_cancelled++;
     return OkStatus();
   }
 
@@ -1102,7 +1208,7 @@ Status Replayer::ReplayIcreateItem(const RecoveredItem& item,
     if (cancelled != clusters) {
       XFS_WARN("partial inode chunk cancellation; skipped icreate");
     }
-    stats_.buffers_skipped_newer++;
+    stats_.icreate_items_cancelled++;
     return OkStatus();
   }
 
@@ -1316,6 +1422,7 @@ Result<ReplayStats> Replayer::Run(const LogScan& scan, RecoveredLogState* state)
   stats_.bytes_written = buffers_.bytes_written();
   stats_.records_scanned = scan.records.size();
   stats_.intents_pending = intents_.size();
+  stats_.cancel_refs_unconsumed = cancel_.Size();
   if (cancel_.Size() != 0) {
     XFS_WARN("log recovery: " << cancel_.Size()
                               << " cancelled buffer(s) were not consumed");

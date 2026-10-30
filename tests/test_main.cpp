@@ -23,7 +23,10 @@
 #include "xfs/ialloc.h"
 #include "xfs/image_device.h"
 #include "xfs/log.h"
+#include "xfs/log_checker.h"
+#include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/recovery.h"
 #include "xfs/superblock.h"
 #include "xfs/xattr.h"
 
@@ -1010,6 +1013,149 @@ int MakeRw6eFixture(const std::string& path_string) {
   return 0;
 }
 
+// QUAL-2 diagnostic: scan an arbitrary image (typically a Linux-captured
+// dirty log) with the same core scanner the Windows CLI uses, and print the
+// cancel geometry the parser sees.  This never writes.
+int ScanImageMode(const std::string& path_string) {
+  using namespace xfs;
+  std::string error;
+  auto device = ImageBlockDevice::Open(path_string, /*writable=*/false, 512,
+                                       &error);
+  if (!device) {
+    std::fprintf(stderr, "cannot open %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  auto sb = ReadSuperblock(*device, 0, true);
+  if (!sb.ok()) {
+    std::fprintf(stderr, "superblock: %s\n", sb.error().Format().c_str());
+    return 1;
+  }
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  auto scan = ScanLog(*device, sb.value(), geo);
+  if (!scan.ok()) {
+    std::fprintf(stderr, "scan: %s\n", scan.error().Format().c_str());
+    return 1;
+  }
+  const LogScan& s = scan.value();
+  uint64_t items = 0;
+  uint64_t cancels = 0;
+  std::printf("state: %s (%s)\n", ToString(s.state), s.detail.c_str());
+  std::printf("head: block=%u cycle=%u\n", s.head_block, s.head_cycle);
+  std::printf("tail: block=%u cycle=%u\n", s.tail_block, s.tail_cycle);
+  std::printf("records: %zu\n", s.records.size());
+  std::printf("transactions: %zu\n", s.transactions.size());
+  for (const RecoveredTransaction& trans : s.transactions) {
+    items += trans.items.size();
+    for (const RecoveredItem& item : trans.items) {
+      if (item.type != xfs::logfmt::kItemBuf || item.regions.empty() ||
+          item.regions[0].size() < xfs::logfmt::kBufLogFormatSize) {
+        continue;
+      }
+      const uint8_t* p = item.regions[0].data();
+      const uint16_t flags = LoadLE16(p + 4);
+      if ((flags & xfs::logfmt::kBlfCancel) == 0) continue;
+      ++cancels;
+      const uint64_t blkno =
+          static_cast<uint64_t>(LoadLE32(p + 8)) |
+          (static_cast<uint64_t>(LoadLE32(p + 12)) << 32);
+      const uint16_t len = LoadLE16(p + 6);
+      const uint16_t blf_size = LoadLE16(p + 2);
+      const uint32_t map_size = LoadLE32(p + 16);
+      bool zero_map = item.regions[0].size() >=
+                      xfs::logfmt::kBufMapOffset + map_size * 4;
+      for (size_t i = 0; zero_map && i < static_cast<size_t>(map_size) * 4;
+           ++i) {
+        zero_map = item.regions[0][xfs::logfmt::kBufMapOffset + i] == 0;
+      }
+      std::printf(
+          "cancel: tid=%u lsn=0x%llx blkno=%llu len=%u flags=0x%x "
+          "blf_size=%u map_size=%u format_bytes=%zu regions=%zu "
+          "zero_map=%s\n",
+          static_cast<unsigned>(trans.tid),
+          static_cast<unsigned long long>(trans.lsn),
+          static_cast<unsigned long long>(blkno), static_cast<unsigned>(len),
+          static_cast<unsigned>(flags), static_cast<unsigned>(blf_size),
+          static_cast<unsigned>(map_size), item.regions[0].size(),
+          item.regions.size(), zero_map ? "yes" : "no");
+    }
+  }
+  std::printf("items: %llu\n", static_cast<unsigned long long>(items));
+  std::printf("cancels: %llu\n", static_cast<unsigned long long>(cancels));
+  std::printf("unsupported: %zu\n", s.unsupported_items.size());
+  for (const std::string& item : s.unsupported_items) {
+    std::printf("  %s\n", item.c_str());
+  }
+  for (const std::string& warning : s.warnings) {
+    std::printf("warning: %s\n", warning.c_str());
+  }
+  device->Close();
+  return s.state == LogState::kUnknown ? 2 : 0;
+}
+
+// QUAL-2 diagnostic: run the production recovery path over an image file on a
+// non-Windows host, print the cancellation counters, and leave a clean log
+// (the same shape as `xfswin recover --yes-i-really-mean-it`).
+int RecoverImageMode(const std::string& path_string) {
+  using namespace xfs;
+  std::string error;
+  auto device = ImageBlockDevice::Open(path_string, /*writable=*/true, 512,
+                                       &error);
+  if (!device) {
+    std::fprintf(stderr, "cannot open %s: %s\n", path_string.c_str(),
+                 error.c_str());
+    return 1;
+  }
+  MountOptions options;
+  options.read_write = true;
+  options.recovery_only = true;
+  options.clean_log_after_recovery = true;
+  auto fs = XfsFilesystem::Mount(std::move(device), options);
+  if (!fs.ok()) {
+    std::fprintf(stderr, "recover: %s\n", fs.error().Format().c_str());
+    return 1;
+  }
+  Status clean = fs.value()->FinishRecoveryClean();
+  if (!clean.ok()) {
+    std::fprintf(stderr, "clean log: %s\n", clean.error().Format().c_str());
+    return 1;
+  }
+  const auto& report = fs.value()->recovery_report();
+  if (!report.has_value()) {
+    std::printf("log is clean; nothing to recover\n");
+    return 0;
+  }
+  const ReplayStats& r = report->replay;
+  std::printf("recovery complete\n");
+  std::printf("  records scanned          : %llu\n",
+              static_cast<unsigned long long>(r.records_scanned));
+  std::printf("  committed transactions   : %llu\n",
+              static_cast<unsigned long long>(r.transactions_replayed));
+  std::printf("  items replayed           : %llu\n",
+              static_cast<unsigned long long>(r.items_replayed));
+  std::printf("  buffers replayed         : %llu\n",
+              static_cast<unsigned long long>(r.buffers_replayed));
+  std::printf("  buffers skipped by LSN   : %llu\n",
+              static_cast<unsigned long long>(r.buffers_skipped_newer));
+  std::printf("  cancel items             : %llu\n",
+              static_cast<unsigned long long>(r.cancels_seen));
+  std::printf("  cancel refs consumed     : %llu (unconsumed %llu)\n",
+              static_cast<unsigned long long>(r.cancels_consumed),
+              static_cast<unsigned long long>(r.cancel_refs_unconsumed));
+  std::printf("  buffers cancelled        : %llu\n",
+              static_cast<unsigned long long>(r.buffers_cancelled));
+  std::printf("  inode items cancelled    : %llu\n",
+              static_cast<unsigned long long>(r.inode_items_cancelled));
+  std::printf("  icreate items cancelled  : %llu\n",
+              static_cast<unsigned long long>(r.icreate_items_cancelled));
+  std::printf("  inodes replayed          : %llu\n",
+              static_cast<unsigned long long>(r.inodes_replayed));
+  std::printf("  icreate chunks replayed  : %llu\n",
+              static_cast<unsigned long long>(r.icreate_chunks_replayed));
+  std::printf("  final log state          : clean\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1028,6 +1174,12 @@ int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--make-rw6e-fixture") == 0) {
     return MakeRw6eFixture(argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--scan-image") == 0) {
+    return ScanImageMode(argv[2]);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--recover-image") == 0) {
+    return RecoverImageMode(argv[2]);
+  }
   std::string filter;
   if (argc == 2 && std::strncmp(argv[1], "--filter=", 9) == 0) {
     filter = argv[1] + 9;
@@ -1039,8 +1191,13 @@ int main(int argc, char** argv) {
                  "[--make-rw6-sparse <image>] "
                  "[--make-rw6c-fixture <image>] "
                  "[--make-rw6d-fixture <image>] "
-                 "[--make-rw6e-fixture <image>] [--filter=<substring>]\n"
+                 "[--make-rw6e-fixture <image>] [--scan-image <image>] "
+                 "[--recover-image <image>] [--filter=<substring>]\n"
                  "  no arguments: run the test suite\n"
+                 "  --scan-image <image>: print the journal scan and every\n"
+                 "      buffer cancellation the parser sees (read-only)\n"
+                 "  --recover-image <image>: replay a dirty log and close it\n"
+                 "      clean, printing the cancellation counters\n"
                  "  --make-fixture <image>: write a fixture image (one "
                  "consistent filesystem with one file) for Linux verification\n"
                  "  --make-rw6-sparse <image>: write a modern-inode filesystem\n"

@@ -801,7 +801,9 @@ class Reconstruction:
         if not trans.items:
             raise LogError("committed transaction with no items")
         # xlog_recover_reorder_trans(): buffer items first, then non-buffer
-        # items, then inode buffers, then cancelled buffers.
+        # items, then inode buffers, then cancelled buffers.  Cancels are moved
+        # to the head of cancel_list (list_move), so that list is in reverse
+        # log order when it is spliced at the tail.
         buffers, items, inode_buffers, cancelled = [], [], [], []
         for item in trans.items:
             tid = item_type(item)
@@ -819,7 +821,7 @@ class Reconstruction:
                 buffers.append(item)
                 continue
             items.append(item)
-        ordered = buffers + items + inode_buffers + cancelled
+        ordered = buffers + items + inode_buffers + list(reversed(cancelled))
         self.transactions.append({
             "tid": trans.tid, "lsn": "0x%x" % trans.lsn,
             "items": [item_summary(item) for item in ordered]})

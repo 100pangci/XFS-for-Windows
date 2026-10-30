@@ -769,7 +769,7 @@ std::vector<uint8_t> AgfBuffer(uint32_t seqno, size_t bytes) {
   return data;
 }
 
-// A synthetic cancel item using the project's provisional encoding.
+// A synthetic cancel item with the Linux stale-buffer encoding.
 // `len_blocks` is in 512-byte daddr units.
 std::vector<std::vector<uint8_t>> CancelItemRegions(uint64_t daddr,
                                                     uint32_t len_blocks) {
@@ -932,13 +932,17 @@ TEST(recovery_replay_cancel_table) {
   CHECK(replay.ok());
   if (!replay.ok()) return;
   CHECK_EQ(replay.value().buffers_replayed, 1u);  // only the post-cancel one
+  CHECK_EQ(replay.value().cancels_seen, 1u);
+  CHECK_EQ(replay.value().cancels_consumed, 1u);
+  CHECK_EQ(replay.value().cancel_refs_unconsumed, 0u);
+  CHECK_EQ(replay.value().buffers_cancelled, 1u);
 
   std::vector<uint8_t> after(512);
   CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
   CHECK_EQ(xfs::GetBE32(after.data(), 8), 10u);
 }
 
-TEST(recovery_replay_cancel_without_map) {
+TEST(recovery_refuses_cancel_without_linux_map) {
   SyntheticLog log;
   std::vector<uint8_t> on_disk = MakeAgf(7);
   log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
@@ -949,6 +953,9 @@ TEST(recovery_replay_cancel_without_map) {
   const uint32_t block2 =
       block1 + log.WriteRecord(1, block1, 0xffffffffu, xfs::MakeLsn(1, 0), 24,
                                first);
+  // Linux xfs_buf_item_format_segment() always writes blf_map_size words
+  // (24 bytes for a one-block buffer).  A 20-byte format cannot come from the
+  // Linux writer, so recovery must refuse it before replaying anything.
   auto cancel = CommitOps(25, CancelItemRegionsWithoutMap(kAgfDaddr, 1));
   log.WriteRecord(1, block2, block1, xfs::MakeLsn(1, 0), 25, cancel);
 
@@ -956,17 +963,20 @@ TEST(recovery_replay_cancel_without_map) {
   CHECK(scan.ok());
   if (!scan.ok()) return;
   auto replay = log.Replay(scan.value(), nullptr);
-  CHECK(replay.ok());
-  if (!replay.ok()) return;
-  CHECK_EQ(replay.value().buffers_replayed, 0u);
-  CHECK_EQ(replay.value().buffers_skipped_newer, 1u);
-  CHECK_EQ(replay.value().transactions_replayed, 2u);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("bitmap size") != std::string::npos);
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 7u);  // nothing replayed
 }
 
-TEST(recovery_replay_cancel_does_not_interpret_map) {
+TEST(recovery_refuses_cancel_with_nonzero_map) {
   SyntheticLog log;
   std::vector<uint8_t> on_disk = MakeAgf(7);
   log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+  // xfs_trans_binval() memsets every data-map word; a set bit is not a Linux
+  // stale buffer and must not be interpreted as one.
   auto cancel = CommitOps(
       26, CancelItemRegionsWithNonzeroMap(kAgfDaddr, 1));
   log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 26, cancel);
@@ -974,13 +984,71 @@ TEST(recovery_replay_cancel_does_not_interpret_map) {
   CHECK(scan.ok());
   if (!scan.ok()) return;
   auto replay = log.Replay(scan.value(), nullptr);
-  CHECK(replay.ok());
-  if (!replay.ok()) return;
-  CHECK_EQ(replay.value().buffers_replayed, 0u);
-  CHECK_EQ(replay.value().transactions_replayed, 1u);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("non-zero data map") != std::string::npos);
 }
 
-TEST(transaction_emits_provisional_cancel_and_revives) {
+TEST(recovery_refuses_partial_cancel_overlap_in_transaction) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  // One transaction cannot log a one-block buffer and cancel a two-block
+  // buffer that overlaps it: the Linux buffer cache never owns two partially
+  // overlapping buffers at once.  Recovery must refuse instead of applying
+  // half of the exact-key cancellation.
+  auto item = BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0, MakeAgf(9));
+  auto cancel = CancelItemRegions(kAgfDaddr, 2);
+  std::vector<std::vector<uint8_t>> regions = std::move(item);
+  regions.insert(regions.end(), std::make_move_iterator(cancel.begin()),
+                 std::make_move_iterator(cancel.end()));
+  auto ops = CommitOps(27, std::move(regions));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 27, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("partially overlaps") !=
+        std::string::npos);
+}
+
+TEST(recovery_allows_cross_transaction_geometry_reuse) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  // Linux cancels only the exact (blkno, len) key.  A later cancellation of
+  // a different, overlapping geometry therefore does not suppress the older
+  // item; the kernel replays it.  Windows must do the same instead of
+  // rejecting a legal metadata-reuse sequence.
+  auto first = CommitOps(28, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                            MakeAgf(9)));
+  const uint32_t block1 = 0;
+  const uint32_t block2 =
+      block1 + log.WriteRecord(1, block1, 0xffffffffu, xfs::MakeLsn(1, 0), 28,
+                               first);
+  auto cancel = CommitOps(29, CancelItemRegions(kAgfDaddr, 2));
+  log.WriteRecord(1, block2, block1, xfs::MakeLsn(1, 0), 29, cancel);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 1u);
+  CHECK_EQ(replay.value().buffers_cancelled, 0u);
+  CHECK_EQ(replay.value().cancels_consumed, 1u);
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 9u);
+}
+
+TEST(transaction_emits_linux_cancel_and_revives) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();
   auto fs = fixture.Mount(/*read_write=*/true);
@@ -1018,8 +1086,9 @@ TEST(transaction_emits_provisional_cancel_and_revives) {
             .InvalidateMetadataBuffer(offset, bytes, "scratch")
             .ok());
 
-  // The local writer's provisional cancel encoding has one format region, no
-  // payload, and a zeroed full-sized map.
+  // The cancel encoding is exactly xfs_trans_binval()/xfs_buf_item_format_
+  // segment(): one BFORMAT region with no payload, blf_size 1, a zeroed map
+  // sized for the whole buffer, and no inode/type flags.
   const auto& cancelled_ops = txn.value().ops();
   CHECK_EQ(cancelled_ops.size(), 1u);
   if (cancelled_ops.size() == 1) {

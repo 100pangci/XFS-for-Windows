@@ -25,12 +25,16 @@ param(
     [string]$Python = "python",
     # Cap the number of images (CI cost): a deterministic stride over the
     # sorted names still covers every crash point.
-    [int]$MaxImages = 0
+    [int]$MaxImages = 0,
+    # QUAL-2: every image must carry at least one Linux XFS_BLF_CANCEL item,
+    # independently confirmed by the raw-log probe before recovery.
+    [switch]$RequireCancel
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $probe = Join-Path $repo "tests/tools/recovery_probe.py"
+$cancelProbe = Join-Path $repo "tests/tools/cancel_probe.py"
 $Exe = (Resolve-Path $Exe).Path
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
@@ -68,6 +72,17 @@ foreach ($image in $images) {
         Write-Output "  FAIL: oracle disagrees with the Windows dump"
         $failed++
         continue
+    }
+    if ($RequireCancel) {
+        # An independent raw-log reader, not the Windows parser, must find a
+        # Linux-encoded cancellation and reject any encoding anomaly.
+        $cancelJson = Join-Path $OutDir ("{0}.windows-cancel-probe.json" -f $image.BaseName)
+        & $Python $cancelProbe $target --json --require-cancel *> $cancelJson
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "  FAIL: cancel probe rejected the dirty image"
+            $failed++
+            continue
+        }
     }
     # Differential against the kernel's own dump, when the fixture includes it
     # (the Linux dirty-log generator writes <scenario>.logprint.txt).

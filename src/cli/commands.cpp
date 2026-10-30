@@ -462,14 +462,20 @@ void PrintJournalText(const LogScan& scan, bool verbose) {
                 << " regions=" << item.regions.size();
       if (item.type == logfmt::kItemBuf && item.regions[0].size() >= 20) {
         const uint8_t* p = item.regions[0].data();
+        const uint16_t blf_size = LoadLE16(p + 2);
         const uint16_t flags = LoadLE16(p + 4);
         const uint16_t len = LoadLE16(p + 6);
         const uint32_t lo = LoadLE32(p + 8);
         const uint32_t hi = LoadLE32(p + 12);
+        const uint32_t map_size = LoadLE32(p + 16);
         std::cout << " blkno=" << ((static_cast<uint64_t>(hi) << 32) | lo)
                   << " len=" << len << " flags=0x" << std::hex << flags
                   << std::dec << " type_id="
-                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask);
+                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask)
+                  << " blf_size=" << blf_size << " map_size=" << map_size;
+        if (flags & logfmt::kBlfCancel) {
+          std::cout << " cancel";
+        }
       } else if (item.type == logfmt::kItemInode && item.regions[0].size() >= 56) {
         const uint8_t* p = item.regions[0].data();
         const uint32_t fields = LoadLE32(p + logfmt::kIlfFields);
@@ -554,12 +560,20 @@ void PrintJournalJson(const LogScan& scan) {
       if (item.type == logfmt::kItemBuf && item.regions[0].size() >= 20) {
         const uint8_t* p = item.regions[0].data();
         const uint16_t flags = LoadLE16(p + 4);
+        const uint32_t map_size = LoadLE32(p + 16);
         std::cout << ", \"blkno\": "
                   << ((static_cast<uint64_t>(LoadLE32(p + 12)) << 32) |
                       LoadLE32(p + 8))
                   << ", \"len\": " << LoadLE16(p + 6) << ", \"flags\": "
                   << flags << ", \"blft\": "
-                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask);
+                  << ((flags >> logfmt::kBlftShift) & logfmt::kBlftMask)
+                  << ", \"blf_size\": " << LoadLE16(p + 2)
+                  << ", \"map_size\": " << map_size
+                  << ", \"cancel\": "
+                  << ((flags & logfmt::kBlfCancel) ? "true" : "false")
+                  << ", \"format_bytes\": "
+                  << logfmt::kBufLogFormatSize +
+                         static_cast<size_t>(map_size) * 4;
       } else if (item.type == logfmt::kItemInode &&
                  item.regions[0].size() >= 56) {
         const uint8_t* p = item.regions[0].data();
@@ -1870,6 +1884,18 @@ int CommandRecover(const std::string& target, const Options& options) {
   std::cout << "  buffers replayed         : " << replay.buffers_replayed << "\n";
   std::cout << "  buffers skipped by LSN   : " << replay.buffers_skipped_newer
             << "\n";
+  if (replay.cancels_seen != 0) {
+    std::cout << "  cancel items             : " << replay.cancels_seen
+              << "\n";
+    std::cout << "  cancel refs consumed     : " << replay.cancels_consumed
+              << " (unconsumed " << replay.cancel_refs_unconsumed << ")\n";
+    std::cout << "  buffers cancelled        : " << replay.buffers_cancelled
+              << "\n";
+    std::cout << "  inode items cancelled    : "
+              << replay.inode_items_cancelled << "\n";
+    std::cout << "  icreate items cancelled  : "
+              << replay.icreate_items_cancelled << "\n";
+  }
   std::cout << "  intents completed        : " << report->intents_completed
             << "\n";
   std::cout << "  unlinked inodes processed: "
