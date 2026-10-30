@@ -590,8 +590,10 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           // The remote symlink payload was logged as one kBlftSymlink buffer
           // per allocated run. File data and other direct writes must never
           // get a cancel item.
-          s = blocks.InvalidateMetadata(e.startblock, e.blockcount,
-                                        "symlink");
+          // On-disk extent lengths are 21 bits, so the count always fits the
+          // uint32_t buffer-invalidation interface.
+          s = blocks.InvalidateMetadata(
+              e.startblock, static_cast<uint32_t>(e.blockcount), "symlink");
           if (!s.ok()) return s;
         }
         s = editor.RemoveRange(e.startoff, e.EndBlock());
