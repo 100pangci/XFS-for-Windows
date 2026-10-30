@@ -278,9 +278,16 @@ def analyse(image):
         raise ProbeError("short log read")
     img = rp.LogImage(log_data, geo)
     tail = rp.find_tail(img, geo)
+    # The capture script probes a device-mapper snapshot node, where stat()
+    # reports size 0 for the block device.  Fall back to sb_dblocks (the data
+    # device size the superblock describes) so the geometry bound still means
+    # the same thing on files and block devices.
+    image_size = os.path.getsize(image)
+    if image_size <= 0:
+        image_size = rp.be64(sb, 8) * geo.block_size
     result = {
         "image": os.path.abspath(image),
-        "image_size": os.path.getsize(image),
+        "image_size": image_size,
         "state": tail["state"],
         "head": {"block": tail["head"], "cycle": tail["cycle"]},
         "tail": {"block": tail["tail"],

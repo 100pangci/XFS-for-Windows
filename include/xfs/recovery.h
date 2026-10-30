@@ -171,6 +171,11 @@ struct ReplayStats {
   uint64_t buffers_cancelled = 0;       // BUF items suppressed by a cancel
   uint64_t inode_items_cancelled = 0;   // INODE items suppressed
   uint64_t icreate_items_cancelled = 0; // ICREATE items suppressed
+  // New owners: items replayed for a geometry whose cancel references were
+  // already consumed (the reuse that the cancel was protecting).
+  uint64_t buffers_after_cancel = 0;
+  uint64_t inode_items_after_cancel = 0;
+  uint64_t icreate_chunks_after_cancel = 0;
   uint64_t inodes_replayed = 0;
   uint64_t icreate_chunks_replayed = 0;
   uint64_t intents_pending = 0;         // unresolved EFI/BUI after replay

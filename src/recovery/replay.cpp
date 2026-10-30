@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -362,9 +363,16 @@ class CancelTable {
   void Add(uint64_t blkno, uint32_t len) {
     auto key = std::make_pair(blkno, len);
     ++counts_[key];
+    ever_cancelled_.insert(key);
   }
   bool IsCancelled(uint64_t blkno, uint32_t len) const {
     return counts_.count(std::make_pair(blkno, len)) != 0;
+  }
+  // Whether this exact geometry was cancelled anywhere in the replay window.
+  // After the last reference is consumed, a later item for the same geometry
+  // is the block's new owner (xlog_recover_put_buffer_cancelled semantics).
+  bool WasCancelled(uint64_t blkno, uint32_t len) const {
+    return ever_cancelled_.count(std::make_pair(blkno, len)) != 0;
   }
   // xlog_put_buffer_cancelled(): releases one reference; the entry disappears
   // when its last occurrence has been consumed.
@@ -378,6 +386,7 @@ class CancelTable {
 
  private:
   std::map<std::pair<uint64_t, uint32_t>, int> counts_;
+  std::set<std::pair<uint64_t, uint32_t>> ever_cancelled_;
 };
 
 // ---------------------------------------------------------------------------
@@ -869,6 +878,18 @@ Status Replayer::Pass1() {
       if (f.flags & lf::kBlfCancel) {
         Status valid = ValidateCancelFormat(item, f);
         if (!valid.ok()) return valid;
+        // A stale item outside the data device cannot describe any buffer
+        // this filesystem owns; refusing it here keeps an unexplainable
+        // cancellation from ever reaching pass 2.
+        const uint64_t device_bb =
+            static_cast<uint64_t>(geo_.dblocks) << (geo_.block_log - 9);
+        if (start > device_bb || f.len > device_bb - start) {
+          return XFS_ERR(XfsError::kCorruptBtree,
+                         "cancel item lies outside the data device")
+              .Offset(start * 512)
+              .Actual(f.len)
+              .Metadata("log item");
+        }
         ++stats_.cancels_seen;
         cancels.emplace_back(start, f.len);
         cancel_.Add(start, f.len);
@@ -920,11 +941,11 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
         .Actual(item.regions.size())
         .Metadata("log item");
   }
+  const bool reused_after_cancel = cancel_.WasCancelled(blkno, len);
   if (cancel_.IsCancelled(blkno, len)) {
     stats_.buffers_cancelled++;
     return OkStatus();
   }
-
   ReplayBuffers::Key key{blkno, len};
   auto buffer = buffers_.Get(key, current_lsn);
   if (!buffer.ok()) return buffer.error();
@@ -945,6 +966,7 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
     stats_.buffers_skipped_newer++;
     return OkStatus();
   }
+  if (reused_after_cancel) ++stats_.buffers_after_cancel;
 
   Status patched = OkStatus();
   if (format.flags & lf::kBlfInodeBuf) {
@@ -1155,6 +1177,9 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
         .Metadata("log replay");
   }
   buffers_.MarkDirty({static_cast<uint64_t>(in_f.blkno), in_f.len});
+  if (cancel_.WasCancelled(static_cast<uint64_t>(in_f.blkno), in_f.len)) {
+    ++stats_.inode_items_after_cancel;
+  }
   stats_.inodes_replayed++;
   return OkStatus();
 }
@@ -1234,6 +1259,16 @@ Status Replayer::ReplayIcreateItem(const RecoveredItem& item,
     }
     buffers_.MarkDirty({cluster_daddr, cluster_bb});
   }
+  bool reused_after_cancel = false;
+  for (uint32_t j = 0; j < clusters; ++j) {
+    const uint32_t cluster_agbno = agbno + j * blocks_per_cluster;
+    const uint64_t daddr = geo_.FsbToByte(geo_.AgFsb(agno, cluster_agbno)) / 512;
+    if (cancel_.WasCancelled(daddr, cluster_bb)) {
+      reused_after_cancel = true;
+      break;
+    }
+  }
+  if (reused_after_cancel) ++stats_.icreate_chunks_after_cancel;
   stats_.icreate_chunks_replayed++;
   return OkStatus();
 }

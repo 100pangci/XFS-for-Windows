@@ -1148,6 +1148,11 @@ int RecoverImageMode(const std::string& path_string) {
               static_cast<unsigned long long>(r.inode_items_cancelled));
   std::printf("  icreate items cancelled  : %llu\n",
               static_cast<unsigned long long>(r.icreate_items_cancelled));
+  std::printf("  new owners after cancel  : %llu bufs, %llu inodes, "
+              "%llu icreate clusters\n",
+              static_cast<unsigned long long>(r.buffers_after_cancel),
+              static_cast<unsigned long long>(r.inode_items_after_cancel),
+              static_cast<unsigned long long>(r.icreate_chunks_after_cancel));
   std::printf("  inodes replayed          : %llu\n",
               static_cast<unsigned long long>(r.inodes_replayed));
   std::printf("  icreate chunks replayed  : %llu\n",

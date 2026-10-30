@@ -1895,6 +1895,10 @@ int CommandRecover(const std::string& target, const Options& options) {
               << replay.inode_items_cancelled << "\n";
     std::cout << "  icreate items cancelled  : "
               << replay.icreate_items_cancelled << "\n";
+    std::cout << "  new owners after cancel  : "
+              << replay.buffers_after_cancel << " bufs, "
+              << replay.inode_items_after_cancel << " inodes, "
+              << replay.icreate_chunks_after_cancel << " icreate clusters\n";
   }
   std::cout << "  intents completed        : " << report->intents_completed
             << "\n";

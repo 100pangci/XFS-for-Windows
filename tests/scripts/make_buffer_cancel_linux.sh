@@ -280,8 +280,9 @@ validate_copy() {
         echo "FAIL: clean unmount of the kernel-recovered copy failed" >&2
         return 1
     fi
-    xfs_repair -n "$sanity" > "$OUT/$base.repair.txt" 2>&1 || true
-    if [ "$scrub_status" != 0 ] ||
+    local repair_status=0
+    xfs_repair -n "$sanity" > "$OUT/$base.repair.txt" 2>&1 || repair_status=$?
+    if [ "$scrub_status" != 0 ] || [ "$repair_status" != 0 ] ||
        grep -Eiq 'corrupt|would fix|bad |error|warn|fatal|alert|dirty|valuable metadata' \
             "$OUT/$base.repair.txt"; then
         echo "FAIL: the kernel-recovered copy failed repair/scrub" >&2
@@ -343,6 +344,7 @@ while [ -n "$remaining" ] && [ "$attempts" -lt "$MAX_SNAPS" ]; do
 import json
 import os
 import platform
+import struct
 import subprocess
 import sys
 
@@ -357,12 +359,43 @@ def version(command):
         return ""
     return text.splitlines()[0] if text else ""
 
+def be16(data, off):
+    return struct.unpack_from(">H", data, off)[0]
+
+def be32(data, off):
+    return struct.unpack_from(">I", data, off)[0]
+
+def be64(data, off):
+    return struct.unpack_from(">Q", data, off)[0]
+
+# Record the geometry of the fixture itself, not the mounted live device, so
+# the manifest stays meaningful after the image is copied or replayed.
+with open(image, "rb") as handle:
+    sb = handle.read(512)
+geometry = {
+    "blocksize": be32(sb, 4),
+    "sectsize": be16(sb, 102),
+    "inodesize": be16(sb, 104),
+    "agcount": be32(sb, 88),
+    "agblocks": be32(sb, 84),
+    "dblocks": be64(sb, 8),
+    "logstart_fsb": be64(sb, 48),
+    "logblocks": be32(sb, 96),
+    "features_compat": be32(sb, 208),
+    "features_ro_compat": be32(sb, 212),
+    "features_incompat": be32(sb, 216),
+    "features_log_incompat": be32(sb, 220),
+}
+geometry["data_device_bytes"] = geometry["dblocks"] * geometry["blocksize"]
+geometry["log_bytes"] = geometry["logblocks"] * geometry["blocksize"]
+
 data = {
     "kind": "linux-buffer-cancel-fixture",
     "image": image,
     "classes": classes.split(","),
     "sha256": sha,
     "size_bytes": int(size_mb) * 1024 * 1024,
+    "geometry": geometry,
     "snapshot_attempt": int(attempts),
     "workloads": workloads,
     "mkfs_options": (mkfs_opts + " " + parent_opt).strip(),

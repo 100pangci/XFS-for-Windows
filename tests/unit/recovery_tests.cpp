@@ -936,6 +936,7 @@ TEST(recovery_replay_cancel_table) {
   CHECK_EQ(replay.value().cancels_consumed, 1u);
   CHECK_EQ(replay.value().cancel_refs_unconsumed, 0u);
   CHECK_EQ(replay.value().buffers_cancelled, 1u);
+  CHECK_EQ(replay.value().buffers_after_cancel, 1u);
 
   std::vector<uint8_t> after(512);
   CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
@@ -987,6 +988,96 @@ TEST(recovery_refuses_cancel_with_nonzero_map) {
   CHECK(!replay.ok());
   if (replay.ok()) return;
   CHECK(replay.error().Format().find("non-zero data map") != std::string::npos);
+}
+
+TEST(recovery_refuses_cancel_with_buffer_type) {
+  SyntheticLog log;
+  // xfs_trans_binval() clears XFS_BLFT_MASK; a stale item that still names a
+  // buffer type is not the encoding the Linux writer produces.
+  auto regions = CancelItemRegions(kAgfDaddr, 1);
+  PutLE16At(regions[0].data(), 4,
+            static_cast<uint16_t>(lf::kBlfCancel |
+                                  (lf::kBlftBtree << lf::kBlftShift)));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 32,
+                  CommitOps(32, std::move(regions)));
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("buffer type") != std::string::npos);
+}
+
+TEST(recovery_refuses_cancel_with_undefined_flags) {
+  SyntheticLog log;
+  // Bits 5..10 are not defined on disk.
+  auto regions = CancelItemRegions(kAgfDaddr, 1);
+  PutLE16At(regions[0].data(), 4,
+            static_cast<uint16_t>(lf::kBlfCancel | (1u << 5)));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 33,
+                  CommitOps(33, std::move(regions)));
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("undefined buffer flags") !=
+        std::string::npos);
+}
+
+TEST(recovery_refuses_cancel_with_inode_bit) {
+  SyntheticLog log;
+  // xfs_trans_binval() clears XFS_BLF_INODE_BUF.
+  auto regions = CancelItemRegions(kAgfDaddr, 1);
+  PutLE16At(regions[0].data(), 4,
+            static_cast<uint16_t>(lf::kBlfCancel | lf::kBlfInodeBuf));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 34,
+                  CommitOps(34, std::move(regions)));
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("unexpected low buffer flags") !=
+        std::string::npos);
+}
+
+TEST(recovery_refuses_cancel_with_payload_region) {
+  SyntheticLog log;
+  // A stale item has blf_size 1 and one BFORMAT region; a second region is
+  // not a Linux stale encoding.
+  auto regions = CancelItemRegions(kAgfDaddr, 1);
+  PutLE16At(regions[0].data(), 2, 2);
+  regions.push_back(std::vector<uint8_t>(128, 0xAA));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 35,
+                  CommitOps(35, std::move(regions)));
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("payload region") != std::string::npos);
+}
+
+TEST(recovery_refuses_cancel_outside_data_device) {
+  SyntheticLog log;
+  // The synthetic device is 4 MiB; this stale item claims a range far
+  // outside it.  Nothing can match that geometry, and accepting it would
+  // leave an unexplainable cancellation in the table.
+  auto cancel = CommitOps(31, CancelItemRegions(1u << 20, 8));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 31, cancel);
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(!replay.ok());
+  if (replay.ok()) return;
+  CHECK(replay.error().Format().find("outside the data device") !=
+        std::string::npos);
 }
 
 TEST(recovery_refuses_partial_cancel_overlap_in_transaction) {
@@ -1042,10 +1133,58 @@ TEST(recovery_allows_cross_transaction_geometry_reuse) {
   if (!replay.ok()) return;
   CHECK_EQ(replay.value().buffers_replayed, 1u);
   CHECK_EQ(replay.value().buffers_cancelled, 0u);
+  CHECK_EQ(replay.value().buffers_after_cancel, 0u);
   CHECK_EQ(replay.value().cancels_consumed, 1u);
   std::vector<uint8_t> after(512);
   CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
   CHECK_EQ(xfs::GetBE32(after.data(), 8), 9u);
+}
+
+TEST(recovery_cancels_follow_buffers_in_reverse_log_order) {
+  SyntheticLog log;
+  const uint64_t buf_a = kAgfDaddr;
+  const uint64_t buf_b = kAgfDaddr + 64;
+  const uint64_t cancel_a = kAgfDaddr + 1;
+  const uint64_t cancel_b = kAgfDaddr + 65;
+
+  // xlog_recover_reorder_trans() moves buffer items to the front and every
+  // cancel to the head of cancel_list with list_move(), then splices that
+  // list onto the tail.  With two cancels logged interleaved with buffers,
+  // recovery must see: buffers in log order, then cancels in reverse log
+  // order.  The scanner is the only component that can establish this order
+  // for the replay pass, so lock it here even though the kernel's cancel
+  // refcounts are order-insensitive for distinct keys.
+  std::vector<std::vector<uint8_t>> regions;
+  auto add = [&regions](std::vector<std::vector<uint8_t>> item) {
+    regions.insert(regions.end(), std::make_move_iterator(item.begin()),
+                   std::make_move_iterator(item.end()));
+  };
+  add(CancelItemRegions(cancel_a, 1));
+  add(BufItemRegions(buf_a, 1, lf::kBlftAgf, 0, MakeAgf(9)));
+  add(CancelItemRegions(cancel_b, 1));
+  add(BufItemRegions(buf_b, 1, lf::kBlftAgf, 0, MakeAgf(10)));
+  auto ops = CommitOps(30, std::move(regions));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 30, ops);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK_EQ(scan.value().transactions.size(), 1u);
+  if (scan.value().transactions.size() != 1u) return;
+  const auto& items = scan.value().transactions[0].items;
+  CHECK_EQ(items.size(), 4u);
+  if (items.size() != 4u) return;
+  for (const auto& item : items) CHECK_EQ(item.type, lf::kItemBuf);
+  CHECK_EQ(xfs::LoadLE32(items[0].regions[0].data() + 8), buf_a);
+  CHECK_EQ(xfs::LoadLE32(items[1].regions[0].data() + 8), buf_b);
+  CHECK_EQ(xfs::LoadLE32(items[2].regions[0].data() + 8), cancel_b);
+  CHECK_EQ(xfs::LoadLE32(items[3].regions[0].data() + 8), cancel_a);
+  for (size_t i = 2; i < 4; ++i) {
+    CHECK((LoadLE16(items[i].regions[0].data() + 4) & lf::kBlfCancel) != 0);
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    CHECK((LoadLE16(items[i].regions[0].data() + 4) & lf::kBlfCancel) == 0);
+  }
 }
 
 TEST(transaction_emits_linux_cancel_and_revives) {

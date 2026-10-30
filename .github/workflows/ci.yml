@@ -3005,15 +3005,27 @@ jobs:
           name: windows-buffer-cancel
           path: windows-buffer-cancel
 
-      - name: Install xfsprogs
+      - name: Install the reference xfsprogs (modern Windows image features)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Show the Linux oracle versions
+        run: |
+          uname -a
+          command -v xfs_db xfs_repair xfs_scrub
+          /usr/local/sbin/xfs_db -V
+          /usr/local/sbin/xfs_repair -V
 
       - name: The Linux kernel replays the Windows cancel log
         run: |
           ls -l windows-buffer-cancel
-          sudo bash tests/scripts/verify_windows_buffer_cancel_linux.sh \
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_windows_buffer_cancel_linux.sh \
             windows-buffer-cancel
 
       - name: Upload the verification logs
