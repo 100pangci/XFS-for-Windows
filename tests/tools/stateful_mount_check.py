@@ -22,6 +22,8 @@ import subprocess
 import sys
 import tempfile
 
+import stateful_range
+
 
 def fnv1a(data):
     value = 14695981039346656037
@@ -41,7 +43,9 @@ def resolve(root, path):
     return os.path.join(root, path.lstrip("/"))
 
 
-def check_state(root, state, range_mode, allowed_sizes=None):
+def check_state(root, state, range_mode, allowed_sizes=None,
+                range_target=None, range_contract=None, range_before=None,
+                range_after=None):
     for listing_path, names in state["listings"].items():
         directory = resolve(root, listing_path)
         if not os.path.isdir(directory) or os.path.islink(directory):
@@ -60,32 +64,36 @@ def check_state(root, state, range_mode, allowed_sizes=None):
             except FileNotFoundError:
                 fail("path %s is missing" % path)
             resolved.append(st.st_ino)
-            if not range_mode or entry["type"] != "file":
-                if st.st_nlink != entry["nlink"]:
-                    fail("%s: nlink %d != %d" %
-                         (path, st.st_nlink, entry["nlink"]))
+            if st.st_nlink != entry["nlink"]:
+                fail("%s: nlink %d != %d" %
+                     (path, st.st_nlink, entry["nlink"]))
             want_type = entry["type"]
             if want_type == "dir":
                 if not os.path.isdir(full) or os.path.islink(full):
                     fail("%s: not a directory" % path)
-                continue
-            if want_type == "file":
+            elif want_type == "file":
                 if not os.path.isfile(full) or os.path.islink(full):
                     fail("%s: not a regular file" % path)
-                if range_mode:
+                if range_mode and entry["id"] == range_target:
                     allowed = allowed_sizes.get(path) if allowed_sizes else None
-                    if allowed and st.st_size not in allowed:
+                    if not allowed or st.st_size not in allowed:
                         fail("%s: size %d not in allowed set %s" %
-                             (path, st.st_size, sorted(allowed)))
-                    continue
-                if st.st_size != entry["size"]:
-                    fail("%s: size %d != %d" %
-                         (path, st.st_size, entry["size"]))
-                with open(full, "rb") as f:
-                    data = f.read()
-                if len(data) != entry["size"] or \
-                        fnv1a(data) != entry["content_fnv"]:
-                    fail("%s: content differs" % path)
+                             (path, st.st_size, sorted(allowed or [])))
+                    with open(full, "rb") as f:
+                        data = f.read()
+                    error = stateful_range.verify_range(
+                        data, range_contract, range_before, range_after)
+                    if error:
+                        fail("%s: %s" % (path, error))
+                else:
+                    if st.st_size != entry["size"]:
+                        fail("%s: size %d != %d" %
+                             (path, st.st_size, entry["size"]))
+                    with open(full, "rb") as f:
+                        data = f.read()
+                    if len(data) != entry["size"] or \
+                            fnv1a(data) != entry["content_fnv"]:
+                        fail("%s: content differs" % path)
             elif want_type == "symlink":
                 if not os.path.islink(full):
                     fail("%s: not a symlink" % path)
@@ -97,27 +105,27 @@ def check_state(root, state, range_mode, allowed_sizes=None):
                     fail("%s: symlink target differs" % path)
             else:
                 fail("%s: unknown type %s" % (path, want_type))
-            actual_attrs = {}
-            try:
-                for name in os.listxattr(full, follow_symlinks=False):
-                    if not name.startswith("user."):
-                        continue
-                    value = os.getxattr(full, name, follow_symlinks=False)
-                    actual_attrs[name] = {
-                        "length": len(value),
-                        "value_fnv": fnv1a(value),
-                    }
-            except OSError as exc:
-                fail("%s: cannot read xattrs: %s" % (path, exc))
-            wanted_attrs = {a["name"]: a for a in entry.get("xattrs", [])}
-            if set(actual_attrs) != set(wanted_attrs):
-                fail("%s: xattr names %s != %s" %
-                     (path, sorted(actual_attrs), sorted(wanted_attrs)))
-            for name, wanted in wanted_attrs.items():
-                got = actual_attrs[name]
-                if got["length"] != wanted["length"] or \
-                        got["value_fnv"] != wanted["value_fnv"]:
-                    fail("%s: xattr %s differs" % (path, name))
+        actual_attrs = {}
+        try:
+            for name in os.listxattr(full, follow_symlinks=False):
+                if not name.startswith("user."):
+                    continue
+                value = os.getxattr(full, name, follow_symlinks=False)
+                actual_attrs[name] = {
+                    "length": len(value),
+                    "value_fnv": fnv1a(value),
+                }
+        except OSError as exc:
+            fail("%s: cannot read xattrs: %s" % (path, exc))
+        wanted_attrs = {a["name"]: a for a in entry.get("xattrs", [])}
+        if set(actual_attrs) != set(wanted_attrs):
+            fail("%s: xattr names %s != %s" %
+                 (path, sorted(actual_attrs), sorted(wanted_attrs)))
+        for name, wanted in wanted_attrs.items():
+            got = actual_attrs[name]
+            if got["length"] != wanted["length"] or \
+                    got["value_fnv"] != wanted["value_fnv"]:
+                fail("%s: xattr %s differs" % (path, name))
         if len(set(resolved)) != 1:
             fail("hard-link paths %s resolve to different inodes %s" %
                  (entry["paths"], resolved))
@@ -156,17 +164,28 @@ def main(argv):
         fail("manifest has no states")
     range_mode = manifest.get("state_mode") == "range"
     allowed_sizes = {}
+    range_contract = range_before = range_after = None
+    range_target = manifest.get("target_node")
     if range_mode:
+        try:
+            range_contract, range_before, range_after = \
+                stateful_range.load_contract(manifest, args.manifest)
+        except (KeyError, OSError, ValueError) as exc:
+            fail("invalid range contract: %s" % exc)
+        if range_contract is None or range_target is None:
+            fail("range manifest is missing its target or byte contract")
         for state in states:
             for entry in state["entries"]:
-                if entry["type"] == "file":
+                if entry["type"] == "file" and entry["id"] == range_target:
                     for path in entry["paths"]:
                         allowed_sizes.setdefault(path, set()).add(entry["size"])
     errors = []
     try:
         for index, state in enumerate(states):
             try:
-                count = check_state(mountpoint, state, range_mode, allowed_sizes)
+                count = check_state(mountpoint, state, range_mode, allowed_sizes,
+                                    range_target, range_contract, range_before,
+                                    range_after)
                 if not args.quiet:
                     print("mounted state %d matches (%d entries)" %
                           (index, count))

@@ -4,11 +4,41 @@
 
 name: CI
 
+# All jobs live here: the bounded push/PR suite, the weekly FUZZ-2 soak and
+# the Windows PERF-1 smoke.  A schedule trigger applies to the whole workflow,
+# so every bounded job is gated with `if: ... soak_only != 'true'` and the
+# soak job runs only for the schedule or an explicit manual `soak_only` run.
+# New jobs must carry the same guard or they will run in the weekly soak.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 3 * * 0'
   workflow_dispatch:
+    inputs:
+      soak_only:
+        description: Run only the long FUZZ-2 soak
+        type: boolean
+        required: false
+        default: false
+      perf_ab:
+        description: Also run the Windows PERF-1 A/B comparison
+        type: boolean
+        required: false
+        default: false
+      soak_steps:
+        description: Operations per soak sequence
+        required: false
+        default: '2000'
+      soak_seeds:
+        description: Space-separated soak seeds (empty = built-in fixed seeds)
+        required: false
+        default: ''
+      soak_workloads:
+        description: Space-separated soak workloads (empty = mixed dir xattr alloc)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -22,6 +52,7 @@ jobs:
   # suite as Windows. These jobs never build WinFsp or the Windows CLI.
   # ---------------------------------------------------------------------------
   linux-build-test:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -55,6 +86,7 @@ jobs:
   # ASan/UBSan exercise the parser, writer, recovery and crash paths without
   # the driver. This is the job that would have caught the xattr tree UAF.
   linux-sanitizer:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -82,6 +114,7 @@ jobs:
   # Bounded libFuzzer smoke for every parser harness. Seeds come from a real
   # mkfs.xfs image generated in the job; no binary corpus is committed.
   linux-fuzz-smoke:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -136,6 +169,7 @@ jobs:
   # mount and the parent-pointer audit.
   # ---------------------------------------------------------------------------
   linux-stateful-fuzz:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -208,6 +242,7 @@ jobs:
           if-no-files-found: ignore
 
   linux-stateful-fuzz-sanitizer:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -254,6 +289,7 @@ jobs:
   # the resulting bytes and the recovered crash image.
   # ---------------------------------------------------------------------------
   linux-verify-stateful-windows:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -304,6 +340,7 @@ jobs:
   # probe, and artifacts for the Linux verification job.
   # ---------------------------------------------------------------------------
   windows-build-test:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -816,6 +853,7 @@ jobs:
   # mkfs.xfs: historical RW-6A fixture without rmapbt/reflink/parent pointers.
   # ---------------------------------------------------------------------------
   linux-generate-rw6-modern:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -844,6 +882,7 @@ jobs:
   # xfs_repair and a Linux writable mount.
   # ---------------------------------------------------------------------------
   linux-verify-rw6-formatted:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -871,6 +910,7 @@ jobs:
   # inode allocation) must be accepted by the real Linux kernel and xfs_repair.
   # ---------------------------------------------------------------------------
   linux-verify-rw6-sparse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -900,6 +940,7 @@ jobs:
   # the formatter's ownership records.
   # ---------------------------------------------------------------------------
   linux-verify-rw6b-formatted:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -928,6 +969,7 @@ jobs:
   # is required to have an rmapbt at level >= 2.
   # ---------------------------------------------------------------------------
   linux-generate-rw6b-rmap:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -957,6 +999,7 @@ jobs:
   # independent ownership oracle, reader differential.
   # ---------------------------------------------------------------------------
   windows-read-rw6b-rmap:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 45
@@ -994,6 +1037,7 @@ jobs:
           if-no-files-found: error
 
   windows-rw6b-tree:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 90
@@ -1020,6 +1064,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6b-tree:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-tree
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1046,6 +1091,7 @@ jobs:
   # expected.json for Linux.
   # ---------------------------------------------------------------------------
   windows-rw6b-mutation:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 120
@@ -1083,6 +1129,7 @@ jobs:
   # the same image again (reverse interoperability).
   # ---------------------------------------------------------------------------
   linux-verify-rw6b-mutation:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-mutation
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -1121,6 +1168,7 @@ jobs:
   # mutates it again and writes the final expected state for Linux.
   # ---------------------------------------------------------------------------
   windows-rw6b-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw6b-mutation
     runs-on: windows-2022
     timeout-minutes: 90
@@ -1160,6 +1208,7 @@ jobs:
   # mutation, final repair/oracle/xfs_db.
   # ---------------------------------------------------------------------------
   linux-verify-rw6b-final:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-reverse
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -1201,6 +1250,7 @@ jobs:
   # metadata must commit completely or fail before the first metadata write.
   # ---------------------------------------------------------------------------
   windows-rw6b-enospc:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 90
@@ -1234,6 +1284,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6b-enospc:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-enospc
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1259,6 +1310,7 @@ jobs:
   # RW-6B: writer crash matrix on a real Linux-created rmapbt filesystem.
   # ---------------------------------------------------------------------------
   linux-generate-rw6b-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -1284,6 +1336,7 @@ jobs:
           if-no-files-found: error
 
   windows-rw6b-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-crash]
     runs-on: windows-2022
     timeout-minutes: 120
@@ -1317,6 +1370,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6b-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -1343,6 +1397,7 @@ jobs:
   # truncate workload; xfs_logprint and recovery_probe.py must both see it.
   # ---------------------------------------------------------------------------
   linux-generate-rw6b-rui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -1376,6 +1431,7 @@ jobs:
   # independent oracle checks the result.
   # ---------------------------------------------------------------------------
   windows-recover-rw6b-rui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rui]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -1415,6 +1471,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6b-rui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recover-rw6b-rui
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1443,6 +1500,7 @@ jobs:
   # then verify every recovered image with Linux.
   # ---------------------------------------------------------------------------
   windows-rw6b-rui-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6b-rui]
     runs-on: windows-2022
     timeout-minutes: 90
@@ -1474,6 +1532,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6b-rui-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6b-rui-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -1512,6 +1571,7 @@ jobs:
   # link/symlink/inode churn), then the independent RW-6A oracle checks it.
   # ---------------------------------------------------------------------------
   windows-rw6-modern-roundtrip:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6-modern]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -1547,6 +1607,7 @@ jobs:
   # (reverse interoperability).
   # ---------------------------------------------------------------------------
   linux-verify-rw6-modern:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6-modern-roundtrip
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1584,6 +1645,7 @@ jobs:
   # Windows re-reads and mutates the Linux-reverse image.
   # ---------------------------------------------------------------------------
   windows-verify-rw6-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw6-modern
     runs-on: windows-2022
     timeout-minutes: 30
@@ -1612,6 +1674,7 @@ jobs:
   # recovered image (clean log, xfs_repair -n, mount).
   # ---------------------------------------------------------------------------
   windows-rw6-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 90
@@ -1637,6 +1700,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1676,6 +1740,7 @@ jobs:
   # inode items in the real kernel log format.
   # ---------------------------------------------------------------------------
   linux-generate-rw6-dirty:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -1700,6 +1765,7 @@ jobs:
           if-no-files-found: error
 
   windows-recover-rw6-dirty:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6-dirty]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -1731,6 +1797,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6-cross-recovery:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recover-rw6-dirty
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1762,6 +1829,7 @@ jobs:
   # the formatter can be compared against a live reference.
   # ---------------------------------------------------------------------------
   linux-reference-probe:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -1831,6 +1899,7 @@ jobs:
   # create a populated golden image written by Linux for the reader test.
   # ---------------------------------------------------------------------------
   linux-verify-windows:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1907,6 +1976,7 @@ jobs:
   # symlinks and consistency checking.
   # ---------------------------------------------------------------------------
   windows-read-linux-image:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-windows
     runs-on: windows-2022
     timeout-minutes: 30
@@ -1936,6 +2006,7 @@ jobs:
   # image read-only and verify reads, write rejection and clean unmount.
   # ---------------------------------------------------------------------------
   windows-mount:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-windows
     runs-on: windows-2022
     timeout-minutes: 45
@@ -2048,6 +2119,7 @@ jobs:
   # applied, and every other file must be byte-identical to the pristine image.
   # ---------------------------------------------------------------------------
   linux-verify-rw:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-mount
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2088,6 +2160,7 @@ jobs:
   # timestamps, and leave a filesystem xfs_repair -n accepts.
   # ---------------------------------------------------------------------------
   linux-verify-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2115,6 +2188,7 @@ jobs:
   # kernel writes to a Windows-extended file).
   # ---------------------------------------------------------------------------
   linux-verify-rw2:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2149,6 +2223,7 @@ jobs:
   # new state, and xfs_repair -n must stay silent.
   # ---------------------------------------------------------------------------
   linux-verify-rw2-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2175,6 +2250,7 @@ jobs:
   # interoperability for an extended file.
   # ---------------------------------------------------------------------------
   windows-verify-rw2-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw2
     runs-on: windows-2022
     timeout-minutes: 20
@@ -2225,6 +2301,7 @@ jobs:
   # directory).
   # ---------------------------------------------------------------------------
   linux-verify-rw3:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2260,6 +2337,7 @@ jobs:
   # -n plus the structural oracle must stay silent.
   # ---------------------------------------------------------------------------
   linux-verify-rw3-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2286,6 +2364,7 @@ jobs:
   # written and removed inside a Windows-created directory.
   # ---------------------------------------------------------------------------
   windows-verify-rw3-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw3
     runs-on: windows-2022
     timeout-minutes: 20
@@ -2342,6 +2421,7 @@ jobs:
   # the Windows-created namespace for the Windows reverse job.
   # ---------------------------------------------------------------------------
   linux-verify-rw4:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -2378,6 +2458,7 @@ jobs:
   # structural oracle must stay silent.
   # ---------------------------------------------------------------------------
   linux-verify-rw4-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2406,6 +2487,7 @@ jobs:
   # hard-link inode) and mutate it again.
   # ---------------------------------------------------------------------------
   windows-verify-rw4-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw4
     runs-on: windows-2022
     timeout-minutes: 20
@@ -2434,6 +2516,7 @@ jobs:
   # through \\.\PhysicalDriveN with the same backend used for real hardware.
   # ---------------------------------------------------------------------------
   windows-rawdevice-vhd:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 30
@@ -2465,6 +2548,7 @@ jobs:
   # VHD is raw data followed by a 512-byte footer; strip it and run xfs_repair.
   # ---------------------------------------------------------------------------
   linux-verify-rawdevice:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rawdevice-vhd
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2504,6 +2588,7 @@ jobs:
   # Linux job verifies.
   # ---------------------------------------------------------------------------
   windows-recover-windows-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 90
@@ -2546,6 +2631,7 @@ jobs:
   # metadata must be intact (xfs_repair -n silent) and the namespace readable.
   # ---------------------------------------------------------------------------
   linux-verify-windows-recovery:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recover-windows-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2576,6 +2662,7 @@ jobs:
   # recovery crash point, restart it, and require convergence.
   # ---------------------------------------------------------------------------
   windows-recovery-crash-matrix:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 90
@@ -2614,6 +2701,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-recovery-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recovery-crash-matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2644,6 +2732,7 @@ jobs:
   # them, Linux verifies namespace/content/allocator state.
   # ---------------------------------------------------------------------------
   linux-generate-dirty-logs:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -2673,6 +2762,7 @@ jobs:
           if-no-files-found: error
 
   windows-recover-linux-logs:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [linux-generate-dirty-logs, windows-build-test]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -2712,6 +2802,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-cross-recovery:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recover-linux-logs
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2746,6 +2837,7 @@ jobs:
   # kernel for both legal profiles (rmapbt=0/1).
   # ---------------------------------------------------------------------------
   linux-verify-rw6c-windows-formatter:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2779,6 +2871,7 @@ jobs:
   # xfs_repair -n and the independent refcount oracle before uploading.
   # ---------------------------------------------------------------------------
   linux-generate-rw6c:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -2810,6 +2903,7 @@ jobs:
   # and runs the raw oracle.
   # ---------------------------------------------------------------------------
   windows-rw6c-roundtrip:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -2855,6 +2949,7 @@ jobs:
   # oracle and a kernel mount, then performs the reverse mutation.
   # ---------------------------------------------------------------------------
   linux-verify-rw6c:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6c-roundtrip
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2903,6 +2998,7 @@ jobs:
   # Windows reads and mutates the image after the Linux reverse pass.
   # ---------------------------------------------------------------------------
   windows-verify-rw6c-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw6c
     runs-on: windows-2022
     timeout-minutes: 45
@@ -2944,6 +3040,7 @@ jobs:
   # Linux validates the final image after the Windows re-mutation.
   # ---------------------------------------------------------------------------
   linux-verify-rw6c-final:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-verify-rw6c-reverse
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -2976,6 +3073,7 @@ jobs:
   # expected old-or-new content manifest.
   # ---------------------------------------------------------------------------
   windows-rw6c-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 90
@@ -3011,6 +3109,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6c-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6c-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -3069,6 +3168,7 @@ jobs:
   # change nothing, for both profiles.
   # ---------------------------------------------------------------------------
   windows-rw6c-refusal:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 30
@@ -3116,6 +3216,7 @@ jobs:
   # write to fail cleanly with no staging record and no data change.
   # ---------------------------------------------------------------------------
   windows-rw6c-enospc:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 90
@@ -3159,6 +3260,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6c-enospc:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6c-enospc
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -3190,6 +3292,7 @@ jobs:
   # copy is the semantic oracle.
   # ---------------------------------------------------------------------------
   linux-generate-rw6c-cui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -3222,6 +3325,7 @@ jobs:
   # semantic state exactly (sharing, CoW count and free blocks).
   # ---------------------------------------------------------------------------
   windows-recover-rw6c-cui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6c-cui]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -3258,6 +3362,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6c-cui:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-recover-rw6c-cui
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -3284,6 +3389,7 @@ jobs:
   # require convergence, no duplicate CUD and the same semantic state.
   # ---------------------------------------------------------------------------
   windows-rw6c-cui-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6c-cui]
     runs-on: windows-2022
     timeout-minutes: 90
@@ -3323,6 +3429,7 @@ jobs:
           if-no-files-found: error
 
   linux-verify-rw6c-cui-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6c-cui-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -3378,6 +3485,7 @@ jobs:
   # on a parent-capable modern kernel and uses the unmodified default.
   # ---------------------------------------------------------------------------
   linux-record-mkfs-defaults:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -3432,6 +3540,7 @@ jobs:
   # symlink attributes, data writes, rename/hardlink/unlink and reflink.
   # ---------------------------------------------------------------------------
   windows-rw6d-native:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 45
@@ -3488,6 +3597,7 @@ jobs:
   # node split/merge, BMBT growth, directory attr, unlink and rename.
   # ---------------------------------------------------------------------------
   windows-rw6d-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 120
@@ -3531,6 +3641,7 @@ jobs:
   # work at zero free blocks.
   # ---------------------------------------------------------------------------
   windows-rw6d-enospc:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: windows-2022
     timeout-minutes: 60
@@ -3574,6 +3685,7 @@ jobs:
   # attribute BMBT included) with xfs_repair and a kernel mount.
   # ---------------------------------------------------------------------------
   linux-verify-rw6d-windows:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [linux-record-mkfs-defaults, windows-rw6d-native,
             windows-rw6d-enospc]
     runs-on: ubuntu-24.04
@@ -3623,6 +3735,7 @@ jobs:
   # requires every representation, including a level-2 DA node.
   # ---------------------------------------------------------------------------
   linux-generate-rw6d:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -3652,6 +3765,7 @@ jobs:
   # writes windows-mutated.manifest.json.
   # ---------------------------------------------------------------------------
   windows-rw6d-roundtrip:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-generate-rw6d]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -3701,6 +3815,7 @@ jobs:
   # a real kernel (including the level-2 tree, remote values and BMBT).
   # ---------------------------------------------------------------------------
   linux-verify-rw6d:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6d-roundtrip
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -3754,6 +3869,7 @@ jobs:
   # Windows reads the Linux reverse image and mutates it once more.
   # ---------------------------------------------------------------------------
   windows-verify-rw6d-reverse:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: linux-verify-rw6d
     runs-on: windows-2022
     timeout-minutes: 45
@@ -3798,6 +3914,7 @@ jobs:
   # Linux validates the final image after the Windows re-mutation.
   # ---------------------------------------------------------------------------
   linux-verify-rw6d-final:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-verify-rw6d-reverse
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -3830,6 +3947,7 @@ jobs:
   # old-or-new manifest to match.
   # ---------------------------------------------------------------------------
   linux-verify-rw6d-crash:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6d-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -3894,6 +4012,7 @@ jobs:
   # verified through a real Linux kernel, xfs_repair and xfs_scrub.
   # ---------------------------------------------------------------------------
   linux-verify-rw6e-windows:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-build-test
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -3945,6 +4064,7 @@ jobs:
   # hand-edited bits.  The runner's kernel must mount it read-write.
   # ---------------------------------------------------------------------------
   linux-rw6e-parent:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -3989,6 +4109,7 @@ jobs:
   # oracle, and leaves an image for the Linux kernel to verify.
   # ---------------------------------------------------------------------------
   windows-rw6e-linux-roundtrip:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: [windows-build-test, linux-rw6e-parent]
     runs-on: windows-2022
     timeout-minutes: 60
@@ -4084,6 +4205,7 @@ jobs:
   # sampler oracle on the same image.
   # ---------------------------------------------------------------------------
   linux-verify-rw6e-mutation:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     needs: windows-rw6e-linux-roundtrip
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -4135,3 +4257,165 @@ jobs:
           name: rw6e-linux-mutation-evidence
           path: rw6e-evidence/
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # FUZZ-2 weekly soak.  Same driver as linux-stateful-fuzz at long length:
+  # three fixed seeds x mixed/dir/xattr/alloc, 2000 operations per sequence,
+  # with kernel verification of every image.  It runs only on the weekly
+  # schedule or on workflow_dispatch with soak_only=true, and its job-level
+  # concurrency group keeps two soak runs from overlapping.
+  # ---------------------------------------------------------------------------
+  linux-stateful-soak:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.soak_only == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    concurrency:
+      group: fuzz2-soak
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the reference xfsprogs (parent pointers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Long stateful soak (kernel verification)
+        env:
+          SOAK_STEPS: ${{ github.event.inputs.soak_steps || '2000' }}
+          SOAK_SEEDS: ${{ github.event.inputs.soak_seeds }}
+          SOAK_WORKLOADS: ${{ github.event.inputs.soak_workloads }}
+        run: |
+          set -euo pipefail
+          sudo env EXE="$PWD/build/tests/stateful_fuzz" WORK="$PWD/fuzz2-soak" \
+            STEPS="$SOAK_STEPS" SEEDS="$SOAK_SEEDS" \
+            WORKLOADS="$SOAK_WORKLOADS" \
+            bash tests/scripts/fuzz2_soak.sh
+
+      - name: Upload soak failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-soak-failure
+          path: fuzz2-soak/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # PERF-1 performance smoke and A/B artifacts.  The smoke job enforces
+  # deterministic gates only (device I/O call counts, concurrency overlap,
+  # cache hits, flush barrier); absolute MB/s is uploaded as an artifact but is
+  # never a pass/fail criterion on hosted runners.  perf-ab stays manual.
+  # ---------------------------------------------------------------------------
+  windows-perf-smoke:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (no WinFsp SDK needed)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_CONFIG --parallel
+
+      - name: PERF-1 deterministic unit gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" --filter=perf_
+          if ($LASTEXITCODE -ne 0) { throw "perf unit gates failed" }
+
+      - name: Core benchmark (perf.json / perf.txt artifacts)
+        shell: pwsh
+        run: |
+          pwsh tests/perf/run_core_perf.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -PerfDir "build\tests\$env:BUILD_CONFIG" `
+            -OutDir out/perf `
+            -SmallFiles 1000 `
+            -Label "ci-$env:GITHUB_SHA"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-perf-smoke
+          path: out/perf
+          if-no-files-found: warn
+
+  windows-perf-ab:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.perf_ab == 'true' && github.event.inputs.soak_only != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout baseline (main) for A/B
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: baseline
+
+      - name: Configure current build
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+
+      - name: Build current
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_CONFIG --parallel
+
+      - name: Configure baseline-compatible A/B runner
+        shell: pwsh
+        run: >
+          cmake -S tests/perf/standalone -B build-ab-baseline
+          -G "Visual Studio 17 2022" -A x64
+          -DXFS_SOURCE="$PWD\baseline"
+          -DBENCH_SOURCE="$PWD\tests\perf\ab_benchmark.cpp"
+
+      - name: Build baseline A/B runner
+        shell: pwsh
+        run: cmake --build build-ab-baseline --config $env:BUILD_CONFIG --parallel
+
+      - name: A/B (baseline then PERF-1, three runs, fresh image each run)
+        shell: pwsh
+        run: |
+          pwsh tests/perf/run_ab.ps1 `
+            -BaselineExe "build-ab-baseline\$env:BUILD_CONFIG\ab_benchmark.exe" `
+            -PerfExe "build\tests\$env:BUILD_CONFIG\xfswin_perf_ab.exe" `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Runs 3 -SmallFiles 1000 -OutDir out/perf-ab
+
+      - name: Correctness check after the benchmark
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "build\src\$env:BUILD_CONFIG\xfswin.exe" check out\perf-ab\images\perf1-1.img
+          if ($LASTEXITCODE -ne 0) { throw "post-benchmark check failed" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-perf-ab
+          path: out/perf-ab
+          if-no-files-found: warn

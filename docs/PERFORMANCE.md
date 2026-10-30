@@ -183,9 +183,9 @@ the same matrix automatically when `-DiskSpd <path>` or `diskspd.exe` on
 - small-file and warm-directory workloads;
 - explicit `Flush` barrier gate.
 
-`tests/perf/run_core_perf.ps1` is the `windows-perf-smoke` entry point; it
-writes `perf.json` and `perf.txt` artifacts and fails only on deterministic
-gates.
+`tests/perf/run_core_perf.ps1` is the entry point of the `windows-perf-smoke`
+job in `ci.yml`; it writes `perf.json` and `perf.txt` artifacts and fails only
+on deterministic gates.
 
 ## Locking and cache model
 

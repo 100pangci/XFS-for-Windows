@@ -137,6 +137,17 @@ The superblock receives `sb_fdblocks` deltas in the same transaction and is
 logged as a sector buffer at daddr 0; replay handles it through
 `xlog_recover_do_primary_sb_buffer` and updates the in-core superblock.
 
+When a btree block is freed (a merge, a root collapse, or an emptied rmapbt /
+refcountbt / inobt / bmbt path), the allocator invalidates that metadata
+buffer with `XFS_BLF_CANCEL` before returning it to free space
+(`BlockAllocator::InvalidateMetadata`). The cancel is what stops an older
+`XFS_LI_BUF` still in the log from overwriting the block after a later owner
+reuses the address. The btree block is cancelled once, immediately before
+`PutTreeBlock`/the pending free, never inside the AGFL machinery: AGFL entries
+are placeholders and are not logged metadata buffers. See
+[JOURNAL.md](JOURNAL.md) and [RECOVERY.md](RECOVERY.md) for the provisional
+stale encoding and replay rule.
+
 ## 4. Data fork mutation (`src/write/bmap.cpp`)
 
 The editor mirrors `xfs_bmap.c` / `xfs_bmap_btree.c`:

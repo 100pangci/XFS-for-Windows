@@ -24,8 +24,11 @@
 // (all built-in mutations do; RunTransaction takes it for them).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
+#include <utility>
 #include <vector>
 
 #include "xfs/error.h"
@@ -34,6 +37,7 @@
 namespace xfs {
 
 class BlockDevice;
+struct XfsGeometry;
 
 // One metadata buffer that becomes visible when the transaction commits.
 struct TransactionWrite {
@@ -44,6 +48,10 @@ struct TransactionWrite {
   // True when the inode's data fork changed (extent map): all parsed extent
   // lists and file data chunks of that inode must be dropped as well.
   bool data_fork_changed = false;
+  // Set when a buffer was invalidated after it was queued: a stale buffer is
+  // never written back (the kernel's XFS_BLI_STALE items are not dispatched
+  // either), but its cache-invalidation metadata still applies.
+  bool suppressed = false;
   const char* what = "metadata";
 };
 
@@ -64,7 +72,14 @@ class XfsTransaction {
   void AddLogOp(std::vector<uint8_t> payload) {
     ops_.push_back(LogOp(0, std::move(payload)));
   }
-  void AddWrite(TransactionWrite write) { writes_.push_back(std::move(write)); }
+  Status AddWrite(TransactionWrite write);
+  // Adds an inode-chunk creation intent and declares the complete physical
+  // buffers it reconstructs during recovery. AddOrderedBuffer accepts only
+  // these exact declared ranges; commit fails if any declared range was not
+  // queued.
+  Status AddIcreateWithOrderedBuffers(std::vector<uint8_t> payload,
+                                      const XfsGeometry& geo,
+                                      uint32_t blocks_per_cluster);
 
   // Adds one metadata buffer to the transaction as an XFS_LI_BUF item:
   //   - stamps the transaction LSN (big-endian) at `lsn_offset` - the value the
@@ -80,6 +95,26 @@ class XfsTransaction {
   Status AddMetadataBuffer(uint64_t offset, std::vector<uint8_t> data,
                            uint16_t blf_type, size_t lsn_offset,
                            size_t crc_offset, const char* what);
+  // Invalidates one complete metadata buffer when its physical block is freed
+  // (xfs_trans_binval). `length` is the buffer size in bytes, a multiple of
+  // 512. Queued write-backs fully inside the range are suppressed like a stale
+  // XFS buffer (this includes 512-byte inode writes inside an inode cluster);
+  // a write crossing the boundary is an error. A logged item for exactly the
+  // same geometry is removed; any overlapping logged item/cancel with a
+  // different geometry is an error because recovery's exact-key match would
+  // not skip it. The emitted cancel encoding is provisional: the exact Linux
+  // stale format region length and map_size have not been confirmed locally.
+  // It protects the exact address/length pair from older transactions.
+  // Callers must not invalidate file data or a remote xattr value: those are
+  // direct-written and have no XFS_LI_BUF item to cancel.
+  //
+  // A later AddMetadataBuffer for exactly the same (offset,length) in this
+  // transaction revives the buffer: the cancel item is removed, because the
+  // newer item supersedes the old one in log order. AddOrderedBuffer requires a
+  // matching cluster range declared by AddIcreateWithOrderedBuffers; that intent
+  // rebuilds the complete buffer during recovery.
+  Status InvalidateMetadataBuffer(uint64_t offset, size_t length,
+                                  const char* what);
   // Queues a metadata buffer for write-back without a physical log item.
   // Newly allocated inode clusters use this: the XFS_LI_ICREATE item in the
   // same record is the logical intent and replay rebuilds the cluster from
@@ -127,8 +162,23 @@ class XfsTransaction {
   struct LoggedBufferRef {
     size_t op_index = 0;  // index into ops_ of the format header
     size_t op_count = 0;  // format header plus one op per run
+    size_t length = 0;
+    uint16_t blf_type = 0;
+    size_t lsn_offset = 0;
+    size_t crc_offset = 0;
+    const char* what = "metadata";
+  };
+  struct CancelledBufferRef {
+    size_t op_index = 0;
   };
   std::map<uint64_t, LoggedBufferRef> logged_buffers_;
+  // The key is (device offset, length): recovery matches a cancellation to a
+  // buffer/inode item only when both blkno and blf_len are identical.
+  std::map<std::pair<uint64_t, size_t>, CancelledBufferRef> cancelled_buffers_;
+  std::set<std::pair<uint64_t, size_t>> ordered_buffer_ranges_;
+  std::set<std::pair<uint64_t, size_t>> ordered_buffer_intents_;
+  void RemoveCancelledLocked(uint64_t offset, size_t length);
+  void ShiftOpIndices(size_t after_index, ptrdiff_t delta);
 };
 
 }  // namespace xfs

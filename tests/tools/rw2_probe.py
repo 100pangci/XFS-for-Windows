@@ -103,6 +103,12 @@ class Geometry:
         self.agblocks = u32(sb, 84)
         self.agcount = u32(sb, 88)
         self.versionnum = u16(sb, 100)
+        # XFS_SB_VERSION_ATTRBIT: xfsprogs mkfs always sets it for v5.  The
+        # kernel maps it to XFS_FEAT_ATTR and xfs_scrub flags attr forks as
+        # corrupt when it is missing.
+        if self.versionnum & 0xF == 5 and not self.versionnum & 0x10:
+            raise SystemExit(
+                "v5 superblock is missing XFS_SB_VERSION_ATTRBIT")
         self.sectsize = u16(sb, 102)
         self.inodesize = u16(sb, 104)
         self.blocklog = sb[120]

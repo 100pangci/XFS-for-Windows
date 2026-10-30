@@ -101,6 +101,11 @@ def main(path: str) -> int:
     assert u32(sb, 0) == SB_MAGIC, "bad superblock magic"
     versionnum = u16(sb, 100)
     assert versionnum & 0xF == 5, f"not v5: versionnum={versionnum:#x}"
+    # XFS_SB_VERSION_ATTRBIT: mkfs.xfs sets it for v5 filesystems.  The kernel
+    # maps it to XFS_FEAT_ATTR; without it xfs_scrub reports every attr fork
+    # as a corrupt "attr block map".
+    assert versionnum & 0x0010, (
+        f"v5 superblock is missing XFS_SB_VERSION_ATTRBIT: {versionnum:#x}")
     blocksize = u32(sb, 4)
     dblocks = u64(sb, 8)
     uuid = sb[32:48]

@@ -293,8 +293,9 @@ Status InobtTree::AllocTreeBlock(uint32_t* agbno) {
 
 Status InobtTree::FreeTreeBlock(uint32_t agbno) {
   const uint64_t fsb = geo_->AgFsb(agno_, agbno);
-  Status s = alloc_->FreeOwned(fsb, 1,
-                               RmapOwner::Metadata(kRmapOwnerInobt));
+  Status s = alloc_->InvalidateMetadata(fsb, 1, name_);
+  if (!s.ok()) return s;
+  s = alloc_->FreeOwned(fsb, 1, RmapOwner::Metadata(kRmapOwnerInobt));
   if (!s.ok()) return s;
   blocks_.erase(agbno);
   dirty_.erase(agbno);
@@ -1333,7 +1334,6 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
   PutBE32(icreate.data(), lf::kIclIsize, geo_->inode_size);
   PutBE32(icreate.data(), lf::kIclLength, length);
   PutBE32(icreate.data(), lf::kIclGen, gen);
-  txn_->AddLogOp(std::move(icreate));
 
   // xfs_ialloc_inode_init also initialises the inode clusters themselves:
   // every inode starts as a pristine free inode (magic, version 3,
@@ -1358,6 +1358,9 @@ Status AllocImpl::CreateChunk(AgiState* ag, InobtRecord* rec_out) {
         .Agbno(agbno)
         .Metadata("inobt");
   }
+  s = txn_->AddIcreateWithOrderedBuffers(std::move(icreate), *geo_,
+                                        blocks_per_cluster);
+  if (!s.ok()) return s;
   const uint32_t clusters = length / blocks_per_cluster;
   for (uint32_t j = 0; j < clusters; ++j) {
     const uint32_t cluster_agbno = agbno + j * blocks_per_cluster;
@@ -1634,50 +1637,85 @@ Status AllocImpl::UpdateFinobtOnFree(AgiState* ag, const InobtRecord& rec,
 
 Status AllocImpl::FreeChunkBlocks(AgiState* ag, const InobtRecord& rec) {
   const uint32_t sagbno = rec.startino >> geo_->inopblog;
-  if (!geo_->features.spinodes || rec.holemask == 0) {
-    const uint64_t chunk_fsb = geo_->AgFsb(ag->agno, sagbno);
-    return alloc_->FreeOwned(
-        chunk_fsb, igeo_.ialloc_blks,
-        RmapOwner::Metadata(kRmapOwnerInodes));
+  const uint32_t cluster_blocks = igeo_.blocks_per_cluster;
+  if (cluster_blocks == 0) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "inode cluster geometry is missing")
+        .Ag(ag->agno)
+        .Metadata("inobt");
   }
-  // Only the backed holemask ranges are owned by the chunk. Walk runs of
-  // zero bits (allocated) and free each contiguous range; holes were never
-  // allocated to inodes and must never enter the free-space tree twice.
-  uint32_t bit = 0;
-  while (bit < bt::kInobtHolemaskBits) {
-    if ((rec.holemask >> bit) & 1u) {
-      ++bit;
-      continue;
+  struct BackedRun {
+    uint32_t agbno;
+    uint32_t blocks;
+  };
+  std::vector<BackedRun> runs;
+  if (!geo_->features.spinodes || rec.holemask == 0) {
+    runs.push_back(BackedRun{sagbno, igeo_.ialloc_blks});
+  } else {
+    // Only the backed holemask ranges are owned by the chunk. Walk runs of
+    // zero bits (allocated) and free each contiguous range; holes were never
+    // allocated to inodes and must never enter the free-space tree twice.
+    uint32_t bit = 0;
+    while (bit < bt::kInobtHolemaskBits) {
+      if ((rec.holemask >> bit) & 1u) {
+        ++bit;
+        continue;
+      }
+      const uint32_t start = bit;
+      while (bit < bt::kInobtHolemaskBits &&
+             ((rec.holemask >> bit) & 1u) == 0) {
+        ++bit;
+      }
+      const uint32_t end = bit;  // exclusive
+      const uint32_t inode_offset =
+          start * ondisk::kInodesPerHolemaskBit;
+      const uint32_t inode_count =
+          (end - start) * ondisk::kInodesPerHolemaskBit;
+      if (inode_offset % geo_->inopblock != 0 ||
+          inode_count % geo_->inopblock != 0) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "sparse inode backing is not block aligned")
+            .Ag(ag->agno)
+            .Metadata("inobt")
+            .Actual(rec.startino);
+      }
+      const uint32_t agbno = sagbno + inode_offset / geo_->inopblock;
+      const uint32_t blocks = inode_count / geo_->inopblock;
+      if (blocks == 0 || agbno + blocks > geo_->AgBlocksFor(ag->agno)) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "sparse inode backing is out of range")
+            .Ag(ag->agno)
+            .Metadata("inobt")
+            .Actual(rec.startino);
+      }
+      runs.push_back(BackedRun{agbno, blocks});
     }
-    const uint32_t start = bit;
-    while (bit < bt::kInobtHolemaskBits &&
-           ((rec.holemask >> bit) & 1u) == 0) {
-      ++bit;
-    }
-    const uint32_t end = bit;  // exclusive
-    const uint32_t inode_offset =
-        start * ondisk::kInodesPerHolemaskBit;
-    const uint32_t inode_count =
-        (end - start) * ondisk::kInodesPerHolemaskBit;
-    if (inode_offset % geo_->inopblock != 0 ||
-        inode_count % geo_->inopblock != 0) {
+  }
+
+  // Cancel each inode cluster first: the inode items name the cluster buffer
+  // (ilf_blkno/ilf_len), so only a matching (blkno,len) protects a freed
+  // cluster from older inode replay. Sparse backing is allocated in
+  // cluster-aligned spino_align runs (the kernel asserts this too).
+  for (const BackedRun& run : runs) {
+    if (run.agbno % cluster_blocks != 0 ||
+        run.blocks % cluster_blocks != 0) {
       return XFS_ERR(XfsError::kCorruptBtree,
-                     "sparse inode backing is not block aligned")
+                     "inode chunk backing is not cluster aligned")
           .Ag(ag->agno)
-          .Metadata("inobt")
-          .Actual(rec.startino);
+          .Agbno(run.agbno)
+          .Actual(run.blocks)
+          .Metadata("inobt");
     }
-    const uint32_t agbno = sagbno + inode_offset / geo_->inopblock;
-    const uint32_t blocks = inode_count / geo_->inopblock;
-    if (blocks == 0 || agbno + blocks > geo_->AgBlocksFor(ag->agno)) {
-      return XFS_ERR(XfsError::kCorruptBtree,
-                     "sparse inode backing is out of range")
-          .Ag(ag->agno)
-          .Metadata("inobt")
-          .Actual(rec.startino);
+    for (uint32_t i = 0; i < run.blocks; i += cluster_blocks) {
+      Status s = alloc_->InvalidateMetadata(
+          geo_->AgFsb(ag->agno, run.agbno + i), cluster_blocks,
+          "inode chunk");
+      if (!s.ok()) return s;
     }
+  }
+  for (const BackedRun& run : runs) {
     Status s = alloc_->FreeOwned(
-        geo_->AgFsb(ag->agno, agbno), blocks,
+        geo_->AgFsb(ag->agno, run.agbno), run.blocks,
         RmapOwner::Metadata(kRmapOwnerInodes));
     if (!s.ok()) return s;
   }

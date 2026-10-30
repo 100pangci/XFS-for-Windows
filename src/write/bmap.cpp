@@ -471,7 +471,9 @@ Status DataForkEditor::AllocBmbtBlock(uint64_t* fsb) {
 }
 
 Status DataForkEditor::FreeBmbtBlock(uint64_t fsb) {
-  Status s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_, attr_fork_));
+  Status s = alloc_->InvalidateMetadata(fsb, 1, "bmbt");
+  if (!s.ok()) return s;
+  s = alloc_->FreeOwned(fsb, 1, RmapOwner::Bmbt(ino_, attr_fork_));
   if (!s.ok()) return s;
   nblocks_delta_ -= 1;
   return OkStatus();

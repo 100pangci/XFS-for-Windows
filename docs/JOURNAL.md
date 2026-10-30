@@ -157,6 +157,42 @@ metadata block header (magic/CRC/LSN) must be part of the logged chunks
 whenever the header changes - in practice the whole first chunk is logged for
 every metadata buffer.
 
+#### Buffer cancellation (`xfs_trans_binval`)
+
+When a metadata buffer is freed, an `XFS_BLF_CANCEL` buffer item protects its
+physical `(blkno, blf_len)` from older log items. Recovery collects cancels in
+pass 1, skips matching buffer or inode items in pass 2, and consumes one cancel
+reference at each cancel item's position in transaction order. This lets a later
+transaction replay a new owner after the last cancellation is consumed.
+
+The local writer currently emits `blf_size = 1`, no payload region,
+`XFS_BLF_CANCEL` with no buffer-type or inode-buffer bits, and an all-zero map
+sized for the complete buffer. The local parser uses only the cancel item's
+`(blkno, len)` geometry and does not interpret its map. The exact Linux stale
+format region length and `blf_map_size` have not been verified from trusted local source or a
+Linux-produced cancel log; the writer encoding is provisional. Project-generated
+fixtures do not provide independent Linux format evidence.
+
+A queued write fully covered by an invalidated metadata buffer is suppressed,
+including contained 512-byte inode writes when an inode cluster is invalidated.
+A write crossing the buffer boundary, or an overlapping logged item/cancel
+with different geometry, is refused: recovery's exact `(blkno, blf_len)` match
+would not protect the rest of that buffer.
+
+Free owners that cancel: free-space btree blocks (bnobt/cntbt), rmapbt,
+refcountbt, inobt/finobt, bmbt, directory data/leaf/node/free/block blocks,
+attr DA leaf/node blocks, inode chunks (one cancel per cluster) and remote
+symlink payload buffers. File data, remote xattr values (direct-written
+`XARM` blocks) and CoW staging are not buffers and are never cancelled;
+neither are AGFL entries, which are free-space placeholders rather than
+logged metadata blocks.
+
+A later `AddMetadataBuffer`/`AddOrderedBuffer` for the same
+`(offset, length)` in the same transaction revives the buffer: the cancel is
+removed and every chunk is logged, so no older item can contribute stale
+chunks. Reviving an ordered inode-cluster buffer is only safe when an
+`ICREATE` item in the same transaction rebuilds the cluster.
+
 ## 5. Clean and dirty state
 
 `xlog_find_tail()` decides whether recovery is required (`xfs_log_recover.c`):

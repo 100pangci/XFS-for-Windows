@@ -538,7 +538,10 @@ Status AllocTree::Remove(const FreeRec& rec) {
         uint8_t* rb = MutableBlock(rr);
         if (rb != nullptr) SetLeftSib(rb, left);
       }
-      Status s = owner_->Ag(agno_)->PutTreeBlock(cur);
+      Status s = owner_->InvalidateMetadata(
+          owner_->geo()->AgFsb(agno_, cur), 1, name_);
+      if (!s.ok()) return s;
+      s = owner_->Ag(agno_)->PutTreeBlock(cur);
       if (!s.ok()) return s;
       blocks_.erase(cur);
       dirty_.erase(cur);
@@ -570,7 +573,10 @@ Status AllocTree::Remove(const FreeRec& rec) {
         uint8_t* rb = MutableBlock(rr);
         if (rb != nullptr) SetLeftSib(rb, cur);
       }
-      Status s = owner_->Ag(agno_)->PutTreeBlock(right);
+      Status s = owner_->InvalidateMetadata(
+          owner_->geo()->AgFsb(agno_, right), 1, name_);
+      if (!s.ok()) return s;
+      s = owner_->Ag(agno_)->PutTreeBlock(right);
       if (!s.ok()) return s;
       blocks_.erase(right);
       dirty_.erase(right);
@@ -671,7 +677,10 @@ Status AllocTree::Remove(const FreeRec& rec) {
     for (size_t i = 0; i < children.size(); ++i) {
       SetRecAt(root_block, i, children[i].key);
     }
-    Status s = owner_->Ag(agno_)->PutTreeBlock(child);
+    Status s = owner_->InvalidateMetadata(
+        owner_->geo()->AgFsb(agno_, child), 1, name_);
+    if (!s.ok()) return s;
+    s = owner_->Ag(agno_)->PutTreeBlock(child);
     if (!s.ok()) return s;
     blocks_.erase(child);
     dirty_.erase(child);

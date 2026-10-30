@@ -278,8 +278,7 @@ Status XfsFilesystem::LogPreparedInode(XfsTransaction& txn, uint64_t ino,
   write.data_fork_changed =
       (ilog_fields & (lf::kILogDExt | lf::kILogDBRoot | lf::kILogDData)) != 0;
   write.what = "inode";
-  txn.AddWrite(std::move(write));
-  return OkStatus();
+  return txn.AddWrite(std::move(write));
 }
 
 Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,

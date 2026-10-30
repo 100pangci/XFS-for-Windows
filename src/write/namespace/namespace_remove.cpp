@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include "xfs/ondisk.h"
 #include "xfs/parent.h"
 #include "xfs/write.h"
+#include "xfs/xattr.h"
 #include "write/namespace/namespace_internal.h"
 
 namespace xfs {
@@ -419,6 +421,12 @@ Status XfsFilesystem::FreeUnlinkedInodeLocked(uint64_t ino) {
 
 Status XfsFilesystem::TruncateForFree(uint64_t ino) {
   constexpr size_t kExtentsPerTransaction = 48;
+  // Attribute DA leaf/node blocks are logged as XFS_LI_BUF items; remote
+  // values are direct writes. Record the DA physical blocks from the still
+  // consistent fork once: the rolling truncation below deliberately leaves
+  // the dead tree internally inconsistent between transactions.
+  std::set<uint64_t> attr_da_blocks;
+  bool attr_da_classified = false;
   for (;;) {
     auto inode = OpenInode(ino);
     if (!inode.ok()) return inode.error();
@@ -427,6 +435,24 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
                      "refusing to truncate an inode that still has links")
           .Ino(ino)
           .Metadata("ifree");
+    }
+    if (!attr_da_classified && inode.value().HasAttrFork() &&
+        inode.value().anextents != 0) {
+      attr_da_classified = true;
+      auto attr_fork = ReadXattrFork(*device_, geometry_, inode.value());
+      if (!attr_fork.ok()) return attr_fork.error();
+      for (const XattrDaLeaf& leaf : attr_fork.value().leaves) {
+        auto fsb = AttrLogicalToPhysical(attr_fork.value(), geometry_,
+                                         leaf.logical);
+        if (!fsb.ok()) return fsb.error();
+        attr_da_blocks.insert(fsb.value());
+      }
+      for (const XattrDaNode& node : attr_fork.value().nodes) {
+        auto fsb = AttrLogicalToPhysical(attr_fork.value(), geometry_,
+                                         node.logical);
+        if (!fsb.ok()) return fsb.error();
+        attr_da_blocks.insert(fsb.value());
+      }
     }
     // xfs_attr_inactive: release every attribute-fork block before the inode
     // is freed.  The DA tree itself does not need to be re-read here: the
@@ -465,6 +491,12 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
           if (removed >= kAttrExtentsPerTransaction) {
             attr_more = true;
             break;
+          }
+          for (uint64_t i = 0; i < e.blockcount; ++i) {
+            if (attr_da_blocks.count(e.startblock + i) == 0) continue;
+            s = blocks.InvalidateMetadata(e.startblock + i, 1,
+                                          "attr DA block");
+            if (!s.ok()) return s;
           }
           s = editor.RemoveRange(e.startoff, e.EndBlock());
           if (!s.ok()) return s;
@@ -544,6 +576,25 @@ Status XfsFilesystem::TruncateForFree(uint64_t ino) {
         if (removed >= kExtentsPerTransaction) {
           more = true;
           break;
+        }
+        if (fresh.value().IsDir()) {
+          // A directory inode's data fork is directory metadata
+          // (kBlftDirData/Leaf/Node/Free), one buffer log item per block.
+          for (uint64_t i = 0; i < e.blockcount; ++i) {
+            s = blocks.InvalidateMetadata(e.startblock + i, 1,
+                                          "directory block");
+            if (!s.ok()) return s;
+          }
+        } else if (fresh.value().IsSymlink() &&
+                   fresh.value().format != di::kFormatLocal) {
+          // The remote symlink payload was logged as one kBlftSymlink buffer
+          // per allocated run. File data and other direct writes must never
+          // get a cancel item.
+          // On-disk extent lengths are 21 bits, so the count always fits the
+          // uint32_t buffer-invalidation interface.
+          s = blocks.InvalidateMetadata(
+              e.startblock, static_cast<uint32_t>(e.blockcount), "symlink");
+          if (!s.ok()) return s;
         }
         s = editor.RemoveRange(e.startoff, e.EndBlock());
         if (!s.ok()) return s;

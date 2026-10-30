@@ -47,7 +47,7 @@ XfsSuperblock MakeSuperblock() {
   sb.logblocks = kLogBlocks;
   sb.logsectsize = 512;
   sb.logsectlog = 9;
-  sb.versionnum = 0xb4a5;
+  sb.versionnum = 0xb4b5;  // canonical mkfs.xfs v5 versionnum
   sb.uuid = fuzz::kFuzzUuid;
   sb.meta_uuid = fuzz::kFuzzUuid;
   return sb;

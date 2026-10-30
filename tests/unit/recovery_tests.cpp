@@ -70,7 +70,7 @@ class SyntheticLog {
       : log_blocks_(log_blocks), device_(4 * 1024 * 1024) {
     std::memcpy(sb_.uuid.data(), kUuid, 16);
     sb_.meta_uuid = sb_.uuid;
-    sb_.versionnum = 0xb4a5;  // v5 + XFS_SB_VERSION_LOGV2BIT
+    sb_.versionnum = 0xb4b5;  // canonical mkfs.xfs v5 versionnum
     sb_.blocksize = 4096;
     sb_.sectsize = 512;
     sb_.inodesize = 512;
@@ -740,12 +740,103 @@ namespace {
 
 constexpr uint64_t kAgfDaddr = 4096;  // byte 2 MiB inside the test device
 
-// A buffer log item for a cancellation (the bitmap logs one chunk).
+bool ScanHasCancelItem(const xfs::LogScan& scan, uint64_t daddr,
+                       uint32_t len_blocks) {
+  for (const xfs::RecoveredTransaction& trans : scan.transactions) {
+    for (const xfs::RecoveredItem& item : trans.items) {
+      if (item.type != lf::kItemBuf || item.regions.empty() ||
+          item.regions[0].size() < lf::kBufLogFormatSize) {
+        continue;
+      }
+      const std::vector<uint8_t>& region = item.regions[0];
+      if ((LoadLE16(region.data() + 4) & lf::kBlfCancel) == 0) continue;
+      const uint32_t len = LoadLE16(region.data() + 6);
+      const uint64_t blkno =
+          static_cast<uint64_t>(xfs::GetLE32(region.data() + 8)) |
+          (static_cast<uint64_t>(xfs::GetLE32(region.data() + 12)) << 32);
+      if (blkno == daddr && len == len_blocks) return true;
+    }
+  }
+  return false;
+}
+
+// Replaces the payload with an AGF-shaped buffer so recovery can classify a
+// replayed buffer (xlog_recover_validate_buf_type). The buffer is always the
+// size of the original remote symlink allocation.
+std::vector<uint8_t> AgfBuffer(uint32_t seqno, size_t bytes) {
+  std::vector<uint8_t> data = MakeAgf(seqno);
+  data.resize(bytes, 0xA5);
+  return data;
+}
+
+// A synthetic cancel item using the project's provisional encoding.
+// `len_blocks` is in 512-byte daddr units.
 std::vector<std::vector<uint8_t>> CancelItemRegions(uint64_t daddr,
-                                                    uint32_t len_blocks,
-                                                    uint16_t blft) {
-  std::vector<uint8_t> chunk(lf::kBufChunkSize, 0);
-  return BufItemRegions(daddr, len_blocks, blft, lf::kBlfCancel, chunk);
+                                                    uint32_t len_blocks) {
+  const uint32_t chunks = len_blocks * (512 / lf::kBufChunkSize);
+  const uint32_t map_words = (chunks + 31) / 32;
+  std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
+  PutLE16At(format.data(), 0, lf::kItemBuf);
+  PutLE16At(format.data(), 2, 1);
+  PutLE16At(format.data(), 4, lf::kBlfCancel);
+  PutLE16At(format.data(), 6, static_cast<uint16_t>(len_blocks));
+  PutLE32At(format.data(), 8, static_cast<uint32_t>(daddr));
+  PutLE32At(format.data(), 12, static_cast<uint32_t>(daddr >> 32));
+  PutLE32At(format.data(), 16, map_words);
+  return {format};
+}
+
+std::vector<std::vector<uint8_t>> CancelItemRegionsWithoutMap(
+    uint64_t daddr, uint32_t len_blocks) {
+  std::vector<uint8_t> format(lf::kBufLogFormatSize, 0);
+  PutLE16At(format.data(), 0, lf::kItemBuf);
+  PutLE16At(format.data(), 2, 1);
+  PutLE16At(format.data(), 4, lf::kBlfCancel);
+  PutLE16At(format.data(), 6, static_cast<uint16_t>(len_blocks));
+  PutLE32At(format.data(), 8, static_cast<uint32_t>(daddr));
+  PutLE32At(format.data(), 12, static_cast<uint32_t>(daddr >> 32));
+  return {format};
+}
+
+std::vector<std::vector<uint8_t>> CancelItemRegionsWithNonzeroMap(
+    uint64_t daddr, uint32_t len_blocks) {
+  std::vector<std::vector<uint8_t>> regions =
+      CancelItemRegions(daddr, len_blocks);
+  regions[0][lf::kBufMapOffset] = 1;
+  return regions;
+}
+
+struct FreedRemoteSymlink {
+  uint64_t fsb = 0;
+  uint32_t blocks = 0;
+};
+
+// Creates a remote symlink (target above the literal-area limit), records its
+// data extent, then unlinks it without deferral. The data blocks are free and
+// their cancel item is in the dirty log.
+bool CreateAndFreeRemoteSymlink(xfs::XfsFilesystem& fs,
+                                const std::string& name,
+                                FreedRemoteSymlink* out) {
+  std::string target(400, 'x');
+  for (size_t i = 0; i < target.size(); ++i) {
+    target[i] = static_cast<char>('a' + (i % 26));
+  }
+  auto ino = fs.CreateSymlink(fs.RootInode(), name, target, 0777, 0, 0);
+  CHECK(ino.ok());
+  if (!ino.ok()) return false;
+  auto extents = fs.GetDataExtents(ino.value());
+  CHECK(extents.ok());
+  if (!extents.ok()) return false;
+  CHECK_EQ(extents.value().size(), 1u);
+  CHECK(!extents.value().empty());
+  if (extents.value().size() != 1 || extents.value()[0].blockcount == 0) {
+    return false;
+  }
+  out->fsb = extents.value()[0].startblock;
+  out->blocks = static_cast<uint32_t>(extents.value()[0].blockcount);
+  auto unlinked = fs.Unlink(fs.RootInode(), name);
+  CHECK(unlinked.ok());
+  return unlinked.ok();
 }
 
 }  // namespace
@@ -824,7 +915,7 @@ TEST(recovery_replay_cancel_table) {
       block1 + log.WriteRecord(1, block1, 0xffffffffu, xfs::MakeLsn(1, 0), 21,
                                first);
   // Record 2: the block is freed (cancelled).
-  auto cancel = CommitOps(22, CancelItemRegions(kAgfDaddr, 1, lf::kBlftAgf));
+  auto cancel = CommitOps(22, CancelItemRegions(kAgfDaddr, 1));
   const uint32_t block3 =
       block2 + log.WriteRecord(1, block2, block1, xfs::MakeLsn(1, 0), 22,
                                cancel);
@@ -845,6 +936,373 @@ TEST(recovery_replay_cancel_table) {
   std::vector<uint8_t> after(512);
   CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
   CHECK_EQ(xfs::GetBE32(after.data(), 8), 10u);
+}
+
+TEST(recovery_replay_cancel_without_map) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  auto first = CommitOps(24, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                            MakeAgf(9)));
+  const uint32_t block1 = 0;
+  const uint32_t block2 =
+      block1 + log.WriteRecord(1, block1, 0xffffffffu, xfs::MakeLsn(1, 0), 24,
+                               first);
+  auto cancel = CommitOps(25, CancelItemRegionsWithoutMap(kAgfDaddr, 1));
+  log.WriteRecord(1, block2, block1, xfs::MakeLsn(1, 0), 25, cancel);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 0u);
+  CHECK_EQ(replay.value().buffers_skipped_newer, 1u);
+  CHECK_EQ(replay.value().transactions_replayed, 2u);
+}
+
+TEST(recovery_replay_cancel_does_not_interpret_map) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+  auto cancel = CommitOps(
+      26, CancelItemRegionsWithNonzeroMap(kAgfDaddr, 1));
+  log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 26, cancel);
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 0u);
+  CHECK_EQ(replay.value().transactions_replayed, 1u);
+}
+
+TEST(transaction_emits_provisional_cancel_and_revives) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  const xfs::XfsGeometry& geo = fs.value()->geometry();
+  const uint32_t last_ag = geo.agcount - 1;
+  const uint64_t scratch_fsb =
+      geo.AgFsb(last_ag, geo.AgBlocksFor(last_ag) - 1);
+  CHECK(geo.FsbValid(scratch_fsb));
+  if (!geo.FsbValid(scratch_fsb)) {
+    fixture.Reset();
+    return;
+  }
+  const uint64_t offset = geo.FsbToByte(scratch_fsb);
+  const size_t bytes = geo.block_size;
+
+  auto txn = fs.value()->BeginTransaction();
+  CHECK(txn.ok());
+  if (!txn.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto first = AgfBuffer(0x1111, bytes);
+  CHECK(txn.value()
+            .AddMetadataBuffer(offset, std::move(first), lf::kBlftAgf,
+                               xfs::ondisk::agf::kLsn,
+                               xfs::ondisk::agf::kCrc, "scratch")
+            .ok());
+  CHECK_EQ(txn.value().writes().size(), 1u);
+  CHECK(txn.value()
+            .InvalidateMetadataBuffer(offset, bytes, "scratch")
+            .ok());
+
+  // The local writer's provisional cancel encoding has one format region, no
+  // payload, and a zeroed full-sized map.
+  const auto& cancelled_ops = txn.value().ops();
+  CHECK_EQ(cancelled_ops.size(), 1u);
+  if (cancelled_ops.size() == 1) {
+    const std::vector<uint8_t>& format = cancelled_ops[0].payload;
+    const uint32_t chunks = static_cast<uint32_t>(bytes / lf::kBufChunkSize);
+    const uint32_t map_words = (chunks + 31) / 32;
+    CHECK_EQ(format.size(), lf::kBufLogFormatSize + map_words * 4);
+    CHECK_EQ(LoadLE16(format.data() + 0), lf::kItemBuf);
+    CHECK_EQ(LoadLE16(format.data() + 2), 1u);
+    CHECK_EQ(LoadLE16(format.data() + 4), lf::kBlfCancel);
+    CHECK_EQ(LoadLE16(format.data() + 6), bytes / 512);
+    CHECK_EQ(xfs::GetLE32(format.data() + 8), offset / 512);
+    CHECK_EQ(xfs::GetLE32(format.data() + 12), (offset / 512) >> 32);
+    CHECK_EQ(xfs::GetLE32(format.data() + 16), map_words);
+    for (uint32_t i = 0; i < map_words * 4; ++i) {
+      CHECK_EQ(format[lf::kBufMapOffset + i], 0u);
+    }
+  }
+  CHECK_EQ(txn.value().writes().size(), 1u);
+  if (txn.value().writes().size() == 1) {
+    CHECK(txn.value().writes()[0].suppressed);
+  }
+
+  // Re-logging the exact buffer supersedes the cancel: the stale item is
+  // removed so recovery cannot skip the new item, and the write-back becomes
+  // live again.
+  auto second = AgfBuffer(0x2222, bytes);
+  CHECK(txn.value()
+            .AddMetadataBuffer(offset, std::move(second), lf::kBlftAgf,
+                               xfs::ondisk::agf::kLsn,
+                               xfs::ondisk::agf::kCrc, "scratch")
+            .ok());
+  CHECK_EQ(txn.value().writes().size(), 1u);
+  if (txn.value().writes().size() == 1) {
+    CHECK(!txn.value().writes()[0].suppressed);
+  }
+  for (const xfs::LogOp& op : txn.value().ops()) {
+    CHECK(op.payload.size() < 6 ||
+          (LoadLE16(op.payload.data() + 4) & lf::kBlfCancel) == 0);
+  }
+
+  fixture.Reset();
+}
+
+TEST(transaction_ordered_inode_buffers_require_icreate_intent) {
+  xfs::XfsGeometry geo;
+  geo.block_size = 4096;
+  geo.block_log = 12;
+  geo.inode_size = 512;
+  geo.inopblock = 8;
+  geo.agcount = 1;
+  geo.agblocks = 128;
+  geo.dblocks = 128;
+  geo.agblklog = 7;
+  constexpr uint32_t agbno = 8;
+  constexpr uint32_t cluster_blocks = 2;
+  const uint64_t offset = geo.FsbToByte(geo.AgFsb(0, agbno));
+  const size_t cluster_bytes = cluster_blocks * geo.block_size;
+
+  xfs::XfsTransaction txn;
+  CHECK(!txn.AddOrderedBuffer(offset, std::vector<uint8_t>(cluster_bytes, 0x55),
+                              64, "inode chunk")
+             .ok());
+  CHECK(txn.InvalidateMetadataBuffer(offset, cluster_bytes, "inode chunk")
+            .ok());
+
+  auto make_icreate = [&] {
+    std::vector<uint8_t> payload(lf::kIcreateLogSize, 0);
+    PutLE16At(payload.data(), lf::kIclType, lf::kItemIcreate);
+    PutLE16At(payload.data(), lf::kIclSize, 1);
+    PutBE32(payload.data(), lf::kIclAg, 0);
+    PutBE32(payload.data(), lf::kIclAgbno, agbno);
+    PutBE32(payload.data(), lf::kIclCount, 16);
+    PutBE32(payload.data(), lf::kIclIsize, 512);
+    PutBE32(payload.data(), lf::kIclLength, cluster_blocks);
+    return payload;
+  };
+  CHECK(txn.AddIcreateWithOrderedBuffers(make_icreate(), geo, cluster_blocks)
+            .ok());
+  CHECK(!txn.AddOrderedBuffer(offset + 512,
+                              std::vector<uint8_t>(cluster_bytes - 512, 0x66),
+                              64, "partial inode chunk")
+             .ok());
+  CHECK(txn.AddOrderedBuffer(offset, std::vector<uint8_t>(cluster_bytes, 0x77),
+                             64, "inode chunk")
+            .ok());
+  CHECK_EQ(txn.ops().size(), 1u);
+  if (txn.ops().size() == 1) {
+    CHECK_EQ(LoadLE16(txn.ops()[0].payload.data()), lf::kItemIcreate);
+  }
+  CHECK_EQ(txn.writes().size(), 1u);
+  if (txn.writes().size() == 1) CHECK(!txn.writes()[0].suppressed);
+}
+
+TEST(transaction_cancel_suppresses_writes_inside_an_inode_cluster) {
+  xfs::XfsTransaction txn;
+  const uint64_t cluster_offset = 8192;
+  const size_t cluster_bytes = 8192;
+
+  // The ifree transaction queues the freed inode's 512-byte write before the
+  // inode allocator discovers that the chunk is empty and invalidates the
+  // whole cluster buffer.
+  xfs::TransactionWrite inode;
+  inode.offset = cluster_offset + 512;
+  inode.data.assign(512, 0x44);
+  inode.ino = 64;
+  inode.inode_metadata = true;
+  inode.what = "inode";
+  CHECK(txn.AddWrite(std::move(inode)).ok());
+
+  xfs::TransactionWrite cluster;
+  cluster.offset = cluster_offset;
+  cluster.data.assign(cluster_bytes, 0x55);
+  cluster.what = "inode cluster";
+  CHECK(txn.AddWrite(std::move(cluster)).ok());
+
+  CHECK(txn.InvalidateMetadataBuffer(cluster_offset, cluster_bytes, "inode chunk")
+            .ok());
+  CHECK_EQ(txn.writes().size(), 2u);
+  for (const xfs::TransactionWrite& write : txn.writes()) {
+    CHECK(write.suppressed);  // neither stale buffer is dispatched
+  }
+  CHECK_EQ(txn.ops().size(), 1u);
+  if (txn.ops().size() == 1) {
+    const std::vector<uint8_t>& format = txn.ops()[0].payload;
+    CHECK_EQ(LoadLE16(format.data() + 4), lf::kBlfCancel);
+    CHECK_EQ(LoadLE16(format.data() + 6), cluster_bytes / 512);
+    CHECK_EQ(xfs::GetLE32(format.data() + 16), 2u);  // 64 chunks, 2 words
+    CHECK_EQ(format.size(), lf::kBufLogFormatSize + 2 * 4);
+  }
+
+  // Re-logging the whole cluster revives only the cluster buffer; the older
+  // inode write into the same cluster stays stale.
+  auto revived = AgfBuffer(0x3333, cluster_bytes);
+  CHECK(txn.AddMetadataBuffer(cluster_offset, std::move(revived),
+                              lf::kBlftAgf, xfs::ondisk::agf::kLsn,
+                              xfs::ondisk::agf::kCrc, "inode cluster")
+            .ok());
+  CHECK_EQ(txn.writes().size(), 2u);
+  for (const xfs::TransactionWrite& write : txn.writes()) {
+    if (write.offset == cluster_offset) {
+      CHECK(!write.suppressed);
+    } else {
+      CHECK(write.suppressed);
+    }
+  }
+  for (const xfs::LogOp& op : txn.ops()) {
+    CHECK(op.payload.size() < 6 ||
+          (LoadLE16(op.payload.data() + 4) & lf::kBlfCancel) == 0);
+  }
+}
+
+TEST(recovery_writer_cancel_protects_direct_symlink_reuse) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  FreedRemoteSymlink freed;
+  CHECK(CreateAndFreeRemoteSymlink(*fs.value(), "reuse-link", &freed));
+  if (freed.blocks == 0) {
+    fixture.Reset();
+    return;
+  }
+  const xfs::XfsGeometry geo = fs.value()->geometry();
+  const xfs::XfsSuperblock sb = fs.value()->superblock();
+  const uint64_t offset = geo.FsbToByte(freed.fsb);
+  const size_t bytes = static_cast<size_t>(freed.blocks) * geo.block_size;
+
+  // The old remote-symlink buffer item is still in the dirty log. Publish new
+  // bytes into the freed address with a plain (not logged) write, as a data
+  // reuse would.
+  std::vector<uint8_t> reuse(bytes, 0x5B);
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(memory->Write(offset, reuse.data(), reuse.size()));
+  CHECK(memory->Flush());
+
+  fs.value().reset();  // crash before a clean unmount
+  auto scan = xfs::ScanLog(*memory, sb, geo);
+  CHECK(scan.ok());
+  if (!scan.ok()) {
+    fixture.Reset();
+    return;
+  }
+  CHECK(scan.value().Recoverable());
+  CHECK(ScanHasCancelItem(scan.value(), offset / 512,
+                          static_cast<uint32_t>(bytes / 512)));
+
+  auto recovered = fixture.Mount(/*read_write=*/true);
+  CHECK(recovered.ok());
+  if (!recovered.ok()) {
+    fixture.Reset();
+    return;
+  }
+  std::vector<uint8_t> after(bytes, 0);
+  CHECK(memory->Read(offset, after.data(), after.size()));
+  CHECK(after == reuse);  // the cancelled older item did not overwrite it
+  recovered.value().reset();
+  fixture.Reset();
+}
+
+TEST(recovery_writer_cancel_allows_later_journaled_reuse) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto fs = fixture.Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  FreedRemoteSymlink freed;
+  CHECK(CreateAndFreeRemoteSymlink(*fs.value(), "relog-link", &freed));
+  if (freed.blocks == 0) {
+    fixture.Reset();
+    return;
+  }
+  const xfs::XfsGeometry geo = fs.value()->geometry();
+  const xfs::XfsSuperblock sb = fs.value()->superblock();
+  const uint64_t offset = geo.FsbToByte(freed.fsb);
+  const size_t bytes = static_cast<size_t>(freed.blocks) * geo.block_size;
+
+  // Reuse the address for new metadata in a later transaction. The cancel was
+  // logged earlier, so recovery consumes it before this record and must replay
+  // the new item.
+  auto txn = fs.value()->BeginTransaction();
+  CHECK(txn.ok());
+  if (!txn.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto image = AgfBuffer(0x5678, bytes);
+  CHECK(txn.value()
+            .AddMetadataBuffer(offset, std::move(image), lf::kBlftAgf,
+                               xfs::ondisk::agf::kLsn,
+                               xfs::ondisk::agf::kCrc, "reuse")
+            .ok());
+  const std::vector<uint8_t>* queued = txn.value().QueuedBuffer(offset);
+  CHECK(queued != nullptr);
+  if (!queued) {
+    fixture.Reset();
+    return;
+  }
+  const std::vector<uint8_t> expected = *queued;
+  CHECK(fs.value()->CommitTransaction(txn.value()).ok());
+
+  // Model a crash that loses this metadata write-back: the log record is
+  // durable, the buffer contents are not.
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  std::vector<uint8_t> lost(bytes, 0);
+  CHECK(memory->Write(offset, lost.data(), lost.size()));
+  CHECK(memory->Flush());
+  fs.value().reset();
+
+  auto scan = xfs::ScanLog(*memory, sb, geo);
+  CHECK(scan.ok());
+  if (scan.ok()) {
+    CHECK(ScanHasCancelItem(scan.value(), offset / 512,
+                            static_cast<uint32_t>(bytes / 512)));
+  }
+  auto recovered = fixture.Mount(/*read_write=*/true);
+  CHECK(recovered.ok());
+  if (!recovered.ok()) {
+    fixture.Reset();
+    return;
+  }
+  std::vector<uint8_t> after(bytes, 0);
+  CHECK(memory->Read(offset, after.data(), after.size()));
+  CHECK(after == expected);  // the post-cancel item was replayed
+  recovered.value().reset();
+  fixture.Reset();
 }
 
 TEST(recovery_replay_refuses_unsupported_items) {

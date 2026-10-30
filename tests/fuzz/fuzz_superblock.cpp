@@ -54,7 +54,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (size != 0) image.assign(data, data + std::min<size_t>(size, 4096));
   if (image.size() < 512) image.resize(512, 0);
   PutBE32(image.data(), sb::kMagic, ondisk::kSbMagic);
-  PutBE16(image.data(), sb::kVersionnum, 0xb4a5);
+  PutBE16(image.data(), sb::kVersionnum, 0xb4b5);
   constexpr uint32_t kFeatures2 = 0x0000018a;  // lazy/attr2/projid32/crc
   PutBE32(image.data(), sb::kFeatures2, kFeatures2);
   PutBE32(image.data(), sb::kBadFeatures2, kFeatures2);

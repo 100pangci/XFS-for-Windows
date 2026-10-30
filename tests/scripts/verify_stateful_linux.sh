@@ -33,6 +33,10 @@ if [ "${3:-}" = "--kernel-replay" ]; then
 elif [ "${4:-}" = "--kernel-replay" ]; then
   KERNEL_REPLAY=1
 fi
+if [ "$(id -u)" -ne 0 ]; then
+  echo "fuzz2: this script mounts a loop device; run it with sudo" >&2
+  exit 2
+fi
 mkdir -p "$WORK"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
@@ -46,12 +50,23 @@ umount_retry() {
     fi
     sleep 1
   done
-  echo "fuzz2: cannot unmount $mp" >&2
-  findmnt -T "$mp" || true
+  echo "fuzz2: normal unmount failed for $mp; trying lazy unmount" >&2
+  umount -l "$mp" 2>/dev/null || true
+  # Lazy unmount detaches the tree immediately but releases the loop device
+  # only once the last user is gone; wait briefly, then report a real leak.
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ! findmnt -M "$mp" -n >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "fuzz2: $mp is still mounted after lazy unmount" >&2
+  findmnt -M "$mp" || true
   if command -v fuser >/dev/null 2>&1; then
     fuser -vm "$mp" || true
   fi
-  umount -l "$mp"
+  echo "fuzz2: clean it up with: sudo umount -l '$mp'" >&2
+  return 1
 }
 
 check_repair() {
@@ -105,6 +120,9 @@ if command -v xfs_scrub >/dev/null 2>&1; then
       exit 1
     fi
   fi
+else
+  echo "fuzz2: xfs_scrub is not installed; recording an online-scrub skip" \
+    | tee "$WORK/xfs_scrub.txt"
 fi
 umount_retry "$MNT"
 trap - EXIT

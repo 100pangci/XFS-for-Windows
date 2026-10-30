@@ -14,6 +14,7 @@ namespace {
 namespace sb = ondisk::sb;
 
 // v5 versionnum/features2 bits written by mkfs for our fixed profile.
+constexpr uint16_t kVersionAttrBit = ondisk::kSbVersionAttrBit;
 constexpr uint16_t kVersionNlinkBit = 0x0020;
 constexpr uint16_t kVersionAlignBit = 0x0080;
 constexpr uint16_t kVersionLogV2Bit = 0x0400;
@@ -56,9 +57,10 @@ void BuildSuperblockImage(const FormatGeometry& geo, std::vector<uint8_t>* buf) 
   PutBE32(p, sb::kRbmblocks, 0);
   PutBE32(p, sb::kLogblocks, geo.logblocks);
 
-  uint16_t versionnum = kVersionNlinkBit | kVersionAlignBit |
-                        kVersionLogV2Bit | kVersionExtflgBit |
-                        kVersionDirV2Bit | kVersionMoreBitsBit | 5;
+  uint16_t versionnum = kVersionAttrBit | kVersionNlinkBit |
+                        kVersionAlignBit | kVersionLogV2Bit |
+                        kVersionExtflgBit | kVersionDirV2Bit |
+                        kVersionMoreBitsBit | 5;
   if (geo.sector_size > 512) versionnum |= kVersionSectorBit;
   PutBE16(p, sb::kVersionnum, versionnum);
 

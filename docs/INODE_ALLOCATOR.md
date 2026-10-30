@@ -243,6 +243,16 @@ cached data can never be served for a reused inode number.
   and its blocks are freed. For sparse chunks the free path walks contiguous
   zero bits of `ir_holemask` and frees only those backing extents, never a
   hole.
+- Every freed cluster is invalidated as one buffer (`XFS_BLF_CANCEL` with
+  `blf_len = cluster_blocks`), exactly like `xfs_trans_binval` on the inode
+  cluster buffer: the cancel covers the whole cluster, not one 512-byte block.
+  The free path validates that each backing run starts and ends on a cluster
+  boundary before cancelling, then frees the runs. Inobt/finobt tree blocks
+  use the ordinary one-block btree cancellation.
+- A cluster allocated and then reused in the same transaction may log the
+  ordered buffer again; that removes the cancel (log order makes the newer
+  item win) and is safe only because the accompanying `ICREATE` item rebuilds
+  the full cluster on replay.
 - `agi_iblocks` and `agi_fblocks` (when inobtcount is on) are recomputed as
   the number of reachable blocks of each tree including the root on every AGI
   write. This is the identity `xfs_repair` checks in `repair/scan.c`.
