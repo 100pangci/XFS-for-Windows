@@ -145,8 +145,8 @@ buffer with `XFS_BLF_CANCEL` before returning it to free space
 reuses the address. The btree block is cancelled once, immediately before
 `PutTreeBlock`/the pending free, never inside the AGFL machinery: AGFL entries
 are placeholders and are not logged metadata buffers. See
-[JOURNAL.md](JOURNAL.md) and [RECOVERY.md](RECOVERY.md) for the provisional
-stale encoding and replay rule.
+[JOURNAL.md](JOURNAL.md) and [RECOVERY.md](RECOVERY.md) for the verified stale
+encoding and replay rule.
 
 ## 4. Data fork mutation (`src/write/bmap.cpp`)
 
