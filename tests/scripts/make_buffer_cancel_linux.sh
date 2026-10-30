@@ -338,7 +338,7 @@ while [ -n "$remaining" ] && [ "$attempts" -lt "$MAX_SNAPS" ]; do
                 echo "fixture $name failed validation; artifacts kept in $OUT" >&2
                 exit 1
             fi
-            python3 - "$OUT/${name%.img}.manifest.json" "$name" "$classes" \
+            python3 - "$OUT/${name%.img}.manifest.json" "$OUT/$name" "$classes" \
                 "$sha256" "$attempts" "$MKFS_OPTS" "$PARENT_OPT" \
                 "$WORKLOADS" "$SIZE_MB" "$OUT/${name%.img}.probe.json" <<'PY'
 import json
@@ -391,7 +391,7 @@ geometry["log_bytes"] = geometry["logblocks"] * geometry["blocksize"]
 
 data = {
     "kind": "linux-buffer-cancel-fixture",
-    "image": image,
+    "image": os.path.basename(image),
     "classes": classes.split(","),
     "sha256": sha,
     "size_bytes": int(size_mb) * 1024 * 1024,

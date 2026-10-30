@@ -2861,6 +2861,7 @@ jobs:
           cat buffer-cancel/summary.txt
 
       - name: Upload the Linux buffer-cancel fixtures
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-buffer-cancel-fixtures
@@ -2896,6 +2897,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows recovery of the Linux cancel logs failed" }
 
       - name: Upload the Windows-recovered images
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: recovered-linux-buffer-cancel
@@ -2986,6 +2988,7 @@ jobs:
           }
 
       - name: Upload the Windows dirty cancel image
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-buffer-cancel
