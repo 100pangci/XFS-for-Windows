@@ -610,17 +610,38 @@ void PrintJournalJson(const LogScan& scan) {
         }
         std::cout << ", \"id\": " << id;
         if (item.type == logfmt::kItemCui) {
+          // xfs_phys_extent: pe_startblock/pe_len/pe_flags.
           const uint32_t nextents = LoadLE32(p + logfmt::kIntentNextentsOffset);
           std::cout << ", \"nextents\": " << nextents << ", \"extents\": [";
           for (uint32_t ext_i = 0; ext_i < nextents; ++ext_i) {
             const size_t base = logfmt::kIntentLogFormatSize + ext_i * 16;
             if (base + 16 > item.regions[0].size()) break;
             const uint8_t* e = p + base;
+            const uint32_t flags = LoadLE32(e + 12);
             std::cout << (ext_i == 0 ? "" : ", ") << "{\"startblock\": "
-                      << (static_cast<uint64_t>(LoadLE32(e + 0)) |
-                          (static_cast<uint64_t>(LoadLE32(e + 4)) << 32))
-                      << ", \"len\": " << LoadLE32(e + 8)
-                      << ", \"op\": " << (LoadLE32(e + 12) & 0xff) << "}";
+                      << LoadLE64(e) << ", \"len\": " << LoadLE32(e + 8)
+                      << ", \"flags\": " << flags
+                      << ", \"op\": " << (flags & 0xff) << "}";
+          }
+          std::cout << "]";
+        } else if (item.type == logfmt::kItemRui ||
+                   item.type == logfmt::kItemBui) {
+          // xfs_map_extent: me_owner/me_startblock/me_startoff/me_len/
+          // me_flags, the same array xfs_rui_log_format and
+          // xfs_bui_log_format describe.
+          const uint32_t nextents = LoadLE32(p + logfmt::kIntentNextentsOffset);
+          std::cout << ", \"nextents\": " << nextents << ", \"extents\": [";
+          for (uint32_t ext_i = 0; ext_i < nextents; ++ext_i) {
+            const size_t base = logfmt::kIntentLogFormatSize + ext_i * 32;
+            if (base + 32 > item.regions[0].size()) break;
+            const uint8_t* e = p + base;
+            const uint32_t flags = LoadLE32(e + 28);
+            std::cout << (ext_i == 0 ? "" : ", ") << "{\"owner\": "
+                      << LoadLE64(e) << ", \"startblock\": " << LoadLE64(e + 8)
+                      << ", \"startoff\": " << LoadLE64(e + 16)
+                      << ", \"len\": " << LoadLE32(e + 24)
+                      << ", \"flags\": " << flags
+                      << ", \"op\": " << (flags & 0xff) << "}";
           }
           std::cout << "]";
         }
