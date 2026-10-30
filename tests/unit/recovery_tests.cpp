@@ -943,6 +943,55 @@ TEST(recovery_replay_cancel_table) {
   CHECK_EQ(xfs::GetBE32(after.data(), 8), 10u);
 }
 
+TEST(recovery_replay_cancel_reuse_cancel_reuse) {
+  SyntheticLog log;
+  std::vector<uint8_t> on_disk = MakeAgf(7);
+  log.WriteRaw(kAgfDaddr * 512, on_disk.data(), on_disk.size());
+
+  // The full reuse chain: an old owner, the free that cancels it, a reuse
+  // that the next free cancels again, and the final new owner.  Every cancel
+  // reference is added in pass 1, so a cancel protects against every older
+  // item even when that item's position precedes the cancel's own position;
+  // only the write after the last cancellation may reach the device.
+  auto first = CommitOps(32, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                            MakeAgf(9)));
+  uint32_t block = log.WriteRecord(1, 0, 0xffffffffu, xfs::MakeLsn(1, 0), 32,
+                                   first);
+  auto cancel1 = CommitOps(33, CancelItemRegions(kAgfDaddr, 1));
+  const uint32_t cancel1_block = block;
+  block += log.WriteRecord(1, block, 0, xfs::MakeLsn(1, 0), 33, cancel1);
+  auto reuse1 = CommitOps(34, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                             MakeAgf(10)));
+  const uint32_t reuse1_block = block;
+  block += log.WriteRecord(1, block, cancel1_block, xfs::MakeLsn(1, 0), 34,
+                           reuse1);
+  auto cancel2 = CommitOps(35, CancelItemRegions(kAgfDaddr, 1));
+  const uint32_t cancel2_block = block;
+  block += log.WriteRecord(1, block, reuse1_block, xfs::MakeLsn(1, 0), 35,
+                           cancel2);
+  auto reuse2 = CommitOps(36, BufItemRegions(kAgfDaddr, 1, lf::kBlftAgf, 0,
+                                             MakeAgf(11)));
+  log.WriteRecord(1, block, cancel2_block, xfs::MakeLsn(1, 0), 36, reuse2);
+
+  auto scan = log.Scan();
+  CHECK(scan.ok());
+  if (!scan.ok()) return;
+  CHECK_EQ(scan.value().transactions.size(), 5u);
+  auto replay = log.Replay(scan.value(), nullptr);
+  CHECK(replay.ok());
+  if (!replay.ok()) return;
+  CHECK_EQ(replay.value().buffers_replayed, 1u);
+  CHECK_EQ(replay.value().buffers_cancelled, 2u);
+  CHECK_EQ(replay.value().buffers_after_cancel, 1u);
+  CHECK_EQ(replay.value().cancels_seen, 2u);
+  CHECK_EQ(replay.value().cancels_consumed, 2u);
+  CHECK_EQ(replay.value().cancel_refs_unconsumed, 0u);
+
+  std::vector<uint8_t> after(512);
+  CHECK(log.ReadRaw(kAgfDaddr * 512, after.data(), after.size()));
+  CHECK_EQ(xfs::GetBE32(after.data(), 8), 11u);
+}
+
 TEST(recovery_refuses_cancel_without_linux_map) {
   SyntheticLog log;
   std::vector<uint8_t> on_disk = MakeAgf(7);

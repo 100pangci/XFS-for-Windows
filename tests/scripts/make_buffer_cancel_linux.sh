@@ -409,8 +409,10 @@ with open(out, "w") as handle:
 PY
             captured=$((captured + 1))
             for cls in ${classes//,/ }; do
+                # grep returns 1 when this was the last class; pipefail
+                # would otherwise abort the capture after a valid fixture.
                 remaining=$(printf '%s' "$remaining" | tr ',' '\n' |
-                            grep -vx "$cls" | paste -sd, -)
+                            grep -vx "$cls" | paste -sd, - || true)
             done
             echo "capture: $name covers '$classes' (attempt $attempts, remaining '${remaining:-none}')" >&2
         fi
