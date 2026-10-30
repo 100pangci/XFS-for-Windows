@@ -25,6 +25,7 @@
 #include "xfs/perf_stats.h"
 #include "xfs/log_format.h"
 #include "xfs/ondisk.h"
+#include "xfs/superblock.h"
 #include "xfs/transaction.h"
 
 namespace xfs {
@@ -134,6 +135,12 @@ std::vector<std::vector<LogOp>> FrameTransactionRecords(
   return records;
 }
 
+bool BufferRangesOverlap(uint64_t a, size_t a_length, uint64_t b,
+                         size_t b_length) {
+  if (a_length == 0 || b_length == 0) return false;
+  return a <= b ? b - a < a_length : a - b < b_length;
+}
+
 std::string TxnText(const XfsTransaction& txn, const char* what) {
   return std::string(what) + " tid=" + std::to_string(txn.tid()) +
          " ino=" +
@@ -149,13 +156,44 @@ std::string TxnText(const XfsTransaction& txn, const char* what) {
 
 }  // namespace
 
+Status XfsTransaction::AddWrite(TransactionWrite write) {
+  for (const auto& entry : cancelled_buffers_) {
+    const uint64_t offset = entry.first.first;
+    const size_t length = entry.first.second;
+    if (!BufferRangesOverlap(write.offset, write.data.size(), offset, length)) {
+      continue;
+    }
+    const bool contained = write.offset >= offset &&
+                           write.data.size() <= length &&
+                           write.offset - offset <= length - write.data.size();
+    if (!contained) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "queued write overlaps a cancelled buffer with "
+                     "different geometry")
+          .Offset(write.offset)
+          .Metadata(write.what ? write.what : "metadata");
+    }
+  }
+  for (const auto& entry : cancelled_buffers_) {
+    const uint64_t offset = entry.first.first;
+    const size_t length = entry.first.second;
+    if (write.offset >= offset && write.data.size() <= length &&
+        write.offset - offset <= length - write.data.size()) {
+      write.suppressed = true;
+    }
+  }
+  writes_.push_back(std::move(write));
+  return OkStatus();
+}
+
 const std::vector<uint8_t>* XfsTransaction::QueuedBuffer(uint64_t offset) const {
   // The write-back copy is always the complete buffer: the log item only holds
   // the chunks that differ from disk.
+  const std::vector<uint8_t>* found = nullptr;
   for (const TransactionWrite& write : writes_) {
-    if (write.offset == offset) return &write.data;
+    if (write.offset == offset && !write.suppressed) found = &write.data;
   }
-  return nullptr;
+  return found;
 }
 
 size_t XfsTransaction::log_bytes() const {
@@ -191,6 +229,222 @@ bool XfsTransaction::record_fits() const {
   return serialized_log_bytes() <= lf::kMaxRecordBytes;
 }
 
+void XfsTransaction::ShiftOpIndices(size_t after_index, ptrdiff_t delta) {
+  if (delta == 0) return;
+  for (auto& entry : logged_buffers_) {
+    if (entry.second.op_index > after_index) {
+      entry.second.op_index = static_cast<size_t>(
+          static_cast<ptrdiff_t>(entry.second.op_index) + delta);
+    }
+  }
+  for (auto& entry : cancelled_buffers_) {
+    if (entry.second.op_index > after_index) {
+      entry.second.op_index = static_cast<size_t>(
+          static_cast<ptrdiff_t>(entry.second.op_index) + delta);
+    }
+  }
+}
+
+void XfsTransaction::RemoveCancelledLocked(uint64_t offset, size_t length) {
+  auto it = cancelled_buffers_.find(std::make_pair(offset, length));
+  if (it == cancelled_buffers_.end()) return;
+  const size_t index = it->second.op_index;
+  cancelled_buffers_.erase(it);
+  if (index < ops_.size()) {
+    ops_.erase(ops_.begin() + static_cast<ptrdiff_t>(index));
+    ShiftOpIndices(index, -1);
+  }
+}
+
+Status XfsTransaction::InvalidateMetadataBuffer(uint64_t offset,
+                                                size_t length,
+                                                const char* what) {
+  const char* name = what ? what : "metadata";
+  if (length == 0 || length % 512 != 0 || length > 0xffffull * 512 ||
+      (length / lf::kBufChunkSize + 31) / 32 > 64) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "cancelled buffer length must fit the supported bitmap "
+                   "format")
+        .Offset(offset)
+        .Metadata(name);
+  }
+  if (offset % 512 != 0 || offset > UINT64_MAX - length) {
+    return XFS_ERR(XfsError::kInternal,
+                   "cancelled buffer is not sector aligned")
+        .Offset(offset)
+        .Metadata(name);
+  }
+  const auto key = std::make_pair(offset, length);
+  if (cancelled_buffers_.count(key) != 0) return OkStatus();
+
+  // A queued write entirely inside the stale buffer is suppressed like the
+  // kernel's XFS_BLI_STALE item: this includes the 512-byte inode writes that
+  // live inside an invalidated inode cluster. A write crossing the boundary
+  // cannot be represented by this cancel (part of it would remain live), so
+  // the caller's geometry is wrong.
+  for (const TransactionWrite& write : writes_) {
+    if (!BufferRangesOverlap(write.offset, write.data.size(), offset, length)) continue;
+    const bool contained = write.offset >= offset &&
+                           write.data.size() <= length &&
+                           write.offset - offset <= length - write.data.size();
+    if (!contained) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "buffer cancellation splits a queued metadata write")
+          .Offset(offset)
+          .Metadata(name);
+    }
+  }
+
+  // Every logged item in this transaction predates the cancel. An overlapping
+  // item with a different (blkno, len) would not be skipped by recovery's
+  // exact-key match and could be replayed over the freed block, so it is an
+  // error rather than silently logging a stale item.
+  for (const auto& entry : logged_buffers_) {
+    if (BufferRangesOverlap(entry.first, entry.second.length, offset, length) &&
+        (entry.first != offset || entry.second.length != length)) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "buffer cancellation geometry differs from a logged "
+                     "metadata item")
+          .Offset(offset)
+          .Metadata(name);
+    }
+  }
+  for (const auto& entry : cancelled_buffers_) {
+    if (BufferRangesOverlap(entry.first.first, entry.first.second, offset, length) &&
+        entry.first != key) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "overlapping buffer cancellations have different "
+                     "geometry")
+          .Offset(offset)
+          .Metadata(name);
+    }
+  }
+  for (TransactionWrite& write : writes_) {
+    if (write.offset >= offset && write.data.size() <= length &&
+        write.offset - offset <= length - write.data.size()) {
+      write.suppressed = true;
+    }
+  }
+
+  // A buffer logged earlier in this transaction is replaced by the cancel
+  // item. Older transactions in the window are protected by the cancel item
+  // itself.
+  auto logged = logged_buffers_.find(offset);
+  if (logged != logged_buffers_.end()) {
+    if (logged->second.length != length) {
+      return XFS_ERR(XfsError::kInternal,
+                     "cancelled buffer geometry differs from its log item")
+          .Offset(offset)
+          .Expected(logged->second.length)
+          .Actual(length)
+          .Metadata(name);
+    }
+    const size_t old_index = logged->second.op_index;
+    const size_t old_count = logged->second.op_count;
+    if (old_index + old_count > ops_.size()) {
+      return XFS_ERR(XfsError::kInternal,
+                     "logged buffer item index is out of range")
+          .Offset(offset)
+          .Metadata(name);
+    }
+    ops_.erase(ops_.begin() + static_cast<ptrdiff_t>(old_index),
+               ops_.begin() + static_cast<ptrdiff_t>(old_index + old_count));
+    logged_buffers_.erase(logged);
+    ShiftOpIndices(old_index, -static_cast<ptrdiff_t>(old_count));
+  }
+
+  // Provisional encoding: one format region, an all-zero map sized for the
+  // complete buffer, and no payload. The exact Linux stale format region
+  // length and map_size have not been verified from trusted local evidence.
+  const uint32_t chunks = static_cast<uint32_t>(length / lf::kBufChunkSize);
+  const uint32_t map_words = (chunks + 31) / 32;
+  std::vector<uint8_t> format(lf::kBufLogFormatSize + map_words * 4, 0);
+  StoreLE16(format.data() + 0, lf::kItemBuf);
+  StoreLE16(format.data() + 2, 1);
+  StoreLE16(format.data() + 4, lf::kBlfCancel);
+  StoreLE16(format.data() + 6, static_cast<uint16_t>(length / 512));
+  StoreLE32(format.data() + 8, static_cast<uint32_t>(offset / 512));
+  StoreLE32(format.data() + 12,
+            static_cast<uint32_t>((offset / 512) >> 32));
+  StoreLE32(format.data() + 16, map_words);
+  const size_t op_index = ops_.size();
+  AddLogOp(std::move(format));
+  cancelled_buffers_.emplace(key, CancelledBufferRef{op_index});
+  return OkStatus();
+}
+
+Status XfsTransaction::AddIcreateWithOrderedBuffers(
+    std::vector<uint8_t> payload, const XfsGeometry& geo,
+    uint32_t blocks_per_cluster) {
+  if (payload.size() != lf::kIcreateLogSize ||
+      LoadLE16(payload.data() + lf::kIclType) != lf::kItemIcreate ||
+      LoadLE16(payload.data() + lf::kIclSize) != 1 ||
+      geo.block_size == 0 || blocks_per_cluster == 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "ordered inode buffers require a valid ICREATE item")
+        .Metadata("inode chunk");
+  }
+  const uint32_t agno = GetBE32(payload.data(), lf::kIclAg);
+  const uint32_t agbno = GetBE32(payload.data(), lf::kIclAgbno);
+  const uint32_t count = GetBE32(payload.data(), lf::kIclCount);
+  const uint32_t isize = GetBE32(payload.data(), lf::kIclIsize);
+  const uint32_t length = GetBE32(payload.data(), lf::kIclLength);
+  const uint64_t length_bytes = static_cast<uint64_t>(length) * geo.block_size;
+  if (agno >= geo.agcount || agbno >= geo.AgBlocksFor(agno) || length == 0 ||
+      length > geo.AgBlocksFor(agno) - agbno || length % blocks_per_cluster ||
+      count == 0 || count > 64 || isize != geo.inode_size ||
+      geo.inopblock == 0 ||
+      static_cast<uint64_t>(count) !=
+          static_cast<uint64_t>(length) * geo.inopblock ||
+      static_cast<uint64_t>(count) * isize != length_bytes) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "ICREATE item has invalid ordered buffer geometry")
+        .Ag(agno)
+        .Agbno(agbno)
+        .Metadata("inode chunk");
+  }
+
+  if (geo.inode_size == 0 || geo.block_size % geo.inode_size != 0 ||
+      geo.inopblock != geo.block_size / geo.inode_size ||
+      (agbno % blocks_per_cluster) != 0) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "ICREATE inode cluster alignment is invalid")
+        .Ag(agno)
+        .Agbno(agbno)
+        .Metadata("inode chunk");
+  }
+  std::set<std::pair<uint64_t, size_t>> ranges;
+  for (uint32_t i = 0; i < length; i += blocks_per_cluster) {
+    const uint64_t fsb = geo.AgFsb(agno, agbno + i);
+    const uint64_t offset = geo.FsbToByte(fsb);
+    const size_t bytes = static_cast<size_t>(blocks_per_cluster) *
+                         geo.block_size;
+    if (offset > UINT64_MAX - bytes ||
+        !geo.FsbRangeValid(fsb, blocks_per_cluster)) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "ICREATE ordered buffer range is outside the device")
+          .Offset(offset)
+          .Metadata("inode chunk");
+    }
+    const auto range = std::make_pair(offset, bytes);
+    for (const auto& existing : ordered_buffer_ranges_) {
+      if (BufferRangesOverlap(range.first, range.second, existing.first,
+                              existing.second)) {
+        return XFS_ERR(XfsError::kInvalidArgument,
+                       "ICREATE ordered buffer range is already declared")
+            .Offset(offset)
+            .Metadata("inode chunk");
+      }
+    }
+    ranges.insert(range);
+  }
+
+  AddLogOp(std::move(payload));
+  ordered_buffer_ranges_.insert(ranges.begin(), ranges.end());
+  ordered_buffer_intents_.insert(ranges.begin(), ranges.end());
+  return OkStatus();
+}
+
 Status XfsTransaction::AddOrderedBuffer(uint64_t offset,
                                         std::vector<uint8_t> data,
                                         uint64_t ino, const char* what) {
@@ -207,6 +461,30 @@ Status XfsTransaction::AddOrderedBuffer(uint64_t offset,
         .Offset(offset)
         .Metadata(what ? what : "metadata");
   }
+  const auto key = std::make_pair(offset, data.size());
+  for (const auto& entry : cancelled_buffers_) {
+    if (BufferRangesOverlap(entry.first.first, entry.first.second, offset,
+                             data.size()) &&
+        entry.first != key) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "ordered write geometry differs from a cancelled "
+                     "buffer")
+          .Offset(offset)
+          .Metadata(what ? what : "metadata");
+    }
+  }
+  const auto intent = ordered_buffer_intents_.find(key);
+  if (intent == ordered_buffer_intents_.end()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "ordered inode buffer has no matching ICREATE intent")
+        .Offset(offset)
+        .Metadata(what ? what : "inode chunk");
+  }
+
+  // Re-initialising a cluster that was freed in this transaction is safe only
+  // because the matching ICREATE item rebuilds this complete physical buffer.
+  RemoveCancelledLocked(offset, data.size());
+  ordered_buffer_intents_.erase(intent);
   TransactionWrite write;
   write.offset = offset;
   write.data = std::move(data);
@@ -223,9 +501,11 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
                                          uint16_t blf_type, size_t lsn_offset,
                                          size_t crc_offset,
                                          const char* what) {
-  if (data.empty() || data.size() % 512 != 0 || data.size() > 0xffffull * 512) {
+  if (data.empty() || data.size() % 512 != 0 || data.size() > 0xffffull * 512 ||
+      (data.size() / lf::kBufChunkSize + 31) / 32 > 64) {
     return XFS_ERR(XfsError::kInvalidArgument,
-                   "metadata buffer length must be a multiple of 512 bytes")
+                   "metadata buffer length must fit the supported bitmap "
+                   "format")
         .Offset(offset)
         .Metadata(what ? what : "metadata");
   }
@@ -242,10 +522,35 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
         .Metadata(what ? what : "metadata");
   }
 
+  const auto key = std::make_pair(offset, data.size());
+  for (const auto& entry : cancelled_buffers_) {
+    if (BufferRangesOverlap(entry.first.first, entry.first.second, offset,
+                             data.size()) &&
+        entry.first != key) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "metadata buffer geometry differs from a cancelled "
+                     "buffer")
+          .Offset(offset)
+          .Metadata(what ? what : "metadata");
+    }
+  }
+
   // On-disk LSN and CRC, exactly what the kernel's write verifier would stamp
   // when it flushes this buffer for our transaction.
   PutBE64(data.data(), lsn_offset, lsn_);
   UpdateXfsChecksum(data.data(), data.size(), crc_offset);
+
+  // A buffer freed earlier in this transaction is being reused. The older
+  // cancel item must not suppress the new item (recovery builds the cancel
+  // table over the whole window before replaying), so remove it and log every
+  // chunk: that covers every chunk an older item for this exact buffer may
+  // still hold, and the log-order replay then converges on these bytes.
+  bool revived = false;
+  if (cancelled_buffers_.find(std::make_pair(offset, data.size())) !=
+      cancelled_buffers_.end()) {
+    RemoveCancelledLocked(offset, data.size());
+    revived = true;
+  }
 
   // Dirty chunks: those that differ from the on-disk image. By the time a
   // transaction is built, every earlier transaction has already written and
@@ -279,8 +584,9 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   }
   for (size_t i = 0; i < chunks; ++i) {
     const size_t at = i * lf::kBufChunkSize;
-    if (have_disk && std::memcmp(disk.data() + at, data.data() + at,
-                                 lf::kBufChunkSize) == 0) {
+    if (!revived && have_disk &&
+        std::memcmp(disk.data() + at, data.data() + at,
+                    lf::kBufChunkSize) == 0) {
       continue;
     }
     map[(i / 32) * 4 + (i % 32) / 8] |= static_cast<uint8_t>(1u << (i % 8));
@@ -307,6 +613,7 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
         if (write.offset == offset) {
           write.data = std::move(data);
           write.what = what ? what : "metadata";
+          write.suppressed = false;
           return OkStatus();
         }
       }
@@ -352,6 +659,14 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   }
 
   if (existing != logged_buffers_.end()) {
+    if (existing->second.length != data.size()) {
+      return XFS_ERR(XfsError::kInternal,
+                     "buffer geometry changed while it was in the log")
+          .Offset(offset)
+          .Expected(existing->second.length)
+          .Actual(data.size())
+          .Metadata(what ? what : "metadata");
+    }
     const size_t old_index = existing->second.op_index;
     const size_t old_count = existing->second.op_count;
     ops_.erase(ops_.begin() + static_cast<ptrdiff_t>(old_index),
@@ -363,19 +678,17 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
     }
     const ptrdiff_t delta = static_cast<ptrdiff_t>(item.size()) -
                             static_cast<ptrdiff_t>(old_count);
-    if (delta != 0) {
-      for (auto& entry : logged_buffers_) {
-        if (entry.second.op_index > old_index) {
-          entry.second.op_index = static_cast<size_t>(
-              static_cast<ptrdiff_t>(entry.second.op_index) + delta);
-        }
-      }
-    }
+    ShiftOpIndices(old_index, delta);
     existing->second.op_count = item.size();
+    existing->second.blf_type = blf_type;
+    existing->second.lsn_offset = lsn_offset;
+    existing->second.crc_offset = crc_offset;
+    existing->second.what = what ? what : "metadata";
     for (TransactionWrite& write : writes_) {
       if (write.offset == offset) {
         write.data = std::move(data);
         write.what = what ? what : "metadata";
+        write.suppressed = false;
         return OkStatus();
       }
     }
@@ -390,8 +703,21 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   for (std::vector<uint8_t>& payload : item) {
     AddLogOp(std::move(payload));
   }
-  logged_buffers_[offset] = LoggedBufferRef{op_index, item.size()};
+  logged_buffers_[offset] =
+      LoggedBufferRef{op_index, item.size(), data.size(), blf_type,
+                      lsn_offset, crc_offset, what ? what : "metadata"};
 
+  // Reviving a cancelled buffer normally reuses the write-back queued before
+  // the cancellation, which was only suppressed. Re-queueing a second write
+  // for the same address would make callers see duplicate buffers.
+  for (TransactionWrite& write : writes_) {
+    if (write.offset == offset) {
+      write.data = std::move(data);
+      write.what = what ? what : "metadata";
+      write.suppressed = false;
+      return OkStatus();
+    }
+  }
   TransactionWrite write;
   write.offset = offset;
   write.data = std::move(data);
@@ -512,6 +838,12 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
   uint32_t block = txn.block_;
   uint32_t prev_block = log_position_.prev_block;
   uint32_t total_blocks = 0;
+  if (!txn.ordered_buffer_intents_.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "ICREATE ordered buffer intent was not fully queued")
+        .Metadata("inode chunk");
+  }
+
   for (size_t i = 0; i < framed.size(); ++i) {
     LogRecordParams params;
     params.cycle = cycle;
@@ -610,6 +942,7 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
 
   // Metadata write-back. The transaction LSN is already stamped into every
   // buffer by the item builder, so recovery can skip older changes.
+  size_t metadata_writes = 0;
   for (size_t i = 0; i < txn.writes_.size(); ++i) {
     const TransactionWrite& write = txn.writes_[i];
     if (i == 0) {
@@ -617,6 +950,8 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     } else {
       MaybeCrash(CrashPoint::kMidMetadataWrite, TxnText(txn, "metadata"));
     }
+    if (write.suppressed) continue;  // a stale buffer is never dispatched
+    ++metadata_writes;
     if (!device_->Write(write.offset, write.data.data(), write.data.size())) {
       return XFS_ERR(XfsError::kIoError,
                      std::string("failed to write ") + write.what + ": " +
@@ -626,7 +961,7 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
           .Metadata(write.what);
     }
   }
-  if (!txn.writes_.empty()) {
+  if (metadata_writes != 0) {
     // Metadata is written after the durable log record. The flush is delayed
     // until a durability boundary or log wrap: recovery replays the still
     // protected log records if power fails before this write-back reaches
@@ -664,12 +999,14 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     perf.journal_bytes.fetch_add(txn.log_bytes(),
                                  std::memory_order_relaxed);
     uint64_t metadata_bytes = 0;
+    uint64_t metadata_write_calls = 0;
     for (const TransactionWrite& write : txn.writes_) {
+      if (write.suppressed) continue;
       metadata_bytes += write.data.size();
+      ++metadata_write_calls;
     }
-    perf.metadata_write_calls.fetch_add(
-        static_cast<uint64_t>(txn.writes_.size()),
-        std::memory_order_relaxed);
+    perf.metadata_write_calls.fetch_add(metadata_write_calls,
+                                        std::memory_order_relaxed);
     perf.metadata_write_bytes.fetch_add(metadata_bytes,
                                         std::memory_order_relaxed);
     // One durable log flush per commit. Metadata write-back is deliberately

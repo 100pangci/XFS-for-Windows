@@ -109,6 +109,12 @@ class BlockAllocator {
   Status FreeOwned(uint64_t fsb, uint32_t len, const RmapOwner& owner);
   Status FreeUnknown(uint64_t fsb, uint32_t len);
 
+  // Cancels a metadata buffer whose owner is releasing it (`len` filesystem
+  // blocks). Free-owner paths call this before returning the blocks to free
+  // space or the AGFL. It must not be used for file data, remote xattr values,
+  // or CoW staging: those are direct writes with no buffer log item to cancel.
+  Status InvalidateMetadata(uint64_t fsb, uint32_t len, const char* what);
+
   // Removes one inode mapping from the ownership ledger.  On a reflink
   // filesystem the owner rmap is removed, the refcount is decreased, and the
   // physical blocks are returned to free space only when the last reference

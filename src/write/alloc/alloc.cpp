@@ -232,6 +232,11 @@ Status BlockAllocator::FreeUnknown(uint64_t fsb, uint32_t len) {
   return impl_->alloc->FreeBlocksInternal(fsb, len, nullptr, true);
 }
 
+Status BlockAllocator::InvalidateMetadata(uint64_t fsb, uint32_t len,
+                                          const char* what) {
+  return impl_->alloc->InvalidateMetadata(fsb, len, what);
+}
+
 Status BlockAllocator::ReleaseData(uint64_t fsb, uint32_t len,
                                    const RmapOwner& owner) {
   return impl_->alloc->ReleaseDataInternal(fsb, len, owner);

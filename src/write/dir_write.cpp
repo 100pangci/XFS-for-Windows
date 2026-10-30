@@ -1247,6 +1247,17 @@ Result<uint64_t> DirectoryEditor::AllocDirBlock(uint64_t file_block) {
 }
 
 Status DirectoryEditor::FreeDirBlock(uint64_t file_block) {
+  const uint64_t fsb = FsbForFileBlock(file_block);
+  if (fsb == kNullFsb) {
+    return XFS_ERR(XfsError::kInternal, "directory block is not mapped")
+        .Ino(ino_)
+        .DirBlock(file_block);
+  }
+  // Every directory data/leaf/node/free block is an XFS_LI_BUF metadata
+  // buffer (kBlftDir*). Cancelling it makes old directory items skip a block
+  // that has been freed, before the block can be reused below.
+  Status s = alloc_->InvalidateMetadata(fsb, 1, "directory block");
+  if (!s.ok()) return s;
   fork_->SetFreeRemovedBlocks(true);
   return fork_->RemoveRange(file_block, file_block + 1);
 }

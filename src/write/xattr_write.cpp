@@ -438,6 +438,27 @@ class AttrBlockMap {
     return editor_->RemoveRange(start, static_cast<uint64_t>(start) + len);
   }
 
+  // Frees DA leaf/node blocks. They are logged as one XFS_LI_BUF item per
+  // filesystem block (kBlftAttrLeaf/kBlftDaNode); a cancel must use exactly
+  // that (blkno,len). Remote value blocks are direct-written and must use the
+  // plain FreeRange below: cancelling them would be a format error.
+  Status FreeDaRange(uint32_t start, uint32_t len) {
+    if (len == 0) return OkStatus();
+    for (uint32_t i = 0; i < len; ++i) {
+      uint64_t fsb = 0;
+      if (!Map(start + i, &fsb)) {
+        return XFS_ERR(XfsError::kInternal,
+                       "attr DA block being freed is not mapped")
+            .Ino(ino_)
+            .Actual(start + i)
+            .Metadata("attr fork");
+      }
+      Status s = alloc_->InvalidateMetadata(fsb, 1, "attr DA block");
+      if (!s.ok()) return s;
+    }
+    return FreeRange(start, len);
+  }
+
   Status FreeAll() {
     uint32_t end = 0;
     for (const XfsExtent& e : editor_->extents()) {
@@ -956,7 +977,7 @@ class TreeEditor {
     WorkingNode& pnode = nodes_.at(parent);
     pnode.entries.erase(pnode.entries.begin() + static_cast<ptrdiff_t>(index));
     pnode.dirty = true;
-    Status s = blocks_->FreeRange(logical, 1);
+    Status s = blocks_->FreeDaRange(logical, 1);
     if (!s.ok()) return s;
     s = UpdateKeys(parent);
     if (!s.ok()) return s;
@@ -1051,7 +1072,7 @@ class TreeEditor {
       pnode.entries.erase(pnode.entries.begin() + static_cast<ptrdiff_t>(index));
       pnode.dirty = true;
       leaves_.erase(drop);
-      Status s = blocks_->FreeRange(drop, 1);
+      Status s = blocks_->FreeDaRange(drop, 1);
       if (!s.ok()) return s;
       s = UpdateKeys(keep);
       if (!s.ok()) return s;
@@ -1191,7 +1212,7 @@ class TreeEditor {
       dp.entries.erase(dp.entries.begin() + static_cast<ptrdiff_t>(drop_index));
       dp.dirty = true;
       nodes_.erase(drop);
-      Status s = blocks_->FreeRange(drop, 1);
+      Status s = blocks_->FreeDaRange(drop, 1);
       if (!s.ok()) return s;
       s = UpdateKeys(keep);
       if (!s.ok()) return s;
@@ -1259,7 +1280,7 @@ class TreeEditor {
         nodes_.erase(0);
         leaves_[0] = std::move(moved);
         root_level_ = 0;
-        return blocks_->FreeRange(child, 1);
+        return blocks_->FreeDaRange(child, 1);
       }
       auto node_it = nodes_.find(child);
       if (node_it == nodes_.end()) {
@@ -1287,7 +1308,7 @@ class TreeEditor {
         auto p = nodes_.find(moved_back);
         if (p != nodes_.end()) p->second.forw = 0;
       }
-      Status s = blocks_->FreeRange(child, 1);
+      Status s = blocks_->FreeDaRange(child, 1);
       if (!s.ok()) return s;
     }
     return OkStatus();
@@ -1484,7 +1505,7 @@ class XattrWriter {
   }
 
   Status DropAllAttrBlocks() {
-    Status s = blocks_->FreeAll();
+    Status s = FreeOldExcept({});
     if (!s.ok()) return s;
     // Removing every extent does not by itself release attr BMBT blocks; the
     // bmap editor's collapse path does that in the same transaction.
@@ -1862,10 +1883,18 @@ class XattrWriter {
   }
 
   // Frees old attr extents that are not in `keep` (one logical block per set
-  // element).  The root block 0 is always kept.
+  // element).  The root block 0 is always kept. A run may mix DA leaf/node
+  // blocks with direct-written remote values; only the DA blocks have a
+  // buffer log item to cancel, so split the range at that boundary.
   Status FreeOldExcept(const std::set<uint32_t>& keep) {
-    std::vector<XfsExtent> old = fork_.extents;
-    for (const XfsExtent& e : old) {
+    std::set<uint32_t> da_logicals;
+    for (const XattrDaLeaf& leaf : fork_.leaves) {
+      da_logicals.insert(leaf.logical);
+    }
+    for (const XattrDaNode& node : fork_.nodes) {
+      da_logicals.insert(node.logical);
+    }
+    for (const XfsExtent& e : fork_.extents) {
       uint32_t b = static_cast<uint32_t>(e.startoff);
       const uint32_t end = static_cast<uint32_t>(e.EndBlock());
       while (b < end) {
@@ -1873,9 +1902,14 @@ class XattrWriter {
           ++b;
           continue;
         }
+        const bool is_da = da_logicals.count(b) != 0;
         uint32_t run = 1;
-        while (b + run < end && !keep.count(b + run)) ++run;
-        Status s = blocks_->FreeRange(b, run);
+        while (b + run < end && !keep.count(b + run) &&
+               (da_logicals.count(b + run) != 0) == is_da) {
+          ++run;
+        }
+        Status s = is_da ? blocks_->FreeDaRange(b, run)
+                         : blocks_->FreeRange(b, run);
         if (!s.ok()) return s;
         b += run;
       }

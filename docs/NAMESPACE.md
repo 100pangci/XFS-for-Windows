@@ -232,7 +232,12 @@ bytes are refused because they cannot exist in a kernel-created symlink.
 On deletion a remote symlink is handled like `xfs_inactive_symlink_rmt`: the
 inode is turned into a regular file and `di_size` becomes 0 in the same
 transaction that frees the remote blocks, so a zero-length symlink is never
-visible on disk.
+visible on disk. The freed remote-symlink buffers are invalidated as metadata
+(`XFS_BLF_CANCEL` for each logged buffer extent) so an older log item cannot
+recreate the payload after reuse. Directory data/leaf/node/free blocks removed
+by a truncating unlink or rmdir are cancelled the same way, while regular file
+data blocks are not: file data is direct-written and has no metadata buffer
+item.
 
 ## Open handles, cache invalidation and WinFsp
 

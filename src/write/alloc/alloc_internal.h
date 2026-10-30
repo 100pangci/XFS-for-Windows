@@ -293,6 +293,10 @@ class Allocator {
   Status FreeRefcountBlock(uint32_t agno, uint32_t agbno);
   Status ReserveForRmap(uint32_t agno);
   Status EnsureAgflInternal(uint32_t agno, uint32_t want);
+  // Emits the Linux XFS_BLF_CANCEL stale item for metadata leaving its owner
+  // (before the block enters the free-space tree). Same-transaction reuse is
+  // allowed only through a matching full-buffer log item.
+  Status InvalidateMetadata(uint64_t fsb, uint32_t len, const char* what);
   Status FreeBlocksInternal(uint64_t fsb, uint32_t len, const RmapOwner* owner,
                             bool unknown_owner);
   Status FreeRaw(uint32_t agno, uint32_t agbno, uint32_t len);

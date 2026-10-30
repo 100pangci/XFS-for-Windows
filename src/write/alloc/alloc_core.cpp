@@ -95,6 +95,21 @@ Status Allocator::LoadAg(uint32_t agno, AgState** out) {
   return OkStatus();
 }
 
+Status Allocator::InvalidateMetadata(uint64_t fsb, uint32_t len,
+                                     const char* what) {
+  if (len == 0 || !geo_->FsbRangeValid(fsb, len)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "metadata cancellation is not inside one AG")
+        .Fsb(fsb)
+        .Actual(len)
+        .Metadata(what ? what : "metadata");
+  }
+  return txn_->InvalidateMetadataBuffer(FsbToByte(fsb),
+                                        static_cast<size_t>(len) *
+                                            geo_->block_size,
+                                        what ? what : "metadata");
+}
+
 Status Allocator::FreeBlocksInternal(uint64_t fsb, uint32_t len,
                                      const RmapOwner* owner,
                                      bool unknown_owner) {

@@ -384,6 +384,7 @@ class CancelTable {
 // Item replay
 // ---------------------------------------------------------------------------
 struct BufLogFormat {
+  uint16_t size = 0;
   uint16_t flags = 0;
   uint16_t len = 0;
   int64_t blkno = 0;
@@ -398,6 +399,7 @@ Result<BufLogFormat> ParseBufFormat(const std::vector<uint8_t>& region) {
         .Metadata("log item");
   }
   BufLogFormat out;
+  out.size = LoadLE16(region.data() + 2);
   out.flags = LoadLE16(region.data() + 4);
   out.len = LoadLE16(region.data() + 6);
   out.blkno = static_cast<int64_t>(LoadLE32(region.data() + 8)) |
@@ -406,17 +408,23 @@ Result<BufLogFormat> ParseBufFormat(const std::vector<uint8_t>& region) {
                << 32);
   out.map_size = LoadLE32(region.data() + 16);
   out.map = region.data() + lf::kBufMapOffset;
+  if (out.len == 0 || out.blkno < 0) {
+    return XFS_ERR(XfsError::kCorruptBtree, "bad buffer log item geometry")
+        .Expected(out.len)
+        .Actual(out.blkno)
+        .Metadata("log item");
+  }
+  if (out.flags & lf::kBlfCancel) {
+    // Recovery uses only the buffer geometry from a cancel item. Its exact
+    // stale-format map and region encoding have not been verified from trusted
+    // local source or a Linux-produced cancel log, so do not interpret them.
+    return out;
+  }
   if (out.map_size == 0 || out.map_size > 64 ||
       lf::kBufMapOffset + static_cast<size_t>(out.map_size) * 4 >
           region.size()) {
     return XFS_ERR(XfsError::kCorruptBtree, "bad buffer log item bitmap size")
         .Actual(out.map_size)
-        .Metadata("log item");
-  }
-  if (out.len == 0 || out.blkno < 0) {
-    return XFS_ERR(XfsError::kCorruptBtree, "bad buffer log item geometry")
-        .Expected(out.len)
-        .Actual(out.blkno)
         .Metadata("log item");
   }
   return out;
@@ -794,6 +802,11 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
   const uint64_t blkno = static_cast<uint64_t>(format.blkno);
   const uint32_t len = format.len;
 
+  if (format.flags & lf::kBlfCancel) {
+    cancel_.Release(blkno, len);  // last occurrence consumed
+    return OkStatus();
+  }
+
   const uint32_t runs = CountRuns(format.map, format.map_size);
   if (item.regions.size() != static_cast<size_t>(runs) + 1) {
     return XFS_ERR(XfsError::kCorruptBtree,
@@ -801,11 +814,6 @@ Status Replayer::ReplayBufferItem(const RecoveredItem& item,
         .Expected(runs + 1)
         .Actual(item.regions.size())
         .Metadata("log item");
-  }
-
-  if (format.flags & lf::kBlfCancel) {
-    cancel_.Release(blkno, len);  // last occurrence consumed
-    return OkStatus();
   }
   if (cancel_.IsCancelled(blkno, len)) {
     stats_.buffers_skipped_newer++;  // counts as "not replayed"

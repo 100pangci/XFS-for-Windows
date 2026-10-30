@@ -164,6 +164,8 @@ Status Allocator::FreeRmapBlock(uint32_t agno, uint32_t agbno) {
         .Ag(agno)
         .Metadata("rmapbt");
   }
+  Status s = InvalidateMetadata(geo_->AgFsb(agno, agbno), 1, "rmapbt");
+  if (!s.ok()) return s;
   return it->second->PutTreeBlock(agbno);
 }
 
@@ -199,6 +201,8 @@ Status Allocator::FreeRefcountBlock(uint32_t agno, uint32_t agbno) {
         .Ag(agno)
         .Metadata("refcountbt");
   }
+  Status s = InvalidateMetadata(geo_->AgFsb(agno, agbno), 1, "refcountbt");
+  if (!s.ok()) return s;
   pending_refcount_frees_[agno].push_back(agbno);
   ags_[agno]->agf_dirty = true;
   return OkStatus();

@@ -117,6 +117,13 @@ reference, so a block reused after its last cancellation is replayed again
 (`xlog_put_buffer_cancelled`). Cancellation matches the full `(blkno, len)`
 pair, never an offset guess.
 
+The exact Linux stale format region length and `blf_map_size` have not been
+verified from trusted local source or a Linux-produced cancel log. The parser
+uses only the cancel item's `(blkno, len)` geometry and does not interpret its
+map. The writer currently emits a zero map sized for the whole buffer, but this
+encoding is provisional and is not claimed to match Linux. Project-generated
+fixtures are not independent Linux format evidence.
+
 ### 4.2 Buffer replay (pass 2)
 
 `XFS_LI_BUF` items carry a `blf_data_map` bitmap of 128-byte dirty chunks; only
@@ -140,7 +147,34 @@ recovery LSN changes, exactly like the kernel's per-commit
 the on-disk LSN rule stays meaningful. LSN and CRC are stamped at flush time
 (`xfs_agf_write_verify` and friends), not at patch time.
 
-### 4.3 Inode items
+### 4.3 Buffer invalidation (writer side)
+
+Any metadata block that is freed must be invalidated with
+`xfs_trans_binval`: the block's own buffer item is replaced by an
+`XFS_BLF_CANCEL` item, and a queued write-back for the same buffer is
+suppressed (a stale buffer is never written). Without this, an older
+`XFS_LI_BUF` still in the recovery window would overwrite the block after a
+new owner reused the address with a direct or ordered write.
+
+The writer emits the provisional stale shape described in 4.1 through
+`XfsTransaction::InvalidateMetadataBuffer`; compatibility with Linux remains
+unverified. The free-owner paths call the allocator's `InvalidateMetadata`
+before releasing the block. Covered metadata
+includes bnobt/cntbt/rmapbt/refcountbt/inobt/finobt/bmbt blocks, directory
+data/leaf/node/free/block blocks, attr DA leaf/node blocks, inode chunks
+(cancelled one whole cluster at a time) and multi-block remote symlink
+buffers. Pure file data, direct-written remote xattr values and CoW staging
+have no buffer item and are never cancelled; AGFL entries are free-space
+placeholders and are not invalidated either.
+
+Cancelling and reviving in one transaction is legal: if the same
+`(offset, length)` is logged again after `InvalidateMetadataBuffer`, the
+writer removes the cancel item (the newer item supersedes the older one in
+log order) and logs every chunk, so no older item for that buffer can
+contribute stale chunks. An ordered buffer (inode cluster) may be revived
+only when an `ICREATE` item in the same transaction rebuilds the cluster.
+
+### 4.4 Inode items
 
 `XFS_LI_INODE` describes the inode **cluster buffer** plus the inode byte offset
 (`ilf_blkno`/`ilf_len`/`ilf_boffset`), not a single inode block. The logged
@@ -165,7 +199,7 @@ non-zero. Replay accepts it with exactly that scope (magic, version, checksum,
 `di_ino` and the UUID must still hold) and never decodes forks for it; the
 readers keep refusing a mode-0 inode, it is not a file.
 
-### 4.4 ICREATE
+### 4.5 ICREATE
 
 `XFS_LI_ICREATE` rebuilds whole inode clusters from the logged geometry
 (`xfs_ialloc_inode_init`): each inode gets `di_magic`, version 3, the logged
@@ -174,7 +208,7 @@ and a fresh CRC; `di_lsn` stays zero like the kernel's fresh inodes. ICREATE is
 ordered with the buffer items, before inode items, so an inode allocated in the
 same transaction is replayed into the initialized cluster.
 
-### 4.5 The end of pass 2
+### 4.6 The end of pass 2
 
 Partial writes in front of the head are overwritten with empty records of the
 previous cycle (`xlog_clear_stale_blocks`), step by step and capped at

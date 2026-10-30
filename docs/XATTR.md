@@ -216,6 +216,14 @@ The replaced entry's old remote range is released in the same transaction as
 the inode and tree buffers. If a new value would not fit, the operation fails
 before any allocation is committed and the old value stays intact.
 
+Only attr-fork **DA** leaf and node blocks are logged metadata buffers and are
+invalidated (`XFS_BLF_CANCEL`) when the tree shrinks or is dropped. Remote
+value blocks are direct-written `XARM` data: they have no `XFS_LI_BUF` item and
+are never cancelled. `AttrBlockMap::FreeDaRange` classifies each old DA block
+through the verified fork before freeing it; `FreeOldExcept` keeps the two
+classes apart when an attr-fork conversion or inode deletion releases a mix of
+DA and remote blocks.
+
 ### forkoff and the data fork
 
 If a new attribute fork needs more literal space, the writer updates
