@@ -111,7 +111,7 @@ Workloads select different pressure patterns:
 | `dir` | up to 950 entries in one directory, churn, rename, shortform → block → leaf → node |
 | `xattr` | small/large/replace/remove, remote values, leaf/node and forkoff relayout |
 | `alloc` | sequential and fragmented writes, sparse holes, truncate, btree growth/collapse, reflink/CoW |
-| `enospc` | large preallocations, xattr growth and creates until `kNoSpace`, then continued operations |
+| `enospc` | large preallocations, xattr growth and creates until `kNoSpace`, then continued operations; a deterministic release/reuse probe runs at the first `kNoSpace` |
 
 The modern profile is the formatter's `modern_default_profile` (finobt,
 inobtcount, sparse inodes, bigtime, NREXT64, rmapbt, reflink, parent pointers,
@@ -134,6 +134,13 @@ operation returns `kNoSpace`, the operation must leave the model state
 unchanged for the operations whose transaction contract says so; the runner
 restores the model and verifies the image before continuing.
 
+The `enospc` workload additionally checks that space becomes usable again.  At
+the first `kNoSpace` it truncates the largest data file to zero, requires every
+one of that inode's data extents to disappear, preallocates one block on the
+same file, requires a new extent to appear, and verifies the model again.  The
+probe is deterministic for a fixed seed and is recorded in the trace as
+`reuse-release` / `reuse-alloc`.
+
 ## 5. Trace, manifest and reproducer
 
 A normal run writes:
@@ -145,7 +152,9 @@ A normal run writes:
 
 A crash run writes the `before` and `after` model states in the crash-plan
 manifest, then exits through the normal `XFSWIN_CRASH_AT` mechanism
-(`0x58435348`).  A failure prints:
+(`0x58435348`). Range-contract manifests also carry a `.range.bin` sidecar with
+the target file's before and after logical bytes and hashes; both independent
+Python oracles validate allowed byte values from this sidecar. A failure prints:
 
 ```text
 FUZZ-2 FAILURE
@@ -188,10 +197,12 @@ stronger POSIX durability promise.  Namespace recovery may leave a zero-link
 inode on the AGI unlinked list; that is a legal crash state and the normal
 recovery path truncates/frees it before the semantic check.
 
-Crash points used by the matrix are the writer's existing points:
-`before_data_write`, `after_data_write`, `before_log_write`,
-`after_log_commit`, `before_metadata_write`, `after_metadata_write` (and
-`after_bmap_switch` for clone).  Recovery can be performed twice:
+Crash points used by the matrix come from the writer's existing points:
+transaction log and metadata phases, applicable data-write and remote-xattr
+flush phases, and reflink/CoW staging and remap phases. A point that does not
+occur in a selected operation is reported as skipped. `CRASH_DENSITY` selects
+up to that many occurrences of each planned operation type. Recovery can be
+performed twice:
 
 1. the project engine (`--recover`), then Linux/xfsprogs verify the result;
 2. the Linux kernel directly on the pre-recovery image, with the before/after
@@ -205,7 +216,8 @@ sudo tests/scripts/verify_stateful_linux.sh <image> <manifest> [workdir] --kerne
 ```
 
 The second form is for a dirty pre-recovery crash image: the raw semantic
-probe is run only after the kernel has replayed the log.  Both forms require:
+probe is run only after the kernel has replayed the log.  The script refuses to
+run as a non-root user (exit 2): it mounts a loop device.  Both forms require:
 
 1. `xfs_repair -n` with no corruption/would-fix output;
 2. the independent raw-image oracle (`stateful_probe.py`) matching the
@@ -214,7 +226,9 @@ probe is run only after the kernel has replayed the log.  Both forms require:
 4. a real kernel mount whose paths, types, nlink, sizes, content, xattrs,
    symlinks and hard-link identities match the manifest
    (`stateful_mount_check.py`);
-5. `xfs_scrub -n` where the running kernel exposes the metadata scrub ioctl;
+5. `xfs_scrub -n` where `xfs_scrub` is installed and the running kernel exposes
+   the metadata scrub ioctl; an absent tool or ioctl is recorded as a skip, not
+   a pass;
 6. a clean log (`xfs_logprint -t` reports `state: <CLEAN>`) and silent
    `xfs_repair -n` after unmount.
 
@@ -228,24 +242,101 @@ PR smoke:
 
 * `stateful_fuzz_smoke` (CTest): 120 mixed operations on the modern profile;
 * `stateful_fuzz_enospc` (CTest): 400 operations on a 300 MiB image,
-  `--require-enospc` (the run must actually return `kNoSpace`);
+  `--require-enospc` (the run must actually return `kNoSpace`, then pass the
+  deterministic release/reuse probe);
 * `linux-stateful-fuzz`: fixed mixed/dir/xattr/alloc/default/enospc seeds,
-  each judged by xfsprogs and a kernel mount, plus the crash matrix;
+  each judged by xfsprogs and a kernel mount; the crash matrix runs the
+  `mixed`/`xattr` plans (the only workloads whose plans contain namespace,
+  xattr and data operations; `dir`/`alloc` plans are for the non-crash runs
+  and `enospc` has no crash mode);
 * `linux-stateful-fuzz-sanitizer`: the same bounded stateful smoke under
   ASan+UBSan;
+* `FUZZ-2 soak` (weekly and `workflow_dispatch`): three fixed seeds ×
+  `mixed dir xattr alloc`, 2000 operations each, kernel verification; failure
+  artifacts keep the image and log;
 * `windows-build-test` generates the Windows-writer images;
 * `linux-verify-stateful-windows` verifies those images, including kernel
   replay of a Windows crash image.
 
 Longer manual/stress runs use the same binary with more steps/seeds, for
-example 1000–10000 operations with a higher crash density.  They are not
-forced into every PR.
+example 1000–10000 operations with a higher crash density; `fuzz2_soak.sh`
+below is the supported driver. They are not forced into every PR.
+
+### Running the crash matrix
+
+Without root, `SKIP_LINUX=1` runs every case through the project recovery
+engine and the in-process verifier:
+
+```bash
+SKIP_LINUX=1 tests/scripts/fuzz2_crash_matrix.sh
+```
+
+Kernel qualification uses the loop-mounted images and therefore needs root:
+
+```bash
+sudo env EXE="$PWD/build/tests/stateful_fuzz" WORK=/var/tmp/fuzz2-crash SEED=0x123456789abcdef STEPS=80 CRASH_DENSITY=1 PROFILE=modern WORKLOAD=mixed tests/scripts/fuzz2_crash_matrix.sh
+```
+
+Keep that command on one line when copying it: a space after a backslash makes
+the shell run the variable assignments as separate commands.  A non-root run
+with `SKIP_LINUX=0` exits 2 before creating any image or mount; use `sudo` or
+`SKIP_LINUX=1`.
+
+Two wrappers keep the long steps separately executable and log every phase:
+
+```bash
+sudo bash tests/scripts/fuzz2_verify_prepared.sh   # SRC, NAMES
+sudo bash tests/scripts/fuzz2_kernel_matrix.sh     # WORKLOAD, SEED, STEPS, ...
+```
+
+`fuzz2_verify_prepared.sh` expects `<name>.pre.img`, `<name>.img` and
+`<name>.manifest.json` under `SRC` (default `/tmp/fuzz2-nonroot`, names
+`ns xattr data`), copies each pre-recovery image before replaying it, and
+writes `<name>.kernel.log` / `<name>.rec.log`.  `fuzz2_kernel_matrix.sh`
+defaults to a workload-specific `WORK` and `/tmp/fuzz2-kernel-<workload>.log`.
+Both refuse to start if a previous run left a mount or loop device under their
+paths and print the exact detach command.
+
+Each case verifies the pre-recovery image through a kernel replay and the
+project-recovered image through `xfs_repair -n`, the raw oracle, the parent
+oracle and a kernel mount. Unmount retries five times and then falls back to
+`umount -l`; if the mount is still present it prints the exact cleanup
+command. The matrix also registers an exit trap that lazy-unmounts any mount
+left under `WORK` and, when started through sudo, chowns failure artifacts
+back to the invoking user. If a process is killed with `SIGKILL`, finish the
+cleanup explicitly:
+
+```bash
+findmnt -rn -o TARGET | grep '^/var/tmp/fuzz2-crash/'
+sudo umount -l <mountpoint>
+sudo losetup -a | grep fuzz2-crash
+sudo rm -rf /var/tmp/fuzz2-crash
+```
+
+### Long-running soak
+
+`fuzz2_soak.sh` runs every (seed, workload) pair, verifies each clean image
+with the Linux oracles unless `SKIP_LINUX=1`, deletes successful images, keeps
+failed ones, and resumes from `<base>.pass` markers:
+
+```bash
+sudo bash tests/scripts/fuzz2_soak.sh
+SKIP_LINUX=1 bash tests/scripts/fuzz2_soak.sh
+```
+
+Defaults are three fixed seeds × `mixed dir xattr alloc`, 2000 operations,
+512 MiB images and the `modern` profile.  Override with `SEEDS`, `WORKLOADS`,
+`STEPS`, `PROFILE`, `SIZE_MB`, `CHECK_EVERY`, `KEEP_IMAGES`, `RESUME=0`,
+`FAIL_FAST=0` and `RUN_TIMEOUT`; `WORK` selects the output directory
+(`/var/tmp/fuzz2-soak` by default).  The `FUZZ-2 soak` workflow runs the same
+script weekly and on `workflow_dispatch`, with optional `steps`, `seeds` and
+`workloads` inputs.
 
 ## 9. Bugs found by FUZZ-2
 
-The first campaign found four real invariant violations.  Each has a
-regression test and a separate fix commit; none was fixed by changing the
-model or weakening an oracle.
+The first campaign found five real invariant violations.  Each has a
+regression test; none was fixed by changing the model or weakening an
+oracle.
 
 ### 9.1 Cached data chunk keeps the old EOF after a hole-only grow
 
@@ -324,6 +415,29 @@ model or weakening an oracle.
   nested inodes, not only root children; the independent xfs_repair oracle
   remains the final gate.
 
+### 9.5 v5 superblock omits XFS_SB_VERSION_ATTRBIT
+
+* Reproducer: any clean modern image with a parent pointer or xattr, for
+  example `stateful_fuzz --seed 1 --steps 1 --profile modern --workload mixed
+  --image <img>`.  A kernel mount of the pre-fix image and `xfs_scrub -n`
+  reports `/f1 attr block map: Repairs are required`; the image's
+  `sb_versionnum` is `0xb4a5` instead of the `0xb4b5` that `mkfs.xfs` writes.
+* Violated invariant: a v5 filesystem that stores attr forks must advertise
+  `XFS_SB_VERSION_ATTRBIT` (0x0010).  The kernel maps the bit to
+  `XFS_FEAT_ATTR`; `xchk_bmap` reports every inode with `i_forkoff != 0` as
+  corrupt when the feature is absent.
+* Root cause: `BuildSuperblockImage` wrote the canonical v5 versionnum without
+  the attribute bit.  The bit is not part of the kernel's
+  `xfs_sb_good_version` required mask (0xb4a0), so the project parser and
+  `xfs_repair -n` accepted the malformed superblock.
+* Fix: set `XFS_SB_VERSION_ATTRBIT` in the shared superblock image
+  (`src/mkfs/superblock_builder.cpp`); the same image is written as the
+  primary and every AG secondary superblock.
+* Regression: `formatter_roundtrip` asserts the bit in the primary and every
+  secondary superblock; the independent `xfs_probe.py` and `rw2_probe.py`
+  reject a v5 image without it, so the stateful and crash pipelines gate on
+  it without root; the hardcoded fuzz fixtures use the canonical `0xb4b5`.
+
 ## 10. Remaining blind spots
 
 * Single-threaded deterministic sequences only; concurrent stateful fuzzing is
@@ -333,7 +447,7 @@ model or weakening an oracle.
 * Reflink/CoW crash semantics are checked structurally and by the documented
   data contract, but the first phase does not enumerate every BUI/CUI/RUI
   intent combination.
-* Directory format pressure in PR smoke is bounded; the scheduled/stress level
-  is what reaches the largest leaf/node trees.
+* Directory format pressure in PR smoke is bounded; the weekly soak and the
+  local `fuzz2_soak.sh` are what reach the largest leaf/node trees.
 * The independent Python probe validates the model's semantic objects; it is
   not a replacement for `xfs_repair -n`, `xfs_scrub` or a kernel mount.

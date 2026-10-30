@@ -37,6 +37,7 @@ import rw6_inode_probe  # noqa: E402
 import rw6d_xattr_probe  # noqa: E402
 import rw6e_parent_probe  # noqa: E402
 import rw4_probe  # noqa: E402
+import stateful_range  # noqa: E402
 
 TYPE_BY_FT = {1: "file", 2: "dir", 7: "symlink"}
 FT_BY_TYPE = {"file": 1, "dir": 2, "symlink": 7}
@@ -156,7 +157,8 @@ def walk(img, geo):
     return listings, paths, records
 
 
-def check_entry(img, geo, entry, path_set, records):
+def check_entry(img, geo, entry, path_set, records, range_target=None,
+                range_contract=None, range_before=None, range_after=None):
     want_type = entry["type"]
     nlink = entry["nlink"]
     size = entry["size"]
@@ -195,12 +197,25 @@ def check_entry(img, geo, entry, path_set, records):
     if record["nlink"] != nlink:
         fail("%s: nlink %d != %d" %
              (entry["paths"][0], record["nlink"], nlink))
-    if want_type != "dir" and record["size"] != size:
-        fail("%s: size %d != %d" %
-             (entry["paths"][0], record["size"], size))
+    if want_type != "dir":
+        if range_contract is not None and entry["id"] == range_target:
+            allowed_sizes = {int(range_contract["before_size"]),
+                             int(range_contract["after_size"])}
+            if record["size"] not in allowed_sizes:
+                fail("%s: size %d not in allowed set %s" %
+                     (entry["paths"][0], record["size"],
+                      sorted(allowed_sizes)))
+        elif record["size"] != size:
+            fail("%s: size %d != %d" %
+                 (entry["paths"][0], record["size"], size))
     if want_type == "file":
         data = read_data(img, geo, record)
-        if len(data) != size or fnv1a(data) != content:
+        if range_contract is not None and entry["id"] == range_target:
+            error = stateful_range.verify_range(
+                data, range_contract, range_before, range_after)
+            if error:
+                fail("%s: %s" % (entry["paths"][0], error))
+        elif len(data) != size or fnv1a(data) != content:
             fail("%s: content hash differs" % entry["paths"][0])
     elif want_type == "symlink":
         target = rw4_probe.symlink_target(img, geo, record)
@@ -221,7 +236,9 @@ def check_entry(img, geo, entry, path_set, records):
     return first
 
 
-def check_state(img, geo, state, range_mode, allowed_sizes=None):
+def check_state(img, geo, state, range_mode, allowed_sizes=None,
+                range_target=None, range_contract=None, range_before=None,
+                range_after=None):
     listings, paths, records = walk(img, geo)
     path_set = {path for values in paths.values() for path in values}
     for path, names in state["listings"].items():
@@ -231,27 +248,8 @@ def check_state(img, geo, state, range_mode, allowed_sizes=None):
             fail("directory %s = %s, expected %s" %
                  (path, listings[path], sorted(names)))
     for entry in state["entries"]:
-        if range_mode and entry["type"] == "file":
-            # Range mode: metadata must still be exact, but the bytes are
-            # covered by the before/after contract in the C++ runner.
-            allowed = allowed_sizes.get(entry["paths"][0]) if allowed_sizes else None
-            if allowed:
-                parts = [p for p in entry["paths"][0].split("/") if p]
-                ino = geo.rootino
-                for part in parts:
-                    listing = rw3_probe.enumerate_directory(img, geo, ino)
-                    found = listing.get(part.encode())
-                    if found is None:
-                        fail("model path %s is missing" % entry["paths"][0])
-                    ino = found[0]
-                record = records.get(ino)
-                if record is None:
-                    record = rw6e_parent_probe.inode_record(img, geo, ino)
-                if record["size"] not in allowed:
-                    fail("%s: size %d not in allowed set %s" %
-                         (entry["paths"][0], record["size"], sorted(allowed)))
-            continue
-        check_entry(img, geo, entry, path_set, records)
+        check_entry(img, geo, entry, path_set, records, range_target,
+                    range_contract, range_before, range_after)
     return len(state["entries"])
 
 
@@ -281,16 +279,18 @@ def main(argv):
         fail("manifest has no states")
     range_mode = manifest.get("state_mode") == "range"
     if range_mode:
-        # For range manifests both states are alternatives; checking the
-        # metadata of one is enough because namespace/xattrs do not change in
-        # a data operation.  The C++ runner validates the byte ranges.
-        allowed_sizes = {}
-        for state in states:
-            for entry in state["entries"]:
-                if entry["type"] == "file":
-                    for path in entry["paths"]:
-                        allowed_sizes.setdefault(path, set()).add(entry["size"])
-        checked = check_state(img, geo, states[0], True, allowed_sizes)
+        try:
+            contract, before, after = stateful_range.load_contract(
+                manifest, args.manifest)
+        except (KeyError, OSError, ValueError) as exc:
+            fail("invalid range contract: %s" % exc)
+        target = manifest.get("target_node")
+        if target is None or contract is None:
+            fail("range manifest is missing its target or byte contract")
+        checked = check_state(img, geo, states[0], True,
+                              range_target=int(target),
+                              range_contract=contract,
+                              range_before=before, range_after=after)
     else:
         errors = []
         for index, state in enumerate(states):

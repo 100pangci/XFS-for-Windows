@@ -161,7 +161,13 @@ OpType Generator::ChooseType(uint64_t op_index) {
     case Workload::kMixed:
       break;
   }
-  // A broad mixed workload.  Reflink is only selected on profiles that
+  // A reflink is followed by a CoW overwrite of its destination before
+  // another clone can replace the pending target.
+  if (pending_cow_target_ != 0 &&
+      (op_index % 3) == 1 && options_.reflink) {
+    return OpType::kCowOverwrite;
+  }
+  // A broad mixed workload. Reflink is only selected on profiles that
   // advertise it; otherwise the slot degrades to an ordinary write.
   if (roll < 8) return OpType::kMkdir;
   if (roll < 22) return OpType::kCreate;
@@ -271,7 +277,9 @@ Operation Generator::MakeRenameOp(uint64_t op_index) {
 
 Operation Generator::MakeDataOp(uint64_t op_index, OpType type) {
   const std::vector<uint64_t> files = CandidateFiles();
-  uint64_t node = Pick(files, 0);
+  uint64_t node = type == OpType::kCowOverwrite && pending_cow_target_ != 0
+                      ? pending_cow_target_
+                      : Pick(files, 0);
   if (node == 0) return FallbackCreate(0);
   const ModelNode* file = model_.Find(node);
   const uint64_t size = file ? file->data.size() : 0;
@@ -474,6 +482,7 @@ Operation Generator::MakeReflinkOp(uint64_t op_index) {
   op.offset = src_block * kBlock;
   op.size = dst_offset;
   op.length = length;
+  pending_cow_target_ = dst;
   return op;
 }
 
@@ -597,6 +606,10 @@ Operation Generator::Next(uint64_t op_index, std::string* error) {
         break;
       case OpType::kReflink:
         op = MakeReflinkOp(op_index);
+        break;
+      case OpType::kCowOverwrite:
+        op = MakeDataOp(op_index, type);
+        if (op.type == OpType::kCowOverwrite) pending_cow_target_ = 0;
         break;
       case OpType::kPreallocate:
         op = MakePreallocateOp(op_index);

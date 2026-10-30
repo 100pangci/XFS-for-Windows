@@ -11,6 +11,7 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #include "stateful/generator.h"
@@ -26,6 +27,13 @@ namespace {
 std::string HexSeed(uint64_t value) {
   char buffer[19];
   std::snprintf(buffer, sizeof(buffer), "0x%016llx",
+                static_cast<unsigned long long>(value));
+  return buffer;
+}
+
+std::string HexHash(uint64_t value) {
+  char buffer[17];
+  std::snprintf(buffer, sizeof(buffer), "%016llx",
                 static_cast<unsigned long long>(value));
   return buffer;
 }
@@ -69,8 +77,40 @@ void WriteManifest(const FuzzOptions& options, const std::string& mode,
                    const std::string& state_mode,
                    const std::vector<ModelFs>& states,
                    const std::vector<std::string>& labels,
-                   uint64_t target_node = 0) {
+                   uint64_t target_node = 0,
+                   const Operation* range_op = nullptr) {
   if (options.manifest.empty()) return;
+  std::string range_data_file;
+  const ModelNode* before_target = nullptr;
+  const ModelNode* after_target = nullptr;
+  if (state_mode == "range") {
+    if (!range_op || target_node == 0 || states.size() != 2) {
+      throw std::runtime_error("range manifest is missing its operation state");
+    }
+    before_target = states[0].Find(target_node);
+    after_target = states[1].Find(target_node);
+    if (!before_target || !after_target ||
+        before_target->type != NodeType::kFile ||
+        after_target->type != NodeType::kFile) {
+      throw std::runtime_error("range manifest target is not a regular file");
+    }
+    const std::filesystem::path manifest_path(options.manifest);
+    range_data_file = manifest_path.filename().string() + ".range.bin";
+    std::ofstream data_out(options.manifest + ".range.bin",
+                           std::ios::binary | std::ios::trunc);
+    if (!data_out) {
+      throw std::runtime_error("cannot create range data contract");
+    }
+    if (!before_target->data.empty()) {
+      data_out.write(reinterpret_cast<const char*>(before_target->data.data()),
+                     static_cast<std::streamsize>(before_target->data.size()));
+    }
+    if (!after_target->data.empty()) {
+      data_out.write(reinterpret_cast<const char*>(after_target->data.data()),
+                     static_cast<std::streamsize>(after_target->data.size()));
+    }
+    if (!data_out) throw std::runtime_error("cannot write range data contract");
+  }
   std::ostringstream out;
   out << "{\n";
   out << "  \"format\": \"xfswin-stateful-v1\",\n";
@@ -83,6 +123,24 @@ void WriteManifest(const FuzzOptions& options, const std::string& mode,
   out << "  \"crash_op\": " << options.crash_op << ",\n";
   out << "  \"crash_point\": \"" << JsonEscape(options.crash_point) << "\",\n";
   if (target_node != 0) out << "  \"target_node\": " << target_node << ",\n";
+  if (!range_data_file.empty()) {
+    out << "  \"range_contract\": {\n";
+    out << "    \"operation\": \"" << ToString(range_op->type) << "\",\n";
+    out << "    \"path\": \""
+        << JsonEscape(states[1].PathOf(target_node)) << "\",\n";
+    out << "    \"offset\": " << range_op->offset << ",\n";
+    out << "    \"length\": " << range_op->length << ",\n";
+    out << "    \"size\": " << range_op->size << ",\n";
+    out << "    \"data_file\": \"" << JsonEscape(range_data_file)
+        << "\",\n";
+    out << "    \"before_size\": " << before_target->data.size() << ",\n";
+    out << "    \"after_size\": " << after_target->data.size() << ",\n";
+    out << "    \"before_hash\": \""
+        << HexHash(ModelFs::HashBytes(before_target->data)) << "\",\n";
+    out << "    \"after_hash\": \""
+        << HexHash(ModelFs::HashBytes(after_target->data)) << "\"\n";
+    out << "  },\n";
+  }
   out << "  \"labels\": [";
   for (size_t i = 0; i < labels.size(); ++i) {
     if (i) out << ", ";
@@ -323,6 +381,105 @@ ExecResult ExecuteOperation(xfs::XfsFilesystem& fs, const ModelFs& model,
   return ExecResult{false, false, {}};
 }
 
+// The ENOSPC workload must prove more than "one operation returned kNoSpace":
+// the failed transaction has to leave the image unchanged, and space must be
+// allocatable again after a real release.  Run one deterministic probe at the
+// first kNoSpace so a fixed seed always exercises the same release/reuse pair:
+// truncate the largest data file to zero (all its extents must disappear),
+// then allocate one block on that file (a new extent must appear).
+void ProveEnospcReleaseReuse(xfs::XfsFilesystem& fs, ModelFs& model,
+                             const FuzzOptions& options, uint64_t step) {
+  uint64_t victim = 0;
+  uint64_t victim_size = 0;
+  for (uint64_t id : model.Files()) {
+    const ModelNode* candidate = model.Find(id);
+    if (!candidate || candidate->actual_ino == 0 || candidate->data.empty()) {
+      continue;
+    }
+    if (candidate->data.size() > victim_size) {
+      victim = id;
+      victim_size = candidate->data.size();
+    }
+  }
+  if (victim == 0) {
+    throw FuzzFailure{
+        "ENOSPC was reached before any data file existed; the workload cannot "
+        "demonstrate release and reuse",
+        step};
+  }
+  const ModelNode* node = model.Find(victim);
+  const uint64_t ino = node->actual_ino;
+  auto before = fs.GetDataExtents(ino);
+  if (!before.ok()) throw FuzzFailure{before.error().Format(), step};
+  if (before.value().empty()) {
+    throw FuzzFailure{"data file has logical content but no allocated extents "
+                      "before the ENOSPC release probe",
+                      step};
+  }
+
+  Operation release;
+  release.type = OpType::kTruncateSmaller;
+  release.node = victim;
+  release.size = 0;
+  uint64_t new_ino = 0;
+  ExecResult released = ExecuteOperation(fs, model, release, &new_ino);
+  if (!released.ok) {
+    throw FuzzFailure{"ENOSPC release probe (truncate to zero) failed: " +
+                          released.error.Format(),
+                      step};
+  }
+  std::string why;
+  if (!model.Apply(release, &why)) {
+    throw FuzzFailure{"model rejected the ENOSPC release probe: " + why, step};
+  }
+  auto freed = fs.GetDataExtents(ino);
+  if (!freed.ok()) throw FuzzFailure{freed.error().Format(), step};
+  if (!freed.value().empty()) {
+    throw FuzzFailure{
+        "truncate to zero left data extents allocated after ENOSPC", step};
+  }
+
+  Operation reuse;
+  reuse.type = OpType::kPreallocate;
+  reuse.node = victim;
+  reuse.offset = 0;
+  reuse.length = fs.geometry().block_size;
+  reuse.keep_size = false;
+  ExecResult reused = ExecuteOperation(fs, model, reuse, &new_ino);
+  if (!reused.ok) {
+    throw FuzzFailure{
+        "ENOSPC reuse probe (one-block preallocate after release) failed: " +
+            reused.error.Format(),
+        step};
+  }
+  if (!model.Apply(reuse, &why)) {
+    throw FuzzFailure{"model rejected the ENOSPC reuse probe: " + why, step};
+  }
+  auto reallocated = fs.GetDataExtents(ino);
+  if (!reallocated.ok()) {
+    throw FuzzFailure{reallocated.error().Format(), step};
+  }
+  if (reallocated.value().empty()) {
+    throw FuzzFailure{
+        "preallocate succeeded after release but produced no data extent",
+        step};
+  }
+
+  VerifyResult verified = VerifyModel(fs, model);
+  if (!verified.ok) {
+    throw FuzzFailure{
+        "ENOSPC release/reuse probe left a changed filesystem: " +
+            verified.error,
+        step};
+  }
+  AppendTrace(options, "reuse-release " + std::to_string(step) + " " +
+                           release.Describe() + " freed_extents=" +
+                           std::to_string(before.value().size()));
+  AppendTrace(options, "reuse-alloc " + std::to_string(step) + " " +
+                           reuse.Describe() + " extents=" +
+                           std::to_string(reallocated.value().size()));
+}
+
 std::string DescribeCheck(const xfs::CheckReport& report) {
   std::ostringstream out;
   out << report.Summary();
@@ -345,21 +502,36 @@ void CheckConsistency(xfs::XfsFilesystem& fs, bool allow_warnings,
   *error = "consistency check failed: " + DescribeCheck(report);
 }
 
-bool CrashPointApplicable(const std::string& point, OpType type) {
-  if (point == "before_log_write" || point == "after_log_commit" ||
-      point == "before_metadata_write" || point == "after_metadata_write") {
+bool CrashPointApplicable(const std::string& point, const Operation& op) {
+  const OpType type = op.type;
+  if (point == "before_log_write" || point == "mid_log_record" ||
+      point == "after_log_commit" || point == "before_metadata_write" ||
+      point == "mid_metadata_write" || point == "after_metadata_write") {
     return true;
   }
   const bool data_write = type == OpType::kWrite || type == OpType::kExtend ||
                           type == OpType::kOverwrite ||
-                          type == OpType::kSparseWrite ||
-                          type == OpType::kCowOverwrite;
+                          type == OpType::kSparseWrite;
+  const bool cow_write = type == OpType::kCowOverwrite ||
+                         type == OpType::kTruncateSmaller ||
+                         type == OpType::kTruncateLarger;
+  const bool xattr_write = type == OpType::kSetXattr ||
+                           type == OpType::kReplaceXattr;
+  const size_t xattr_entry_size =
+      (3 + op.xattr_name.size() + op.xattr_length + 3) & ~size_t{3};
+  const bool remote_xattr = xattr_write && xattr_entry_size >= 3072;
   if (point == "before_data_write" || point == "after_data_write") {
-    return data_write;
+    return data_write || remote_xattr || type == OpType::kPreallocate ||
+           cow_write;
+  }
+  if (point == "mid_data_write") return data_write || cow_write ||
+                                           type == OpType::kPreallocate;
+  if (point == "before_device_flush" || point == "after_device_flush") {
+    return remote_xattr || cow_write;
   }
   if (point == "after_bmap_switch") return type == OpType::kReflink;
   if (point == "cow_staged" || point == "before_cow_data_write" ||
-      point == "after_cow_data_write" ||
+      point == "mid_cow_data_write" || point == "after_cow_data_write" ||
       point == "before_cow_remap_commit" || point == "after_cow_remap" ||
       point == "after_refcount_update" || point == "after_rmap_update" ||
       point == "before_old_range_release" ||
@@ -440,6 +612,7 @@ std::unique_ptr<xfs::XfsFilesystem> OpenAndRecover(const FuzzOptions& options,
   xfs::MountOptions mount;
   mount.read_write = true;
   mount.recover_dirty_log = true;
+  mount.clean_log_after_recovery = true;
   auto mounted = xfs::XfsFilesystem::Mount(std::move(device), mount);
   if (!mounted.ok()) {
     *error = "recovery mount failed: " + mounted.error().Format();
@@ -517,8 +690,7 @@ int RunFresh(const FuzzOptions& options) {
     if (!crash_plan.has_capture) {
       throw FuzzFailure{"internal: crash plan has no capture", options.crash_op};
     }
-    if (!CrashPointApplicable(options.crash_point,
-                              crash_plan.capture_op.type)) {
+    if (!CrashPointApplicable(options.crash_point, crash_plan.capture_op)) {
       throw FuzzFailure{"crash point '" + options.crash_point +
                             "' is not applicable to operation " +
                             std::to_string(options.crash_op) + " (" +
@@ -532,7 +704,10 @@ int RunFresh(const FuzzOptions& options) {
                   {"before", "after"},
                   crash_plan.capture_op.type == OpType::kReflink
                       ? crash_plan.capture_op.dst_node
-                      : crash_plan.capture_op.node);
+                      : crash_plan.capture_op.node,
+                  IsRangeCrashOperation(crash_plan.capture_op.type)
+                      ? &crash_plan.capture_op
+                      : nullptr);
     for (size_t i = 0; i < crash_plan.ops.size(); ++i) {
       AppendTrace(options, "plan " + std::to_string(i + 1) + " " +
                                crash_plan.ops[i].Describe());
@@ -548,6 +723,7 @@ int RunFresh(const FuzzOptions& options) {
 
   uint64_t no_space = 0;
   uint64_t executed = 0;
+  bool reuse_probe_done = false;
 
   if (options.crash_op != 0) {
     for (uint64_t i = 0; i < crash_plan.ops.size(); ++i) {
@@ -630,6 +806,10 @@ int RunFresh(const FuzzOptions& options) {
         }
         AppendTrace(options, "enospc " + std::to_string(i) + " " +
                                  op.Describe());
+        if (!reuse_probe_done) {
+          ProveEnospcReleaseReuse(fs, model, options, i);
+          reuse_probe_done = true;
+        }
       } else {
         if (!model.Apply(op, &why)) {
           throw FuzzFailure{"model rejected executed operation " +
@@ -771,7 +951,7 @@ int RunRecover(const FuzzOptions& options) {
   if (range) {
     WriteManifest(options, "recovered", "range",
                   {plan.before_capture, plan.after_capture},
-                  {"before", "after"}, target);
+                  {"before", "after"}, target, &op);
   } else if (matches_after) {
     WriteManifest(options, "recovered", "exact", {plan.after_capture},
                   {"after"});
