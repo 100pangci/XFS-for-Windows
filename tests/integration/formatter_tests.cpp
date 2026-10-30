@@ -10,6 +10,7 @@
 #include "xfs/formatter.h"
 #include "xfs/image_device.h"
 #include "xfs/log_checker.h"
+#include "xfs/ondisk.h"
 #include "xfs/superblock.h"
 
 using namespace xfs;
@@ -52,6 +53,11 @@ TEST(formatter_roundtrip) {
   CHECK_EQ(geo.inode_size, 512u);
   CHECK_EQ(geo.agcount, 4u);
   CHECK_EQ(geo.agblocks, 19200u);
+  // XFS_SB_VERSION_ATTRBIT: the kernel maps this bit to XFS_FEAT_ATTR and
+  // treats an attr fork on a filesystem without it as corruption, so mkfs
+  // must advertise attribute support in every superblock copy.
+  CHECK_EQ(fs.value()->superblock().versionnum & ondisk::kSbVersionAttrBit,
+           ondisk::kSbVersionAttrBit);
   // mkfs writes a nonzero realtime extent size even without an rt device.
   CHECK_EQ(fs.value()->superblock().rextsize, 1u);
   CHECK_EQ(fs.value()->superblock().rootino, 64u);
@@ -97,6 +103,8 @@ TEST(formatter_roundtrip) {
     auto sb = ReadSuperblock(fs.value()->device(), offset, true);
     CHECK(sb.ok());
     CHECK_EQ(sb.value().rootino, 64u);
+    CHECK_EQ(sb.value().versionnum & ondisk::kSbVersionAttrBit,
+             ondisk::kSbVersionAttrBit);
   }
 
   // The formatter writes a clean log.

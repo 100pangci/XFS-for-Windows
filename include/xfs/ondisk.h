@@ -121,6 +121,10 @@ constexpr size_t kMetaUuid = 248;            // 16 bytes
 // versionnum bit fields
 constexpr uint16_t kSbVersionNumbits = 0x000f;
 constexpr uint16_t kSbVersion5 = 5;
+// XFS_SB_VERSION_ATTRBIT: extended attributes are supported.  mkfs.xfs always
+// sets this for v5 filesystems; the kernel maps it to XFS_FEAT_ATTR and
+// xfs_scrub reports an attr fork as corrupt when the bit is missing.
+constexpr uint16_t kSbVersionAttrBit = 0x0010;
 
 // features2 bits (v4 compatibility area; XFS_SB_VERSION2_*)
 constexpr uint32_t kVersion2LazySbCount = 0x00000002;
