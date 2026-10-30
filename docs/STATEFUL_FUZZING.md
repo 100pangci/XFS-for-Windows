@@ -328,9 +328,9 @@ Defaults are three fixed seeds × `mixed dir xattr alloc`, 2000 operations,
 512 MiB images and the `modern` profile.  Override with `SEEDS`, `WORKLOADS`,
 `STEPS`, `PROFILE`, `SIZE_MB`, `CHECK_EVERY`, `KEEP_IMAGES`, `RESUME=0`,
 `FAIL_FAST=0` and `RUN_TIMEOUT`; `WORK` selects the output directory
-(`/var/tmp/fuzz2-soak` by default).  The `FUZZ-2 soak` workflow runs the same
-script weekly and on `workflow_dispatch`, with optional `steps`, `seeds` and
-`workloads` inputs.
+(`/var/tmp/fuzz2-soak` by default).  The `linux-stateful-soak` job in `ci.yml`
+runs the same script weekly and on `workflow_dispatch` with `soak_only: true`,
+with optional `soak_steps`, `soak_seeds` and `soak_workloads` inputs.
 
 ## 9. Bugs found by FUZZ-2
 

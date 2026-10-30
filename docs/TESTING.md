@@ -993,7 +993,8 @@ The `perf_*` tests assert:
 - a real `ImageBlockDevice` performs concurrent positioned I/O and reads back
   every range.
 
-`xfswin_perf` writes `perf.json`/`perf.txt`; `windows-perf-smoke` uploads them.
+`xfswin_perf` writes `perf.json`/`perf.txt`; the `windows-perf-smoke` job in
+`ci.yml` uploads them.
 The A/B runner and the mounted WinFsp layer are documented in
 `tests/perf/README.md`; `run_mounted_perf.ps1` needs the WinFsp runtime and
 optionally DiskSpd. It exercises ordinary `Remove-Item -Force` (POSIX-delete
