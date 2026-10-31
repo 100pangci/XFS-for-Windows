@@ -295,12 +295,13 @@ detach vdisk
                 Assert ($raceProc.ExitCode -eq 0) "race mount reported a failed clean unmount: $($raceProc.ExitCode)"
             } else {
                 # Detached: the mounted filesystem must observe a terminal
-                # device failure.  The unmount request must fail (the journal
-                # cannot be closed on a vanished device) and the mount host
-                # must exit instead of retrying forever.
+                # device failure.  The unmount request only signals the stop
+                # event, so its own exit code is not the signal; the mount
+                # host must exit non-zero (the journal cannot be closed on a
+                # vanished device) instead of retrying forever or reporting
+                # a successful clean unmount.
                 $results.steps['detach-while-mounted'] = 'detached'
                 $code = Invoke-Xfswin -Arguments @('unmount', $MountPoint) -LogName 'unmount-after-detach'
-                Assert ($code -ne 0) "unmount after a successful detach reported success"
                 if (-not $raceProc.WaitForExit(60000)) {
                     $raceProc.Kill()
                     throw "the mount host hung after the device disappeared"
