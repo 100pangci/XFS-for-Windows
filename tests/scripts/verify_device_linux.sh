@@ -106,7 +106,13 @@ sync
 echo "== 4. xfs_scrub -n =="
 if command -v xfs_scrub >/dev/null 2>&1; then
     if ! xfs_scrub -n "$mnt" 2>&1 | tee "$artifacts/xfs-scrub.log"; then
-        if [ "${XFSWIN_ALLOW_SKIP_SCRUB:-0}" = "1" ]; then
+        if grep -q 'Kernel metadata scrubbing facility is not available' \
+            "$artifacts/xfs-scrub.log"; then
+            # The GitHub runner kernel has no online scrub ioctl.  Record the
+            # skip; a real scrub rejection still fails below.
+            echo "warning: the kernel has no online scrub facility; recording a skip" \
+                | tee -a "$artifacts/xfs-scrub.log"
+        elif [ "${XFSWIN_ALLOW_SKIP_SCRUB:-0}" = "1" ]; then
             echo "warning: xfs_scrub failed (allowed by XFSWIN_ALLOW_SKIP_SCRUB)"
         else
             echo "FAILED: xfs_scrub -n failed" >&2
