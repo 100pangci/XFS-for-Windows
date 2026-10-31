@@ -167,9 +167,20 @@ try {
     # -----------------------------------------------------------------------
     # Real WinFsp read-write mount and file operations.
     # -----------------------------------------------------------------------
-    $winfsp = Get-Service -Name 'WinFsp' -ErrorAction SilentlyContinue
+    # WinFsp installs a user-mode launcher service ("WinFsp.Launcher") and a
+    # kernel driver ("WinFsp"); Get-Service does not reliably list the driver,
+    # and older packages expose only one of the two.  Fall back to the
+    # installed runtime DLL before declaring WinFsp missing.
+    $winfsp = Get-Service -Name 'WinFsp.Launcher' -ErrorAction SilentlyContinue
+    if (-not $winfsp) {
+        $winfsp = Get-Service -Name 'WinFsp' -ErrorAction SilentlyContinue
+    }
+    if (-not $winfsp) {
+        $winfspDll = Join-Path ${env:ProgramFiles(x86)} 'WinFsp\bin\winfsp-x64.dll'
+        if (Test-Path $winfspDll) { $winfsp = $true }
+    }
     if (-not $winfsp -and $RequireWinFsp) {
-        throw "WinFsp is not installed (service not found)"
+        throw "WinFsp is not installed (no launcher/driver service and no runtime DLL)"
     }
     if ($winfsp) {
         "== WinFsp read-write mount =="

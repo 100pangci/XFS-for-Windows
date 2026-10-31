@@ -112,7 +112,7 @@ TEST(device_alignment_math_checks_overflow) {
 }
 
 TEST(device_direct_request_requires_aligned_buffer) {
-  alignas(4096) uint8_t aligned[4096];
+  alignas(4096) uint8_t aligned[4096] = {};
   CHECK(xfs::IsDirectDeviceRequest(4096, 4096, aligned, 4096));
   CHECK(!xfs::IsDirectDeviceRequest(1, 4096, aligned, 4096));
   CHECK(!xfs::IsDirectDeviceRequest(4096, 100, aligned, 4096));
