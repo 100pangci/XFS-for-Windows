@@ -67,12 +67,14 @@ artifact is marked "not run".
 
 ## 2. CI evidence
 
-Run: [41238711400](https://github.com/100pangci/XFS-for-Windows/actions/runs/41238711400)
+Run: [41243857500](https://github.com/100pangci/XFS-for-Windows/actions/runs/41243857500)
 on branch `dev1-device-qualification`, HEAD
-`8576f57d540a0ad7bfc3bcf5e936e49bc00593c6`, triggered with `workflow_dispatch`.
+`08250c27eb91a7a9be95c07cd22d6d6407e68e8e`, triggered with `workflow_dispatch`.
 Final status: **success**.  The run created 135 jobs: 131 succeeded and 4 were
 skipped by design (the two soak jobs, the PERF-1 A/B job and the opt-in
-`>2 TiB` large-device job).
+`>2 TiB` large-device job).  The same three DEV-1 jobs had already passed in
+run 41238711400 at `8576f57d540a0ad7bfc3bcf5e936e49bc00593c6`; the final run
+re-ran them after the device concurrency matrix test was added.
 
 | Job | Result | What it proves |
 | --- | --- | --- |
