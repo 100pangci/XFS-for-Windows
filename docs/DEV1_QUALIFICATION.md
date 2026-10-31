@@ -1,10 +1,13 @@
 # DEV-1 qualification report
 
-Status date: 2026-10-31
-Decision: **NOT READY** — the Windows block-device layer has been implemented
-and the portable tests pass, but no real-device VHD/WinFsp qualification or
-Linux XFS oracle has been executed yet.  The default fixed-disk write policy is
-therefore unchanged (refuse).
+Status date: 2026-11-01
+
+Decision: **NOT READY** for lifting the default that refuses writes to real
+fixed `\\.\PhysicalDriveN` disks.  The virtual-disk path (fixed VHD, 512/512
+sectors) is qualified end-to-end on Windows + MSVC and verified by the Linux
+XFS oracle.  No physical fixed disk, removable medium or 4Kn device was tested,
+so the conservative default stays: a physical fixed disk is still refused
+unless the operator passes both the qualification and fixed-disk opt-ins.
 
 This file records evidence, not intentions.  A claim without a command, log or
 artifact is marked "not run".
@@ -28,8 +31,8 @@ artifact is marked "not run".
   `--device-write-qualification`, `--allow-fixed-disk-write`,
   `--allow-removable-disk-write`, `--device-cache-mode`.
 * `mount_host`/WinFsp: the device policy reaches the backend; a failed clean
-  unmount or final flush is now returned as a failed unmount instead of
-  `OkStatus()`.
+  unmount or final flush is returned as a failed unmount; a terminal device
+  failure stops the mount instead of leaving it alive.
 * Qualification scripts:
   `tests/scripts/verify_device_windows.ps1`,
   `tests/scripts/verify_device_linux.sh`,
@@ -37,9 +40,10 @@ artifact is marked "not run".
 * CI jobs: `windows-vhd-device`, `windows-vhd-winfsp`,
   `linux-verify-windows-vhd`; the main Windows job also runs the filtered
   `device_` unit tests.
-* Documentation: `docs/WINDOWS_BLOCK_DEVICE.md`.
+* Documentation: `docs/WINDOWS_BLOCK_DEVICE.md`, `docs/LOCKING.md`,
+  `docs/TESTING.md`.
 
-### 1.1 Defects found by the DEV-1 audit and fixed
+### 1.1 Defects found and fixed during DEV-1
 
 | Defect | Fix |
 | --- | --- |
@@ -56,75 +60,141 @@ artifact is marked "not run".
 | A terminal device failure left the WinFsp mount alive | the adapter latches the failure, fails the callback, and signals the stop event so the unmount path runs |
 | Directory enumeration skipped unreadable inodes even after the device failed, returning success | a dead device aborts the enumeration with an I/O error |
 | `BlockDevice::Flush()` promised "stable storage" unconditionally | the interface now documents the API barrier, not media power-loss durability |
+| The WinFsp qualification expected Windows to refuse `diskpart detach vdisk` while the exclusive handle was open; Windows Server 2022 allows it | the test accepts either outcome and asserts the disappearance behavior instead |
+| The test treated the `unmount` request's exit code as the clean-unmount result, but that command only signals the stop event | the test asserts the mount host's exit code, which must be non-zero after the device disappeared |
+| The independent Python oracle read the AGF at AG sector 0 (the superblock copy) instead of sector 1 | read sector 1; the AGI/AGFL offsets were already correct |
+| `xfs_scrub -n` aborts on the runner kernel with "Kernel metadata scrubbing facility is not available" | the oracle records a skip for that environment error; a real scrub rejection still fails |
 
-## 2. Evidence obtained locally
+## 2. CI evidence
 
-| Evidence | Command | Result |
+Run: [41238711400](https://github.com/100pangci/XFS-for-Windows/actions/runs/41238711400)
+on branch `dev1-device-qualification`, HEAD
+`8576f57d540a0ad7bfc3bcf5e936e49bc00593c6`, triggered with `workflow_dispatch`.
+Final status: **success**.  The run created 135 jobs: 131 succeeded and 4 were
+skipped by design (the two soak jobs, the PERF-1 A/B job and the opt-in
+`>2 TiB` large-device job).
+
+| Job | Result | What it proves |
 | --- | --- | --- |
-| MSVC build | `cmake --build build-winfsp --config RelWithDebInfo` | success |
-| MSVC warnings-as-errors build (core) | `cmake --build build-perf2-werror --config RelWithDebInfo` | success (only pre-existing test warnings) |
-| Full unit/integration suite | `build-winfsp/tests/RelWithDebInfo/xfs_tests.exe` | 238 tests, all passed |
-| Device policy/lifecycle/64-bit tests | same binary, `--filter=device_` | 14 tests, all passed |
-| >2 TiB sparse image write/read | `image_device_64_bit_offsets` | passed (3 TiB sparse image, 2 TiB boundary) |
-| PowerShell script syntax | `[Parser]::ParseFile` | valid |
-| Linux/Python script syntax | `bash -n`, `ast.parse` | valid |
+| `windows-build-test` | success | MSVC build and the full portable suite, including `--filter=device_` |
+| `linux-build-test` (gcc, clang) | success | the same suite with `-Werror` on Linux |
+| `windows-vhd-device` | success | device policy/geometry, destructive self-test, fault matrix, format through `\\.\PhysicalDriveN`, info/check/ls |
+| `windows-vhd-winfsp` | success | real WinFsp read-write mount on the VHD: create, 256 KiB binary write/readback, rename, delete, clean unmount, detach race |
+| `linux-verify-windows-vhd` | success | the independent Linux XFS oracle on the WinFsp-written VHD |
 
-Environment: Windows 11 Pro for Workstations (10.0.26200), non-elevated
-session.  VHD attach/detach and raw-device access require Administrator and
-were **not** run locally.
+Artifacts: `dev1-vhd-device`, `dev1-vhd-winfsp`, `dev1-linux-oracle`
+(`dev1-results.json`, `device-trace.jsonl`, `xfs-repair-*.log`,
+`xfs-db-superblock.log`, `xfs-scrub.log`, `xfs-logprint.log`, probe log).
 
-## 3. Evidence not obtained
+## 3. Actual devices tested
 
-| Required evidence | Status | Why |
+| Property | Value |
+| --- | --- |
+| Device | Microsoft VHD, fixed, 512 MiB (`Msft Virtual Disk`) |
+| Bus / media | `File Backed Virtual`, media type reported as `Unspecified`/`SSD` on different runners |
+| Path | `\\.\PhysicalDrive2` (the number is assigned by Windows and was verified by `Get-Disk`) |
+| Logical / physical sector | 512 / 512 |
+| Serial | none (VHD); `stable_id` is the volume `DeviceGuid` |
+| Cache mode | `buffered` |
+| Filesystem | XFS v5, block size 4096, inode size 512, 4 AGs x 32768 blocks, internal log at block 65540 |
+
+No physical fixed disk, USB/removable medium or 4Kn device was tested.
+
+## 4. Self-test and fault matrix (real VHD)
+
+`dev1-results.json` from `windows-vhd-winfsp` (the device-only job produced the
+same matrix):
+
+| Step | Exit | Expectation |
 | --- | --- | --- |
-| VHD/VHDX attach and `\\.\PhysicalDriveN` open | not run | local session is not elevated |
-| `device-selftest` on a real (virtual) disk | not run | requires an attached disk |
-| fault matrix on a real device | not run | requires an attached disk |
-| WinFsp read-write mount on a VHD | not run | requires elevated VHD + WinFsp runtime |
-| detach/disappearance race | not run | requires elevated VHD |
-| Linux `xfs_repair -n`, kernel mount, `xfs_scrub -n`, `xfs_logprint`, Python probe | not run | Linux VM SSH authentication failed; no CI run has been triggered |
-| 4Kn real hardware | not run | no 4Kn device available |
-| removable-device qualification | not run | manual/opt-in by design |
+| `list`, `device-info`, `device-check` | 0 | geometry/policy probes |
+| `device-selftest` | 0 | aligned write/flush/read, unaligned bounce I/O, 64-bit last-sector write, ordering |
+| `write_fail:1` | 1 | injected write failure is reported |
+| `flush_fail:1` | 1 | injected flush failure is reported |
+| `invalidate_after:1` | 1 | terminal invalidation is reported |
+| `write_short:1` | 0 | short write is completed by the backend |
+| `read_short:1` | 0 | short read is completed by the backend |
+| `format` | 0 | XFS format through `\\.\PhysicalDriveN` |
+| `info`/`check`/`ls` | 0 | the formatted filesystem is readable |
+| `winfsp-mount-rw` | 0 | real WinFsp create/write/read/rename/delete and a clean unmount |
+| `check-final` | 0 | the post-unmount image is still clean |
+| `detach-while-mounted` | `detached` | see below |
 
-The provided Linux VM accepted TCP/SSH but rejected the supplied root
-password (`paramiko` `AuthenticationException`; the server offers
-`publickey`, `gssapi-*`, `password`).  No credential or host address was
-written to the repo or to logs.  The VM can still be used once the credential
-or key is confirmed.
+## 5. Device disappearance (detach race)
 
-## 4. Windows API guarantees vs. what this project proves
+Windows Server 2022 **allowed** `diskpart detach vdisk` while the writable
+backend held an exclusive handle to `\\.\PhysicalDrive2`.  The mount host
+observed the disappearance and failed explicitly:
+
+```
+[error] unmount journal close failed: I/O error [log]: failed to read log offset=0x10004000
+[error] unmount flush failed: I/O error [device]: device flush failed: device is not open
+error: I/O error [log]: failed to read log offset=0x10004000
+```
+
+The device trace ends with `read` and `flush` failing in state `invalid`,
+followed by a successful `close` in state `closed`; the mount host exited
+non-zero.  It did not hang, did not retry forever, did not report a successful
+clean unmount and did not reopen `\\.\PhysicalDrive2`.  The race mount had
+performed no writes before the detach (338 reads, zero writes), so the VHD
+handed to Linux was still the clean image from the previous unmount.
+
+## 6. Linux XFS oracle results
+
+The oracle stripped the 512-byte fixed-VHD footer (536871424 -> 536870912
+bytes) and ran on the WinFsp-written image:
+
+| Step | Result |
+| --- | --- |
+| `xfs_repair -n` (before mount) | clean; only "Cannot get host filesystem geometry" because the image is a file |
+| independent Python probe | OK: 4096 block, 512 sector, 512 inode, 131072 dblocks, 4 AG x 32768 blocks, log start 65540 / 16384 blocks, root inode 64, UUID `b3fa1aba-...` |
+| `xfs_db` superblock | magic `0x58465342`, `crc = correct`, `sectsize = 512`, `agcount = 4`, `logstart = 65540` |
+| kernel mount and semantics | `marker.txt` content matched; `dir/data.bin` 262144 bytes matched the generated pattern; create/delete/hardlink/rename on the Linux side succeeded |
+| `xfs_scrub -n` | **not executed**: the runner kernel has no online scrub facility (`XFS_IOC_SCRUB_METADATA`); recorded as a skip, not as a pass |
+| clean unmount | success |
+| `xfs_logprint` | the log ends with an `UNMOUNT` record; no bad-log/corruption errors |
+| `xfs_repair -n` (after the Linux writable pass) | clean |
+
+## 7. Windows API guarantees vs. what this project proves
 
 * `FlushFileBuffers` proves that the Windows storage stack accepted a flush
   request after the journal write.  It does not prove media-level power-loss
-  durability.
+  durability; no power-cut test was run against a physical device.
 * The WAL order is enforced by the filesystem: log record -> flush -> metadata
-  -> flush.  The `device-selftest` ordering step and the WinFsp unmount path
-  exercise the API sequence; they are not a power-cut test.
+  -> flush.  The self-test's ordering step and the WinFsp unmount path exercise
+  the API sequence; they are not a power-cut test.
 * Volume ownership is proven only for the volumes `FindFirstVolumeW` returned.
   An enumeration error refuses the open.
 * The backend does not prove that a device reports its geometry honestly; it
   rejects contradictory reports and requires alignment consistency.
+* 4Kn/512e: the tested VHD is 512/512.  A 4096/4096 or 512/4096 device is
+  accepted by the policy layer and covered by unit tests, but **no real 4Kn
+  hardware was tested**; this report makes no 4Kn claim.
 
-## 5. Default policy recommendation
+## 8. Default policy recommendation
 
 **Keep the current default: fixed `\\.\PhysicalDriveN` writes are refused.**
 Attached VHD/VHDX disks are writable only with
 `--device-write-qualification`; removable disks additionally need
 `--allow-removable-disk-write`; fixed disks additionally need
-`--allow-fixed-disk-write`.  Do not lift the default until the CI VHD/WinFsp
-jobs and the Linux oracle have passed and the maintainer has reviewed the
-artifacts.
+`--allow-fixed-disk-write`.
 
-## 6. Next steps to reach READY
+The virtual-disk path is qualified (`READY` for the VHD/VHDX qualification
+scope).  The physical fixed-disk decision is **NOT READY**: the evidence
+covers disposable virtual disks only, and no physical disk, removable medium
+or 4Kn device was exercised.
 
-1. Run `windows-vhd-device` and inspect `dev1-results.json`, the fault-matrix
-   exit codes and the geometry dump.
-2. Run `windows-vhd-winfsp`; confirm the clean unmount exit code is 0 and the
-   WinFsp-created files survive.
-3. Run `linux-verify-windows-vhd`; archive `xfs_repair`, `xfs_logprint`,
-   `xfs_scrub` and the Python probe output.
-4. Run the manual removable-device procedure, including physical removal
+## 9. Remaining work
+
+1. Run the manual removable-device procedure, including physical removal
    during I/O.
-5. If a Hyper-V host is available, repeat with a 4Kn VHDX; otherwise state
-   explicitly that real 4Kn hardware was not tested.
-6. Review the evidence, then decide whether to change the fixed-disk default.
+2. Repeat on a real fixed disk in a disposable machine (never the host system
+   disk) before changing the fixed-disk default.
+3. If a Hyper-V host is available, repeat with a 4Kn VHDX; otherwise keep the
+   explicit "no 4Kn hardware tested" non-claim.
+4. Run the opt-in `windows-vhdx-large-device` job (`large_device=true`) to
+   exercise >2 TiB offsets through a real Windows disk handle; the portable
+   image test already covers the 3 TiB path.
+5. Run `xfs_scrub -n` on a kernel with online scrub support; the GitHub runner
+   kernel cannot, so the oracle records a skip.
+6. Review the artifacts, then decide whether the fixed-disk default changes.

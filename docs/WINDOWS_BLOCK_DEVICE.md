@@ -221,7 +221,10 @@ acquired while either is held.
 Reads run concurrently.  Writes are serialized: an unaligned write is a
 read-modify-write of the enclosing sector block, so two concurrent writers
 could silently lose each other's bytes.  Flush is a durability barrier; Close
-drains everything.  See `docs/LOCKING.md`.
+drains everything.  See `docs/LOCKING.md`.  The portable matrix test
+`image_device_concurrency_matrix` exercises all seven operation pairs on the
+image backend, which uses the same lock order; the raw backend is exercised by
+the VHD jobs.
 
 ## Qualification
 

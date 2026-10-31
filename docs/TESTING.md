@@ -1158,10 +1158,14 @@ Portable tests (`--filter=device_`) cover:
 - cache-mode and fault-plan parsing;
 - `ImageBlockDevice` lifecycle (open/write/flush/read/close, repeated close,
   write after close) and 64-bit offsets on a 3 TiB sparse image, including a
-  request straddling the 2 TiB boundary.
+  request straddling the 2 TiB boundary;
+- the device concurrency matrix on the image backend: Read+Read, Read+Write,
+  Write+Write, Write+Flush, Read+Close, Write+Close and Flush+Close, with a
+  start gate so the lock interaction is exercised (the Windows raw backend
+  uses the same `lifecycle_mutex_ -> flush_barrier_` order).
 
 Real-device evidence is produced by the three CI jobs above and recorded in
 `docs/DEV1_QUALIFICATION.md`.  That report is intentionally separate from the
 test matrix: passing unit tests does not prove Windows block-device semantics,
-and the report marks the current decision (NOT READY until the VHD/WinFsp and
-Linux oracle jobs have run).
+and the report records the evidence actually obtained (the VHD/WinFsp and
+Linux oracle jobs and the resulting physical-disk write decision).

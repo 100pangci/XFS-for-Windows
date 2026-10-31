@@ -9,10 +9,12 @@
 // Windows (see tests/scripts/verify_device_windows.ps1).
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_util.h"
@@ -346,4 +348,125 @@ TEST(image_device_64_bit_offsets) {
   CHECK(dev->Read(straddle, readback.data(), readback.size()));
   CHECK(std::memcmp(pattern.data(), readback.data(), pattern.size()) == 0);
   dev->Close();
+}
+
+TEST(image_device_concurrency_matrix) {
+  TempImage temp;
+  std::string error;
+  constexpr size_t kBlock = 4096;
+  constexpr uint64_t kSize = 4u << 20;
+  auto dev = xfs::ImageBlockDevice::Create(temp.path, kSize, 512, &error);
+  CHECK_MESSAGE(dev != nullptr, error);
+  if (!dev) return;
+
+  // Both operations start from the same gate so the lock interaction is
+  // exercised rather than serialized by thread creation.
+  auto run_pair = [](auto&& first, auto&& second) {
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    std::thread a([&] {
+      ready.fetch_add(1);
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      if (!first()) failures.fetch_add(1);
+    });
+    std::thread b([&] {
+      ready.fetch_add(1);
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      if (!second()) failures.fetch_add(1);
+    });
+    while (ready.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    a.join();
+    b.join();
+    CHECK_EQ(failures.load(), 0);
+  };
+
+  auto read_matches = [&](uint64_t offset, uint8_t value) {
+    std::vector<uint8_t> buf(kBlock, 0);
+    if (!dev->Read(offset, buf.data(), buf.size())) return false;
+    return std::all_of(buf.begin(), buf.end(),
+                       [value](uint8_t byte) { return byte == value; });
+  };
+  auto write_block = [&](uint64_t offset, uint8_t value) {
+    std::vector<uint8_t> buf(kBlock, value);
+    return dev->Write(offset, buf.data(), buf.size());
+  };
+
+  // Read+Read.
+  CHECK(write_block(0, 0x11));
+  CHECK(write_block(kBlock, 0x22));
+  run_pair([&] { return read_matches(0, 0x11); },
+           [&] { return read_matches(kBlock, 0x22); });
+
+  // Read+Write on disjoint regions.
+  run_pair([&] { return read_matches(0, 0x11); },
+           [&] { return write_block(2 * kBlock, 0x33); });
+  CHECK(read_matches(0, 0x11));
+  CHECK(read_matches(2 * kBlock, 0x33));
+
+  // Write+Write on disjoint regions.
+  run_pair([&] { return write_block(3 * kBlock, 0x44); },
+           [&] { return write_block(4 * kBlock, 0x55); });
+  CHECK(dev->Flush());
+  CHECK(read_matches(3 * kBlock, 0x44));
+  CHECK(read_matches(4 * kBlock, 0x55));
+
+  // Write+Flush.
+  run_pair([&] { return write_block(5 * kBlock, 0x66); },
+           [&] { return dev->Flush(); });
+  CHECK(read_matches(5 * kBlock, 0x66));
+
+  // Read+Close, Write+Close and Flush+Close: the racing operation is either
+  // served before Close or fails cleanly.  What must hold is that Close is
+  // idempotent, the device ends Closed, and no operation crashes or hangs.
+  auto run_close_pair = [&](uint64_t offset, uint8_t value, int mode) {
+    // TempImage uses a per-process name, so the close pairs need their own
+    // paths: the outer device still holds temp.path open.
+    const std::filesystem::path close_path =
+        std::filesystem::path(temp.path.string() + ".close" +
+                              std::to_string(mode) +
+                              std::to_string(offset / kBlock));
+    auto device =
+        xfs::ImageBlockDevice::Create(close_path, kSize, 512, &error);
+    CHECK_MESSAGE(device != nullptr, error);
+    if (!device) return;
+    CHECK(device->Write(offset, std::vector<uint8_t>(kBlock, value).data(),
+                        kBlock));
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::thread racer([&] {
+      ready.fetch_add(1);
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      std::vector<uint8_t> buf(kBlock, 0);
+      if (mode == 0) {
+        (void)device->Read(offset, buf.data(), buf.size());
+      } else if (mode == 1) {
+        (void)device->Write(offset, buf.data(), buf.size());
+      } else {
+        (void)device->Flush();
+      }
+    });
+    std::thread closer([&] {
+      ready.fetch_add(1);
+      while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+      device->Close();
+    });
+    while (ready.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    racer.join();
+    closer.join();
+    CHECK_EQ(device->State(), xfs::DeviceState::kClosed);
+    device->Close();  // repeated Close is safe
+    CHECK(!device->Read(offset, std::vector<uint8_t>(kBlock, 0).data(), kBlock));
+    device.reset();
+    std::error_code ec;
+    std::filesystem::remove(close_path, ec);
+  };
+  run_close_pair(6 * kBlock, 0x77, /*mode=read*/ 0);
+  run_close_pair(7 * kBlock, 0x88, /*mode=write*/ 1);
+  run_close_pair(kBlock, 0x99, /*mode=flush*/ 2);
+
+  dev->Close();
+  CHECK_EQ(dev->State(), xfs::DeviceState::kClosed);
 }
