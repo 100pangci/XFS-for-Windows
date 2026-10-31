@@ -111,18 +111,24 @@ Result<InobtRecord> LookupInodeRecord(BlockDevice& dev, const XfsGeometry& geo,
 }  // namespace
 
 Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
+  XFS_CONC_INO(ino);
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
   if (perf_on) perf.inode_opens.fetch_add(1, std::memory_order_relaxed);
   auto overlay_deferred = [&](XfsInode& inode) {
-    std::lock_guard<std::mutex> deferred_lock(deferred_mutex_);
+    std::lock_guard<xfs::conc::Mutex> deferred_lock(deferred_mutex_);
     auto it = deferred_times_.find(ino);
     if (it != deferred_times_.end()) {
       inode.mtime = it->second;
       inode.ctime = it->second;
     }
   };
+  uint64_t metadata_generation = 0;
+  uint64_t chunk_generation = 0;
   auto finish = [&](XfsInode inode) -> Result<XfsInode> {
+    inode.cache_generation = metadata_generation;
+    XFS_CONC_SYNC("inode.cache.insert.before",
+                  "ino=" + std::to_string(ino));
     if (inode.OnUnlinkedList() && !writable_) {
       return XFS_ERR(XfsError::kUnsupportedFeature,
                      "inode is on the unlinked list; reading it read-only is "
@@ -131,22 +137,31 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
           .Metadata("inode");
     }
     {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
-      constexpr size_t kMaxCachedInodes = 32768;
-      if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
-      inode_cache_.emplace(ino, inode);
+      std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+      // The device read happened before this lock. If a mutation committed
+      // and invalidated this inode in between, publishing the parsed image
+      // would resurrect pre-mutation state forever. The generation check is
+      // the metadata analogue of InsertDataChunk's.
+      if (metadata_generation_[ino] == metadata_generation) {
+        constexpr size_t kMaxCachedInodes = 32768;
+        if (inode_cache_.size() >= kMaxCachedInodes) inode_cache_.clear();
+        inode_cache_.emplace(ino, inode);
+      }
     }
     overlay_deferred(inode);
+    XFS_CONC_SYNC("inode.cache.insert.after",
+                  "ino=" + std::to_string(ino));
     return inode;
   };
 
   bool cache_hit = false;
   XfsInode cached;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
     auto it = inode_cache_.find(ino);
     if (it != inode_cache_.end()) {
       cached = it->second;
+      cached.cache_generation = metadata_generation_[ino];
       cache_hit = true;
     }
   }
@@ -189,7 +204,12 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
   const uint64_t chunk_start = inode_off & ~(kInodeChunkBytes - 1);
   std::shared_ptr<const std::vector<uint8_t>> chunk;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    // Sample both generations under the same lock as the chunk lookup: a
+    // chunk found here was current at this instant, and any mutation after
+    // this point is caught by the checks at publication time.
+    metadata_generation = metadata_generation_[ino];
+    chunk_generation = inode_chunk_generation_;
     auto it = inode_chunk_cache_.find(chunk_start);
     if (it != inode_chunk_cache_.end()) chunk = it->second;
   }
@@ -201,17 +221,25 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
     }
     if (len >= geometry_.inode_size) {
       auto buf = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(len));
+      XFS_CONC_SYNC("inode.read.before_device",
+                    "ino=" + std::to_string(ino));
       if (!device_->Read(chunk_start, buf->data(), buf->size())) {
         return XFS_ERR(XfsError::kIoError, "failed to read inode")
             .Ino(ino)
             .Offset(chunk_start)
             .Metadata("inode");
       }
+      XFS_CONC_SYNC("inode.read.after_device",
+                    "ino=" + std::to_string(ino));
       {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        constexpr size_t kMaxChunks = 4096;  // 64 MiB of inode chunks
-        if (inode_chunk_cache_.size() >= kMaxChunks) inode_chunk_cache_.clear();
-        inode_chunk_cache_.emplace(chunk_start, buf);
+        std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+        if (inode_chunk_generation_ == chunk_generation) {
+          constexpr size_t kMaxChunks = 4096;  // 64 MiB of inode chunks
+          if (inode_chunk_cache_.size() >= kMaxChunks) {
+            inode_chunk_cache_.clear();
+          }
+          inode_chunk_cache_.emplace(chunk_start, buf);
+        }
       }
       chunk = std::move(buf);
     }
@@ -233,6 +261,11 @@ Result<XfsInode> XfsFilesystem::OpenInode(uint64_t ino) const {
 }
 
 Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return LookupPathLocked(path);
+}
+
+Result<XfsInode> XfsFilesystem::LookupPathLocked(std::string_view path) const {
   uint64_t ino = geometry_.rootino;
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -252,7 +285,7 @@ Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
                                              "directory")
           .Ino(inode.value().ino);
     }
-    auto entry = LookupName(inode.value().ino, component);
+    auto entry = LookupNameLocked(inode.value().ino, component);
     if (!entry.ok()) return entry.error();
     auto next = OpenInode(entry.value().ino);
     if (!next.ok()) return next.error();
@@ -263,10 +296,18 @@ Result<XfsInode> XfsFilesystem::LookupPath(std::string_view path) const {
 
 Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
     uint64_t ino) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return ListDirectoryLocked(ino);
+}
+
+Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectoryLocked(
+    uint64_t ino) const {
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
+  uint64_t dir_generation = 0;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    dir_generation = metadata_generation_[ino];
     auto it = dir_cache_.find(ino);
     if (it != dir_cache_.end()) {
       it->second.last_used = ++dir_cache_clock_;
@@ -286,6 +327,8 @@ Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
     return XFS_ERR(XfsError::kNotDirectory, "inode is not a directory")
         .Ino(ino);
   }
+  XFS_CONC_INO(ino);
+  XFS_CONC_SYNC("dir.read.before_device", "ino=" + std::to_string(ino));
   std::vector<XfsDirEntry> entries;
   Status s = xfs::ListDirectory(
       *device_, geometry_, inode.value(),
@@ -294,16 +337,25 @@ Result<std::vector<XfsDirEntry>> XfsFilesystem::ListDirectory(
         return OkStatus();
       });
   if (!s.ok()) return s.error();
-  CacheDirectory(ino, entries);
+  XFS_CONC_SYNC("dir.read.after_device", "ino=" + std::to_string(ino));
+  XFS_CONC_SYNC("dir.cache.insert.before", "ino=" + std::to_string(ino));
+  CacheDirectory(ino, entries, dir_generation);
+  XFS_CONC_SYNC("dir.cache.insert.after", "ino=" + std::to_string(ino));
   return entries;
 }
 
 Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
                                               std::string_view name) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return LookupNameLocked(dir_ino, name);
+}
+
+Result<XfsDirEntry> XfsFilesystem::LookupNameLocked(
+    uint64_t dir_ino, std::string_view name) const {
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
     auto it = dir_cache_.find(dir_ino);
     if (it != dir_cache_.end()) {
       it->second.last_used = ++dir_cache_clock_;
@@ -329,11 +381,11 @@ Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
   // directory and turning a large-directory create loop quadratic. A single
   // random lookup on a huge directory pays one bounded parse here and all
   // following lookups are hash hits.
-  auto listed = ListDirectory(dir_ino);
+  auto listed = ListDirectoryLocked(dir_ino);
   if (!listed.ok()) return listed.error();
   bool cache_complete = false;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
     auto it = dir_cache_.find(dir_ino);
     if (it != dir_cache_.end()) {
       cache_complete = true;
@@ -359,12 +411,51 @@ Result<XfsDirEntry> XfsFilesystem::LookupName(uint64_t dir_ino,
 
 Result<size_t> XfsFilesystem::ReadFile(uint64_t ino, uint64_t offset,
                                        void* buffer, size_t length) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  // Hold the inode's extent-map lock before opening the inode: a writer that
+  // commits an extent-map change while this call runs must not free a BMBT
+  // block that this reader's snapshot can still reach.
+  std::shared_lock<xfs::conc::SharedMutex> map_lock(ExtentMapLock(ino));
+  return ReadFileLocked(ino, offset, buffer, length);
+}
+
+Result<size_t> XfsFilesystem::ReadFileLocked(uint64_t ino, uint64_t offset,
+                                             void* buffer,
+                                             size_t length) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
-  return ReadFile(inode.value(), nullptr, offset, buffer, length);
+  return ReadFileSnapshotLocked(inode.value(), nullptr, offset, buffer,
+                                length);
 }
 
 Result<size_t> XfsFilesystem::ReadFile(
+    const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
+    uint64_t offset, void* buffer, size_t length) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  // The generation check in ReadFileLocked and the BMBT parse both run under
+  // this lock, so an extent-map commit cannot slip between them.
+  std::shared_lock<xfs::conc::SharedMutex> map_lock(ExtentMapLock(inode.ino));
+  return ReadFileLocked(inode, cached_extents, offset, buffer, length);
+}
+
+Result<size_t> XfsFilesystem::ReadFileLocked(
+    const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
+    uint64_t offset, void* buffer, size_t length) const {
+  if (MetadataGeneration(inode.ino) == inode.cache_generation) {
+    return ReadFileSnapshotLocked(inode, cached_extents, offset, buffer,
+                                  length);
+  }
+  // The snapshot predates a committed metadata change. It may describe a
+  // size, extent map or cache generation that no longer exists, and the
+  // extent list passed with it may point at blocks the mutation freed. Read
+  // the current inode under the barrier instead and use its own data fork.
+  auto fresh = OpenInode(inode.ino);
+  if (!fresh.ok()) return fresh.error();
+  return ReadFileSnapshotLocked(fresh.value(), nullptr, offset, buffer,
+                                length);
+}
+
+Result<size_t> XfsFilesystem::ReadFileSnapshotLocked(
     const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
     uint64_t offset, void* buffer, size_t length) const {
   PerfStats::ReadScope read_scope;
@@ -406,6 +497,12 @@ Result<size_t> XfsFilesystem::ReadFile(
   uint8_t* out = static_cast<uint8_t*>(buffer);
   size_t total = 0;
   const uint64_t size = inode.size;
+  // If this inode image predates an invalidation, its extent map and size are
+  // a legal snapshot for this read, but they must not seed the shared data
+  // cache: a truncate may already have freed the blocks it maps. Read through
+  // the device without looking up or publishing chunks.
+  const bool cacheable =
+      MetadataGeneration(inode.ino) == inode.cache_generation;
   while (total < length && offset < size) {
     const size_t want = static_cast<size_t>(
         std::min<uint64_t>(length - total, size - offset));
@@ -418,16 +515,24 @@ Result<size_t> XfsFilesystem::ReadFile(
     // write bumps it, which makes both this lookup and the later insert
     // refuse the chunk (see InsertDataChunk).
     const uint64_t generation = DataGeneration(inode.ino);
-    auto data = LookupDataChunk(inode.ino, chunk_index);
+    auto data = cacheable ? LookupDataChunk(inode.ino, chunk_index) : nullptr;
     if (!data) {
       auto loaded =
           std::make_shared<AlignedBuffer>(static_cast<size_t>(chunk_len));
+      XFS_CONC_SYNC("data.read.before_device",
+                    "ino=" + std::to_string(inode.ino));
       auto read = ReadFileData(*device_, geometry_, inode, chunk_start,
                                loaded->data(), loaded->size(), extents);
       if (!read.ok()) return read.error();
+      XFS_CONC_SYNC("data.read.after_device",
+                    "ino=" + std::to_string(inode.ino));
       loaded->resize(read.value());
-      data = InsertDataChunk(inode.ino, chunk_index, std::move(loaded),
-                             generation);
+      if (cacheable) {
+        data = InsertDataChunk(inode.ino, chunk_index, std::move(loaded),
+                               generation);
+      } else {
+        data = std::move(loaded);
+      }
     }
 
     const size_t in_chunk = static_cast<size_t>(offset - chunk_start);
@@ -445,12 +550,21 @@ Result<size_t> XfsFilesystem::ReadFile(
 
 Result<std::shared_ptr<const std::vector<XfsExtent>>>
 XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
+  XFS_CONC_INO(inode.ino);
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
+  uint64_t generation = 0;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    generation = extent_generation_[inode.ino];
     auto it = extent_cache_.find(inode.ino);
-    if (it != extent_cache_.end()) {
+    // A cached extent list describes the current on-disk state, not the
+    // inode snapshot the caller passed. Combining it with an inode parsed
+    // before a truncate/preallocate would mix the old size with the new
+    // extent map; the reader must use the extent list that belongs to its
+    // own snapshot. The insert checks below make the same distinction.
+    if (it != extent_cache_.end() &&
+        metadata_generation_[inode.ino] == inode.cache_generation) {
       if (perf_on) {
         perf.extent_cache_hits.fetch_add(1, std::memory_order_relaxed);
       }
@@ -461,24 +575,40 @@ XfsFilesystem::LoadExtentsCached(const XfsInode& inode) const {
     perf.extent_cache_misses.fetch_add(1, std::memory_order_relaxed);
   }
   auto loaded = std::make_shared<std::vector<XfsExtent>>();
+  XFS_CONC_SYNC("extent.read.before_device",
+                "ino=" + std::to_string(inode.ino));
   Status s = LoadDataForkExtents(*device_, geometry_, inode, loaded.get());
   if (!s.ok()) return s.error();
+  XFS_CONC_SYNC("extent.read.after_device",
+                "ino=" + std::to_string(inode.ino));
   std::shared_ptr<const std::vector<XfsExtent>> shared(loaded);
+  XFS_CONC_SYNC("extent.cache.insert.before",
+                "ino=" + std::to_string(inode.ino));
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    constexpr size_t kMaxCachedExtentLists = 8192;
-    if (extent_cache_.size() >= kMaxCachedExtentLists) extent_cache_.clear();
-    // A concurrent mutation may have replaced the extent list between the
-    // lookup above and the insert here; keep whichever entry is already there
-    // (the invalidation that replaced it knows about the newer state).
-    auto existing = extent_cache_.find(inode.ino);
-    if (existing != extent_cache_.end()) return existing->second;
-    extent_cache_.emplace(inode.ino, shared);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    // Invalidation may have run between the lookup and this insert. If it
+    // did, this parse predates the new extent map: do not publish it (the
+    // caller still gets the snapshot it read).
+    if (extent_generation_[inode.ino] == generation &&
+        metadata_generation_[inode.ino] == inode.cache_generation) {
+      constexpr size_t kMaxCachedExtentLists = 8192;
+      if (extent_cache_.size() >= kMaxCachedExtentLists) extent_cache_.clear();
+      auto existing = extent_cache_.find(inode.ino);
+      if (existing != extent_cache_.end()) return existing->second;
+      extent_cache_.emplace(inode.ino, shared);
+    }
   }
+  XFS_CONC_SYNC("extent.cache.insert.after",
+                "ino=" + std::to_string(inode.ino));
   return shared;
 }
 
 Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return ReadSymlinkLocked(ino);
+}
+
+Result<std::string> XfsFilesystem::ReadSymlinkLocked(uint64_t ino) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   if (!inode.value().IsSymlink()) {
@@ -488,10 +618,20 @@ Result<std::string> XfsFilesystem::ReadSymlink(uint64_t ino) const {
 }
 
 Result<XfsFileInfo> XfsFilesystem::GetFileInfo(uint64_t ino) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return GetFileInfoLocked(ino);
+}
+
+Result<XfsFileInfo> XfsFilesystem::GetFileInfoLocked(uint64_t ino) const {
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
     auto it = info_cache_.find(ino);
     if (it != info_cache_.end()) return it->second;
+  }
+  uint64_t info_generation = 0;
+  {
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    info_generation = metadata_generation_[ino];
   }
 
   auto inode = OpenInode(ino);
@@ -516,12 +656,16 @@ Result<XfsFileInfo> XfsFilesystem::GetFileInfo(uint64_t ino) const {
   info.immutable = (i.flags & di::kDiFlagImmutable) != 0;
   info.append_only = (i.flags & di::kDiFlagAppend) != 0;
 
+  XFS_CONC_SYNC("info.cache.insert.before", "ino=" + std::to_string(ino));
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    constexpr size_t kMaxCachedInfos = 32768;
-    if (info_cache_.size() >= kMaxCachedInfos) info_cache_.clear();
-    info_cache_.emplace(ino, info);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    if (metadata_generation_[ino] == info_generation) {
+      constexpr size_t kMaxCachedInfos = 32768;
+      if (info_cache_.size() >= kMaxCachedInfos) info_cache_.clear();
+      info_cache_.emplace(ino, info);
+    }
   }
+  XFS_CONC_SYNC("info.cache.insert.after", "ino=" + std::to_string(ino));
   return info;
 }
 

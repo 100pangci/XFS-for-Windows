@@ -24,6 +24,8 @@
 #include <mutex>
 #include <string>
 
+#include "xfs/concurrency_hooks.h"
+
 namespace xfs {
 
 class PerfStats {
@@ -160,13 +162,13 @@ class PerfStats {
 // inode stripes; relies on the same optional counters.
 class TimedLockGuard {
  public:
-  explicit TimedLockGuard(std::mutex& mutex);
+  explicit TimedLockGuard(conc::Mutex& mutex);
   ~TimedLockGuard() = default;
   TimedLockGuard(const TimedLockGuard&) = delete;
   TimedLockGuard& operator=(const TimedLockGuard&) = delete;
 
  private:
-  std::unique_lock<std::mutex> lock_;
+  std::unique_lock<conc::Mutex> lock_;
 };
 
 // Convenience: only evaluate the event when instrumentation is on.

@@ -74,6 +74,12 @@ struct XfsInode {
   bool bigtime = false;   // per-inode bigtime flag
   bool nrext64 = false;   // per-inode large extent counters
 
+  // Runtime snapshot token, never on disk: the metadata-cache generation that
+  // OpenInode observed when it produced this image. Readers use it to decide
+  // whether a later parse may be published (see InsertDataChunk and
+  // LoadExtentsCached). Zero for inodes built by tests/formatters.
+  uint64_t cache_generation = 0;
+
   std::vector<uint8_t> data_fork;
   std::vector<uint8_t> attr_fork;
 

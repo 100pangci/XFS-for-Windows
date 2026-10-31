@@ -102,13 +102,21 @@ Result<uint64_t> XfsFilesystem::ReflinkRange(uint64_t src_ino,
   // Namespace/metadata barrier plus ordered per-inode locks (lower inode
   // first). Reflink changes the destination extent map and both inode
   // timestamps, so it must not race an ordinary data write to either file.
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
-  std::mutex& first_mutex = InodeLock(std::min(src_ino, dst_ino));
-  std::mutex& second_mutex = InodeLock(std::max(src_ino, dst_ino));
-  std::unique_lock<std::mutex> first_lock(first_mutex);
-  std::unique_lock<std::mutex> second_lock(second_mutex, std::defer_lock);
+  XFS_CONC_INO(src_ino);
+  XFS_CONC_SYNC("reflink.barrier.before",
+                "src=" + std::to_string(src_ino) +
+                    " dst=" + std::to_string(dst_ino));
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  xfs::conc::Mutex& first_mutex = InodeLock(std::min(src_ino, dst_ino));
+  xfs::conc::Mutex& second_mutex = InodeLock(std::max(src_ino, dst_ino));
+  std::unique_lock<xfs::conc::Mutex> first_lock(first_mutex);
+  XFS_CONC_SYNC("reflink.first_lock",
+                "ino=" + std::to_string(std::min(src_ino, dst_ino)));
+  std::unique_lock<xfs::conc::Mutex> second_lock(second_mutex, std::defer_lock);
   if (&first_mutex != &second_mutex) second_lock.lock();
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  XFS_CONC_SYNC("reflink.second_lock",
+                "ino=" + std::to_string(std::max(src_ino, dst_ino)));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto src = OpenInode(src_ino);
   if (!src.ok()) return src.error();
   auto dst = OpenInode(dst_ino);

@@ -23,6 +23,7 @@
 
 #include "xfs/block_device.h"
 #include "xfs/cache.h"
+#include "xfs/concurrency_hooks.h"
 #include "xfs/directory.h"
 #include "xfs/error.h"
 #include "xfs/extent.h"
@@ -178,20 +179,39 @@ class XfsFilesystem {
   bool writable() const { return writable_; }
 
   // ---- core API ----
+  // OpenInode returns a snapshot without taking write_barrier_. A caller that
+  // goes on to read file data or namespace state must pass the snapshot to a
+  // public read API, which validates it under the barrier (see ReadFile).
   Result<XfsInode> OpenInode(uint64_t ino) const;
+
+  // The data/namespace read APIs below take write_barrier_ in shared mode for
+  // their whole duration; data-fork readers also take the inode's extent_map
+  // lock shared. That is what keeps a read from touching blocks that a
+  // concurrent truncate/unlink/reflink transaction, or an ordinary write's
+  // extent-map transaction, has freed and reallocated. The maintenance
+  // traversals (CheckConsistency, ListAllocatedInodes, VerifyParentPointers)
+  // take the barrier exclusively because they walk allocator/inode metadata
+  // that ordinary writes update during commit. Internal callers that already
+  // hold the barrier use the corresponding ...Locked helper instead of
+  // re-acquiring it.
   Result<XfsInode> LookupPath(std::string_view path) const;
   Result<std::vector<XfsDirEntry>> ListDirectory(uint64_t ino) const;
   Result<XfsDirEntry> LookupName(uint64_t ino, std::string_view name) const;
   Result<size_t> ReadFile(uint64_t ino, uint64_t offset, void* buffer,
                           size_t length) const;
-  // Fast path: the caller already holds the inode (and may hold its cached
-  // extent list); skips the inode cache and extent-cache lookups.
+  // Fast path: the caller already holds an inode snapshot (and may hold its
+  // cached extent list). If the snapshot predates a committed metadata
+  // change, ReadFile re-opens the inode under the barrier and ignores the
+  // cached extent list, so an old size can never be combined with a new (or
+  // freed) extent map.
   Result<size_t> ReadFile(const XfsInode& inode,
                           const std::vector<XfsExtent>* cached_extents,
                           uint64_t offset, void* buffer, size_t length) const;
   Result<std::string> ReadSymlink(uint64_t ino) const;
   Result<XfsFileInfo> GetFileInfo(uint64_t ino) const;
   // Monotonic extent-map generation (see ExtentGeneration in filesystem.cpp).
+  // This is a generation read, not a data/namespace read, and takes no
+  // barrier; callers use it only to decide whether a cache entry is current.
   uint64_t ExtentGeneration(uint64_t ino) const;
 
   // ---- mutation API (read-write mounts only) ----
@@ -495,6 +515,18 @@ class XfsFilesystem {
  private:
   XfsFilesystem() = default;
 
+  // Names every core lock for the CONC-1 event log. The names are static
+  // string literals; this runs once at mount.
+  void InitConcurrencyLockNames() {
+    write_barrier_.SetName("write_barrier_");
+    mutation_mutex_.SetName("mutation_mutex_");
+    cache_mutex_.SetName("cache_mutex_");
+    deferred_mutex_.SetName("deferred_mutex_");
+    data_mutex_.SetName("data_mutex_");
+    for (auto& lock : inode_locks_) lock.SetName("inode_stripe");
+    for (auto& lock : extent_map_locks_) lock.SetName("extent_map");
+  }
+
   // Read-only caches. Directory contents and inodes cannot change while we
   // mount (the filesystem is never written by this process), so caching them
   // is safe and makes large-directory enumeration fast.
@@ -503,7 +535,13 @@ class XfsFilesystem {
     std::unordered_map<std::string, size_t> index;
     uint64_t last_used = 0;  // clock value for bounded LRU eviction
   };
-  void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries) const;
+  // Publishes a listing only if the directory's metadata generation still
+  // matches the generation sampled before the device read. This is the
+  // metadata analogue of the data-chunk generation check: a reader that
+  // started before a mutation must not put its stale parse back into the
+  // cache after the mutation's InvalidateCaches() ran.
+  void CacheDirectory(uint64_t ino, std::vector<XfsDirEntry> entries,
+                      uint64_t generation) const;
   // Incremental updates for the common one-entry namespace operations. They
   // keep a warm directory cache current instead of dropping it after every
   // create/unlink; dropping it makes a large-directory create loop re-read the
@@ -511,6 +549,46 @@ class XfsFilesystem {
   void CacheDirectoryAdd(uint64_t ino, std::string_view name, uint64_t child_ino,
                          uint8_t ftype) const;
   void CacheDirectoryRemove(uint64_t ino, std::string_view name) const;
+
+  // Barrier-protected read helpers. Every ...Locked function requires the
+  // caller to hold write_barrier_ at least shared (some hold it exclusively)
+  // for the whole call, so it never re-acquires it. They are used by the
+  // public read wrappers above and by mutation paths that already own the
+  // exclusive barrier.
+  Result<XfsInode> LookupPathLocked(std::string_view path) const;
+  Result<std::vector<XfsDirEntry>> ListDirectoryLocked(uint64_t ino) const;
+  Result<XfsDirEntry> LookupNameLocked(uint64_t ino,
+                                       std::string_view name) const;
+  Result<size_t> ReadFileLocked(uint64_t ino, uint64_t offset, void* buffer,
+                                size_t length) const;
+  // Re-validates the inode snapshot under the held barrier. `cached_extents`
+  // is used only when the snapshot is still current; a stale snapshot is
+  // re-opened and its cached extent list is discarded.
+  Result<size_t> ReadFileLocked(const XfsInode& inode,
+                                const std::vector<XfsExtent>* cached_extents,
+                                uint64_t offset, void* buffer,
+                                size_t length) const;
+  // The actual read, against an inode snapshot that is current under the
+  // held barrier. No generation validation happens here.
+  Result<size_t> ReadFileSnapshotLocked(
+      const XfsInode& inode, const std::vector<XfsExtent>* cached_extents,
+      uint64_t offset, void* buffer, size_t length) const;
+  Result<std::string> ReadSymlinkLocked(uint64_t ino) const;
+  Result<XfsFileInfo> GetFileInfoLocked(uint64_t ino) const;
+  Result<std::vector<XfsExtent>> GetDataExtentsLocked(uint64_t ino) const;
+  Result<std::vector<XattrEntry>> ListXattrsLocked(
+      uint64_t ino, bool include_private) const;
+  Result<XattrEntry> GetXattrLocked(uint64_t ino, std::string_view name,
+                                    bool include_private) const;
+
+  // Consistency checks are read-only but traverse AG headers, allocator
+  // btrees, inode btrees and inode forks. Ordinary writes update those
+  // structures during commit under the shared barrier, so their public entry
+  // points hold the barrier exclusively for a quiescent snapshot; their
+  // internal calls use these helpers.
+  CheckReport CheckConsistencyLocked(const CheckOptions& options) const;
+  Result<ParentNamespaceReport> VerifyParentPointersLocked() const;
+  Result<std::vector<uint64_t>> ListAllocatedInodesLocked() const;
 
   // Parsed data-fork extent list, from the extent cache or freshly loaded.
   // Shared between reads and writes so both see the same extents.
@@ -543,6 +621,29 @@ class XfsFilesystem {
                                        uint64_t offset, uint64_t length,
                                        const void* buffer, uint64_t new_size);
   Status CleanupCowStagingLocked(const std::vector<CowRun>& runs);
+  // State carried from the shared-barrier COW detection pass to the exclusive
+  // retry. The retry refuses to run when the inode was freed (and possibly its
+  // number reused) in the window between the two passes: di_gen identifies the
+  // inode instance and changes on free, so a mismatch means the write would
+  // otherwise land in a different file.
+  struct WriteRetry {
+    bool needs_exclusive = false;
+    // The COW detection pass and its exclusive retry are one logical write;
+    // count it once in the perf stats.
+    bool perf_counted = false;
+    uint32_t inode_gen = 0;
+  };
+  // One attempt of the write path. `exclusive_barrier` selects the barrier
+  // mode. A first pass that finds shared blocks keeps `retry->inode_gen` and
+  // sets `retry->needs_exclusive` without mutating anything, so WriteFileData
+  // can retry under the exclusive barrier: the COW remap frees the private
+  // blocks it replaces and readers hold the barrier shared across their device
+  // reads.
+  Result<size_t> WriteFileDataAttempt(uint64_t ino, uint64_t offset,
+                                      const void* buffer, size_t length,
+                                      bool append, bool defer_timestamps,
+                                      bool exclusive_barrier,
+                                      WriteRetry* retry);
 
   // Reads the inode, lets `mutate` change its raw bytes, then logs it (core +
   // optional data fork region) and queues the write-back.
@@ -609,6 +710,9 @@ class XfsFilesystem {
       uint64_t generation) const;
   // Current data generation of an inode (0 for never-written inodes).
   uint64_t DataGeneration(uint64_t ino) const;
+  // Current metadata-cache generation of an inode (see XfsInode::
+  // cache_generation).
+  uint64_t MetadataGeneration(uint64_t ino) const;
 
   // Deferred timestamp state. The caller holds the inode lock when marking;
   // the commit helpers also acquire the inode lock (caller order:
@@ -627,8 +731,8 @@ class XfsFilesystem {
   bool writable_ = false;
 
   // PERF-1 lock hierarchy (full description in docs/LOCKING.md):
-  //   write_barrier_ -> per-inode locks (inode-number order) -> mutation_mutex_
-  //   -> cache leaves.
+  //   write_barrier_ -> per-inode locks (inode-number order) -> extent_map
+  //   -> mutation_mutex_ -> cache leaves.
   //
   // Ordinary data writes hold write_barrier_ shared and their inode lock, so
   // different files run concurrently. Namespace changes, truncate/reflink and
@@ -636,19 +740,33 @@ class XfsFilesystem {
   // and exclude new I/O while they change the namespace or establish a
   // durability barrier. mutation_mutex_ still serializes journal state and
   // metadata transactions; it is not held across ordinary data transfer.
-  mutable std::shared_mutex write_barrier_;
+  mutable conc::SharedMutex write_barrier_;
   // A bounded sharded inode lock table. 4096 stripes keep independent files
   // independent (a collision only serializes unrelated inodes) without an
   // unbounded map of mutexes. Same inode always maps to the same stripe.
   static constexpr size_t kInodeLockStripes = 4096;
-  std::mutex& InodeLock(uint64_t ino) const {
+  conc::Mutex& InodeLock(uint64_t ino) const {
     return inode_locks_[ino % kInodeLockStripes];
   }
-  mutable std::array<std::mutex, kInodeLockStripes> inode_locks_;
+  mutable std::array<conc::Mutex, kInodeLockStripes> inode_locks_;
+
+  // Per-inode data-fork extent-map lock. Public data-fork readers hold it
+  // shared for the whole call (inode snapshot, BMBT parse and device reads).
+  // An ordinary writer that changes the extent map takes it exclusively
+  // around the transaction that does so, through commit and cache
+  // invalidation. A pure in-place data write never takes it. Lock order:
+  // inode stripe -> extent_map -> mutation_mutex_. Never hold two
+  // extent_map stripes at once.
+  static constexpr size_t kExtentMapLockStripes = 4096;
+  conc::SharedMutex& ExtentMapLock(uint64_t ino) const {
+    return extent_map_locks_[ino % kExtentMapLockStripes];
+  }
+  mutable std::array<conc::SharedMutex, kExtentMapLockStripes>
+      extent_map_locks_;
 
   // Serializes metadata/journal transactions and keeps log_position_,
   // next_tid_ and superblock counters coherent.
-  mutable std::mutex mutation_mutex_;
+  mutable conc::Mutex mutation_mutex_;
 
   // ---- journal state (read-write writer) ----
   // Next log write position. Scanned from the log on first use; kept in memory
@@ -691,8 +809,15 @@ class XfsFilesystem {
   Status ClearAgiBucket(uint32_t agno, uint32_t bucket,
                         const char* reason);
 
-  mutable std::mutex cache_mutex_;
+  mutable conc::Mutex cache_mutex_;
   mutable std::unordered_map<uint64_t, XfsInode> inode_cache_;
+  // Per-inode generation for the metadata caches (parsed inode, file info,
+  // directory listing). Bumped by every InvalidateCaches() that touches the
+  // inode's metadata; guarded by cache_mutex_.
+  mutable std::unordered_map<uint64_t, uint64_t> metadata_generation_;
+  // Generation of the shared inode-chunk read-ahead cache. Any chunk
+  // invalidation bumps it; guarded by cache_mutex_.
+  mutable uint64_t inode_chunk_generation_ = 0;
   // 16 KiB inode-chunk read-ahead (shared so lookups stay cheap).
   mutable std::unordered_map<uint64_t,
                              std::shared_ptr<const std::vector<uint8_t>>>
@@ -707,13 +832,13 @@ class XfsFilesystem {
   // Extent-map generation, bumped only by extent changes. It lets the WinFsp
   // adapter keep its parsed extent list across data-only overwrites.
   mutable std::unordered_map<uint64_t, uint64_t> extent_generation_;
-  mutable std::mutex deferred_mutex_;
+  mutable conc::Mutex deferred_mutex_;
   mutable std::unordered_map<uint64_t, XfsTimestamp> deferred_times_;
 
   static constexpr uint64_t kInodeChunkBytes = 16384;  // inode read-ahead chunk
   static constexpr uint64_t kDataChunkBytes = 512 * 1024;
   static constexpr size_t kDataCacheMaxBytes = 512ull * 1024 * 1024;
-  mutable std::mutex data_mutex_;
+  mutable conc::Mutex data_mutex_;
   mutable std::unordered_map<DataCacheKey, DataCacheEntry, DataCacheKeyHash>
       data_cache_;
   mutable std::list<DataCacheKey> data_lru_;  // front = most recently used

@@ -54,7 +54,9 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
                                            bool directory_expected,
                                            bool defer_inode_free,
                                            uint64_t* removed_ino) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (name.empty() || name == "." || name == "..") {
     return XFS_ERR(XfsError::kInvalidArgument, "invalid unlink name")
         .Ino(parent_ino);
@@ -72,7 +74,7 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
       return XFS_ERR(XfsError::kPermissionDenied, "parent is immutable")
           .Ino(parent_ino);
     }
-    auto found = LookupName(parent_ino, name);
+    auto found = LookupNameLocked(parent_ino, name);
     if (!found.ok()) return found.error();
     const XfsDirEntry entry = found.value();
     auto child = OpenInode(entry.ino);
@@ -98,7 +100,7 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
             .Ino(entry.ino)
             .Actual(child.value().nlink);
       }
-      auto listing = ListDirectory(entry.ino);
+      auto listing = ListDirectoryLocked(entry.ino);
       if (!listing.ok()) return listing.error();
       for (const XfsDirEntry& e : listing.value()) {
         if (e.name != "." && e.name != "..") {
@@ -144,7 +146,10 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
                        "parent link count is already zero")
             .Ino(parent_ino);
       }
+      XFS_CONC_SYNC("nlink.update.before",
+                    "ino=" + std::to_string(parent_ino) + " drop=1");
       PutBE32(parent_image.data(), di::kNlink, nlink - 1);
+      XFS_CONC_SYNC("nlink.update.after", "ino=" + std::to_string(parent_ino));
     }
     s = StoreModifiedTimes(parent_image.data(), now);
     if (!s.ok()) return s;
@@ -162,7 +167,11 @@ Status XfsFilesystem::RemoveNamespaceEntry(uint64_t parent_ino,
           .Ino(entry.ino);
     }
     const uint32_t new_nlink = is_dir ? 0 : nlink - 1;
+    XFS_CONC_SYNC("nlink.update.before",
+                  "ino=" + std::to_string(entry.ino) +
+                      " nlink=" + std::to_string(new_nlink));
     PutBE32(child_image.data(), di::kNlink, new_nlink);
+    XFS_CONC_SYNC("nlink.update.after", "ino=" + std::to_string(entry.ino));
 
     // Remove the reverse record in the same transaction.  This happens before
     // the directory ".." rewrite because that rewrite may change the child's
@@ -270,7 +279,9 @@ Status XfsFilesystem::RemoveEmptyDirectory(uint64_t parent_ino,
 // ---------------------------------------------------------------------------
 
 Status XfsFilesystem::FreeUnlinkedInode(uint64_t ino) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   return FreeUnlinkedInodeLocked(ino);
 }
 
@@ -409,7 +420,7 @@ Status XfsFilesystem::FreeUnlinkedInodeLocked(uint64_t ino) {
   if (status.ok()) {
     // A freed inode number can be reused with a new generation; do not carry
     // the old deferred timestamp into the next incarnation.
-    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
     deferred_times_.erase(ino);
   }
   return status;

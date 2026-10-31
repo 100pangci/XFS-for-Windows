@@ -336,6 +336,16 @@ Status ExpectedInodeBlocks(BlockDevice& dev, const XfsGeometry& geo,
 }  // namespace
 
 Result<std::vector<uint64_t>> XfsFilesystem::ListAllocatedInodes() const {
+  // Maintenance traversal: it reads AGF/AGI/inobt from the device. Ordinary
+  // writes update AGF counters during commit, so a shared barrier could
+  // observe a mid-transaction header. An exclusive barrier gives a quiescent
+  // metadata snapshot; it is not a hot path.
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return ListAllocatedInodesLocked();
+}
+
+Result<std::vector<uint64_t>> XfsFilesystem::ListAllocatedInodesLocked()
+    const {
   std::vector<uint64_t> out;
   const XfsGeometry& geo = geometry_;
   BlockDevice& dev = *device_;
@@ -412,6 +422,17 @@ Result<std::vector<uint64_t>> XfsFilesystem::ListAllocatedInodes() const {
 }
 
 CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
+  // The check walks superblock, AG headers, allocator btrees, inode btrees and
+  // data forks. Ordinary writes mutate those structures under the shared
+  // barrier, so a shared check could report a false mismatch or read a torn
+  // btree block. Take the barrier exclusively to get a quiescent snapshot;
+  // this is a maintenance path, not file I/O.
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return CheckConsistencyLocked(options);
+}
+
+CheckReport XfsFilesystem::CheckConsistencyLocked(
+    const CheckOptions& options) const {
   CheckReport report;
   const XfsGeometry& geo = geometry_;
   BlockDevice& dev = *device_;
@@ -1112,7 +1133,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
                      root_attr_rmap.error().Format());
         }
       }
-      auto entries = ListDirectory(geo.rootino);
+      auto entries = ListDirectoryLocked(geo.rootino);
       if (!entries.ok()) {
         report.Add("root directory", CheckStatus::kCorrupt,
                    entries.error().Format());
@@ -1185,7 +1206,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   // Parent-pointer namespace audit: every real dirent has exactly one reverse
   // record and every reverse record has exactly one real dirent.  This is a
   if (options.all_allocated_inodes) {
-    auto inodes = ListAllocatedInodes();
+    auto inodes = ListAllocatedInodesLocked();
     if (!inodes.ok()) {
       report.Add("allocated inodes", CheckStatus::kCorrupt,
                  inodes.error().Format());
@@ -1228,7 +1249,7 @@ CheckReport XfsFilesystem::CheckConsistency(const CheckOptions& options) const {
   // second, independent view of the directory tree (the root_children check
   // above only validates direct children).
   if (options.parent_pointers && live_sb.features.parent) {
-    auto parents = VerifyParentPointers();
+    auto parents = VerifyParentPointersLocked();
     if (!parents.ok()) {
       report.Add("parent pointers", CheckStatus::kCorrupt,
                  parents.error().Format());

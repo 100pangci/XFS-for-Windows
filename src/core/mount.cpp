@@ -52,6 +52,7 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   }
 
   auto fs = std::unique_ptr<XfsFilesystem>(new XfsFilesystem());
+  fs->InitConcurrencyLockNames();
   fs->superblock_ = std::move(sb);
   fs->geometry_ = std::move(geo);
   fs->options_ = options;

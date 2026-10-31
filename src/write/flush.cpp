@@ -34,12 +34,12 @@ Status XfsFilesystem::Flush() {
   // every file-data write that started before it, and for any metadata
   // transaction, then issues one device flush. New writes wait at the barrier
   // only for the duration of the flush itself.
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
   // A durability boundary also publishes every deferred inode timestamp
   // before the device flush, so FlushFileBuffers semantics stay intact.
   Status committed = CommitAllDeferredTimesLocked();
   if (!committed.ok()) return committed;
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   MaybeCrash(CrashPoint::kBeforeDeviceFlush, device_->Info().description);
   if (!device_->Flush()) {
     return XFS_ERR(XfsError::kIoError,

@@ -538,6 +538,42 @@ Windows-generated stateful images and `linux-verify-stateful-windows`, while
 all existing RW-0..RW-6E crash, recovery and Linux-oracle jobs remain hard
 gates.
 
+## CONC-1: deterministic concurrency
+
+The concurrency suite locks the project mutexes through test hooks and drives
+operations one deterministic turn at a time. No test relies on a thread
+start order, a random sleep or a rerun. The full architecture, sync points,
+invariant classes, coverage matrix, sanitizer scope and blind spots are in
+`docs/CONCURRENCY.md`.
+
+```bash
+cmake -S . -B build-conc -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_CONCURRENCY_HOOKS=ON -DXFSWIN_WARNINGS_AS_ERRORS=ON
+cmake --build build-conc -j "$(nproc)"
+./build-conc/tests/xfs_tests --filter=conc_
+```
+
+The seeded stress tests export their final images after a clean unmount:
+`XFSWIN_CONC_IMAGE_DIR=<dir> ./build-conc/tests/xfs_tests
+--filter=conc_stress` writes `conc-mixed.img`, `conc-shared-names.img` and
+`conc-cow.img`. `XFSWIN_CONC_IMAGE_OUT` still selects one explicit path.
+`tests/scripts/verify_conc_image_linux.sh` runs the full external chain:
+`xfs_repair -n`, the independent raw content/namespace probe, a real kernel
+mount with the mounted semantic check, `xfs_scrub -n`, clean-log check and a
+second `xfs_repair -n`. `tests/tools/conc_cow_probe.py` and
+`tests/tools/conc_mount_probe.py` are independent of the C++ implementation.
+
+CI: `linux-concurrency` (hooks build + full suite + Linux oracle chain),
+`linux-concurrency-sanitizer` (ASan/UBSan), `linux-concurrency-tsan` (TSan),
+`linux-concurrency-soak` (weekly/manual, 8 threads, three seeds),
+`windows-concurrency-core` + `linux-verify-conc-windows` (MSVC core images
+verified on Linux), and the `windows-mount` concurrent WinFsp step +
+`linux-verify-conc-winfsp` (real driver threads, sha256 manifest re-read on
+Linux). The known coverage gaps (forced multi-AG allocation, journal wrap,
+crash+concurrency, bounded WinFsp iteration counts) are listed in
+`docs/CONCURRENCY.md` and are not claimed as covered.
+
 ## Regression rule
 
 Any bug found in the wild must first become a failing test (unit, synthetic

@@ -34,6 +34,7 @@ add_library(xfs_core STATIC
   core/cache.cpp
   core/check.cpp
   core/invalidation.cpp
+  core/concurrency_hooks.cpp
   block/image_device.cpp
   block/windows_raw_device.cpp
   mkfs/geometry.cpp
@@ -76,6 +77,14 @@ add_library(xfs_core STATIC
 target_include_directories(xfs_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# CONC-1 deterministic scheduling hooks. Off by default: the production
+# wrappers then reduce to direct std::mutex/std::shared_mutex calls and every
+# XFS_CONC_SYNC compiles away. The dedicated CI/test configuration enables
+# this for the whole xfs_tests target.
+if(XFSWIN_CONCURRENCY_HOOKS)
+  target_compile_definitions(xfs_core PUBLIC XFSWIN_CONCURRENCY_HOOKS=1)
+endif()
 
 if(MSVC)
   target_compile_options(xfs_core PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)

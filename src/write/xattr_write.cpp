@@ -2126,6 +2126,12 @@ Result<PreparedInode> PrepareXattrMutation(
 
 Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrs(
     uint64_t ino, bool include_private) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return ListXattrsLocked(ino, include_private);
+}
+
+Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrsLocked(
+    uint64_t ino, bool include_private) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   return xfs::ListXattrs(*device_, geometry_, inode.value(), include_private);
@@ -2134,6 +2140,12 @@ Result<std::vector<XattrEntry>> XfsFilesystem::ListXattrs(
 Result<XattrEntry> XfsFilesystem::GetXattr(uint64_t ino,
                                            std::string_view name,
                                            bool include_private) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return GetXattrLocked(ino, name, include_private);
+}
+
+Result<XattrEntry> XfsFilesystem::GetXattrLocked(
+    uint64_t ino, std::string_view name, bool include_private) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   return xfs::GetXattr(*device_, geometry_, inode.value(), name,
@@ -2147,7 +2159,9 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
                                            XattrSetMode mode) {
   // Serialize with namespace/data writes: xattr changes publish an inode
   // metadata transaction and must not interleave with a file-data mutation.
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -2165,7 +2179,7 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
   auto ns = XattrNamespace::ParseName(name, &on_disk_name, false);
   if (!ns.ok()) return ns.error();
 
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   auto fork = ReadXattrFork(*device_, geometry_, inode.value());
@@ -2248,13 +2262,15 @@ Result<XattrEntry> XfsFilesystem::SetXattr(uint64_t ino,
   if (!s.ok()) return s.error();
   s = CommitTransaction(txn.value());
   if (!s.ok()) return s.error();
-  return GetXattr(ino, name);
+  return GetXattrLocked(ino, name, /*include_private=*/false);
 }
 
 Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
   // Serialize with namespace/data writes: xattr changes publish an inode
   // metadata transaction and must not interleave with a file-data mutation.
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -2265,7 +2281,7 @@ Status XfsFilesystem::RemoveXattr(uint64_t ino, std::string_view name) {
   auto ns = XattrNamespace::ParseName(name, &on_disk_name, false);
   if (!ns.ok()) return ns.error();
 
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   auto fork = ReadXattrFork(*device_, geometry_, inode.value());

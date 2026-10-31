@@ -231,6 +231,15 @@ Result<std::optional<ParentPointer>> FindParent(
 }
 
 Result<ParentNamespaceReport> XfsFilesystem::VerifyParentPointers() const {
+  // The audit enumerates allocated inodes through AGF/AGI/inobt and parses
+  // parent pointers. Ordinary writes update AGF counters during commit, so
+  // use the exclusive barrier for a quiescent metadata snapshot.
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  return VerifyParentPointersLocked();
+}
+
+Result<ParentNamespaceReport> XfsFilesystem::VerifyParentPointersLocked()
+    const {
   ParentNamespaceReport report;
   if (!geometry_.features.parent) {
     // Nothing to audit: parent pointers are not part of this filesystem.
@@ -281,7 +290,7 @@ Result<ParentNamespaceReport> XfsFilesystem::VerifyParentPointers() const {
           std::to_string(inode.value().mode));
       continue;
     }
-    auto listing = ListDirectory(dir_ino);
+    auto listing = ListDirectoryLocked(dir_ino);
     if (!listing.ok()) {
       report.malformed.push_back("directory " + std::to_string(dir_ino) +
                                  " unreadable: " + listing.error().message);
@@ -544,7 +553,7 @@ Result<ParentNamespaceReport> XfsFilesystem::VerifyParentPointers() const {
   // tree (deferred free, torn namespace transaction) must not be ignored: the
   // kernel's repair scan builds its master index from the inobt, not only from
   // a forward walk.  `checked` above is the reachable set.
-  auto allocated = ListAllocatedInodes();
+  auto allocated = ListAllocatedInodesLocked();
   if (!allocated.ok()) {
     report.malformed.push_back("cannot enumerate allocated inodes: " +
                                allocated.error().message);
