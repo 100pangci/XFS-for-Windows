@@ -132,11 +132,13 @@ def main(argv):
         assert file_size >= dblocks * block_size, \
             f"image is shorter than sb_dblocks ({file_size} < {dblocks * block_size})"
 
-        # Every AG header is a v5 sector with its own CRC.
+        # Every AG header is a v5 sector with its own CRC.  In the v5 layout
+        # sector 0 of each AG is the superblock copy, sector 1 the AGF, sector
+        # 2 the AGI and sector 3 the AGFL -- the AGF is not at offset 0.
         ag_bytes = agblocks * block_size
         for agno in range(agcount):
             base = agno * ag_bytes
-            agf = read_at(f, base, sectsize)
+            agf = read_at(f, base + sectsize, sectsize)
             assert be32(agf, 0) == AGF_MAGIC, f"AG {agno}: bad AGF magic"
             assert be32(agf, 4) == 1, f"AG {agno}: bad AGF version"
             check_crc(agf, AGF_CRC_OFF, f"AG {agno} AGF")
