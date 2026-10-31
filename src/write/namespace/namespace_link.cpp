@@ -46,7 +46,9 @@ using namespace_detail::kMaxLink;
 
 Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
                            std::string_view dst_name) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("link");
@@ -84,7 +86,7 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
           .Actual(source.value().nlink)
           .Metadata("link");
     }
-    auto existing = LookupName(dst_parent, dst_name);
+    auto existing = LookupNameLocked(dst_parent, dst_name);
     if (existing.ok()) {
       return XFS_ERR(XfsError::kAlreadyExists, "name already exists")
           .Ino(dst_parent)
@@ -137,7 +139,9 @@ Status XfsFilesystem::Link(uint64_t ino, uint64_t dst_parent,
             .Ino(ino)
             .Metadata("link");
       }
+      XFS_CONC_SYNC("nlink.update.before", "ino=" + std::to_string(ino));
       PutBE32(image.data(), di::kNlink, nlink + 1);
+      XFS_CONC_SYNC("nlink.update.after", "ino=" + std::to_string(ino));
       uint32_t attr_ilog = 0;
       std::vector<uint8_t> attr_region;
       if (geometry_.features.parent) {

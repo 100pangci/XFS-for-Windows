@@ -268,7 +268,7 @@ bool ImageBlockDevice::Read(uint64_t offset, void* buffer, size_t size) {
   if (size == 0) return true;
   PerfStats& stats = PerfStats::Get();
   const bool perf = stats.enabled();
-  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::shared_lock<xfs::conc::SharedMutex> lifecycle(lifecycle_mutex_);
   if (offset > info_.size_bytes || size > info_.size_bytes - offset) {
     SetError("read out of bounds");
     return false;
@@ -323,8 +323,8 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
   if (size == 0) return true;
   PerfStats& stats = PerfStats::Get();
   const bool perf = stats.enabled();
-  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  std::shared_lock<std::shared_mutex> barrier(flush_barrier_);
+  std::shared_lock<xfs::conc::SharedMutex> lifecycle(lifecycle_mutex_);
+  std::shared_lock<xfs::conc::SharedMutex> barrier(flush_barrier_);
   if (!info_.writable) {
     SetError("image opened read-only");
     return false;
@@ -382,10 +382,10 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
 bool ImageBlockDevice::Flush() {
   PerfStats& stats = PerfStats::Get();
   const bool perf = stats.enabled();
-  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::shared_lock<xfs::conc::SharedMutex> lifecycle(lifecycle_mutex_);
   // A flush is a durability barrier: it waits for every write that started
   // before it. Reads are not part of the barrier and may continue.
-  std::unique_lock<std::shared_mutex> barrier(flush_barrier_);
+  std::unique_lock<xfs::conc::SharedMutex> barrier(flush_barrier_);
 #ifdef _WIN32
   if (impl_->handle == INVALID_HANDLE_VALUE) {
     SetError("image not open");
@@ -420,7 +420,7 @@ bool ImageBlockDevice::Flush() {
 }
 
 void ImageBlockDevice::Close() {
-  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::unique_lock<xfs::conc::SharedMutex> lifecycle(lifecycle_mutex_);
 #ifdef _WIN32
   if (impl_ && impl_->handle != INVALID_HANDLE_VALUE) {
     CloseHandle(impl_->handle);

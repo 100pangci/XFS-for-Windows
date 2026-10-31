@@ -13,18 +13,25 @@
 namespace xfs {
 
 void XfsFilesystem::InvalidateCaches(const CacheInvalidation& invalidation) const {
+  XFS_CONC_SYNC("cache.invalidate.before",
+                "ino=" + std::to_string(invalidation.ino));
+  struct ExitHook {
+    ~ExitHook() { XFS_CONC_SYNC("cache.invalidate.after", ""); }
+  } exit_hook;
   if (invalidation.Has(CacheInvalidation::kAll)) {
     {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
+      std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
       inode_cache_.clear();
       inode_chunk_cache_.clear();
       info_cache_.clear();
       extent_cache_.clear();
       for (auto& entry : extent_generation_) ++entry.second;
+      for (auto& entry : metadata_generation_) ++entry.second;
+      ++inode_chunk_generation_;
       dir_cache_.clear();
       dir_cache_entries_ = 0;
     }
-    std::lock_guard<std::mutex> lock(data_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(data_mutex_);
     // Bump every known generation instead of clearing the map: a reader that
     // is mid-read must not be able to publish a chunk afterwards.
     for (auto& entry : data_generation_) ++entry.second;
@@ -37,7 +44,19 @@ void XfsFilesystem::InvalidateCaches(const CacheInvalidation& invalidation) cons
 
   const uint64_t ino = invalidation.ino;
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    const bool metadata_changed =
+        invalidation.Has(CacheInvalidation::kInode) ||
+        invalidation.Has(CacheInvalidation::kInodeChunk) ||
+        invalidation.Has(CacheInvalidation::kFileInfo) ||
+        invalidation.Has(CacheInvalidation::kExtents) ||
+        invalidation.Has(CacheInvalidation::kDirectory);
+    if (metadata_changed) {
+      ++metadata_generation_[ino];
+    }
+    if (invalidation.Has(CacheInvalidation::kInodeChunk)) {
+      ++inode_chunk_generation_;
+    }
     if (invalidation.Has(CacheInvalidation::kInode)) {
       inode_cache_.erase(ino);
     }

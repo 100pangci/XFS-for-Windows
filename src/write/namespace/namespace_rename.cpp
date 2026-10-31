@@ -69,7 +69,9 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
     uint64_t src_parent, std::string_view src_name, uint64_t dst_parent,
     std::string_view dst_name, bool replace_existing,
     bool defer_replaced_free) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("rename");
@@ -118,7 +120,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
       dst_dp = std::move(d.value());
     }
 
-    auto src_entry = LookupName(src_parent, src_name);
+    auto src_entry = LookupNameLocked(src_parent, src_name);
     if (!src_entry.ok()) return src_entry.error();
     auto moved = OpenInode(src_entry.value().ino);
     if (!moved.ok()) return moved.error();
@@ -139,7 +141,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
 
     bool target_exists = false;
     XfsInode target;
-    auto target_entry = LookupName(dst_parent, dst_name);
+    auto target_entry = LookupNameLocked(dst_parent, dst_name);
     if (target_entry.ok()) {
       if (!replace_existing) {
         return XFS_ERR(XfsError::kAlreadyExists, "target name already exists")
@@ -182,7 +184,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
               .Actual(target.nlink)
               .Metadata("rename");
         }
-        auto listing = ListDirectory(target.ino);
+        auto listing = ListDirectoryLocked(target.ino);
         if (!listing.ok()) return listing.error();
         for (const XfsDirEntry& e : listing.value()) {
           if (e.name != "." && e.name != "..") {
@@ -210,7 +212,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
               .Metadata("rename");
         }
         if (cursor == geometry_.rootino) break;
-        auto up = LookupName(cursor, "..");
+        auto up = LookupNameLocked(cursor, "..");
         if (!up.ok()) return up.error();
         if (up.value().ino == cursor) break;  // defensive: self-parent
         cursor = up.value().ino;
@@ -363,7 +365,11 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
             .Metadata("rename");
       }
       const uint32_t new_nlink = nlink - drops;
+      XFS_CONC_SYNC("nlink.update.before",
+                    "ino=" + std::to_string(target.ino) +
+                        " nlink=" + std::to_string(new_nlink));
       PutBE32(image.data(), di::kNlink, new_nlink);
+      XFS_CONC_SYNC("nlink.update.after", "ino=" + std::to_string(target.ino));
       if (new_nlink == 0) {
         const uint32_t agno = geometry_.InoAgno(target.ino);
         const uint32_t agino = geometry_.InoAgino(target.ino);
@@ -410,7 +416,11 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
               .Ino(src_parent)
               .Metadata("rename");
         }
+        XFS_CONC_SYNC("nlink.update.before",
+                      "ino=" + std::to_string(src_parent) + " drop=1");
         PutBE32(image.data(), di::kNlink, nlink - 1);
+        XFS_CONC_SYNC("nlink.update.after",
+                      "ino=" + std::to_string(src_parent));
       }
       s = StoreModifiedTimes(image.data(), now);
       if (!s.ok()) return s;
@@ -429,7 +439,11 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
       if (!target_exists && src_is_dir) {
         // The moved directory's ".." adds one link to the new parent.
         const uint32_t nlink = GetBE32(image.data(), di::kNlink);
+        XFS_CONC_SYNC("nlink.update.before",
+                      "ino=" + std::to_string(dst_parent) + " add=1");
         PutBE32(image.data(), di::kNlink, nlink + 1);
+        XFS_CONC_SYNC("nlink.update.after",
+                      "ino=" + std::to_string(dst_parent));
       }
       s = StoreModifiedTimes(image.data(), now);
       if (!s.ok()) return s;

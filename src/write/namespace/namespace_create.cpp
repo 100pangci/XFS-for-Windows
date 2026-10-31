@@ -92,7 +92,9 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
                                            std::string_view name,
                                            uint16_t mode, uint32_t uid,
                                            uint32_t gid) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("create");
@@ -123,7 +125,7 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
           .Ino(parent_ino)
           .Metadata("create");
     }
-    auto existing = LookupName(parent_ino, name);
+    auto existing = LookupNameLocked(parent_ino, name);
     if (existing.ok()) {
       return XFS_ERR(XfsError::kAlreadyExists, "name already exists")
           .Ino(parent_ino)
@@ -217,7 +219,9 @@ Result<uint64_t> XfsFilesystem::CreateRegularFile(uint64_t parent_ino,
 
 Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
                             uint16_t mode, uint32_t uid, uint32_t gid) {
-  std::unique_lock<std::shared_mutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.before", "op=namespace");
+  std::unique_lock<xfs::conc::SharedMutex> namespace_barrier(write_barrier_);
+  XFS_CONC_SYNC("namespace.barrier.after", "op=namespace");
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("mkdir");
@@ -241,7 +245,7 @@ Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
           .Ino(parent_ino)
           .Metadata("mkdir");
     }
-    auto existing = LookupName(parent_ino, name);
+    auto existing = LookupNameLocked(parent_ino, name);
     if (existing.ok()) {
       return XFS_ERR(XfsError::kAlreadyExists, "name already exists")
           .Ino(parent_ino)
@@ -312,8 +316,11 @@ Status XfsFilesystem::Mkdir(uint64_t parent_ino, std::string_view name,
     s = dir.FinalizeInode(&raw_inode, &ilog_fields, &fork_region);
     if (!s.ok()) return s;
     // A subdirectory adds one link to the parent (".." in the child).
+    XFS_CONC_SYNC("nlink.update.before",
+                  "ino=" + std::to_string(parent_ino) + " add=1");
     PutBE32(raw_inode.data(), di::kNlink,
             GetBE32(raw_inode.data(), di::kNlink) + 1);
+    XFS_CONC_SYNC("nlink.update.after", "ino=" + std::to_string(parent_ino));
     s = StoreModifiedTimes(raw_inode.data(), now);
     if (!s.ok()) return s;
     s = LogPreparedInode(txn, parent_ino, std::move(raw_inode), ilog_fields,

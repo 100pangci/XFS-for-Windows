@@ -18,6 +18,7 @@
 #include <shared_mutex>
 
 #include "xfs/block_device.h"
+#include "xfs/concurrency_hooks.h"
 
 namespace xfs {
 
@@ -57,8 +58,8 @@ class ImageBlockDevice final : public BlockDevice {
   // behind each other. Flush takes the barrier exclusively (a durability
   // barrier waits for every earlier write), Close takes the lifecycle lock
   // exclusively (no I/O may outlive the handle).
-  mutable std::shared_mutex lifecycle_mutex_;
-  mutable std::shared_mutex flush_barrier_;
+  mutable conc::SharedMutex lifecycle_mutex_;
+  mutable conc::SharedMutex flush_barrier_;
   DeviceInfo info_;
   std::filesystem::path path_;
 };

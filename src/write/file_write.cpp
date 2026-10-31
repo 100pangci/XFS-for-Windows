@@ -460,6 +460,30 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
                                             const void* buffer, size_t length,
                                             bool append,
                                             bool defer_timestamps) {
+  // Ordinary overwrites run under the shared barrier so independent file I/O
+  // scales. A write that touches shared blocks needs the COW remap, which
+  // replaces the old extent mappings and frees the private blocks in the
+  // replaced range. Readers hold the same barrier shared across their device
+  // reads (ReadFile), so that free is only safe once every in-flight read has
+  // finished. The first pass has no side effects before it detects the COW
+  // range; it then asks for a retry under the exclusive barrier.
+  WriteRetry retry;
+  auto first = WriteFileDataAttempt(ino, offset, buffer, length, append,
+                                    defer_timestamps, /*exclusive=*/false,
+                                    &retry);
+  if (!retry.needs_exclusive) return first;
+  // No core lock is held here: the detection pass released the shared barrier
+  // and the inode stripe before returning. The retry re-validates the inode
+  // generation because a namespace mutation can free and reuse the number.
+  XFS_CONC_SYNC("write.retry.before", "ino=" + std::to_string(ino));
+  return WriteFileDataAttempt(ino, offset, buffer, length, append,
+                              defer_timestamps, /*exclusive=*/true, &retry);
+}
+
+Result<size_t> XfsFilesystem::WriteFileDataAttempt(
+    uint64_t ino, uint64_t offset, const void* buffer, size_t length,
+    bool append, bool defer_timestamps, bool exclusive_barrier,
+    WriteRetry* retry) {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
@@ -479,7 +503,10 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
 
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
-  if (perf_on) perf.write_calls.fetch_add(1, std::memory_order_relaxed);
+  if (perf_on && !retry->perf_counted) {
+    perf.write_calls.fetch_add(1, std::memory_order_relaxed);
+    retry->perf_counted = true;
+  }
 
   // Ordinary file-data I/O is concurrent across files. The shared barrier lets
   // independent writes proceed in parallel and excludes namespace changes,
@@ -487,13 +514,36 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
   // inode stripe serializes writes to the same file (including append EOF
   // allocation). Metadata transactions still take mutation_mutex_ below, but
   // only around the transaction, never across the data transfer.
-  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  XFS_CONC_INO(ino);
+  XFS_CONC_SYNC("barrier.before", "ino=" + std::to_string(ino));
+  std::unique_lock<xfs::conc::SharedMutex> exclusive_barrier_lock(
+      write_barrier_, std::defer_lock);
+  std::shared_lock<xfs::conc::SharedMutex> shared_barrier_lock(
+      write_barrier_, std::defer_lock);
+  if (exclusive_barrier) {
+    exclusive_barrier_lock.lock();
+  } else {
+    shared_barrier_lock.lock();
+  }
+  XFS_CONC_SYNC("inode.lock.before", "ino=" + std::to_string(ino));
   TimedLockGuard inode_lock(InodeLock(ino));
+  XFS_CONC_SYNC("inode.lock.after", "ino=" + std::to_string(ino));
   // Count actual in-flight writes, not callers queued on the inode lock.
   PerfStats::WriteScope write_scope;
 
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
+  if (exclusive_barrier && inode.value().gen != retry->inode_gen) {
+    // The detection pass held the barrier shared; between that pass and this
+    // one an unlink could free the inode and a create reuse its number.
+    // di_gen identifies the inode instance, so refuse instead of writing into
+    // a different file.
+    return XFS_ERR(XfsError::kNotFound,
+                   "inode was freed while upgrading the write barrier")
+        .Ino(ino)
+        .Expected(retry->inode_gen)
+        .Actual(inode.value().gen);
+  }
   if (inode.value().IsDir()) {
     return XFS_ERR(XfsError::kNotRegularFile,
                    "cannot write directory contents")
@@ -573,10 +623,20 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
                                    plan.first_block, plan.last_block);
   if (!shared.ok()) return shared.error();
   if (shared.value()) {
+    if (!exclusive_barrier) {
+      // The remap below releases every private block it replaces. A reader
+      // that mapped them before the invalidation holds the barrier shared
+      // while it copies from the device, so the free must not run until all
+      // such readers have drained: retry under the exclusive barrier. Nothing
+      // has been mutated yet, so the retry starts from a fresh snapshot.
+      retry->needs_exclusive = true;
+      retry->inode_gen = inode.value().gen;
+      return size_t{0};
+    }
     // COW staging/remap is a multi-transaction operation with ordering
     // dependencies; keep it serialized for now (the ordinary overwrite path is
     // the one that must scale).
-    std::lock_guard<std::mutex> meta_lock(mutation_mutex_);
+    std::lock_guard<xfs::conc::Mutex> meta_lock(mutation_mutex_);
     constexpr uint64_t kCowChunkBlocks = 64;
     const auto* src = static_cast<const uint8_t*>(buffer);
     for (uint64_t b = plan.first_block; b <= plan.last_block;) {
@@ -611,6 +671,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
     Status mapped = MapWrittenRange(geometry_, inode.value(), *extents.value(),
                                     offset, length, &mappings);
     if (mapped.ok()) {
+      XFS_CONC_SYNC("data.write.before", "ino=" + std::to_string(ino));
       MaybeCrash(CrashPoint::kBeforeDataWrite, "write-path fast");
       const auto* src = static_cast<const uint8_t*>(buffer);
       for (size_t i = 0; i < mappings.size(); ++i) {
@@ -629,6 +690,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         }
       }
       MaybeCrash(CrashPoint::kAfterDataWrite, "write-path fast");
+      XFS_CONC_SYNC("data.write.after", "ino=" + std::to_string(ino));
       InvalidateCaches(CacheInvalidation::DataRange(ino, offset, length));
       {
         const XfsTimestamp now = CurrentTimestamp();
@@ -642,7 +704,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         } else {
           // Only the timestamp transaction is serialized with metadata work;
           // the data transfer above was concurrent across files.
-          std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+          std::lock_guard<xfs::conc::Mutex> txn_lock(mutation_mutex_);
           auto txn = BeginTransaction();
           if (!txn.ok()) return txn.error();
           Status status = UpdateTimesInTransaction(
@@ -669,7 +731,14 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
 
   // 1. Allocate the holes as unwritten extents, in one transaction.
   {
-    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+    // The editor can split the data-fork BMBT and allocate new bmbt blocks.
+    // Readers hold this lock shared for their whole extent parse, so they
+    // never observe a half-updated tree. An exclusive-barrier caller already
+    // excludes every reader and does not need the per-inode lock.
+    std::unique_lock<xfs::conc::SharedMutex> map_lock(ExtentMapLock(ino),
+                                                     std::defer_lock);
+    if (!exclusive_barrier) map_lock.lock();
+    std::lock_guard<xfs::conc::Mutex> txn_lock(mutation_mutex_);
     auto txn = BeginTransaction();
     if (!txn.ok()) return txn.error();
     BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
@@ -776,6 +845,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
   //    large positioned writes; only a partial head/tail block needs a
   //    read-modify-write scratch buffer. Then one flush makes the bytes
   //    durable before the conversion transaction can expose them.
+  XFS_CONC_SYNC("data.write.prepare", "ino=" + std::to_string(ino));
   {
     auto fresh_inode = OpenInode(ino);
     if (!fresh_inode.ok()) return fresh_inode.error();
@@ -791,6 +861,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
       return true;
     };
 
+    XFS_CONC_SYNC("data.write.before", "ino=" + std::to_string(ino));
     MaybeCrash(CrashPoint::kBeforeDataWrite, "write-path allocate");
     Status write_status = WriteBlockRange(
         *device_, geometry_, ino, offset, length, src, fresh_inode.value(),
@@ -798,6 +869,7 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
         "write-path general");
     if (!write_status.ok()) return write_status.error();
     MaybeCrash(CrashPoint::kAfterDataWrite, "write-path general");
+    XFS_CONC_SYNC("data.write.after", "ino=" + std::to_string(ino));
     if (!device_->Flush()) {
       return XFS_ERR(XfsError::kIoError,
                      "failed to flush file data: " + device_->LastError())
@@ -808,7 +880,16 @@ Result<size_t> XfsFilesystem::WriteFileData(uint64_t ino, uint64_t offset,
   }
   // 3. Convert the written range to written extents and set the new size.
   {
-    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+    // RemoveRange can merge BMBT nodes, collapse the tree or drop the fork
+    // back to extents format; all of those free bmbt blocks. A reader that
+    // holds only the shared barrier may still be parsing the old root, so the
+    // map transaction is exclusive against readers of this inode. The lock
+    // spans commit and its cache invalidation, so a reader cannot see the new
+    // inode with the old cached extent list.
+    std::unique_lock<xfs::conc::SharedMutex> map_lock(ExtentMapLock(ino),
+                                                     std::defer_lock);
+    if (!exclusive_barrier) map_lock.lock();
+    std::lock_guard<xfs::conc::Mutex> txn_lock(mutation_mutex_);
     auto txn = BeginTransaction();
     if (!txn.ok()) return txn.error();
     BlockAllocator alloc(&txn.value(), device_.get(), &geometry_);
@@ -887,9 +968,13 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
   }
 
   // Changing the extent map must not overlap a data transfer to this inode.
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  XFS_CONC_INO(ino);
+  XFS_CONC_SYNC("barrier.before", "ino=" + std::to_string(ino));
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  XFS_CONC_SYNC("inode.lock.before", "ino=" + std::to_string(ino));
   TimedLockGuard inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  XFS_CONC_SYNC("inode.lock.after", "ino=" + std::to_string(ino));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   if (!inode.value().IsRegular()) {
@@ -968,7 +1053,7 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
     block = run_end;
   }
 
-  if (!changed && new_size == old_size) return GetFileInfo(ino);
+  if (!changed && new_size == old_size) return GetFileInfoLocked(ino);
 
   auto raw = ReadRawInode(ino);
   if (!raw.ok()) return raw.error();
@@ -995,7 +1080,7 @@ Result<XfsFileInfo> XfsFilesystem::AllocateUnwritten(uint64_t ino,
   XFS_EXT_DEBUG("preallocated " << length << " bytes at " << offset
                                 << " in inode " << ino << " (size " << old_size
                                 << " -> " << new_size << ")");
-  return GetFileInfo(ino);
+  return GetFileInfoLocked(ino);
 }
 
 Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
@@ -1017,9 +1102,13 @@ Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
         .Metadata("convert-unwritten");
   }
 
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  XFS_CONC_INO(ino);
+  XFS_CONC_SYNC("barrier.before", "ino=" + std::to_string(ino));
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  XFS_CONC_SYNC("inode.lock.before", "ino=" + std::to_string(ino));
   TimedLockGuard inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  XFS_CONC_SYNC("inode.lock.after", "ino=" + std::to_string(ino));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   if (!inode.value().IsRegular()) {
@@ -1105,7 +1194,7 @@ Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
     if (!s.ok()) return s.error();
     changed = true;
   }
-  if (!changed) return GetFileInfo(ino);
+  if (!changed) return GetFileInfoLocked(ino);
 
   auto raw = ReadRawInode(ino);
   if (!raw.ok()) return raw.error();
@@ -1128,10 +1217,17 @@ Result<XfsFileInfo> XfsFilesystem::ConvertUnwritten(uint64_t ino,
   InvalidateCaches(CacheInvalidation::Extents(ino));
   XFS_EXT_DEBUG("converted " << length << " unwritten bytes at " << offset
                              << " in inode " << ino);
-  return GetFileInfo(ino);
+  return GetFileInfoLocked(ino);
 }
 
 Result<std::vector<XfsExtent>> XfsFilesystem::GetDataExtents(
+    uint64_t ino) const {
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  std::shared_lock<xfs::conc::SharedMutex> map_lock(ExtentMapLock(ino));
+  return GetDataExtentsLocked(ino);
+}
+
+Result<std::vector<XfsExtent>> XfsFilesystem::GetDataExtentsLocked(
     uint64_t ino) const {
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
@@ -1153,9 +1249,13 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
         .Actual(new_size)
         .Metadata("truncate");
   }
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  XFS_CONC_INO(ino);
+  XFS_CONC_SYNC("truncate.barrier.before", "ino=" + std::to_string(ino));
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  XFS_CONC_SYNC("inode.lock.before", "ino=" + std::to_string(ino));
   TimedLockGuard inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  XFS_CONC_SYNC("inode.lock.after", "ino=" + std::to_string(ino));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   if (!inode.value().IsRegular()) {
@@ -1175,7 +1275,7 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
   }
 
   const uint64_t old_size = inode.value().size;
-  if (new_size == old_size) return GetFileInfo(ino);
+  if (new_size == old_size) return GetFileInfoLocked(ino);
 
   if (new_size > old_size) {
     // Growing only moves the logical EOF. Bytes that an existing *written*
@@ -1280,7 +1380,7 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
     if (status.ok()) status = CommitTransaction(txn.value());
     if (!status.ok()) return status.error();
     InvalidateCaches(CacheInvalidation::Inode(ino));
-    return GetFileInfo(ino);
+    return GetFileInfoLocked(ino);
   }
 
   // Shrinking. The last partially kept block keeps its contents below
@@ -1407,7 +1507,7 @@ Result<XfsFileInfo> XfsFilesystem::SetFileSize(uint64_t ino, uint64_t new_size) 
     }
   }
   InvalidateCaches(CacheInvalidation::Extents(ino));
-  return GetFileInfo(ino);
+  return GetFileInfoLocked(ino);
 }
 
 }  // namespace xfs

@@ -20,8 +20,15 @@
 namespace xfs {
 
 void XfsFilesystem::CacheDirectory(uint64_t ino,
-                                   std::vector<XfsDirEntry> entries) const {
-  std::lock_guard<std::mutex> lock(cache_mutex_);
+                                   std::vector<XfsDirEntry> entries,
+                                   uint64_t generation) const {
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+  if (metadata_generation_[ino] != generation) {
+    // A mutation invalidated this directory while the listing was being read.
+    // Publishing it would make LookupName return a name that no longer exists
+    // (or miss one that does) for as long as the cache entry lives.
+    return;
+  }
   constexpr size_t kMaxCachedDirs = 128;
   constexpr size_t kMaxCachedDirEntries = 262144;
   if (entries.size() > kMaxCachedDirEntries) return;
@@ -57,7 +64,7 @@ void XfsFilesystem::CacheDirectoryAdd(uint64_t ino, std::string_view name,
                                       uint64_t child_ino,
                                       uint8_t ftype) const {
   constexpr size_t kMaxCachedDirEntries = 262144;
-  std::lock_guard<std::mutex> lock(cache_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
   auto it = dir_cache_.find(ino);
   if (it == dir_cache_.end()) return;  // cold: the next lookup loads it
   auto indexed = it->second.index.find(std::string(name));
@@ -85,7 +92,7 @@ void XfsFilesystem::CacheDirectoryAdd(uint64_t ino, std::string_view name,
 
 void XfsFilesystem::CacheDirectoryRemove(uint64_t ino,
                                          std::string_view name) const {
-  std::lock_guard<std::mutex> lock(cache_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
   auto it = dir_cache_.find(ino);
   if (it == dir_cache_.end()) return;
   auto indexed = it->second.index.find(std::string(name));
@@ -109,17 +116,17 @@ void XfsFilesystem::MarkDeferredTimes(uint64_t ino,
   // Drop the cached XfsFileInfo first so GetFileInfo rebuilds it through the
   // OpenInode overlay. (Cache lock before the deferred lock, matching OpenInode.)
   {
-    std::lock_guard<std::mutex> cache_lock(cache_mutex_);
+    std::lock_guard<xfs::conc::Mutex> cache_lock(cache_mutex_);
     info_cache_.erase(ino);
   }
-  std::lock_guard<std::mutex> lock(deferred_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
   deferred_times_[ino] = now;
 }
 
 Status XfsFilesystem::CommitDeferredTimesUnderInodeLock(uint64_t ino) {
   XfsTimestamp now;
   {
-    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
     auto it = deferred_times_.find(ino);
     if (it == deferred_times_.end()) return OkStatus();
     now = it->second;
@@ -133,7 +140,7 @@ Status XfsFilesystem::CommitDeferredTimesUnderInodeLock(uint64_t ino) {
   if (status.ok()) status = CommitTransaction(txn.value());
   if (!status.ok()) return status;
   {
-    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
     deferred_times_.erase(ino);
   }
   return OkStatus();
@@ -145,14 +152,14 @@ Status XfsFilesystem::CommitDeferredMetadata(uint64_t ino) {
   // timestamp; check before taking the barrier and inode stripe. A concurrent
   // write on another handle will publish its own timestamp at its boundary.
   {
-    std::lock_guard<std::mutex> lock(deferred_mutex_);
+    std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
     if (deferred_times_.find(ino) == deferred_times_.end()) {
       return OkStatus();
     }
   }
-  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
   TimedLockGuard inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   return CommitDeferredTimesUnderInodeLock(ino);
 }
 
@@ -160,12 +167,12 @@ Status XfsFilesystem::CommitAllDeferredTimesLocked() {
   for (;;) {
     uint64_t ino = 0;
     {
-      std::lock_guard<std::mutex> lock(deferred_mutex_);
+      std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
       if (deferred_times_.empty()) break;
       ino = deferred_times_.begin()->first;
     }
-    std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
-    std::lock_guard<std::mutex> lock(mutation_mutex_);
+    std::lock_guard<xfs::conc::Mutex> inode_lock(InodeLock(ino));
+    std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
     Status status = CommitDeferredTimesUnderInodeLock(ino);
     if (!status.ok()) return status;
   }
@@ -174,26 +181,32 @@ Status XfsFilesystem::CommitAllDeferredTimesLocked() {
 
 Status XfsFilesystem::CommitAllDeferredMetadata() {
   if (!writable_) return OkStatus();
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
   return CommitAllDeferredTimesLocked();
 }
 
 uint64_t XfsFilesystem::ExtentGeneration(uint64_t ino) const {
-  std::lock_guard<std::mutex> lock(cache_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
   auto it = extent_generation_.find(ino);
   return it == extent_generation_.end() ? 0 : it->second;
 }
 
 uint64_t XfsFilesystem::DataGeneration(uint64_t ino) const {
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(data_mutex_);
   auto it = data_generation_.find(ino);
   return it == data_generation_.end() ? 0 : it->second;
+}
+
+uint64_t XfsFilesystem::MetadataGeneration(uint64_t ino) const {
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+  auto it = metadata_generation_.find(ino);
+  return it == metadata_generation_.end() ? 0 : it->second;
 }
 
 std::shared_ptr<const AlignedBuffer> XfsFilesystem::LookupDataChunk(
     uint64_t ino, uint64_t chunk) const {
   const DataCacheKey key{ino, chunk};
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(data_mutex_);
   auto it = data_cache_.find(key);
   if (it == data_cache_.end()) return nullptr;
   auto gen = data_generation_.find(ino);
@@ -214,7 +227,7 @@ std::shared_ptr<const AlignedBuffer> XfsFilesystem::InsertDataChunk(
     uint64_t ino, uint64_t chunk, std::shared_ptr<const AlignedBuffer> data,
     uint64_t generation) const {
   const DataCacheKey key{ino, chunk};
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(data_mutex_);
   auto gen = data_generation_.find(ino);
   const uint64_t current = gen == data_generation_.end() ? 0 : gen->second;
   if (generation != current) {
@@ -251,7 +264,7 @@ std::shared_ptr<const AlignedBuffer> XfsFilesystem::InsertDataChunk(
 
 void XfsFilesystem::DropDataChunks(uint64_t ino, uint64_t byte_offset,
                                    uint64_t byte_length, bool drop_all) const {
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(data_mutex_);
   // Bumping the generation is what actually makes older chunks unusable; the
   // erase below is hygiene (it frees memory and forces a fresh device read).
   // Callers must have written the device *before* calling this.

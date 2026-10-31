@@ -16,6 +16,9 @@ option(XFSWIN_BUILD_WINFSP "Build the WinFsp adapter (mount support)" ON)
 option(XFSWIN_BUILD_TESTS "Build unit and integration tests" ON)
 option(XFSWIN_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(XFSWIN_BUILD_FUZZERS "Build the libFuzzer parser harnesses (Clang only)" OFF)
+option(XFSWIN_CONCURRENCY_HOOKS
+       "Compile the deterministic concurrency scheduler hooks (CONC-1 tests)"
+       OFF)
 
 # The canonical CI builds turn warnings into errors. MSVC applies /WX to
 # xfs_core in src/CMakeLists.txt (the product library); GCC/Clang get the same

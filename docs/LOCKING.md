@@ -19,15 +19,27 @@ Acquire in this order (left before right). Never acquire a lock to the left
 while holding one to the right.
 
 ```text
-write_barrier_
-    -> inode lock(s), ordered by inode number (lower first)
-        -> mutation_mutex_
-            -> cache_mutex_ / data_mutex_ / deferred_mutex_
-                -> adapter node_mutex (WinFsp layer only)
+adapter node_mutex (WinFsp layer only; outermost)
+    -> write_barrier_
+        -> inode lock(s), ordered by inode number (lower first)
+            -> extent_map lock (that inode; shared for readers, exclusive
+               for an ordinary write's extent-map transaction)
+                -> mutation_mutex_
+                    -> cache_mutex_ / data_mutex_ / deferred_mutex_
 ```
 
+No core code takes the adapter `node_mutex`: the adapter sits above
+`XfsFilesystem`, so every callback enters with no core lock and either copies
+a snapshot under `node_mutex` before calling the core, or calls the core after
+releasing it. `TakeNode` also reads `ExtentGeneration` while holding
+`node_mutex`, so when both are held the adapter mutex comes first. This is
+the actual CONC-1 order; the earlier PERF-1 text placed the adapter mutex at
+the innermost position, which no call path can satisfy.
+
 Leaves (`cache_mutex_`, `data_mutex_`, `deferred_mutex_`, adapter
-`node_mutex`) never call back into the filesystem while held.
+`node_mutex`) never call back into the filesystem while held (the
+`ExtentGeneration` read under `node_mutex` is a leaf cache lookup, not a
+mutation or a callback).
 
 The block device has its own independent hierarchy:
 
@@ -42,15 +54,27 @@ No filesystem lock is ever acquired while a block-device lock is held.
 
 ### `write_barrier_` (`std::shared_mutex`, core)
 
-- **Shared**: ordinary file-data mutations:
-  - `WriteFileData` / `OverwriteFileData`
+- **Shared**:
+  - ordinary file-data mutations: `WriteFileData` / `OverwriteFileData`
+    (the extent-map transaction inside `WriteFileData` additionally takes
+    the per-inode `extent_map` lock exclusively; see below)
   - `SetFileTimes`
   - the deferred-timestamp mark/commit helpers
+  - every public read path: `LookupPath`, `ListDirectory`, `LookupName`,
+    `ReadFile`, `ReadSymlink`, `GetFileInfo`, `GetDataExtents`,
+    `ListXattrs`, `GetXattr`
 - **Exclusive**:
   - `Flush`, `CommitAllDeferredMetadata`
   - namespace changes: create, mkdir, unlink/rmdir, rename, link, symlink
   - `SetFileSize`, `AllocateUnwritten`, `ConvertUnwritten`, `ReflinkRange`
+  - the COW remap inside `WriteFileData` (the write detects a shared range
+    under the shared barrier, then retries the whole write exclusively)
   - `FreeUnlinkedInode`, xattr changes, `WriteCleanUnmountRecord`
+  - maintenance traversals: `CheckConsistency`, `ListAllocatedInodes`,
+    `VerifyParentPointers`. They walk AG headers, allocator btrees, inode
+    btrees and forks, so a shared barrier could observe a commit's metadata
+    write in progress. They are not hot paths; taking the barrier
+    exclusively gives them a quiescent metadata snapshot.
 
 Why: namespace and extent-map changes must not interleave with a data
 transfer that is using the old extent map. Taking the barrier exclusively
@@ -58,6 +82,23 @@ waits for every in-flight file write, then keeps new ones out for the
 duration of the metadata operation. This is deliberately coarser than
 per-inode locking for namespace work; the first PERF-1 goal is concurrent
 **file I/O**, not parallel rename.
+
+Reads take the barrier **shared for the whole call**, including the extent
+parse and every device read. For a data-fork read they also take that inode's
+`extent_map` lock shared, before opening the inode and until the call returns.
+A writer that only holds the barrier shared may not free a block that an
+inode's extent map can still reach: a reader that started before the mutation
+keeps its snapshot and would copy from a block that has since been
+reallocated. Truncate, reflink and the COW remap are barrier-exclusive, so
+they remove old mappings and release their blocks only after every reader has
+drained. An ordinary write that changes the extent map (allocation,
+conversion, BMBT split/merge/collapse) takes the inode's `extent_map` lock
+exclusively for that transaction, through commit and cache invalidation. This
+is what covers BMBT blocks freed by shrink/merge/collapse: they are metadata
+blocks owned by rmap, not just data blocks. The COW detection pass is
+side-effect-free and the retry is exclusive (re-validating the inode
+generation in between, since the inode can be unlinked and its number reused
+while the barrier is dropped).
 
 `Flush` is a durability barrier, not a global I/O lock: it takes the barrier
 exclusively, publishes deferred timestamps, waits for metadata transactions,
@@ -77,9 +118,38 @@ because an inode-number-keyed map can grow without limit and cannot be
 evicted safely while a waiter holds a reference. A stripe collision only
 serializes two unrelated inodes; it never breaks correctness.
 
-Reads do **not** take an inode lock. They use stable `FileNode` snapshots,
-shared extent-list pointers and generation-checked data chunks (see
-`CacheInvalidation`), so a read can proceed while another inode writes.
+Reads do **not** take an inode stripe. They take `write_barrier_` shared and
+the inode's `extent_map` lock shared for the whole call (extent parse and
+device reads included), and use stable `FileNode` snapshots, shared
+extent-list pointers and generation-checked data chunks (see
+`CacheInvalidation`). A read can proceed while an ordinary in-place write to
+the same inode is in flight; a write that changes the extent map waits for the
+read's parse to finish. An operation that frees mapped blocks (truncate,
+reflink, COW remap) is barrier-exclusive and therefore waits for the whole
+read.
+
+### `extent_map` locks (`extent_map_locks_`, 4096 `std::shared_mutex`)
+
+- One stripe per `ino % 4096`, like the inode stripes.
+- **Shared**: public `ReadFile` (both overloads) and `GetDataExtents`, from
+  before `OpenInode`/cache access until the call returns. Holding it across
+  the generation check, the BMBT parse and the data reads is what makes the
+  snapshot consistent: a map transaction cannot commit between the check and
+  the parse.
+- **Exclusive**: the Step 1 (allocation/insertion) and Step 3 (conversion/
+  removal) transaction scopes of an ordinary `WriteFileData`, when it holds
+  the barrier only shared. The lock spans `BeginTransaction` through
+  `CommitTransaction`, including the commit's metadata write-back and cache
+  invalidation, so a reader cannot acquire the lock in the window between the
+  new on-disk inode and the old cached extent list.
+- Not taken by the in-place fast path, by Step 2 data transfer, or by any
+  barrier-exclusive mutation (truncate, preallocate, convert, reflink, COW
+  remap, namespace, xattr, Flush): those already exclude every reader.
+- Readers of a data fork must never call `LoadDataForkExtents` directly.
+  The WinFsp adapter uses `XfsFilesystem::GetDataExtents`, which takes this
+  lock; parsing the BMBT from the adapter would race with `FreeBmbtBlock`.
+- Never hold two `extent_map` stripes at once, and never acquire one while
+  holding `mutation_mutex_` or a cache leaf.
 
 ### `mutation_mutex_` (`std::mutex`, core)
 
@@ -122,11 +192,15 @@ before a mutation cannot publish a stale chunk.
 
 ### Adapter (`winfsp_adapter.cpp`)
 
-- `node_mutex`: node table, path memo, directory-children memo and the mutable
-  fields of a `FileNode` (name, parent, delete-pending). It is held only for
-  hash/list operations or for copying a small snapshot; inode/btree reads and
-  writes happen after releasing it (`RefreshNode`, `TakeNode`,
-  `ResolvePathCached`).
+- `node_mutex` is the outermost project lock. WinFsp callbacks enter with no
+  core lock, copy a small snapshot under it, release it, and only then call
+  the core for inode/btree reads and writes (`RefreshNode`, `TakeNode`,
+  `ResolvePathCached`). The one core leaf call made under it,
+  `XfsFilesystem::ExtentGeneration`, takes `cache_mutex_` only. Core code never
+  references `AdapterState` or `node_mutex`, so the inverse order cannot
+  occur.
+- It protects the node table, path memo, directory-children memo and the
+  mutable fields of a `FileNode` (name, parent, delete-pending).
 - `LookupNode` copies the current inode/extent shared_ptrs and extent
   generation under `node_mutex`; callbacks use this snapshot. This prevents a
   concurrent `RefreshNode`/`Cleanup`/`Rename` from racing with a Read/Write/
@@ -157,19 +231,25 @@ semantics. The host NTFS cache is not bypassed.
 
 ## Deadlock rules
 
-1. Always `write_barrier_` before inode/mutation locks.
-2. For two inodes, lock the lower inode number first.
-3. Never call a public mutation API while holding `mutation_mutex_` or an
+1. Always `write_barrier_` before an inode stripe, an inode stripe before an
+   `extent_map` lock, and `extent_map` before `mutation_mutex_` or a cache
+   leaf.
+2. For two inodes, lock the lower inode number first. Never hold two
+   `extent_map` stripes at once; a reader holds only the inode it reads.
+3. Data-fork readers take `extent_map` shared before `OpenInode` or any cache
+   lookup. A caller that already holds the barrier exclusively (the
+   maintenance traversals) does not take it.
+4. Never call a public mutation API while holding `mutation_mutex_` or an
    inode stripe. Use the `...Locked` helpers:
    - `FreeUnlinkedInodeLocked` (caller holds the write barrier exclusively);
    - `CommitDeferredTimesUnderInodeLock` (caller holds the inode stripe and
      `mutation_mutex_`);
    - `CommitAllDeferredTimesLocked` (caller holds the write barrier
      exclusively).
-4. Never take `write_barrier_` while holding a cache leaf.
-5. Never call `XfsFilesystem::Flush()` while holding `mutation_mutex_`; it
+5. Never take `write_barrier_` while holding a cache leaf.
+6. Never call `XfsFilesystem::Flush()` while holding `mutation_mutex_`; it
    takes the barrier and then the mutation mutex. Use the internal helpers.
-6. Device locks are leaves; no callbacks into the filesystem while held.
+7. Device locks are leaves; no callbacks into the filesystem while held.
 
 The old `mutation_mutex_` remains a correctness fence around journal and
 metadata state. Removing it entirely is a later project; what PERF-1 removes
@@ -212,6 +292,10 @@ Guarantees:
 - Metadata block caching is not implemented. Every cold inode/AG/btree read
   still goes through the block device (the host page cache helps, but the
   syscall remains).
+- Maintenance traversals (`CheckConsistency`, `ListAllocatedInodes`,
+  `VerifyParentPointers`) take the barrier exclusively. A scan blocks file
+  I/O for its duration; that is deliberate, because a shared scan could read
+  AGF/bnobt/cntbt/rmap blocks while an ordinary write is committing them.
 
 These are deliberate PERF-1 boundaries; see `docs/PERFORMANCE.md` for the
 measured effect and the remaining bottleneck list.

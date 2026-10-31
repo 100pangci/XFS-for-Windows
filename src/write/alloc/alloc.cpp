@@ -13,8 +13,30 @@
 #include "xfs/btree.h"
 #include "xfs/endian.h"
 #include "write/alloc/alloc_internal.h"
+#include "xfs/concurrency_hooks.h"
 
 namespace xfs {
+
+#ifdef XFSWIN_CONCURRENCY_HOOKS
+class AllocPhaseHook {
+ public:
+  AllocPhaseHook(const char* point, std::string detail)
+      : point_(point), detail_(std::move(detail)) {
+    XFS_CONC_SYNC(point_, detail_);
+  }
+  ~AllocPhaseHook() { XFS_CONC_SYNC("alloc.phase.after", detail_); }
+
+ private:
+  const char* point_;
+  std::string detail_;
+};
+#define XFS_ALLOC_PHASE(name, detail) \
+  ::xfs::AllocPhaseHook conc_phase((name), (detail))
+#else
+#define XFS_ALLOC_PHASE(name, detail) \
+  do {                                \
+  } while (0)
+#endif
 
 using alloc_detail::AgState;
 using alloc_detail::Allocator;
@@ -34,6 +56,7 @@ BlockAllocator::~BlockAllocator() = default;
 
 Status BlockAllocator::Allocate(uint32_t preferred_agno, uint32_t len,
                                 Allocation* out) {
+  XFS_ALLOC_PHASE("alloc.allocate", "agno=" + std::to_string(preferred_agno) + " len=" + std::to_string(len));
   if (impl_->alloc->rmap_enabled()) {
     return XFS_ERR(XfsError::kInvalidArgument,
                    "rmapbt allocation requires an owner")
@@ -61,6 +84,7 @@ Status BlockAllocator::Allocate(uint32_t preferred_agno, uint32_t len,
 
 Status BlockAllocator::AllocateOwned(uint32_t preferred_agno, uint32_t len,
                                      const RmapOwner& owner, Allocation* out) {
+  XFS_ALLOC_PHASE("alloc.allocate.owned", "agno=" + std::to_string(preferred_agno) + " len=" + std::to_string(len));
   if (len == 0) {
     return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
         .Metadata("allocator");
@@ -208,6 +232,7 @@ Status BlockAllocator::AllocateFromAgRangeOwned(
 }
 
 Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {
+  XFS_ALLOC_PHASE("alloc.free", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   if (impl_->alloc->rmap_enabled()) {
     return XFS_ERR(XfsError::kInvalidArgument,
                    "rmapbt free requires an owner")
@@ -219,10 +244,12 @@ Status BlockAllocator::Free(uint64_t fsb, uint32_t len) {
 
 Status BlockAllocator::FreeOwned(uint64_t fsb, uint32_t len,
                                  const RmapOwner& owner) {
+  XFS_ALLOC_PHASE("alloc.free.owned", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   return impl_->alloc->FreeBlocksInternal(fsb, len, &owner, false);
 }
 
 Status BlockAllocator::FreeUnknown(uint64_t fsb, uint32_t len) {
+  XFS_ALLOC_PHASE("alloc.free.unknown", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   if (!impl_->alloc->rmap_enabled()) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "OWN_UNKNOWN free requires rmapbt")
@@ -239,11 +266,13 @@ Status BlockAllocator::InvalidateMetadata(uint64_t fsb, uint32_t len,
 
 Status BlockAllocator::ReleaseData(uint64_t fsb, uint32_t len,
                                    const RmapOwner& owner) {
+  XFS_ALLOC_PHASE("alloc.release", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   return impl_->alloc->ReleaseDataInternal(fsb, len, owner);
 }
 
 Status BlockAllocator::AllocateCowStaging(uint32_t preferred_agno,
                                           uint32_t len, Allocation* out) {
+  XFS_ALLOC_PHASE("alloc.cow.staging", "len=" + std::to_string(len));
   if (len == 0) {
     return XFS_ERR(XfsError::kInvalidArgument, "cannot allocate zero blocks")
         .Metadata("allocator");
@@ -284,6 +313,7 @@ Status BlockAllocator::AllocateCowStaging(uint32_t preferred_agno,
 
 Status BlockAllocator::CommitCowStaging(uint64_t fsb, uint32_t len,
                                         const RmapOwner& final_owner) {
+  XFS_ALLOC_PHASE("alloc.cow.commit", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->features.reflink) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -314,6 +344,7 @@ Status BlockAllocator::CommitCowStaging(uint64_t fsb, uint32_t len,
 }
 
 Status BlockAllocator::ReleaseCowStaging(uint64_t fsb, uint32_t len) {
+  XFS_ALLOC_PHASE("alloc.cow.release", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->features.reflink) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -342,6 +373,7 @@ Status BlockAllocator::ReleaseCowStaging(uint64_t fsb, uint32_t len) {
 }
 
 Status BlockAllocator::RefcountIncrease(uint64_t fsb, uint32_t len) {
+  XFS_ALLOC_PHASE("alloc.refcount.increase", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->FsbRangeValid(fsb, len)) {
     return XFS_ERR(XfsError::kInvalidArgument,
@@ -358,6 +390,7 @@ Status BlockAllocator::RefcountIncrease(uint64_t fsb, uint32_t len) {
 
 Status BlockAllocator::RefcountDecrease(uint64_t fsb, uint32_t len,
                                         bool unknown_owner) {
+  XFS_ALLOC_PHASE("alloc.refcount.decrease", "fsb=" + std::to_string(fsb) + " len=" + std::to_string(len));
   const XfsGeometry* geo = impl_->alloc->geo();
   if (!geo->FsbRangeValid(fsb, len)) {
     return XFS_ERR(XfsError::kInvalidArgument,
@@ -530,6 +563,7 @@ Status BlockAllocator::RmapConvert(uint64_t fsb, uint32_t len,
 }
 
 Status BlockAllocator::EnsureAgfl(uint32_t agno, uint32_t blocks) {
+  XFS_ALLOC_PHASE("alloc.reserve.agfl", "agno=" + std::to_string(agno) + " blocks=" + std::to_string(blocks));
   const XfsGeometry* geo = impl_->alloc->geo();
   if (agno >= geo->agcount) {
     return XFS_ERR(XfsError::kOutOfRange, "AG number out of range")

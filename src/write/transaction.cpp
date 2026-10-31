@@ -800,6 +800,8 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
   txn.lsn_ = MakeLsn(txn.cycle_, txn.block_);
   txn.started_ = true;
   txn.device_ = device_.get();
+  XFS_CONC_TXN(txn.tid_);
+  XFS_CONC_SYNC("txn.begin", "tid=" + std::to_string(txn.tid_));
   return txn;
 }
 
@@ -893,6 +895,8 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         .Actual(total_blocks);
   }
 
+  XFS_CONC_SYNC("txn.commit.before_log",
+                "tid=" + std::to_string(txn.tid_));
   MaybeCrash(CrashPoint::kBeforeLogWrite, TxnText(txn, "commit"));
   for (size_t i = 0; i < records.size(); ++i) {
     const BuiltRecord& record = records[i];
@@ -939,9 +943,13 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         .Metadata("log");
   }
   MaybeCrash(CrashPoint::kAfterLogCommit, TxnText(txn, "committed"));
+  XFS_CONC_SYNC("txn.commit.log_durable",
+                "tid=" + std::to_string(txn.tid_));
 
   // Metadata write-back. The transaction LSN is already stamped into every
   // buffer by the item builder, so recovery can skip older changes.
+  XFS_CONC_SYNC("txn.commit.before_metadata",
+                "tid=" + std::to_string(txn.tid_));
   size_t metadata_writes = 0;
   for (size_t i = 0; i < txn.writes_.size(); ++i) {
     const TransactionWrite& write = txn.writes_[i];
@@ -973,6 +981,8 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     }
     MaybeCrash(CrashPoint::kAfterMetadataWrite, TxnText(txn, "metadata"));
   }
+  XFS_CONC_SYNC("txn.commit.metadata_applied",
+                "tid=" + std::to_string(txn.tid_));
 
   // The transaction is durable (its log record was flushed above). Advance the
   // write position. The tail stays at the oldest transaction whose metadata is
@@ -1015,6 +1025,8 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     perf.journal_flushes.fetch_add(1, std::memory_order_relaxed);
   }
 
+  XFS_CONC_SYNC("txn.commit.before_invalidate",
+                "tid=" + std::to_string(txn.tid_));
   for (const TransactionWrite& write : txn.writes_) {
     if (write.inode_metadata && write.ino != 0) {
       InvalidateCaches(write.data_fork_changed
@@ -1022,10 +1034,11 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
                            : CacheInvalidation::Inode(write.ino));
       // Any committed inode metadata carries a timestamp of its own; an older
       // deferred update must not overwrite it later.
-      std::lock_guard<std::mutex> deferred_lock(deferred_mutex_);
+      std::lock_guard<xfs::conc::Mutex> deferred_lock(deferred_mutex_);
       deferred_times_.erase(write.ino);
     }
   }
+  XFS_CONC_SYNC("txn.commit.done", "tid=" + std::to_string(txn.tid_));
   XFS_TRACE("transaction committed: tid=" << txn.tid() << " lsn=0x" << std::hex
                                           << txn.lsn() << std::dec
                                           << " items=" << txn.ops_.size()
@@ -1039,7 +1052,7 @@ Status XfsFilesystem::RunTransaction(
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("transaction");
   }
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();
   // If building fails nothing has been written: there is no record yet, so the
@@ -1052,10 +1065,10 @@ Status XfsFilesystem::RunTransaction(
 Status XfsFilesystem::WriteCleanUnmountRecord() {
   if (!writable_) return OkStatus();
   // A clean log must not be followed by pending timestamp transactions.
-  std::unique_lock<std::shared_mutex> barrier(write_barrier_);
+  std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
   Status deferred = CommitAllDeferredTimesLocked();
   if (!deferred.ok()) return deferred;
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   if (!log_dirty_ && log_position_valid_) {
     return OkStatus();  // the log already ends with an unmount record
   }

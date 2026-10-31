@@ -99,7 +99,7 @@ void PerfStats::UpdatePeak(std::atomic<uint64_t>& peak, uint64_t value) {
   }
 }
 
-TimedLockGuard::TimedLockGuard(std::mutex& mutex)
+TimedLockGuard::TimedLockGuard(conc::Mutex& mutex)
     : lock_(mutex, std::defer_lock) {
   // Do not pay two clock reads for every file-data write when instrumentation
   // is off. The lock itself is unchanged.

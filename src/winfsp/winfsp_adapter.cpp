@@ -35,6 +35,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <utility>
 #include <vector>
 
+#include "xfs/concurrency_hooks.h"
 #include "xfs/log.h"
 #include "xfs/perf_stats.h"
 #include "xfs/ondisk.h"
@@ -101,7 +102,7 @@ struct AdapterState {
     // (FreeUnlinkedInode).
     bool delete_pending = false;
   };
-  std::mutex node_mutex;
+  xfs::conc::Mutex node_mutex;
   std::unordered_map<uint64_t, uint64_t> node_by_inode;
   std::unordered_map<uint64_t, std::shared_ptr<FileNode>> nodes;
   uint64_t next_node_id = 1;
@@ -147,7 +148,7 @@ uint64_t NodeId(PVOID context) {
 // Returns the current immutable inode/extent image of a live file node.
 std::optional<NodeSnapshot> LookupNode(AdapterState& state, PVOID context) {
   if (!context) return std::nullopt;
-  std::lock_guard<std::mutex> lock(state.node_mutex);
+  std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
   auto it = state.nodes.find(NodeId(context));
   if (it == state.nodes.end()) return std::nullopt;
   return NodeSnapshot{it->second->inode, it->second->extents,
@@ -160,7 +161,7 @@ std::optional<NodeSnapshot> LookupNode(AdapterState& state, PVOID context) {
 std::shared_ptr<AdapterState::FileNode> LookupNodeState(AdapterState& state,
                                                         PVOID context) {
   if (!context) return nullptr;
-  std::lock_guard<std::mutex> lock(state.node_mutex);
+  std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
   auto it = state.nodes.find(NodeId(context));
   if (it == state.nodes.end()) return nullptr;
   return it->second;
@@ -284,7 +285,7 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   const bool perf_on = perf.enabled();
   uint64_t cached_ino = 0;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.path_inode_cache.find(key);
     if (it != state.path_inode_cache.end()) {
       cached_ino = it->second.ino;
@@ -301,7 +302,7 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
       }
       return inode;
     }
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.path_inode_cache.find(key);
     if (it != state.path_inode_cache.end()) {
       state.path_cache_lru.erase(it->second.lru);
@@ -311,7 +312,7 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   if (perf_on) perf.path_cache_misses.fetch_add(1, std::memory_order_relaxed);
   auto inode = ResolvePath(*state.fs, file_name);
   if (inode.ok()) {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     constexpr size_t kMaxPathCacheEntries = 32768;
     auto existing = state.path_inode_cache.find(key);
     if (existing != state.path_inode_cache.end()) {
@@ -368,7 +369,7 @@ Result<std::pair<uint64_t, std::string>> ResolveParentAndName(
 void DropPathCache(AdapterState& state, const std::wstring& path,
                    bool prefix = false) {
   if (path.empty()) return;
-  std::lock_guard<std::mutex> lock(state.node_mutex);
+  std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
   if (!prefix) {
     auto it = state.path_inode_cache.find(path);
     if (it != state.path_inode_cache.end()) {
@@ -396,7 +397,7 @@ void DropPathCache(AdapterState& state, const std::wstring& path,
 // (last-close of an unlinked inode).
 void DropNamespaceCaches(AdapterState& state, uint64_t parent_ino,
                          uint64_t second_parent_ino = 0) {
-  std::lock_guard<std::mutex> lock(state.node_mutex);
+  std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
   for (uint64_t dir : {parent_ino, second_parent_ino}) {
     if (dir == 0) continue;
     auto it = state.dir_children.find(dir);
@@ -551,7 +552,7 @@ void RefreshNode(AdapterState& state, uint64_t node_id) {
   std::shared_ptr<const std::vector<XfsExtent>> old_extents;
   uint64_t old_generation = 0;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     ino = node->inode->ino;
     old_extents = node->extents;
     old_generation = node->extent_generation;
@@ -567,18 +568,22 @@ void RefreshNode(AdapterState& state, uint64_t node_id) {
   std::shared_ptr<const std::vector<XfsExtent>> fresh_extents = old_extents;
   const uint64_t generation = state.fs->ExtentGeneration(ino);
   if (fresh->IsRegular() && generation != old_generation) {
-    auto extents = std::make_shared<std::vector<XfsExtent>>();
-    Status s = LoadDataForkExtents(state.fs->device(), state.fs->geometry(),
-                                   *fresh, extents.get());
-    if (!s.ok()) {
-      XFS_ERROR("RefreshNode: cannot reload extents: " << s.error().Format());
+    // Parse through the core API: it takes write_barrier_ and the inode's
+    // extent-map lock. A direct LoadDataForkExtents here would race with an
+    // ordinary write that frees a bmbt block.
+    auto loaded = state.fs->GetDataExtents(ino);
+    if (!loaded.ok()) {
+      XFS_ERROR("RefreshNode: cannot reload extents: "
+                << loaded.error().Format());
       return;
     }
+    auto extents =
+        std::make_shared<std::vector<XfsExtent>>(std::move(loaded.value()));
     fresh_extents = std::shared_ptr<const std::vector<XfsExtent>>(
         std::move(extents));
   }
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.nodes.find(node_id);
     if (it == state.nodes.end() || it->second != node) return;
     node->inode = std::move(fresh);
@@ -622,16 +627,20 @@ Result<PVOID> TakeNode(AdapterState& state, XfsInode inode, uint64_t parent_ino,
   // list or the BMBT.
   std::shared_ptr<const std::vector<XfsExtent>> extents;
   if (node->IsRegular() && node->format != ondisk::inode::kFormatLocal) {
-    auto loaded = std::make_shared<std::vector<XfsExtent>>();
-    if (LoadDataForkExtents(state.fs->device(), state.fs->geometry(), *node,
-                            loaded.get())
-            .ok()) {
-      extents = std::move(loaded);
+    // The core API takes write_barrier_ shared and the inode's extent-map
+    // lock shared, so the BMBT parse cannot race with a writer freeing a
+    // bmbt block.
+    auto loaded = state.fs->GetDataExtents(node->ino);
+    if (loaded.ok()) {
+      auto parsed =
+          std::make_shared<std::vector<XfsExtent>>(std::move(loaded.value()));
+      extents = std::shared_ptr<const std::vector<XfsExtent>>(
+          std::move(parsed));
     }
   }
   uint64_t id;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto index = state.node_by_inode.find(node->ino);
     if (index != state.node_by_inode.end()) {
       // Same file already open: reuse its node and take another reference.
@@ -642,6 +651,8 @@ Result<PVOID> TakeNode(AdapterState& state, XfsInode inode, uint64_t parent_ino,
       auto entry = std::make_shared<AdapterState::FileNode>();
       entry->inode = node;
       entry->extents = std::move(extents);
+      // node_mutex is the outermost project lock (docs/LOCKING.md); this
+      // leaf cache lookup is the only core call made while holding it.
       entry->extent_generation = state.fs->ExtentGeneration(node->ino);
       entry->refcount = 1;
       entry->parent_ino = parent_ino;
@@ -902,7 +913,7 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
   uint64_t parent_ino = 0;
   std::string name;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     ino = node->inode->ino;
     is_dir = node->inode->IsDir();
     delete_pending = node->delete_pending;
@@ -954,7 +965,7 @@ VOID Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
     deferred = fresh.ok() && fresh.value().nlink == 0;
   }
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.nodes.find(NodeId(file_context));
     if (it != state.nodes.end() && it->second == node) {
       node->delete_pending = deferred;
@@ -978,7 +989,7 @@ VOID Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
   // on the AGI unlinked list.
   uint64_t free_ino = 0;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.nodes.find(NodeId(file_context));
     if (it == state.nodes.end()) return;
     if (0 == --it->second->refcount) {
@@ -1249,7 +1260,7 @@ NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_nam
 
   uint64_t free_ino = 0;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     // An open handle on the moved inode keeps following it under the new
     // name; a pending delete-on-close on it now refers to the new name.
     if (file_context != nullptr) {
@@ -1351,7 +1362,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   // Explorer enumerations.
   std::shared_ptr<const std::vector<DirChild>> children;
   {
-    std::lock_guard<std::mutex> lock(state.node_mutex);
+    std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.dir_children.find(context->inode->ino);
     if (it != state.dir_children.end()) {
       children = it->second;
@@ -1379,7 +1390,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
                 return a.name < b.name;
               });
     {
-      std::lock_guard<std::mutex> lock(state.node_mutex);
+      std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
       constexpr size_t kMaxCachedDirs = 64;
       constexpr size_t kMaxCachedEntries = 262144;
       if (built->size() <= kMaxCachedEntries) {

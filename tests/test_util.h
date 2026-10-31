@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -109,10 +110,13 @@ class MemoryBlockDevice final : public xfs::BlockDevice {
     read_bytes_.fetch_add(size);
     if (size >= 65536) large_read_calls_.fetch_add(1);
     bool ok = true;
-    if (offset > data_.size() || size > data_.size() - offset) {
-      ok = false;
-    } else {
-      std::memcpy(buffer, data_.data() + offset, size);
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (offset > data_.size() || size > data_.size() - offset) {
+        ok = false;
+      } else {
+        std::memcpy(buffer, data_.data() + offset, size);
+      }
     }
     active_reads_.fetch_sub(1);
     return ok;
@@ -128,10 +132,13 @@ class MemoryBlockDevice final : public xfs::BlockDevice {
     write_bytes_.fetch_add(size);
     if (size >= 65536) large_write_calls_.fetch_add(1);
     bool ok = true;
-    if (offset > data_.size() || size > data_.size() - offset) {
-      ok = false;
-    } else {
-      std::memcpy(data_.data() + offset, buffer, size);
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (offset > data_.size() || size > data_.size() - offset) {
+        ok = false;
+      } else {
+        std::memcpy(data_.data() + offset, buffer, size);
+      }
     }
     active_writes_.fetch_sub(1);
     return ok;
@@ -192,6 +199,12 @@ class MemoryBlockDevice final : public xfs::BlockDevice {
   std::atomic<uint64_t> large_read_calls_{0};
   std::atomic<uint64_t> large_write_calls_{0};
   std::atomic<uint64_t> flush_calls_{0};
+  // The array itself is not atomic: serialize the byte copies so
+  // ThreadSanitizer can distinguish a real filesystem race from the test
+  // device's deliberately concurrent, overlapping read/write calls. The
+  // active counters are updated outside this lock, so the overlap
+  // assertions still measure concurrent requests.
+  std::mutex data_mutex_;
   std::atomic<uint64_t> active_reads_{0};
   std::atomic<uint64_t> active_writes_{0};
   std::atomic<uint64_t> max_reads_{0};

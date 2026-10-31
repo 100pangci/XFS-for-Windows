@@ -111,6 +111,197 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
 
+  # ---------------------------------------------------------------------------
+  # CONC-1: deterministic concurrency and lock-model verification. The hooks
+  # build pauses operations at named sync points and lock waits, so scheduling
+  # is a recorded script, never a random sleep. The seeded stress images are
+  # exported after a clean unmount and judged by the independent Python probes,
+  # xfs_repair and a real Linux kernel mount.
+  # ---------------------------------------------------------------------------
+  linux-concurrency:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - name: Configure (concurrency hooks on)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Full suite with the scheduler compiled in
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Export the seeded stress images
+        run: |
+          set -euo pipefail
+          mkdir -p conc-images
+          XFSWIN_CONC_IMAGE_DIR="$PWD/conc-images" \
+            ./build/tests/xfs_tests --filter=conc_stress
+          ls -l conc-images
+
+      - name: Linux oracle chain (probe, repair, kernel mount, scrub)
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-images/conc-mixed.img --work conc-work/mixed \
+            --workload mixed --threads 4
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-images/conc-shared-names.img --work conc-work/shared \
+            --workload shared
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-images/conc-cow.img --work conc-work/cow \
+            --workload cow
+
+      - name: Upload concurrency images and oracles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conc-images-linux
+          path: |
+            conc-images/
+            conc-work/
+          if-no-files-found: warn
+
+  # Bounded sanitizer pass over the deterministic concurrency tests only. The
+  # full non-hooks suite already has its own ASan/UBSan job above.
+  linux-concurrency-sanitizer:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Clang, ASan + UBSan, hooks on)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Concurrency tests under ASan/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/tests/xfs_tests --filter=conc_
+
+  # ThreadSanitizer is a second, independent judge for data races and lock
+  # misuse on the concurrency tests. The test device was made thread-safe so
+  # a harness byte-copy is not reported as a filesystem race.
+  linux-concurrency-tsan:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Clang, TSan, hooks on)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      # Some hosted kernels use 32-bit mmap randomization, which newer TSan
+      # runtimes reject with "unexpected memory mapping".
+      - name: Relax ASLR for TSan
+        run: |
+          if [ -w /proc/sys/vm/mmap_rnd_bits ]; then
+            sudo sysctl -w vm.mmap_rnd_bits=28
+          fi
+
+      - name: Concurrency tests under TSan
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ./build/tests/xfs_tests --filter=conc_
+
+  # Weekly/manual long run: 8 coordinated operations per stress scenario and
+  # several seeds, with kernel verification of the exported images. Journal
+  # wrap and forced multi-AG allocation are not yet forced here; see
+  # docs/CONCURRENCY.md for that blind spot.
+  linux-concurrency-soak:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.soak_only == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    concurrency:
+      group: conc-soak
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - name: Configure (concurrency hooks on)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXFSWIN_BUILD_TESTS=ON
+          -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Long seeded stress (8 threads, three seeds)
+        run: |
+          set -euo pipefail
+          mkdir -p conc-soak
+          # ENOSPC plus concurrent free/reallocate, deterministic schedule.
+          ./build/tests/xfs_tests --filter=conc_enospc_free_and_reallocate
+          for seed in 0x1111111111111111 0x2222222222222222 0x3333333333333333; do
+            dir="conc-soak/$seed"
+            mkdir -p "$dir"
+            echo "=== seed $seed"
+            XFSWIN_CONC_STRESS_THREADS=8 XFSWIN_CONC_STRESS_ITERS=20 \
+              XFSWIN_CONC_STRESS_SEED="$seed" \
+              XFSWIN_CONC_IMAGE_DIR="$PWD/$dir" \
+              ./build/tests/xfs_tests --filter=conc_stress
+            sudo bash tests/scripts/verify_conc_image_linux.sh \
+              "$dir/conc-cow.img" --work "$dir/cow-work" --workload cow \
+              --seed "$seed" --iterations 20
+          done
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-soak/0x1111111111111111/conc-mixed.img \
+            --work conc-soak/mixed-work --workload mixed --threads 8
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-soak/0x1111111111111111/conc-shared-names.img \
+            --work conc-soak/shared-work --workload shared
+
+      - name: Upload soak failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conc-soak-failure
+          path: conc-soak/
+          if-no-files-found: ignore
+
   # Bounded libFuzzer smoke for every parser harness. Seeds come from a real
   # mkfs.xfs image generated in the job; no binary corpus is committed.
   linux-fuzz-smoke:
@@ -849,6 +1040,83 @@ jobs:
             out/rw6e-windows.img.manifest.json
             out/rw6e-windows.oracle.json
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # CONC-1 on Windows/MSVC: the same deterministic scheduler and stress
+  # scenarios run on the portable core (no driver). The exported images are
+  # judged again by Linux xfs_repair and a real kernel mount below.
+  # ---------------------------------------------------------------------------
+  windows-concurrency-core:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (MSVC, concurrency hooks on)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_CONFIG
+
+      - name: Deterministic concurrency tests and image export
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force out\conc | Out-Null
+          $env:XFSWIN_CONC_IMAGE_DIR = "$PWD\out\conc"
+          & "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" --filter=conc_
+          if ($LASTEXITCODE -ne 0) { throw "Windows concurrency tests failed" }
+          Get-ChildItem out\conc | Select-Object Name,Length
+
+      - name: Upload the Windows-generated concurrency images
+        uses: actions/upload-artifact@v4
+        with:
+          name: conc-images-windows
+          path: out/conc/
+          if-no-files-found: error
+
+  linux-verify-conc-windows:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-concurrency-core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: conc-images-windows
+          path: conc-win
+
+      - name: Linux oracle chain for the Windows-built images
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-win/conc-mixed.img --work conc-win/mixed \
+            --workload mixed --threads 4
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-win/conc-shared-names.img --work conc-win/shared \
+            --workload shared
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-win/conc-cow.img --work conc-win/cow --workload cow
+
+      - name: Upload verification artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conc-windows-verify-failure
+          path: conc-win/
+          if-no-files-found: ignore
 
   # ===========================================================================
   # RW-6A: modern inode feature profile
@@ -2119,6 +2387,59 @@ jobs:
           name: rw-modified
           path: rw/rw-work/rw-modified.img
           if-no-files-found: error
+
+      # CONC-1: several runspaces create, write, read back, rename (same and
+      # cross directory), delete and enumerate through the real WinFsp
+      # callbacks. The image and sha256 manifest are verified on Linux below.
+      - name: Concurrent WinFsp operations
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_mount_concurrency_windows.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -Image "rw\rw.img" -Drive Y: -Threads 4 -Iterations 20
+
+      - name: Upload the concurrent WinFsp image and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-conc
+          path: rw/conc-work/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux judges the image Windows produced under real WinFsp concurrency:
+  # xfs_repair -n, a kernel mount that re-reads the sha256 manifest, xfs_scrub,
+  # a clean log and a second xfs_repair -n.
+  # ---------------------------------------------------------------------------
+  linux-verify-conc-winfsp:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-mount
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-conc
+          path: conc-win
+
+      - name: Verify the concurrent WinFsp image on Linux
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/verify_conc_image_linux.sh \
+            conc-win/conc-win.img --work conc-win/work \
+            --workload manifest --manifest conc-win/conc-win.manifest.json
+
+      - name: Upload verification artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conc-winfsp-verify-failure
+          path: conc-win/
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Linux verifies the read-write round trip: xfs_repair -n must stay clean,

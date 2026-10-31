@@ -291,9 +291,9 @@ Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
         .Ino(ino)
         .Metadata("inode");
   }
-  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
-  std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  std::lock_guard<xfs::conc::Mutex> inode_lock(InodeLock(ino));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto txn = BeginTransaction();
   if (!txn.ok()) return txn.error();
   Status status =
@@ -301,7 +301,7 @@ Result<XfsFileInfo> XfsFilesystem::SetFileTimes(uint64_t ino,
   if (!status.ok()) return status.error();
   status = CommitTransaction(txn.value());
   if (!status.ok()) return status.error();
-  return GetFileInfo(ino);
+  return GetFileInfoLocked(ino);
 }
 
 Result<XfsFileInfo> XfsFilesystem::SetFileMode(uint64_t ino, uint16_t mode) {
@@ -311,9 +311,9 @@ Result<XfsFileInfo> XfsFilesystem::SetFileMode(uint64_t ino, uint16_t mode) {
         .Ino(ino)
         .Metadata("inode");
   }
-  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
-  std::lock_guard<std::mutex> inode_lock(InodeLock(ino));
-  std::lock_guard<std::mutex> lock(mutation_mutex_);
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  std::lock_guard<xfs::conc::Mutex> inode_lock(InodeLock(ino));
+  std::lock_guard<xfs::conc::Mutex> lock(mutation_mutex_);
   auto inode = OpenInode(ino);
   if (!inode.ok()) return inode.error();
   const uint16_t type = inode.value().mode & kSIfmt;
@@ -338,7 +338,7 @@ Result<XfsFileInfo> XfsFilesystem::SetFileMode(uint64_t ino, uint16_t mode) {
   if (status.ok()) status = CommitTransaction(txn.value());
   if (!status.ok()) return status.error();
   InvalidateCaches(CacheInvalidation::Inode(ino));
-  return GetFileInfo(ino);
+  return GetFileInfoLocked(ino);
 }
 
 Status XfsFilesystem::UpdateTimesInTransaction(XfsTransaction& txn, uint64_t ino,

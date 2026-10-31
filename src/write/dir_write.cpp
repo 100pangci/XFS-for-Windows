@@ -23,6 +23,8 @@
 //     xfs_dir2_shrink_inode.
 #include "xfs/dir_write.h"
 
+#include "xfs/concurrency_hooks.h"
+
 #include <algorithm>
 #include <cstring>
 #include <set>
@@ -2159,6 +2161,14 @@ Status DirectoryEditor::FinalizeInode(std::vector<uint8_t>* raw_inode,
 }
 
 Status DirectoryEditor::Insert(const DirEntryWrite& entry) {
+  XFS_CONC_SYNC("dirent.update.before",
+                "dir=" + std::to_string(ino_) + " name=" + entry.name);
+  struct ExitHook {
+    uint64_t ino;
+    ~ExitHook() {
+      XFS_CONC_SYNC("dirent.update.after", "dir=" + std::to_string(ino));
+    }
+  } exit_hook{ino_};
   Status s = ValidateDirName(entry.name, ino_);
   if (!s.ok()) return s;
   if (fmt_ == XfsDirFormat::kShortform) {
@@ -2196,6 +2206,14 @@ Status DirectoryEditor::Insert(const DirEntryWrite& entry) {
 
 Status DirectoryEditor::Replace(std::string_view name, uint64_t new_ino,
                                 uint8_t new_ftype) {
+  XFS_CONC_SYNC("dirent.update.before",
+                "dir=" + std::to_string(ino_) + " name=" + std::string(name));
+  struct ExitHook {
+    uint64_t ino;
+    ~ExitHook() {
+      XFS_CONC_SYNC("dirent.update.after", "dir=" + std::to_string(ino));
+    }
+  } exit_hook{ino_};
   Status s = ValidateDirName(name, ino_);
   if (!s.ok()) return s;
   if (fmt_ == XfsDirFormat::kShortform || fmt_ == XfsDirFormat::kBlock) {
@@ -2259,6 +2277,14 @@ Status DirectoryEditor::Replace(std::string_view name, uint64_t new_ino,
 }
 
 Result<XfsDirEntry> DirectoryEditor::Remove(std::string_view name) {
+  XFS_CONC_SYNC("dirent.update.before",
+                "dir=" + std::to_string(ino_) + " name=" + std::string(name));
+  struct ExitHook {
+    uint64_t ino;
+    ~ExitHook() {
+      XFS_CONC_SYNC("dirent.update.after", "dir=" + std::to_string(ino));
+    }
+  } exit_hook{ino_};
   XfsDirEntry removed;
   Status s = ValidateDirName(name, ino_);
   if (!s.ok()) return s.error();

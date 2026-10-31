@@ -47,11 +47,15 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
   if (perf_on) perf.write_calls.fetch_add(1, std::memory_order_relaxed);
+  XFS_CONC_INO(ino);
   // Independent files write concurrently; same inode writes serialize. The
   // shared barrier excludes namespace changes/truncate/Flush for the duration
   // of the data transfer.
-  std::shared_lock<std::shared_mutex> barrier(write_barrier_);
+  XFS_CONC_SYNC("barrier.before", "ino=" + std::to_string(ino));
+  std::shared_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
+  XFS_CONC_SYNC("inode.lock.before", "ino=" + std::to_string(ino));
   TimedLockGuard inode_lock(InodeLock(ino));
+  XFS_CONC_SYNC("inode.lock.after", "ino=" + std::to_string(ino));
   PerfStats::WriteScope write_scope;
 
   auto inode = OpenInode(ino);
@@ -64,6 +68,7 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
                              length, &mappings);
   if (!s.ok()) return s.error();
 
+  XFS_CONC_SYNC("data.write.before", "ino=" + std::to_string(ino));
   MaybeCrash(CrashPoint::kBeforeDataWrite, RangeText(ino, offset, length));
 
   const auto* src = static_cast<const uint8_t*>(buffer);
@@ -98,7 +103,7 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
   // Metadata transaction for mtime/ctime (ordered mode: the data write above
   // is not journalled, the inode change is). atime intentionally unchanged.
   {
-    std::lock_guard<std::mutex> txn_lock(mutation_mutex_);
+    std::lock_guard<xfs::conc::Mutex> txn_lock(mutation_mutex_);
     const XfsTimestamp now = CurrentTimestamp();
     auto txn = BeginTransaction();
     if (!txn.ok()) {
