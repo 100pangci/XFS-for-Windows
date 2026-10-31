@@ -165,19 +165,34 @@ pass 1, skips matching buffer or inode items in pass 2, and consumes one cancel
 reference at each cancel item's position in transaction order. This lets a later
 transaction replay a new owner after the last cancellation is consumed.
 
-The local writer currently emits `blf_size = 1`, no payload region,
-`XFS_BLF_CANCEL` with no buffer-type or inode-buffer bits, and an all-zero map
-sized for the complete buffer. The local parser uses only the cancel item's
-`(blkno, len)` geometry and does not interpret its map. The exact Linux stale
-format region length and `blf_map_size` have not been verified from trusted local source or a
-Linux-produced cancel log; the writer encoding is provisional. Project-generated
-fixtures do not provide independent Linux format evidence.
+The stale shape is verified against Linux source and against real Linux
+kernel output. The Linux 6.17 `xfs_buf_item_format_segment`/`xfs_trans_binval`
+path writes `blf_size = 1`, no payload region, `XFS_BLF_CANCEL` with no
+buffer-type or inode-buffer bits, exactly one `XFS_BUF_FORMAT` region of
+`20 + 4 * blf_map_size` bytes, an all-zero map, and
+`blf_map_size = ceil(blf_len / 8)` for `blf_len` counted in 512-byte basic
+blocks. The map covers the complete buffer, not only the logged chunks.
+QUAL-2 captured this shape from a running Linux kernel (7.0.0-1017-azure,
+xfsprogs 6.6.0, 512 MiB rmapbt filesystem): 4,878 cancel items across three
+fixtures, all with `blf_type = XFS_LI_BUF` (0x123c), `blf_size = 1`,
+`blf_flags = 0x2` and only `blf_flags`' cancel bit set. Eight-block buffers
+produced `blf_map_size = 1` and a 24-byte region, thirty-two-block buffers
+`blf_map_size = 4` and a 36-byte region; refcounts on one geometry reached 13
+as the block was cancelled repeatedly inside the window. The independent
+`cancel_probe.py` reader and `xfs_logprint` (`BUF: #regs:1 ... flags:0x2`)
+agree on those items, and the project writer emits the same shape. The real
+Linux kernel replays a Windows-written cancel image, and `xfs_repair -n` is
+silent afterwards; the hosted runner kernel has no online scrub ioctl, which
+the qualification records as a skip rather than hiding an error.
 
 A queued write fully covered by an invalidated metadata buffer is suppressed,
 including contained 512-byte inode writes when an inode cluster is invalidated.
-A write crossing the buffer boundary, or an overlapping logged item/cancel
-with different geometry, is refused: recovery's exact `(blkno, blf_len)` match
-would not protect the rest of that buffer.
+A write crossing the buffer boundary is refused. Within one transaction a
+logged item and a cancel with a different, partially overlapping geometry are
+also refused: the Linux buffer cache never owns two partially overlapping
+buffers at once. Across transactions the kernel matches only the exact
+`(blkno, blf_len)` key, so an older item with a different geometry is not
+suppressed and is replayed, and this replay does the same.
 
 Free owners that cancel: free-space btree blocks (bnobt/cntbt), rmapbt,
 refcountbt, inobt/finobt, bmbt, directory data/leaf/node/free/block blocks,

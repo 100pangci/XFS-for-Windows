@@ -117,12 +117,18 @@ reference, so a block reused after its last cancellation is replayed again
 (`xlog_put_buffer_cancelled`). Cancellation matches the full `(blkno, len)`
 pair, never an offset guess.
 
-The exact Linux stale format region length and `blf_map_size` have not been
-verified from trusted local source or a Linux-produced cancel log. The parser
-uses only the cancel item's `(blkno, len)` geometry and does not interpret its
-map. The writer currently emits a zero map sized for the whole buffer, but this
-encoding is provisional and is not claimed to match Linux. Project-generated
-fixtures are not independent Linux format evidence.
+The Linux stale encoding is verified from the Linux 6.17 source
+(`xfs_buf_item_format_segment`, `xfs_trans_binval`) and from real kernel logs.
+QUAL-2 captured three fixtures from a running kernel (7.0.0-1017-azure) with
+4,878 `XFS_BLF_CANCEL` items: every item used `blf_type = XFS_LI_BUF`,
+`blf_size = 1`, `blf_flags = 0x2`, one `XFS_BUF_FORMAT` region of
+`20 + 4 * blf_map_size` bytes and an all-zero map, with
+`blf_map_size = ceil(blf_len / 8)` for `blf_len` in 512-byte blocks. The
+independent `cancel_probe.py` reader and `xfs_logprint` agree on the items.
+The parser uses only the cancel item's `(blkno, len)` geometry and does not
+interpret its map. The writer emits the same shape; real Linux mounts and
+repairs images it writes (the hosted kernel has no online scrub ioctl, which
+the qualification records as a skip).
 
 ### 4.2 Buffer replay (pass 2)
 
@@ -156,9 +162,11 @@ suppressed (a stale buffer is never written). Without this, an older
 `XFS_LI_BUF` still in the recovery window would overwrite the block after a
 new owner reused the address with a direct or ordered write.
 
-The writer emits the provisional stale shape described in 4.1 through
-`XfsTransaction::InvalidateMetadataBuffer`; compatibility with Linux remains
-unverified. The free-owner paths call the allocator's `InvalidateMetadata`
+The writer emits the Linux stale shape described in 4.1 through
+`XfsTransaction::InvalidateMetadataBuffer`. The real Linux kernel replays a
+Windows-written cancel image and `xfs_repair -n` accepts the result; the
+hosted runner kernel has no online scrub ioctl, which the qualification
+records as a skip. The free-owner paths call the allocator's `InvalidateMetadata`
 before releasing the block. Covered metadata
 includes bnobt/cntbt/rmapbt/refcountbt/inobt/finobt/bmbt blocks, directory
 data/leaf/node/free/block blocks, attr DA leaf/node blocks, inode chunks

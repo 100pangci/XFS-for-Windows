@@ -752,6 +752,81 @@ newer-metadata skip, cancellation, refusal before any write), the completion
 phases (EFI free + EFD + no double free after a second recovery, AGI unlinked
 freeing) and recovery restartability at every write (`FailAfterWrites`).
 
+## QUAL-2: Linux-derived buffer cancellation evidence
+
+Buffer cancellation (`XFS_BLF_CANCEL`) is qualified on real Linux output in
+both directions. The five jobs are:
+
+26. **linux-generate-buffer-cancel** (ubuntu-24.04, root): mounts a 512 MiB
+    rmapbt filesystem through a device-mapper snapshot origin, runs
+    `tests/tools/buffer_cancel_workload.py` (fragmented bmbt files, node-format
+    directory churn, inode-batch create/unlink), and takes atomic
+    `dm-snapshot` copies of the mounted origin while the deferred-free intents
+    pin the log tail. Every snapshot is probed with the independent raw-log
+    reader `tests/tools/cancel_probe.py`; a snapshot is kept only when its log
+    carries a cancel and the probe reports no encoding anomalies. Each fixture
+    is confirmed independently by `cancel_probe.py` and `xfs_logprint`
+    (`BUF: #regs:1 ... flags:0x2`) and by mounting a copy in the Linux kernel
+    (the kernel must replay it) with a silent `xfs_repair -n`; the manifest
+    records kernel, xfsprogs, mkfs options, superblock geometry and SHA-256.
+    The hosted runner kernel has no online scrub ioctl; `xfs_scrub -n` records
+    that specific skip instead of a pass. Any other scrub/repair complaint
+    fails the job.
+27. **windows-recover-linux-buffer-cancel** (windows-2022): for every fixture,
+    compares `xfswin journal --json` against `recovery_probe.py` and the
+    fixture's `xfs_logprint` output, requires `cancel_probe.py` to find at
+    least one cancel, then runs `xfswin recover --yes-i-really-mean-it` and
+    requires a clean journal, a passing `xfswin check` and a second oracle
+    match. Uploads the recovered images.
+28. **linux-verify-windows-buffer-cancel-recovery** (ubuntu-24.04, root):
+    requires the recovered image to have a clean log before mounting (the
+    kernel must not replay anything), mounts it read-write, runs `xfs_scrub -n`
+    when the kernel provides the ioctl, writes and reads back a canary file,
+    requires a clean unmount, and requires `xfs_repair -n` to be silent both
+    before and after the mount.
+29. **windows-generate-buffer-cancel** (windows-2022): `stateful_fuzz` writes a
+    dirty image that cancels the bmbt block of `/big` at a crash point; the
+    independent probe and `compare_logprint.py` confirm the encoding before
+    the image is uploaded.
+30. **linux-recover-windows-buffer-cancel** (ubuntu-24.04, root with reference
+    xfsprogs 7.2.0): replays the Windows image with the real kernel, requires
+    the cancel flag in `xfs_logprint`, a clean log after the kernel replay,
+    a silent `xfs_repair -n` and a clean unmount (scrub when available).
+
+The qualifying run at commit `2d3e69c` (capture kernel 7.0.0-1017-azure,
+xfsprogs 6.6.0; reference xfsprogs 7.2.0 for the Windows-image replay)
+captured three fixtures in five snapshots: `cancel-bmbt.img` (329 cancels),
+`cancel-dir.img` (279) and `cancel-inode.img` (4,270). `cancel_probe.py`
+reported zero anomalies for all of them, every item used the Linux stale
+encoding (`blf_size = 1`, one `20 + 4 * blf_map_size` region, zero map,
+`blf_map_size = ceil(len / 8)`), and the `xfs_logprint` cancel counts matched
+exactly. Windows recovered all three with every cancel reference consumed and
+a clean log; new owners after cancellation were replayed (`cancel-dir`: 10
+buffers, 672 inodes, 11 ICREATE clusters; `cancel-inode`: 48 buffers, 584
+inodes, 10 ICREATE clusters; `cancel-bmbt`: no post-cancel owner in that
+window), and Linux mounted the recovered images without a replay, with silent
+repair before and after. In the reverse direction Windows wrote a cancel item
+with the same Linux encoding and the Linux kernel replayed it, ending with a
+clean log, a passing canary and silent repair. `xfs_scrub -n` could not run on
+the hosted kernel because it has no online scrub ioctl; that skip is recorded
+in every scrub log and is not treated as a pass.
+
+Local equivalents (root; the Windows recovery script runs on Windows):
+
+```bash
+sudo bash tests/scripts/make_buffer_cancel_linux.sh buffer-cancel
+pwsh tests/scripts/verify_recovery_windows.ps1 -Exe build\src\RelWithDebInfo\xfswin.exe `
+    -WorkDir buffer-cancel -OutDir recovered-linux-cancel -RequireCancel
+sudo bash tests/scripts/verify_buffer_cancel_recovery_linux.sh recovered-linux-cancel
+sudo bash tests/scripts/verify_windows_buffer_cancel_linux.sh windows-cancel
+```
+
+The unit tests in `tests/unit/recovery_tests.cpp` pin the cancel table
+(refcounts across transactions), the stale encodings Linux cannot produce
+(payload region, buffer-type/inode bits, non-zero map, undefined flags,
+out-of-device range), reverse-log cancel order, the cancel -> reuse -> cancel
+-> reuse chain, and the writer's cancel/revive contract.
+
 ## RW-6A: modern inode features
 
 ### Unit tests (`tests/unit/rw6_tests.cpp`)

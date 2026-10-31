@@ -102,9 +102,11 @@ class XfsTransaction {
   // a write crossing the boundary is an error. A logged item for exactly the
   // same geometry is removed; any overlapping logged item/cancel with a
   // different geometry is an error because recovery's exact-key match would
-  // not skip it. The emitted cancel encoding is provisional: the exact Linux
-  // stale format region length and map_size have not been confirmed locally.
-  // It protects the exact address/length pair from older transactions.
+  // not skip it. The emitted item follows xfs_trans_binval(): blf_size 1,
+  // only the BFORMAT region with length offsetof(blf_data_map) +
+  // blf_map_size * 4, a zeroed map sized for the whole buffer, XFS_BLF_CANCEL
+  // and no inode/buffer-type flags. It protects the exact address/length pair
+  // from older transactions.
   // Callers must not invalidate file data or a remote xattr value: those are
   // direct-written and have no XFS_LI_BUF item to cancel.
   //

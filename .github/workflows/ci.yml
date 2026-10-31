@@ -769,6 +769,13 @@ jobs:
           path: build/src/${{ env.BUILD_CONFIG }}/xfswin.exe
           if-no-files-found: error
 
+      - name: Upload the stateful fuzz runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateful-fuzz-exe
+          path: build/tests/${{ env.BUILD_CONFIG }}/stateful_fuzz.exe
+          if-no-files-found: error
+
       - name: Upload Windows-formatted image
         uses: actions/upload-artifact@v4
         with:
@@ -2823,6 +2830,216 @@ jobs:
         run: |
           ls -l recovered-linux | head -40
           sudo bash tests/scripts/verify_recovery_linux.sh recovered-linux
+
+  # ===========================================================================
+  # QUAL-2: Linux-derived metadata buffer cancellation evidence.
+  #
+  # Linux generates real XFS_BLF_CANCEL dirty logs from a metadata-reuse
+  # workload (bmbt blocks, directory blocks, complete inode chunks).  Windows
+  # recovers them and Linux verifies the result with the kernel, xfs_scrub and
+  # xfs_repair.  In the other direction Windows writes a cancel item and the
+  # real Linux kernel replays it.  No job here lowers an oracle: every stage
+  # fails on any repair/scrub complaint.
+  # ===========================================================================
+
+  linux-generate-buffer-cancel:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Capture real Linux buffer-cancel logs
+        run: |
+          sudo bash tests/scripts/make_buffer_cancel_linux.sh buffer-cancel
+          ls -l buffer-cancel | head -60
+          cat buffer-cancel/summary.txt
+
+      - name: Upload the Linux buffer-cancel fixtures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-buffer-cancel-fixtures
+          path: buffer-cancel/
+          if-no-files-found: error
+
+  windows-recover-linux-buffer-cancel:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [linux-generate-buffer-cancel, windows-build-test]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-buffer-cancel-fixtures
+          path: buffer-cancel
+
+      - name: Recover the Linux cancel logs with xfswin
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_recovery_windows.ps1 `
+            -Exe "bin\xfswin.exe" `
+            -WorkDir "buffer-cancel" `
+            -OutDir "recovered-linux-buffer-cancel" `
+            -RequireCancel
+          if ($LASTEXITCODE -ne 0) { throw "Windows recovery of the Linux cancel logs failed" }
+
+      - name: Upload the Windows-recovered images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-linux-buffer-cancel
+          path: recovered-linux-buffer-cancel/
+          if-no-files-found: error
+
+  linux-verify-windows-buffer-cancel-recovery:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-recover-linux-buffer-cancel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovered-linux-buffer-cancel
+          path: recovered-linux-buffer-cancel
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Linux verifies the Windows recovery of Linux cancels
+        run: |
+          ls -l recovered-linux-buffer-cancel | head -40
+          sudo bash tests/scripts/verify_buffer_cancel_recovery_linux.sh \
+            recovered-linux-buffer-cancel
+
+      - name: Upload the verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffer-cancel-recovery-verification
+          path: |
+            recovered-linux-buffer-cancel/*.txt
+            recovered-linux-buffer-cancel/*.json
+          if-no-files-found: warn
+
+  windows-generate-buffer-cancel:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stateful-fuzz-exe
+          path: fuzz-bin
+
+      - name: Write a dirty image with a Windows buffer cancel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fuzz = "fuzz-bin\stateful_fuzz.exe"
+          $exe = "bin\xfswin.exe"
+          $python = "python"
+          New-Item -ItemType Directory -Force out | Out-Null
+          & $fuzz --seed 0x51 --steps 50 `
+            --image "out\cancel-bmbt.img" `
+            --trace "out\cancel-bmbt.trace.txt" `
+            --ops-file "tests\fixtures\qual2\bmbt_cancel.ops" `
+            --crash-op 50 --crash-point after_log_commit --crash-hit 1 --quiet
+          $crashExit = $LASTEXITCODE
+          if ($crashExit -ne 0x58435348) {
+            throw "stateful crash returned 0x$('{0:x}' -f $crashExit), expected 0x58435348"
+          }
+          & $python tests/tools/cancel_probe.py out\cancel-bmbt.img --json `
+            --require-cancel *> out\cancel-bmbt.cancel-probe.json
+          if ($LASTEXITCODE -ne 0) { throw "the Windows image has no valid cancel" }
+          & $python tests/tools/cancel_probe.py out\cancel-bmbt.img `
+            *> out\cancel-bmbt.cancel-probe.txt
+          & $exe journal out\cancel-bmbt.img --json *> out\cancel-bmbt.journal.json
+          if ($LASTEXITCODE -ne 0) { throw "xfswin journal failed" }
+          & $exe journal out\cancel-bmbt.img *> out\cancel-bmbt.journal.txt
+          & $python tests/tools/recovery_probe.py out\cancel-bmbt.img `
+            --compare out\cancel-bmbt.journal.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "the independent oracle disagrees with the Windows journal"
+          }
+
+      - name: Upload the Windows dirty cancel image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-buffer-cancel
+          path: out/
+          if-no-files-found: error
+
+  linux-recover-windows-buffer-cancel:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-generate-buffer-cancel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-buffer-cancel
+          path: windows-buffer-cancel
+
+      - name: Install the reference xfsprogs (modern Windows image features)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Show the Linux oracle versions
+        run: |
+          uname -a
+          command -v xfs_db xfs_repair xfs_scrub
+          /usr/local/sbin/xfs_db -V
+          /usr/local/sbin/xfs_repair -V
+
+      - name: The Linux kernel replays the Windows cancel log
+        run: |
+          ls -l windows-buffer-cancel
+          sudo env PATH="/usr/local/sbin:/usr/local/bin:$PATH" \
+            bash tests/scripts/verify_windows_buffer_cancel_linux.sh \
+            windows-buffer-cancel
+
+      - name: Upload the verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-buffer-cancel-verification
+          path: |
+            windows-buffer-cancel/*.txt
+            windows-buffer-cancel/*.json
+          if-no-files-found: warn
 
   # ===========================================================================
   # RW-6C: reflink / refcountbt / CoW qualification.
