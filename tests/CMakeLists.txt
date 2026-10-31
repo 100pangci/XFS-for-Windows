@@ -19,6 +19,7 @@ add_executable(xfs_tests
   unit/perf_tests.cpp
   unit/conc_tests.cpp
   unit/recovery_tests.cpp
+  unit/device_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )

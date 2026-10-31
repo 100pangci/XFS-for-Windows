@@ -185,7 +185,11 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Open(
   dev->info_.physical_sector_size = sector_size;
   dev->info_.writable = writable;
   dev->info_.is_raw_device = false;
+  dev->info_.device_class = DeviceClass::kImageFile;
+  dev->info_.cache_mode = DeviceCacheMode::kBuffered;
+  dev->info_.stable_id = "image:" + path.string();
   dev->info_.description = path.string();
+  dev->state_.store(DeviceState::kOpen);
   return dev;
 }
 
@@ -260,7 +264,11 @@ std::unique_ptr<ImageBlockDevice> ImageBlockDevice::Create(
   dev->info_.physical_sector_size = sector_size;
   dev->info_.writable = true;
   dev->info_.is_raw_device = false;
+  dev->info_.device_class = DeviceClass::kImageFile;
+  dev->info_.cache_mode = DeviceCacheMode::kBuffered;
+  dev->info_.stable_id = "image:" + path.string();
   dev->info_.description = path.string();
+  dev->state_.store(DeviceState::kOpen);
   return dev;
 }
 
@@ -326,6 +334,7 @@ bool ImageBlockDevice::Write(uint64_t offset, const void* buffer, size_t size) {
   std::shared_lock<xfs::conc::SharedMutex> lifecycle(lifecycle_mutex_);
   std::shared_lock<xfs::conc::SharedMutex> barrier(flush_barrier_);
   if (!info_.writable) {
+    last_error_kind_.store(DeviceErrorKind::kWriteProtected);
     SetError("image opened read-only");
     return false;
   }
@@ -432,6 +441,7 @@ void ImageBlockDevice::Close() {
     impl_->fd = -1;
   }
 #endif
+  state_.store(DeviceState::kClosed);
 }
 
 }  // namespace xfs

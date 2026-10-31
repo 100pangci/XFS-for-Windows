@@ -27,6 +27,11 @@ on:
         type: boolean
         required: false
         default: false
+      large_device:
+        description: Also run the >2 TiB expandable-VHD device qualification
+        type: boolean
+        required: false
+        default: false
       soak_steps:
         description: Operations per soak sequence
         required: false
@@ -551,6 +556,13 @@ jobs:
       - name: Unit and integration tests
         shell: pwsh
         run: ctest --test-dir build -C $env:BUILD_CONFIG --output-on-failure
+
+      - name: DEV-1 device policy and 64-bit I/O tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" --filter=device_
+          if ($LASTEXITCODE -ne 0) { throw "DEV-1 device tests failed" }
 
       - name: FUZZ-2 stateful sequences (Windows writer)
         shell: pwsh
@@ -2652,11 +2664,31 @@ jobs:
           sudo bash tests/scripts/verify_rw3_linux.sh rw3
 
       - name: Upload the reverse-interoperability image
+        id: upload-rw3-reverse
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: rw3-reverse
           path: rw3/reverse.img
           if-no-files-found: error
+
+      # Artifact storage occasionally resets the connection (ECONNRESET) even
+      # though the job itself succeeded. Retry once; downstream jobs need this
+      # artifact, so a second failure still fails the job.
+      - name: Retry the reverse-interoperability image upload
+        id: retry-rw3-reverse
+        if: steps.upload-rw3-reverse.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw3-reverse
+          path: rw3/reverse.img
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Fail if the reverse-interoperability image was not uploaded
+        if: steps.upload-rw3-reverse.outcome == 'failure' && steps.retry-rw3-reverse.outcome == 'failure'
+        run: exit 1
 
   # ---------------------------------------------------------------------------
   # Linux replays every RW-3 crash image: create, mkdir, unlink and rmdir at
@@ -2899,6 +2931,191 @@ jobs:
           head -c $((size - 512)) vhd/xfswin.vhd > rawdevice.img
           ls -l rawdevice.img
           sudo bash tests/scripts/verify_windows_image_linux.sh rawdevice.img
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: device qualification on a disposable fixed VHD, without WinFsp.
+  # Covers geometry/policy probes, the destructive self-test, the fault matrix,
+  # format through \\.\PhysicalDriveN and the post-format checks.
+  # ---------------------------------------------------------------------------
+  windows-vhd-device:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: Device qualification on a real (virtual) disk
+        shell: pwsh
+        env:
+          XFSWIN_DEVICE_TRACE: ${{ github.workspace }}\artifacts\device-trace.jsonl
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 512
+
+      - name: Upload the VHD and qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-vhd-device
+          path: |
+            vhd/dev1.vhd
+            artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: the same VHD through the real WinFsp mount path.  WinFsp is
+  # installed here because the main build job does not have the SDK.
+  # ---------------------------------------------------------------------------
+  windows-vhd-winfsp:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinFsp runtime and extract the SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+          $p = Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$PWD\sdk") -Wait -PassThru
+          "sdk extract exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "WinFsp SDK extraction failed with $($p.ExitCode)" }
+          if (-not (Test-Path "$PWD\sdk\DYNAMIC\inc\winfsp\winfsp.h")) {
+            throw "SDK layout unexpected: DYNAMIC/inc/winfsp/winfsp.h not found"
+          }
+
+      - name: Build with WinFsp support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_WINFSP_ROOT="$PWD\sdk\DYNAMIC"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config $env:BUILD_CONFIG
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Provide winfsp-x64.dll next to the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem 'C:\Program Files (x86)\WinFsp' -Recurse -Filter 'winfsp-x64.dll' |
+                 Select-Object -First 1
+          if (-not $dll) { throw "winfsp-x64.dll not found after installation" }
+          Copy-Item $dll.FullName "build\src\$env:BUILD_CONFIG\"
+
+      - name: WinFsp read-write qualification on a real (virtual) disk
+        shell: pwsh
+        env:
+          XFSWIN_DEVICE_TRACE: ${{ github.workspace }}\artifacts\device-trace.jsonl
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1-winfsp.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 512 -RequireWinFsp
+
+      - name: Upload the WinFsp VHD and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-vhd-winfsp
+          path: |
+            vhd/dev1-winfsp.vhd
+            artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: Linux is the external oracle for the image Windows produced through
+  # the real WinFsp path.  The chain is xfs_repair, an independent Python raw
+  # probe, a kernel mount with semantic checks, xfs_scrub, a clean unmount,
+  # xfs_logprint and a second xfs_repair.
+  # ---------------------------------------------------------------------------
+  linux-verify-windows-vhd:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-vhd-device, windows-vhd-winfsp]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev1-vhd-winfsp
+          path: dev1
+
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Run the Linux XFS oracle on the WinFsp VHD
+        run: |
+          sudo bash tests/scripts/verify_device_linux.sh \
+            dev1/vhd/dev1-winfsp.vhd dev1-linux-oracle
+
+      - name: Upload the Linux oracle artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-linux-oracle
+          path: dev1-linux-oracle/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: scheduled/manual >2 TiB device qualification.  An expandable VHD is
+  # sparse on the host, so the 3 TiB nominal disk does not need 3 TiB of runner
+  # disk.  This exercises the 64-bit offset path on a real Windows disk handle
+  # (the unit test covers the image backend).  The VHD itself is not uploaded.
+  # ---------------------------------------------------------------------------
+  windows-vhdx-large-device:
+    if: github.event_name == 'schedule' || github.event.inputs.large_device == 'true'
+    needs: windows-build-test
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: ">2 TiB device qualification (expandable VHD)"
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1-large.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 3145728 -VhdType expandable
+
+      - name: Upload the large-device artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-large-device-artifacts
+          path: artifacts/
+          if-no-files-found: error
 
   # ===========================================================================
   # RW-5: Windows-native journal recovery.

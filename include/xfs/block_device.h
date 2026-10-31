@@ -19,14 +19,30 @@
 #include <string>
 #include <utility>
 
+#include "xfs/device_policy.h"
+
 namespace xfs {
 
 struct DeviceInfo {
   uint64_t size_bytes = 0;
   uint32_t logical_sector_size = 512;
   uint32_t physical_sector_size = 512;
+  uint32_t alignment_offset = 0;
   bool writable = false;
   bool is_raw_device = false;
+  DeviceClass device_class = DeviceClass::kUnknown;
+  DeviceBusType bus_type = DeviceBusType::kUnknown;
+  DeviceCacheMode cache_mode = DeviceCacheMode::kBuffered;
+  bool removable_media = false;
+  bool offline = false;
+  bool read_only_media = false;
+  bool ownership_confirmed = false;
+  bool is_system_disk = false;
+  bool has_pagefile = false;
+  uint32_t disk_number = 0;
+  uint32_t partition_number = 0;
+  std::string stable_id;      // DeviceGuid or serial/model fallback
+  std::string serial_number;
   std::string description;  // path, model, or other human readable identity
 };
 
@@ -42,7 +58,11 @@ class BlockDevice {
   // device was opened read-only.
   virtual bool Write(uint64_t offset, const void* buffer, size_t size) = 0;
 
-  // Flushes pending writes to stable storage.
+  // Asks the backend to push pending writes to the device (a durability
+  // barrier). Success means the platform accepted the barrier request; it
+  // does not by itself prove that the device's own volatile cache survives a
+  // power loss. Backends document exactly what they can and cannot prove
+  // (see docs/WINDOWS_BLOCK_DEVICE.md).
   virtual bool Flush() = 0;
 
   // Total device size in bytes.
@@ -53,7 +73,19 @@ class BlockDevice {
 
   virtual const DeviceInfo& Info() const = 0;
 
-  // Releases the underlying handle. Safe to call multiple times.
+  // Explicit lifecycle state. A backend whose device disappeared reports
+  // kInvalid and must fail every later operation instead of reconnecting to a
+  // device that happens to reuse the same path or disk number.
+  virtual DeviceState State() const { return DeviceState::kOpen; }
+
+  // Classification of the most recent failure. A terminal kind means the
+  // handle must not be used again.
+  virtual DeviceErrorKind LastErrorKind() const {
+    return DeviceErrorKind::kNone;
+  }
+
+  // Releases the underlying handle. Safe to call multiple times. Waits for
+  // in-flight I/O and Flush before releasing the handle.
   virtual void Close() = 0;
 
   // Last backend error, for diagnostics. The value is copied under a lock:

@@ -705,6 +705,30 @@ Then the product-specific matrix runs:
 This is the environment-independent version of the Linux/WinFsp acceptance
 checks; see the jobs for the exact commands.
 
+### DEV-1 device qualification jobs
+
+DEV-1 adds three jobs next to the existing raw-device pair:
+
+* **windows-vhd-device** (windows-2022, Administrator): creates a fixed VHD,
+  attaches it, runs `device-info`/`device-check`, the destructive
+  `device-selftest`, the fault matrix (`write_fail`, `flush_fail`,
+  `invalidate_after` must fail; `write_short`, `read_short` must be completed),
+  formats through `\\.\PhysicalDriveN`, checks it and detaches it.
+* **windows-vhd-winfsp** (windows-2022, Administrator): installs WinFsp, builds
+  with the SDK, repeats the VHD qualification through the real WinFsp
+  read-write mount (create/write/rename/delete), requires a successful clean
+  unmount and verifies that detaching an open exclusive device is refused.
+* **linux-verify-windows-vhd** (ubuntu-24.04): runs
+  `tests/scripts/verify_device_linux.sh` on the WinFsp VHD: `xfs_repair -n`,
+  the independent Python raw-image probe, a kernel mount with semantic checks,
+  `xfs_scrub -n`, a clean unmount, `xfs_logprint` and a second
+  `xfs_repair -n`.
+
+The portable policy/geometry/lifecycle and >2 TiB image tests
+(`tests/unit/device_tests.cpp`) run in `windows-build-test` and in every Linux
+unit job.  Removable media and real fixed disks are manual qualifications; see
+`docs/WINDOWS_BLOCK_DEVICE.md`.
+
 ## RW-5: journal recovery
 
 The recovery milestone adds three independent verification layers on top of the
@@ -1117,3 +1141,24 @@ The measured baseline, ratios and remaining bottlenecks are recorded in
 All existing RW-0..RW-6E crash, recovery and Linux-oracle jobs remain hard
 gates. A performance change that weakens them is rejected even if the
 deterministic counters improve.
+
+## DEV-1 (Windows block device lifecycle)
+
+Portable tests (`--filter=device_`) cover:
+
+- geometry acceptance/rejection (512/512, 512/4096, 4096/4096, bad powers of
+  two, inconsistent alignment offsets, non-sector-multiple sizes);
+- overflow-safe request bounds and alignment arithmetic;
+- the write-eligibility matrix (image, virtual, removable, fixed, volume,
+  unknown; system/pagefile/offline/read-only; volume ownership);
+- Windows error classification and terminal-state rules;
+- cache-mode and fault-plan parsing;
+- `ImageBlockDevice` lifecycle (open/write/flush/read/close, repeated close,
+  write after close) and 64-bit offsets on a 3 TiB sparse image, including a
+  request straddling the 2 TiB boundary.
+
+Real-device evidence is produced by the three CI jobs above and recorded in
+`docs/DEV1_QUALIFICATION.md`.  That report is intentionally separate from the
+test matrix: passing unit tests does not prove Windows block-device semantics,
+and the report marks the current decision (NOT READY until the VHD/WinFsp and
+Linux oracle jobs have run).

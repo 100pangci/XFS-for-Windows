@@ -13,6 +13,7 @@
 //     pretending success.
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -46,6 +47,10 @@ class ImageBlockDevice final : public BlockDevice {
   uint64_t Size() const override { return info_.size_bytes; }
   uint32_t SectorSize() const override { return info_.logical_sector_size; }
   const DeviceInfo& Info() const override { return info_; }
+  DeviceState State() const override { return state_.load(); }
+  DeviceErrorKind LastErrorKind() const override {
+    return last_error_kind_.load();
+  }
   void Close() override;
 
  private:
@@ -62,6 +67,8 @@ class ImageBlockDevice final : public BlockDevice {
   mutable conc::SharedMutex flush_barrier_;
   DeviceInfo info_;
   std::filesystem::path path_;
+  std::atomic<DeviceState> state_{DeviceState::kClosed};
+  std::atomic<DeviceErrorKind> last_error_kind_{DeviceErrorKind::kNone};
 };
 
 }  // namespace xfs
