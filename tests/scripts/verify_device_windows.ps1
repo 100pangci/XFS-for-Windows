@@ -252,9 +252,13 @@ try {
     $results.steps['check-final'] = 0
 
     # -----------------------------------------------------------------------
-    # Detach while a handle is open.  The writable backend holds the disk
-    # exclusively, so Windows must refuse the detach; the point of the test is
-    # that nothing silently reconnects to a reused disk number.
+    # Detach while mounted.  Windows may either refuse the detach (the disk is
+    # still held through an exclusive handle) or allow it and invalidate the
+    # open handles; both are platform outcomes, and the observed Windows
+    # Server 2022 behavior is that diskpart detaches the VHD anyway.  What
+    # must hold in both cases is that the mount never hangs, never silently
+    # reconnects to a reused disk number and never reports a successful clean
+    # unmount after the device disappeared.
     # -----------------------------------------------------------------------
     if ($winfsp) {
         "== detach while mounted =="
@@ -281,11 +285,28 @@ detach vdisk
             $detachCode = $LASTEXITCODE
             $detachOutput | Tee-Object -FilePath (Join-Path $ArtifactDir 'detach-while-mounted.log')
             "detach exit code while mounted: $detachCode"
-            $results.steps['detach-while-mounted'] = $detachCode
-            Assert ($detachCode -ne 0) "Windows allowed detaching a disk with an open exclusive handle"
-            Assert (Test-Path "$MountPoint\") "the mount disappeared after the refused detach"
-            & $Xfswin unmount $MountPoint 2>&1 | Out-Null
-            Assert ($raceProc.WaitForExit(60000)) "race mount did not exit"
+            if ($detachCode -ne 0) {
+                # Refused: the mount must still be serving.
+                $results.steps['detach-while-mounted'] = 'refused'
+                Assert (Test-Path "$MountPoint\") "the mount disappeared after the refused detach"
+                $code = Invoke-Xfswin -Arguments @('unmount', $MountPoint) -LogName 'unmount-after-refused-detach'
+                Assert ($code -eq 0) "unmount after a refused detach failed: $code"
+                Assert ($raceProc.WaitForExit(60000)) "race mount did not exit after a clean unmount"
+                Assert ($raceProc.ExitCode -eq 0) "race mount reported a failed clean unmount: $($raceProc.ExitCode)"
+            } else {
+                # Detached: the mounted filesystem must observe a terminal
+                # device failure.  The unmount request must fail (the journal
+                # cannot be closed on a vanished device) and the mount host
+                # must exit instead of retrying forever.
+                $results.steps['detach-while-mounted'] = 'detached'
+                $code = Invoke-Xfswin -Arguments @('unmount', $MountPoint) -LogName 'unmount-after-detach'
+                Assert ($code -ne 0) "unmount after a successful detach reported success"
+                if (-not $raceProc.WaitForExit(60000)) {
+                    $raceProc.Kill()
+                    throw "the mount host hung after the device disappeared"
+                }
+                Assert ($raceProc.ExitCode -ne 0) "the mount host exited 0 after the device disappeared"
+            }
         } finally {
             if (-not $raceProc.HasExited) {
                 & $Xfswin unmount $MountPoint 2>&1 | Out-Null

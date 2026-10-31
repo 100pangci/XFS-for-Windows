@@ -239,7 +239,11 @@ drains everything.  See `docs/LOCKING.md`.
 5. formats the disk through `\\.\PhysicalDriveN`;
 6. mounts it read-write through real WinFsp, performs create/write/overwrite/
    rename/delete, unmounts and requires a successful clean unmount;
-7. verifies that a detach is refused while the exclusive handle is open;
+7. detaches the VHD while the mount is open.  Windows Server 2022 allows
+   this even with an exclusive handle; the script accepts either a refusal
+   (the mount must keep serving) or a successful detach (the mount must fail
+   explicitly, exit, and report the failed clean unmount, never hang or
+   reconnect);
 8. writes `dev1-results.json` and leaves the VHD for Linux.
 
 `tests/scripts/verify_device_linux.sh` then runs the external oracle:

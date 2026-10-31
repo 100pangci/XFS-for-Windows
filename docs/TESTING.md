@@ -717,7 +717,10 @@ DEV-1 adds three jobs next to the existing raw-device pair:
 * **windows-vhd-winfsp** (windows-2022, Administrator): installs WinFsp, builds
   with the SDK, repeats the VHD qualification through the real WinFsp
   read-write mount (create/write/rename/delete), requires a successful clean
-  unmount and verifies that detaching an open exclusive device is refused.
+  unmount and then detaches the VHD while a second mount is open.  Windows may
+  refuse the detach or allow it; either way the mount must not hang, must not
+  reconnect to a reused disk number and must not report a successful clean
+  unmount after the device disappeared.
 * **linux-verify-windows-vhd** (ubuntu-24.04): runs
   `tests/scripts/verify_device_linux.sh` on the WinFsp VHD: `xfs_repair -n`,
   the independent Python raw-image probe, a kernel mount with semantic checks,
