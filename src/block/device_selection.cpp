@@ -120,6 +120,7 @@ std::string FormatFilesystemMenuEntry(
     case LogState::kUnknown:
       out << "  [journal state unknown]";
       break;
+    case LogState::kEmpty:
     case LogState::kClean:
       break;
   }
