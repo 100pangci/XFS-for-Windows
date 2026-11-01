@@ -177,7 +177,7 @@ Optionally let a resident service do it whenever the media is inserted:
 
 ```powershell
 & $exe automount install
-& $exe automount enable 11111111-1111-4111-8111-111111111111 --drive=auto
+& $exe automount enable 11111111-1111-4111-8111-111111111111 --drive auto
 & $exe automount start
 ```
 

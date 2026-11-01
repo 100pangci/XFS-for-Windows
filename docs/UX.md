@@ -16,7 +16,7 @@ qualification boundary.
    ```powershell
    PS> xfswin mount
    XFS filesystems attached to this computer:
-     [1] UX1-SINGLE  384.00 MiB (381.02 MiB free)  virtual  UUID 11111111-...  \\.\PhysicalDriveN partition 1
+     [1] UX1-SINGLE  384.00 MiB (319.89 MiB free)  virtual  UUID 11111111-...  \\.\PhysicalDriveN partition 1
 
    Select a filesystem by number, UUID, or label: 1
    Drive letter [auto]:
@@ -31,7 +31,7 @@ qualification boundary.
 
    ```powershell
    PS> xfswin automount install
-   PS> xfswin automount enable 11111111-1111-4111-8111-111111111111 --drive=auto
+   PS> xfswin automount enable 11111111-1111-4111-8111-111111111111 --drive auto
    PS> xfswin automount start
    ```
 
@@ -69,9 +69,9 @@ logic is separated from console input/output and is unit tested.
 Everything except the legacy `xfswin mount <device> X:` form goes through one
 allocator:
 
-* automatic (`--drive=auto` or an empty answer) counts down from `Z:` and
+* automatic (`--drive auto` or an empty answer) counts down from `Z:` and
   chooses the first free letter;
-* an explicit `--drive=E:` is a preference, not an override: if `E:` is used
+* an explicit `--drive E:` is a preference, not an override: if `E:` is used
   by a volume, a network mapping, SUBST or another DOS mapping, `xfswin`
   mounts at the next free letter and prints
 
@@ -115,7 +115,7 @@ xfswin automount status
 xfswin automount stop
 xfswin automount uninstall
 
-xfswin automount enable <uuid|label|number> [--drive=E:|auto]
+xfswin automount enable <uuid|label|number> [--drive <E:|auto>]
 xfswin automount disable <uuid|label|number>
 xfswin status
 ```
@@ -177,7 +177,7 @@ read-write:
 
 ```powershell
 xfswin automount enable <uuid> --rw-experimental `
-    --device-write-qualification --drive=auto
+    --device-write-qualification --drive auto
 ```
 
 That command is refused unless the filesystem is attached, all three DEV-1
