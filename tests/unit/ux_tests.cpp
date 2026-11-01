@@ -17,6 +17,7 @@
 #include "xfs/automount_engine.h"
 #include "xfs/crc32c.h"
 #include "xfs/device_discovery.h"
+#include "xfs/device_selection.h"
 #include "xfs/drive_letter.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
@@ -1121,4 +1122,115 @@ TEST(ux_automount_config_loader_applies_changes) {
   CHECK(platform.sessions.empty());
   CHECK(engine.status().entries.front().state ==
         xfs::AutomountEntryState::kDisabled);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive selection: menu formatting and answer parsing without console IO.
+// ---------------------------------------------------------------------------
+
+TEST(ux_selection_menu_and_number_parsing) {
+  xfs::DiscoveryReport report;
+  const xfs::Uuid uuid = TestUuid(0x99);
+  xfs::DiscoveredFilesystem filesystem =
+      TestFilesystem(uuid, "USB1", 1, "SN1");
+  report.filesystems.push_back(filesystem);
+
+  const auto lines = xfs::FormatDeviceMenu(report);
+  CHECK_EQ(lines.size(), 1u);
+  CHECK(lines.front().find("USB1") != std::string::npos);
+  CHECK(lines.front().find(xfs::FormatUuid(uuid)) != std::string::npos);
+  CHECK(lines.front().find("removable") != std::string::npos);
+  CHECK(lines.front().find("free") != std::string::npos);
+  CHECK(lines.front().find("whole disk") != std::string::npos);
+
+  auto selected = xfs::SelectDiscoveredFilesystem("1", report.filesystems);
+  CHECK(selected.ok());
+  CHECK_EQ(selected.value(), 0u);
+  selected = xfs::SelectDiscoveredFilesystem(" #1 ", report.filesystems);
+  CHECK(selected.ok());
+  CHECK(!xfs::SelectDiscoveredFilesystem("0", report.filesystems).ok());
+  CHECK(!xfs::SelectDiscoveredFilesystem("2", report.filesystems).ok());
+  CHECK(!xfs::SelectDiscoveredFilesystem("", report.filesystems).ok());
+  CHECK(!xfs::SelectDiscoveredFilesystem("3x", report.filesystems).ok());
+
+  filesystem.xfswin_mounted = true;
+  filesystem.xfswin_drive = "E:";
+  CHECK(xfs::DescribeMountState(filesystem).find("mounted at E:") !=
+        std::string::npos);
+  report.filesystems.front() = filesystem;
+  CHECK(xfs::FormatDeviceMenu(report).front().find("mounted at E:") !=
+        std::string::npos);
+}
+
+TEST(ux_selection_accepts_uuid_and_unique_label) {
+  std::vector<xfs::DiscoveredFilesystem> filesystems;
+  const xfs::Uuid first = TestUuid(0xaa);
+  const xfs::Uuid second = TestUuid(0xbb);
+  filesystems.push_back(TestFilesystem(first, "alpha", 1, "SN1"));
+  filesystems.push_back(TestFilesystem(second, "beta", 2, "SN2"));
+
+  auto selected = xfs::SelectDiscoveredFilesystem("alpha", filesystems);
+  CHECK(selected.ok());
+  CHECK_EQ(selected.value(), 0u);
+  selected = xfs::SelectDiscoveredFilesystem("BETA", filesystems);
+  CHECK(selected.ok());
+  CHECK_EQ(selected.value(), 1u);
+  selected = xfs::SelectDiscoveredFilesystem(xfs::FormatUuid(second),
+                                             filesystems);
+  CHECK(selected.ok());
+  CHECK_EQ(selected.value(), 1u);
+  CHECK(!xfs::SelectDiscoveredFilesystem("gamma", filesystems).ok());
+
+  filesystems.push_back(TestFilesystem(TestUuid(0xcc), "alpha", 3, "SN3"));
+  auto ambiguous = xfs::SelectDiscoveredFilesystem("alpha", filesystems);
+  CHECK(!ambiguous.ok());
+  CHECK(ambiguous.error().message.find("more than one") != std::string::npos);
+}
+
+TEST(ux_selection_drive_answers) {
+  auto selection = xfs::ParseDriveSelection("");
+  CHECK(selection.ok());
+  CHECK(selection.value().automatic);
+  selection = xfs::ParseDriveSelection(" auto ");
+  CHECK(selection.ok());
+  CHECK(selection.value().automatic);
+
+  selection = xfs::ParseDriveSelection("E");
+  CHECK(selection.ok());
+  CHECK(!selection.value().automatic);
+  CHECK_STR_EQ(selection.value().drive, "E:");
+  selection = xfs::ParseDriveSelection("f:");
+  CHECK(selection.ok());
+  CHECK_STR_EQ(selection.value().drive, "F:");
+  selection = xfs::ParseDriveSelection("C:");
+  CHECK(selection.ok());
+
+  CHECK(!xfs::ParseDriveSelection("A:").ok());
+  CHECK(!xfs::ParseDriveSelection("B:").ok());
+  CHECK(!xfs::ParseDriveSelection("AA:").ok());
+  CHECK(!xfs::ParseDriveSelection("1").ok());
+}
+
+TEST(ux_selection_lists_rejected_xfs_candidates) {
+  xfs::DiscoveryReport report;
+  xfs::RejectedFilesystem rejected;
+  rejected.location.disk_number = 2;
+  rejected.location.disk_path = "\\\\.\\PhysicalDrive2";
+  rejected.location.partition_number = 1;
+  rejected.probe.state = xfs::XfsProbeState::kCorrupt;
+  rejected.probe.magic_seen = true;
+  rejected.probe.label = "BROKEN";
+  report.rejected.push_back(rejected);
+
+  xfs::RejectedFilesystem plain;
+  plain.probe.state = xfs::XfsProbeState::kNoXfs;
+  plain.probe.magic_seen = false;
+  report.rejected.push_back(plain);
+
+  const auto lines = xfs::FormatRejectedDevices(report);
+  CHECK_EQ(lines.size(), 1u);
+  CHECK(lines.front().find("[!]") != std::string::npos);
+  CHECK(lines.front().find("damaged") != std::string::npos);
+  CHECK(lines.front().find("BROKEN") != std::string::npos);
+  CHECK(lines.front().find("partition 1") != std::string::npos);
 }

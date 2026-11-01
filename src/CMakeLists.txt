@@ -42,6 +42,7 @@ add_library(xfs_core STATIC
   block/windows_volume.cpp
   block/device_discovery.cpp
   block/windows_device_discovery.cpp
+  block/device_selection.cpp
   block/windows_raw_device.cpp
   automount/automount_config.cpp
   automount/automount_engine.cpp
