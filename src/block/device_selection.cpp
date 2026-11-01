@@ -113,6 +113,16 @@ std::string FormatFilesystemMenuEntry(
       << DescribeFilesystemClass(filesystem.location) << "  UUID "
       << FormatUuid(filesystem.probe.superblock.uuid) << "  "
       << LocationName(filesystem.location);
+  switch (filesystem.probe.log_state) {
+    case LogState::kDirty:
+      out << "  [journal dirty]";
+      break;
+    case LogState::kUnknown:
+      out << "  [journal state unknown]";
+      break;
+    case LogState::kClean:
+      break;
+  }
   const std::string mount_state = DescribeMountState(filesystem);
   if (!mount_state.empty()) out << "  [" << mount_state << "]";
   return out.str();

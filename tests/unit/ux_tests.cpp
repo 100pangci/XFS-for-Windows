@@ -1142,6 +1142,18 @@ TEST(ux_selection_menu_and_number_parsing) {
   CHECK(lines.front().find("removable") != std::string::npos);
   CHECK(lines.front().find("free") != std::string::npos);
   CHECK(lines.front().find("whole disk") != std::string::npos);
+  CHECK(lines.front().find("journal") == std::string::npos);
+
+  filesystem.probe.log_state = xfs::LogState::kDirty;
+  report.filesystems.front() = filesystem;
+  CHECK(xfs::FormatDeviceMenu(report).front().find("[journal dirty]") !=
+        std::string::npos);
+  filesystem.probe.log_state = xfs::LogState::kUnknown;
+  report.filesystems.front() = filesystem;
+  CHECK(xfs::FormatDeviceMenu(report).front().find("journal state unknown") !=
+        std::string::npos);
+  filesystem.probe.log_state = xfs::LogState::kClean;
+  report.filesystems.front() = filesystem;
 
   auto selected = xfs::SelectDiscoveredFilesystem("1", report.filesystems);
   CHECK(selected.ok());
