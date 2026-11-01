@@ -43,6 +43,7 @@ add_library(xfs_core STATIC
   block/device_discovery.cpp
   block/windows_device_discovery.cpp
   block/windows_raw_device.cpp
+  automount/automount_config.cpp
   mkfs/geometry.cpp
   mkfs/ag_builder.cpp
   mkfs/inode_builder.cpp
