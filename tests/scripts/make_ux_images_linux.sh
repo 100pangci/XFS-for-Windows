@@ -132,7 +132,9 @@ sgdisk -n 1:2048:+655360 -t 1:8300 -c 1:UX1-NOT-XFS \
 write_at_mib "$WORK/raw/ext4.img" "$WORK/raw/no-xfs.disk" 1
 
 # multi-partition: XFS, ext4, XFS.  The ext4 partition must not be reported.
-gpt_disk "$WORK/raw/multi.disk" 832
+# 819 MiB = 13 * 63 MiB is an exact VHD CHS geometry; the CHS-derived size of
+# a fixed VHD then covers the whole image, including its backup GPT.
+gpt_disk "$WORK/raw/multi.disk" 819
 sgdisk -n 1:2048:+786432 -t 1:8300 -c 1:UX1-PART-A \
        -n 2:788480:+65536 -t 2:8300 -c 2:UX1-MIDDLE \
        -n 3:854016:+786432 -t 3:8300 -c 3:UX1-PART-B \
@@ -148,7 +150,9 @@ python3 "$TOOLS/ux_fixture_tools.py" unsupported-feature \
     "$WORK/raw/single.img" "$WORK/raw/unsupported.img"
 
 echo "== dirty journal (real Linux capture) =="
-SCENARIOS=create bash "$REPO/tests/scripts/make_dirty_logs_linux.sh" \
+# 384 MiB is also an exact VHD CHS geometry (780 cylinders of 16*63 sectors),
+# so the whole-disk filesystem ends exactly at the virtual disk size.
+SIZE_MB=384 SCENARIOS=create bash "$REPO/tests/scripts/make_dirty_logs_linux.sh" \
     "$WORK/dirty" >/dev/null
 cp --sparse=always "$WORK/dirty/create.img" "$WORK/raw/dirty.img"
 
