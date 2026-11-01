@@ -190,10 +190,14 @@ for file in "$OUT"/*.vhd "$OUT"/*.vhdx; do
     esac
     # A fixed VHD has no leading magic, so qemu's content probe reports "raw".
     # Naming the format is what makes qemu validate the footer, geometry and
-    # block table instead of treating the image as a raw file.
+    # block table instead of treating the image as a raw file.  qemu has no
+    # checker for the fixed VPC format; opening it validates the footer
+    # checksum and disk type.  VHDX does have a block-table checker.
     qemu-img info -f "$format" --output=json "$file" | python3 -c \
         'import json,sys; d=json.load(sys.stdin); assert d["format"] in ("vpc","vhdx"), d'
-    qemu-img check -f "$format" "$file" >/dev/null
+    if [ "$format" = vhdx ]; then
+        qemu-img check -f "$format" "$file" >/dev/null
+    fi
 done
 
 echo "== Linux XFS oracle on the pristine payloads =="
