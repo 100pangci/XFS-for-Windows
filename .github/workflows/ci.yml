@@ -973,7 +973,6 @@ jobs:
           name: rw-crash
           path: crash/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-2 round-trip images
         uses: actions/upload-artifact@v4
@@ -981,7 +980,6 @@ jobs:
           name: rw2-images
           path: rw2/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-2 crash images
         uses: actions/upload-artifact@v4
@@ -989,7 +987,6 @@ jobs:
           name: rw2-crash
           path: crash-rw2/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-3 round-trip images
         uses: actions/upload-artifact@v4
@@ -997,7 +994,6 @@ jobs:
           name: rw3-images
           path: rw3/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-3 crash images
         uses: actions/upload-artifact@v4
@@ -1005,7 +1001,6 @@ jobs:
           name: rw3-crash
           path: crash-rw3/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-4 round-trip images
         uses: actions/upload-artifact@v4
@@ -1013,7 +1008,6 @@ jobs:
           name: rw4-images
           path: rw4/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-4 crash images
         uses: actions/upload-artifact@v4
@@ -1021,7 +1015,6 @@ jobs:
           name: rw4-crash
           path: crash-rw4/
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload Windows-formatted image
         uses: actions/upload-artifact@v4
@@ -1029,7 +1022,6 @@ jobs:
           name: windows-image
           path: out/windows.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload stateful Windows images
         uses: actions/upload-artifact@v4
@@ -1037,7 +1029,6 @@ jobs:
           name: stateful-windows
           path: out/stateful-*
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload fixture image
         uses: actions/upload-artifact@v4
@@ -1045,7 +1036,6 @@ jobs:
           name: fixture-image
           path: out/fixture.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6A Windows-formatted image
         uses: actions/upload-artifact@v4
@@ -1053,7 +1043,6 @@ jobs:
           name: rw6-windows-formatted
           path: out/modern.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6A sparse-chunk fixture
         uses: actions/upload-artifact@v4
@@ -1061,7 +1050,6 @@ jobs:
           name: rw6-sparse-fixture
           path: out/rw6-sparse.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6B Windows-formatted rmapbt image
         uses: actions/upload-artifact@v4
@@ -1069,7 +1057,6 @@ jobs:
           name: rw6b-windows-rmap
           path: out/rw6b-rmap.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6C Windows-formatted reflink images
         uses: actions/upload-artifact@v4
@@ -1079,7 +1066,6 @@ jobs:
             out/rw6c-rmap.img
             out/rw6c-normap.img
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6D Windows xattr fixture
         uses: actions/upload-artifact@v4
@@ -1090,7 +1076,6 @@ jobs:
             out/rw6d-windows.img.manifest.json
             out/rw6d-windows.oracle.json
           if-no-files-found: error
-          compression-level: 0
 
       - name: Upload the RW-6E Windows parent fixtures
         uses: actions/upload-artifact@v4
@@ -1104,7 +1089,6 @@ jobs:
             out/rw6e-windows.img.manifest.json
             out/rw6e-windows.oracle.json
           if-no-files-found: error
-          compression-level: 0
 
   # ---------------------------------------------------------------------------
   # CONC-1 on Windows/MSVC: the same deterministic scheduler and stress
