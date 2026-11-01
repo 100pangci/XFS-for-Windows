@@ -1627,7 +1627,12 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
         }
         return disks;
       }
-      break;
+      // Disk numbers are not dense: removing a disk leaves a hole and the
+      // disks above it keep their numbers.  Stopping at the first number that
+      // cannot be opened would hide every disk after the hole, so a healthy
+      // mount on one of them would look removed.  Keep scanning; disk 0 is the
+      // only number whose absence means the whole enumeration is unusable.
+      continue;
     }
 
     RawDiskInfo info;
