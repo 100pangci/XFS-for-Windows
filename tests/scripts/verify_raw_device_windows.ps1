@@ -61,7 +61,7 @@ try {
     & $Xfswin list
 
     "== xfswin format $rawPath =="
-    & $Xfswin format $rawPath --yes-i-really-mean-it
+    & $Xfswin format $rawPath --yes-i-really-mean-it --device-write-qualification
     Assert ($LASTEXITCODE -eq 0) "format failed with $LASTEXITCODE"
 
     "== xfswin info =="
