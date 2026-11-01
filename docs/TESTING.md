@@ -596,9 +596,12 @@ Every push runs the portable build gates first:
 
 Then the product-specific matrix runs:
 
-1. **windows-build-test** (windows-2022): builds with MSVC, with the core
-   library held to warnings-as-errors (`/W4 /WX`), runs the full test
-   suite (including the journal, allocator, namespace and RW-4 tests), formats a
+1. **windows-build**, then **windows-build-test** (windows-2022): the build job
+   compiles with MSVC, with the core library held to warnings-as-errors
+   (`/W4 /WX`), and uploads `xfswin.exe`, `xfs_tests.exe` and
+   `stateful_fuzz.exe`; the test job downloads those binaries and runs the full
+   test suite (including the journal, allocator, namespace and RW-4 tests),
+   formats a
    300 MiB image, runs `xfswin check`, cross-checks the image with the
    independent Python probe, builds the fixture image (one allocated file) and
    probes it, exercises the CLI write path (`pwrite`, growth, truncate,
