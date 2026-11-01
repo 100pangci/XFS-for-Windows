@@ -1091,6 +1091,390 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # UX-1: build VHD/VHDX fixtures on Linux and verify them with the real
+  # xfsprogs/qemu tools.  Every fixture is a genuine filesystem image: a
+  # no-XFS disk, single XFS, multiple partitions, whole-disk XFS, corrupt
+  # superblock, unsupported feature, a real dirty journal, and two devices
+  # sharing a label.  The Windows jobs below consume this artifact and hash
+  # the files before and after discovery to prove discovery did not write.
+  # ---------------------------------------------------------------------------
+  linux-verify-ux-images:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs, gdisk, e2fsprogs and qemu-utils
+        run: |
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 \
+            xfsprogs gdisk e2fsprogs qemu-utils
+
+      - name: Generate the UX-1 fixtures
+        run: |
+          set -euo pipefail
+          sudo bash tests/scripts/make_ux_images_linux.sh "$PWD/ux-images"
+          ls -l ux-images
+
+      - name: Independently verify the fixture manifest
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('ux-images')
+          manifest = json.loads((root / 'ux-fixtures.json').read_text())
+          fixtures = {item['name']: item for item in manifest['fixtures']}
+          expected = {'single', 'no-xfs', 'multi-partition', 'whole-disk',
+                      'corrupt', 'unsupported', 'dirty', 'same-a', 'same-b'}
+          assert set(fixtures) == expected, sorted(fixtures)
+          assert {item['format'] for item in fixtures.values()} == {
+              'vhd', 'vhdx'}, {item['format'] for item in fixtures.values()}
+          assert fixtures['no-xfs']['expect'] == 'none'
+          assert fixtures['corrupt']['expect'] == 'corrupt'
+          assert fixtures['unsupported']['expect'] == 'unsupported'
+          assert fixtures['dirty']['partitions'][0]['journal'] == 'dirty'
+          assert fixtures['same-a']['partitions'][0]['label'] == \
+              fixtures['same-b']['partitions'][0]['label']
+          assert fixtures['same-a']['partitions'][0]['uuid'] != \
+              fixtures['same-b']['partitions'][0]['uuid']
+          for name, item in fixtures.items():
+              path = root / item['file']
+              assert path.is_file(), path
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              assert digest == item['sha256'], name
+          print('UX fixture manifest verified:', ', '.join(sorted(fixtures)))
+          PY
+
+      - name: Upload the fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-images
+          path: ux-images/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # UX-1: one WinFsp build shared by the interactive, Explorer and automount
+  # jobs.  Each consumer still installs the runtime; the artifact carries the
+  # executable and winfsp-x64.dll next to it.
+  # ---------------------------------------------------------------------------
+  windows-ux-build:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinFsp runtime and extract the SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+          $p = Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$PWD\sdk") -Wait -PassThru
+          "sdk extract exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "WinFsp SDK extraction failed with $($p.ExitCode)" }
+          if (-not (Test-Path "$PWD\sdk\DYNAMIC\inc\winfsp\winfsp.h")) {
+            throw "SDK layout unexpected: DYNAMIC/inc/winfsp/winfsp.h not found"
+          }
+
+      - name: Build with WinFsp support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_WINFSP_ROOT="$PWD\sdk\DYNAMIC"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config $env:BUILD_CONFIG
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Provide winfsp-x64.dll next to the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem 'C:\Program Files (x86)\WinFsp' -Recurse -Filter 'winfsp-x64.dll' |
+                 Select-Object -First 1
+          if (-not $dll) { throw "winfsp-x64.dll not found after installation" }
+          Copy-Item $dll.FullName "build\src\$env:BUILD_CONFIG\"
+
+      - name: Upload the WinFsp build
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfswin-winfsp
+          path: |
+            build/src/${{ env.BUILD_CONFIG }}/xfswin.exe
+            build/src/${{ env.BUILD_CONFIG }}/winfsp-x64.dll
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # UX-1: discovery against real attached VHD/VHDX media.  No WinFsp is
+  # needed: this job only exercises the read-only discovery path.
+  # ---------------------------------------------------------------------------
+  windows-device-discovery:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-build, linux-verify-ux-images]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: fixtures
+
+      - name: Discovery over the VHD/VHDX matrix
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_ux_discovery_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -FixtureDir "$PWD\fixtures" `
+            -ArtifactDir "$PWD\artifacts"
+
+      - name: Upload the discovery logs and fixture hashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-discovery-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # UX-1: interactive selection and console IO.  The injectable selection and
+  # drive-answer tests run first; then the real console prompts are driven
+  # through redirected stdin against a mounted XFS VHD.
+  # ---------------------------------------------------------------------------
+  windows-interactive-mount:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-build, windows-ux-build, linux-verify-ux-images]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-winfsp
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-tests
+          path: test-bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: fixtures
+
+      - name: Install the WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+
+      - name: Selection, drive-answer and console IO unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "test-bin\xfs_tests.exe" --filter=ux_selection
+          if ($LASTEXITCODE -ne 0) { throw "interactive selection tests failed" }
+          & "test-bin\xfs_tests.exe" --filter=ux_drive_letter
+          if ($LASTEXITCODE -ne 0) { throw "drive-letter allocator tests failed" }
+
+      - name: Interactive mount over a real XFS VHD
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_ux_interactive_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -FixtureDir "$PWD\fixtures" `
+            -ArtifactDir "$PWD\artifacts"
+
+      - name: Upload the interactive mount logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-interactive-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # UX-1: the automount event/debounce/retry state machine.  These sequences
+  # are injected (no USB, no service) and include removal/reinsertion, retry
+  # bounds, identity pins and one-failure-does-not-disturb-the-others.
+  # ---------------------------------------------------------------------------
+  windows-automount-events:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-tests
+          path: bin
+
+      - name: Injectable automount event sequences
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "bin\xfs_tests.exe" --filter=ux_automount
+          if ($LASTEXITCODE -ne 0) { throw "automount event tests failed" }
+
+      - name: UX-1 unit matrix (discovery, selection, drive letters, config)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "bin\xfs_tests.exe" --filter=ux_
+          if ($LASTEXITCODE -ne 0) { throw "UX-1 unit matrix failed" }
+
+  # ---------------------------------------------------------------------------
+  # UX-1: the real resident service and real device events on attached VHDs:
+  # install/start with a device already inserted, removal, immediate
+  # reinsertion, service restart, preferred-letter fallback, and two devices
+  # with the same label but different UUIDs.
+  # ---------------------------------------------------------------------------
+  windows-automount-vhd:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-ux-build, linux-verify-ux-images]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-winfsp
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: fixtures
+
+      - name: Install the WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+
+      - name: Automount service over real VHD insertion/removal
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_ux_automount_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -FixtureDir "$PWD\fixtures" `
+            -ArtifactDir "$PWD\artifacts"
+
+      - name: Service diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          sc.exe query XFSWinAutomount
+          Get-Service -Name XFSWinAutomount -ErrorAction SilentlyContinue | Format-List *
+          Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -match 'XFS|WinFsp' } |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message
+
+      - name: Upload the automount logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-automount-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # UX-1: what Explorer shows for a mounted XFS filesystem.  Capacity and free
+  # space must come from the XFS geometry/free-block count, the label from the
+  # XFS label, the serial from the XFS UUID, and the volume must be read-only.
+  # ---------------------------------------------------------------------------
+  windows-explorer-volume-info:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-ux-build, linux-verify-ux-images]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-winfsp
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: fixtures
+
+      - name: Install the WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+
+      - name: Win32 volume information for a mounted XFS VHD
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_ux_explorer_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -FixtureDir "$PWD\fixtures" `
+            -ArtifactDir "$PWD\artifacts"
+
+      - name: Upload the volume information
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-explorer-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
   # CONC-1 on Windows/MSVC: the same deterministic scheduler and stress
   # scenarios run on the portable core (no driver). The exported images are
   # judged again by Linux xfs_repair and a real kernel mount below.
