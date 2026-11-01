@@ -144,6 +144,8 @@ void PrintUsage() {
       "  --allow-removable-disk-write  additionally allow a removable disk\n"
       "  --device-cache-mode=<mode>    buffered | write-through | no-buffering |\n"
       "                                no-buffering-write-through\n"
+      "  Real-device writes require --device-write-qualification and the\n"
+      "  device-class opt-in in addition to the command's own options.\n"
       "  --help                        this message\n"
       "\n"
       "examples:\n"
@@ -346,18 +348,18 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
 }
 
 // Shared gate for the commands that mutate their target.  Image files need
-// only --rw-experimental.  A real device needs the same two opt-ins as a
-// writable mount, --rw-experimental and --device-write-qualification; the
-// device class policy (fixed/removable), the expected-identity pins, the
-// system/pagefile refusal and volume ownership are then enforced by the
-// backend when the device is opened.  Returning nonzero is a CLI exit code.
+// only --rw-experimental (recover uses its own confirmation instead).  A real
+// device needs --device-write-qualification; the class policy
+// (fixed/removable), the expected-identity pins, the system/pagefile refusal
+// and volume ownership are then enforced by the backend when the device is
+// opened.  Returning nonzero is a CLI exit code.
 int CheckRawWritableTarget(const std::string& target, const Options& options) {
   if (!IsRawDevicePath(target) || options.device_write_qualification) {
     return 0;
   }
   std::cerr
-      << "error: writable commands on a real device require both "
-         "--rw-experimental and --device-write-qualification.\n"
+      << "error: writable commands on a real device require "
+         "--device-write-qualification.\n"
          "       The class policy still applies: fixed disks need "
          "--allow-fixed-disk-write and removable disks need "
          "--allow-removable-disk-write.\n";
@@ -3268,9 +3270,10 @@ int Run(const std::vector<std::string>& args) {
   }
 
   // --rw is the eventual stable alias. The qualified writer is still opt-in
-  // as --rw-experimental; real disks stay read-only regardless.
+  // as --rw-experimental; a real device additionally needs
+  // --device-write-qualification and a device-class opt-in.
   if (explicit_rw) {
-    std::cerr << "error: --rw is not enabled yet as a stable alias. Use --rw-experimental for the qualified image-file writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices stay read-only in this version.\n";
+    std::cerr << "error: --rw is not enabled yet as a stable alias. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
     return 3;
   }
 
@@ -3598,14 +3601,16 @@ int Run(const std::vector<std::string>& args) {
   if (command == "selftest") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin selftest <device|image> "
-                   "[--rw-experimental]\n";
+                   "[--rw-experimental]\n"
+                   "       read-write selftest: image only; use device-selftest "
+                   "for a raw device\n";
       return 1;
     }
 #ifdef XFSWIN_HAS_WINFSP
     {
       if (options.rw_experimental && IsRawDevicePath(positional[1])) {
         std::cerr << "error: the read-write self-test is restricted to image "
-                     "files\n";
+                     "files; use device-selftest for a raw device\n";
         return 3;
       }
       std::string error;

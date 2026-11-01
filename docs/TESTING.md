@@ -200,8 +200,10 @@ python tests\tools\rw4_probe.py test.img --model model.json
 ```
 
 `pwrite`, `extend` and `truncate` perform the same core mutations the WinFsp
-callbacks do (image only, require `--rw-experimental`), so CI can verify writes
-against Linux oracles without the WinFsp driver. `pwrite` supports growth now;
+callbacks do (image files need `--rw-experimental`; a real device additionally
+needs `--device-write-qualification` and the device-class opt-in, then the
+raw-device policy applies), so CI can verify writes against Linux oracles
+without the WinFsp driver. `pwrite` supports growth now;
 `extend` writes the deterministic pattern `((offset * 131) + 7) & 0xFF` (or a
 `--fill=0xNN` constant) past EOF; `truncate` is `SetFileSize`. `create`,
 `mkdir`, `unlink` and `rmdir` are the RW-3 namespace mutations
@@ -725,10 +727,11 @@ DEV-1 adds three jobs next to the existing raw-device pair:
   reconnect to a reused disk number and must not report a successful clean
   unmount after the device disappeared.
 * **linux-verify-windows-vhd** (ubuntu-24.04): runs
-  `tests/scripts/verify_device_linux.sh` on the WinFsp VHD: `xfs_repair -n`,
-  the independent Python raw-image probe, a kernel mount with semantic checks,
-  `xfs_scrub -n`, a clean unmount, `xfs_logprint` and a second
-  `xfs_repair -n`.
+  `tests/scripts/verify_device_linux.sh` on the WinFsp VHD: the probe's
+  AG-packed log-decode selftest (a non-power-of-two AG vector that the VHD
+  geometry cannot distinguish), `xfs_repair -n`, the independent Python
+  raw-image probe, a kernel mount with semantic checks, `xfs_scrub -n`, a clean
+  unmount, `xfs_logprint` and a second `xfs_repair -n`.
 
 The portable policy/geometry/lifecycle and >2 TiB image tests
 (`tests/unit/device_tests.cpp`) run in `windows-build-test` and in every Linux

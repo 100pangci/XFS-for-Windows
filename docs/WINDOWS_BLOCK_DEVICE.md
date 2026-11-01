@@ -162,7 +162,7 @@ Tested sector combinations:
 
 | Logical | Physical | Status |
 | --- | --- | --- |
-| 512 | 512 | unit tests; VHD CI |
+| 512 | 512 | unit tests; VHD CI; DEV-1R real removable hardware (one device, 2026-11-01) |
 | 512 | 4096 (512e) | unit tests; VHD CI if the host reports it |
 | 4096 | 4096 (4Kn) | unit tests; VHDX 4Kn if Hyper-V is available |
 | other powers of two | >= logical | policy accepts after sanity checks; not claimed as hardware-tested |
@@ -287,6 +287,9 @@ before running the Linux script.
 Removable qualification is never part of normal PR CI. The prepared end-to-end
 procedure is `tests/scripts/qualify_removable_windows.ps1`; its evidence ledger
 is [`docs/DEV1_REMOVABLE_QUALIFICATION.md`](DEV1_REMOVABLE_QUALIFICATION.md).
+The 2026-11-01 run passed the Windows phases and the external Linux oracle on
+the one tested device; the claim does not extend to another removable device,
+UASP, 4Kn or media power-loss durability.
 The script requires elevated PowerShell 7, WinFsp, an explicit
 `-PhysicalDriveNumber`, expected size and expected serial. It is currently pinned
 to the confirmed `PhysicalDrive2` candidate and never selects a replacement disk.

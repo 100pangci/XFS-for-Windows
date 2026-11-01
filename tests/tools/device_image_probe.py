@@ -11,6 +11,7 @@ chain after xfs_repair/xfs_db and before the kernel mount, so a bug shared
 between the Windows writer and the Linux tools is less likely to go unnoticed.
 
 usage: device_image_probe.py <image> [--expect-marker <text>]
+       device_image_probe.py --selftest
 
 exit code 0 = all checks passed.
 """
@@ -83,10 +84,75 @@ def read_at(f, offset, size):
     return data
 
 
+def decode_log_fsblock(logstart, agblklog, agblocks, agcount, logblocks,
+                       block_size):
+    """Return (byte_offset, agno, agbno) for an internal-log fsblock.
+
+    sb_logstart is an fsblock number, and fsblock numbers pack the AG number
+    in the high bits: fsb = (agno << agblklog) | agbno.  AGs are physically
+    contiguous, so the byte offset is (agno * agblocks + agbno) * block_size,
+    not logstart * block_size.  See docs/DESIGN.md.
+    """
+    log_agno = logstart >> agblklog
+    log_agbno = logstart & ((1 << agblklog) - 1)
+    assert log_agno < agcount, (
+        f"log AG {log_agno} is outside the filesystem ({agcount} AGs)")
+    assert log_agbno + logblocks <= agblocks, (
+        f"log ({logblocks} blocks at agbno {log_agbno}) does not fit in "
+        f"AG {log_agno} ({agblocks} blocks)")
+    return ((log_agno * agblocks + log_agbno) * block_size,
+            log_agno, log_agbno)
+
+
+def selftest():
+    """Exercise the AG-packed log decode with a non-power-of-two AG size.
+
+    The tested removable device has agblocks=3916040 and agblklog=22, so the
+    old logstart * block_size formula and the correct AG-packed formula give
+    different offsets.  The DEV-1 VHD uses a power-of-two AG size, where the
+    two formulas coincide; this vector is the regression guard.
+    """
+    agblklog = 22
+    agblocks = 3916040
+    agcount = 4
+    logstart = (2 << agblklog) | 5   # AG 2, block 5: fsb 8388613
+    logblocks = 16384
+    block_size = 4096
+
+    offset, agno, agbno = decode_log_fsblock(
+        logstart, agblklog, agblocks, agcount, logblocks, block_size)
+    assert (agno, agbno) == (2, 5), f"decoded AG/block {(agno, agbno)}"
+    expected = (2 * agblocks + 5) * block_size
+    assert offset == expected, f"offset {offset} != {expected}"
+    assert offset != logstart * block_size, (
+        "the self-test vector must distinguish the AG-packed formula from "
+        "logstart * block_size")
+
+    bad_cases = [
+        # AG number outside the filesystem.
+        (agcount << agblklog, agblklog, agblocks, agcount),
+        # Log extent runs past the end of its AG.
+        ((1 << agblklog) | agblocks, agblklog, agblocks, agcount),
+    ]
+    for case in bad_cases:
+        try:
+            decode_log_fsblock(case[0], case[1], case[2], case[3],
+                               logblocks, block_size)
+        except AssertionError:
+            continue
+        raise AssertionError(f"out-of-range log fsblock accepted: {case}")
+
+    print("device image probe selftest OK: AG 2, block 5, "
+          f"offset {offset}, old formula {logstart * block_size}")
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
+    if argv[1] == "--selftest":
+        selftest()
+        return 0
     path = argv[1]
     marker = None
     if len(argv) >= 4 and argv[2] == "--expect-marker":
@@ -130,18 +196,10 @@ def main(argv):
         assert agblocks <= (1 << agblklog), "agblocks does not fit agblklog"
         assert rootino != 0, "zero root inode"
         assert logblocks >= 512 and logblocks <= dblocks, "bad log size"
-        # sb_logstart is an fsblock number, and fsblock numbers pack the AG
-        # number in the high bits and the AG block number in the low bits:
-        # fsb = (agno << agblklog) | agbno.  AGs are physically contiguous, so
-        # the byte offset is (agno * agblocks + agbno) << blocklog, not
-        # logstart << blocklog.  See docs/DESIGN.md.
-        log_agno = logstart >> agblklog
-        log_agbno = logstart & ((1 << agblklog) - 1)
-        assert log_agno < agcount, (
-            f"log AG {log_agno} is outside the filesystem ({agcount} AGs)")
-        assert log_agbno + logblocks <= agblocks, (
-            f"log ({logblocks} blocks at agbno {log_agbno}) does not fit in "
-            f"AG {log_agno} ({agblocks} blocks)")
+        # sb_logstart is an fsblock number; decode the AG number from the
+        # high bits before converting to a physical byte offset.
+        log_byte, log_agno, log_agbno = decode_log_fsblock(
+            logstart, agblklog, agblocks, agcount, logblocks, block_size)
         assert any(uuid), "zero uuid"
         assert file_size >= dblocks * block_size, \
             f"image is shorter than sb_dblocks ({file_size} < {dblocks * block_size})"
@@ -167,7 +225,6 @@ def main(argv):
             check_crc(agfl, AGFL_CRC_OFF, f"AG {agno} AGFL")
 
         # Journal: the first log record header must be recognizable.
-        log_byte = (log_agno * agblocks + log_agbno) * block_size
         header = read_at(f, log_byte, 512)
         assert be32(header, 0) == XLOG_MAGIC, "bad log record magic"
         h_size = be32(header, 12)

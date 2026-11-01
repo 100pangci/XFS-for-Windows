@@ -132,11 +132,15 @@ Further preparation findings, all fixed before the hardware result is claimed:
 * The CLI namespace, xattr, reflink, pwrite, extend, truncate, fallocate,
   convert-unwritten and recover commands still had a blanket image-file
   refusal from before the device-qualification work, so the WinFsp phase's CLI
-  fallback could not run on the device.  They now share the writable mount's
-  gate: `--rw-experimental` plus `--device-write-qualification`, after which
-  the device class policy, the expected-identity pins, the system/pagefile
-  refusal and volume ownership decide whether the disk may be written.  A raw
-  target without the qualification opt-in is still refused before any I/O.
+  fallback could not run on the device.  They now accept a qualified real
+  device through the shared raw-device gate: each requires
+  `--device-write-qualification`; the file-mutating commands also require
+  `--rw-experimental`, while `recover` keeps its `--yes-i-really-mean-it`
+  confirmation.  The device class policy, the expected-identity pins, the
+  system/pagefile refusal and volume ownership then decide whether the disk
+  may be written.  A raw target without the qualification opt-in is still
+  refused before any I/O.  `selftest --rw-experimental` remains image-only by
+  design; raw-device destructive testing uses `device-selftest`.
 * The CoW `pwrite` step passed `'--from=' + $overlay` inside a PowerShell array
   literal.  The comma operator binds tighter than `+`, so the CLI received
   `--from=` and the path as two positional arguments and printed its usage
@@ -166,7 +170,10 @@ Further preparation findings, all fixed before the hardware result is claimed:
   AG number in the high bits (`(agno << agblklog) | agbno`) while AGs are
   physically contiguous. The probe now decodes the AG block, verifies that the
   log fits inside its AG, and reads the header at
-  `(agno * agblocks + agbno) * block_size`.
+  `(agno * agblocks + agbno) * block_size`. A fixed-vector `--selftest` with a
+  non-power-of-two AG size now guards the decode in the CI Linux oracle; the
+  VHD geometry is a power of two, where the old formula would produce the same
+  offset and the regression would otherwise pass.
 * The mounted semantic probe treated `xattr_roundtrip` as an attribute to create
   and required it to be absent, while the Windows phase deliberately leaves that
   attribute set for Linux to read back. The probe now requires the attribute to
@@ -211,11 +218,17 @@ records the handoff only; it does not connect to Linux or execute Linux tools.
 The preflight compares default removable-write refusal with the explicit
 removable opt-in. The raw phase then runs `device-selftest`, including aligned
 and unaligned I/O, middle- and last-sector cases, bounds and flush ordering.
-The self-test writes test patterns and restores the sectors it touched. The
-fault matrix requires injected write, flush and invalidation failures to be
-reported, and short transfers to be completed. Each cache mode (`buffered`,
+The run also exercised the concurrency matrix (3 rounds of Read+Read,
+Read+Write, Write+Write and Write+Flush, plus Read/Write/Flush+Close pairs
+against the scratch region) with 0 failures, ending in the Closed state. The
+self-test writes test patterns and restores the sectors it touched. The fault
+matrix requires injected write, flush and invalidation failures to be reported,
+and short transfers to be completed. Each cache mode (`buffered`,
 `write-through`, `no-buffering` and `no-buffering-write-through`) is recorded
-and exercised.
+and exercised with the full self-test, including the concurrency matrix. The
+fault-injection matrix does not set a cache mode, so injected short-transfer
+recovery was exercised in the default no-buffering mode only; this ledger makes
+no per-cache-mode fault-injection claim.
 
 The format phase writes an XFS v5 filesystem with reflink enabled to the whole
 device, then checks the filesystem and verifies its root directory. Treat this
@@ -253,7 +266,11 @@ For each scenario, the script requires a terminal invalid device trace, no reope
 of the raw path after invalidation, a released mount point, and no successful
 clean-unmount report after removal. It then waits for the same expected serial
 and capacity at the pinned disk number; it never follows a newly assigned disk
-number. On reinsertion it mounts read-only and checks the journal and filesystem.
+number. All four reinsertions in this run were observed at Windows disk 2. That
+is a run observation, not an interface guarantee: Windows assigns disk numbers
+dynamically, and the authorization basis is the fresh handle plus the
+serial/stable-id/size pins. The old device instance stays `Invalid`. On
+reinsertion the script mounts read-only and checks the journal and filesystem.
 If a dirty journal is observed, the script attempts the explicit raw recovery
 phase and verifies the journal and filesystem again. A failed unplug/reinsert
 scenario or a failed identity check is recorded as a failure, with artifacts
@@ -262,6 +279,30 @@ retained.
 Removing a device during writes is an error-path and lifecycle test. It is not
 a media power-loss test and does not establish that acknowledged writes survive
 power loss.
+
+### Observed removal errors (2026-11-01 run)
+
+The table records only values present in this run's artifacts. The workload's
+client-side error, the raw-device trace and the mount host report are separate
+observations. `error 0` in a raw trace row means the trace did not retain a
+Win32 error code; it is not an observation that Windows returned zero.
+
+| Scenario | Workload operation / reported error | First failing raw operation and trace error | Mount host terminal report | Backend classification and final state | Journal on reinsertion |
+|---|---|---|---|---|---|
+| `idle` | `FlushFileBuffers` on the mounted file handle: Win32 `1117` (`ERROR_IO_DEVICE`) | `flush`; trace error `55` (`ERROR_DEV_NOT_EXIST`) | `FlushFileBuffers failed (error 55: ...)`; then terminal removal | `device-removed` (terminal); `invalid` -> `closed`; no reopen | dirty; explicit raw recovery -> clean |
+| `read` | `Read` on the mounted file: `OperationCanceledException` (HRESULT `-2146233087`); no Win32 code reported | `read`; trace error field `0`; **exact Win32 error code was not retained** | `block device failed terminally (device-removed)`; no numeric code | `device-removed` (terminal); `invalid` -> `closed`; no reopen | clean |
+| `write` | `Write` on the mounted file: `OperationCanceledException` (HRESULT `-2146233087`); no Win32 code reported | `write`; trace error field `0`; **exact Win32 error code was not retained** | `block device failed terminally (device-removed)`; no numeric code | `device-removed` (terminal); `invalid` -> `closed`; no reopen | clean |
+| `flush` | `Flush` on the mounted file: `OperationCanceledException` (HRESULT `-2146233087`); no Win32 code reported | `flush`; trace error `55` (`ERROR_DEV_NOT_EXIST`) | `FlushFileBuffers failed (error 55: ...)`; then terminal removal | `device-removed` (terminal); `invalid` -> `closed`; no reopen | clean |
+
+For all four scenarios the mount host exited `1`, `opens_after_invalid` was `0`,
+and the last trace event was a successful `close` in state `closed`. The
+reinsertion probes matched the expected serial and size at the pinned disk
+number, and the read-only mount, journal and filesystem checks passed. The
+`read` and `write` scenarios also contain later failing reads or flushes with
+trace error `0`; those belong to the unmount path after the first failure.
+Because this build's raw trace records error `0` for `Read`/`Write` failures
+(`Flush` records the real code), the exact Win32 codes for those two scenarios
+cannot be recovered from the qualification artifacts. No code is guessed here.
 
 ## 4. Linux XFS oracle
 
@@ -331,7 +372,10 @@ full USB product string while Linux often exposes a truncated SCSI product id.
 Windows reads the disk's SCSI VPD serial, while Linux usb-storage typically
 exposes only the USB iSerial.  The manifest records both forms
 (`identity.serial` and `identity.usb_serial`), and the preflight accepts the
-observed Linux serial only when it equals one of them exactly.
+observed Linux serial only when it equals one of them exactly. The schema-v1
+validator also pins the qualified device's serial, model and capacity, so a
+manifest produced by another device is refused at validation. That is part of
+the one-device scope, not a generic multi-device schema.
 
 The Linux oracle was run on 2026-11-01 against the candidate attached to the
 Fedora VM as `/dev/sda`. The semantic manifest was transferred byte-for-byte
@@ -342,6 +386,14 @@ probe, the Linux mutation pass, `xfs_scrub -n` (exit 0, not skipped), a clean
 unmount, `xfs_logprint`, and the second `xfs_repair -n`. The verifier's
 `result.json` records `status: passed` and `exit_code: 0`.
 
+The operational run record's `linux_oracle.status` remains
+`pending-external-linux-oracle`: the Windows script writes that field at the
+handoff and does not edit it afterwards. The passed Linux result is the
+external verifier's `linux-oracle-rerun2/result.json` (`status: passed`,
+`exit_code: 0`), not a change to the Windows run record. Both files are
+archived with the run; the handoff field and the oracle result are distinct
+records.
+
 ## 5. Results ledger
 
 Rows below are backed by the 2026-11-01 run. The Windows artifacts are in
@@ -351,13 +403,25 @@ Linux artifacts pulled from the VM are in its `linux-oracle-rerun2\`
 subdirectory; the VM's original directory is
 `/home/ywpc/xfswin-dev1r/artifacts-rerun2`.
 
+Run provenance: the Windows run used
+`build-winfsp\src\RelWithDebInfo\xfswin.exe` (`xfswin 0.1.0`), built before
+the run; the production device-policy, raw-I/O, lifecycle and write-gate
+sources were last modified before that build. The qualification script was
+edited after the run completed, and the run manifest does not record a script
+hash. The archived command lines and marker assertions show the current
+script's checks were active, but the exact run-time script text cannot be
+cryptographically pinned. Final PR HEAD changes only documentation, comments,
+CLI diagnostic text and test/tooling after that binary; it does not change
+device behavior, so the hardware result applies to the device path in final
+HEAD.
+
 ### Windows
 
 | Evidence | Result | Artifact / notes |
 |---|---|---|
 | Fresh identity, geometry, removable class and safety gates | Passed | `manifest.json` `target` and `geometry`: disk 2, serial `AA00000000000489`, 512/512-byte sectors, USB, removable, not system/boot, no pagefile |
 | Default policy refusal and explicit removable opt-in | Passed | `policy`: default `refused-removable-disk` (exit 2); opt-in `eligible` (exit 0); fixed-disk policy unchanged |
-| `device-selftest`, sector restoration and trace | Passed | `raw_selftest`: aligned, unaligned, middle-sector, last-sector, out-of-range, ordering and restore markers all true; 103 trace events |
+| `device-selftest`, sector restoration, concurrency and trace | Passed | `raw_selftest`: aligned, unaligned, middle-sector, last-sector, out-of-range, ordering and restore markers all true; 103 trace events; 3 concurrency rounds with 0 failures and all close pairs ending Closed |
 | Fault matrix (`write_fail`, `flush_fail`, `invalidate_after`, short transfers) | Passed | `fault_matrix`: injected failures exited nonzero; `write_short` and `read_short` completed with their markers |
 | Four cache modes | Passed | `cache_modes`: `buffered`, `write-through`, `no-buffering`, `no-buffering-write-through`, all exit 0 with full selftest coverage |
 | Whole-device format, `info`, `check` and root listing | Passed | `post_format`: `info` and `check` exit 0 |

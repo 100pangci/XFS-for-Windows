@@ -154,8 +154,10 @@ struct DeviceOpenPolicy {
   // Optional identity pin for destructive qualification runs.  An empty string
   // or a zero size means "not specified".  The backend compares these values
   // with the freshly probed device before it locks any volume or writes a
-  // byte, so a device that re-enumerated into the same disk number can never
-  // inherit the previous target's authorization.
+  // byte, so a device that re-enumerated into the same disk number cannot
+  // inherit the previous target's authorization.  This guarantee requires a
+  // real serial or a DeviceGuid-derived stable id; the model/disk-number
+  // fallback stable id is diagnostic only and must not be the sole pin.
   std::string expected_serial;
   std::string expected_stable_id;
   uint64_t expected_size_bytes = 0;

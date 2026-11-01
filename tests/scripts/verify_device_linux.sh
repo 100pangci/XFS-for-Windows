@@ -57,6 +57,8 @@ if grep -qiE 'corruption|fatal|would fix' "$artifacts/xfs-repair-before.log"; th
 fi
 
 echo "== 2. independent Python raw-image oracle =="
+python3 "$repo_root/tests/tools/device_image_probe.py" --selftest \
+    2>&1 | tee "$artifacts/device-image-probe-selftest.log"
 python3 "$repo_root/tests/tools/device_image_probe.py" "$img" \
     --expect-marker "hello from xfswin dev1" \
     2>&1 | tee "$artifacts/device-image-probe.log"

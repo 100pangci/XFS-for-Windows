@@ -68,7 +68,7 @@ artifact is marked "not run".
 | `Read`/`Write`/`Flush` read `Impl::handle` before taking the lifecycle lock (data race with `Close`) | all handle reads happen under the lifecycle lock |
 | A negative `DiskSize`/length from a driver was cast to a huge `uint64_t` | non-positive capacities are rejected before conversion |
 | `VolumeOwnershipConfirmed()` read a plain `bool` without the ownership mutex | the flag is atomic |
-| `FSCTL_IS_VOLUME_MOUNTED` failure was always read as "dismounted" | only `FALSE` + `ERROR_NOT_READY` proves the dismount; other errors refuse ownership |
+| `FSCTL_IS_VOLUME_MOUNTED` failure was always read as "dismounted" | only `FALSE` + `ERROR_NOT_READY` proves the dismount; other errors refuse ownership. DEV-1R additionally accepts `FALSE` + `ERROR_INVALID_PARAMETER` on a RAW volume only when the pre-dismount query already reported no mounted filesystem |
 | A terminal device failure left the WinFsp mount alive | the adapter latches the failure, fails the callback, and signals the stop event so the unmount path runs |
 | Directory enumeration skipped unreadable inodes even after the device failed, returning success | a dead device aborts the enumeration with an I/O error |
 | `BlockDevice::Flush()` promised "stable storage" unconditionally | the interface now documents the API barrier, not media power-loss durability |

@@ -364,8 +364,10 @@ tree-collapse/namespace stress coverage remain separate qualification gates.
 
 * The exchange-range **operation** (XMI/XMD) is not implemented; a log that
   contains one is refused before writes.
-* PhysicalDrive mounted read-write remains unqualified; experimental RW stays
-  image-file-only.
+* A fixed physical PhysicalDrive mounted read-write remains unqualified.
+  One removable USB device passed the manual DEV-1R qualification (USB BOT,
+  512/512-byte sectors); other removable devices and all fixed physical disks
+  remain refused by default.
 * Quotas, realtime devices, external logs, metadir and zoned filesystems remain
   outside the writable profile.
 * Ordinary logged-xattr ATTRI/ATTRD capture (`docs/XATTR.md` row 6) still

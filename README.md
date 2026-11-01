@@ -10,9 +10,12 @@ path are C++20 in this repository; Linux and xfsprogs are used as external
 oracles in CI, not as runtime dependencies.
 
 > **Experimental read-write.** Image-file read-write is qualified in CI for the
-> documented profile. `\\.\PhysicalDriveN` mounted read-write is **not yet
-> qualified**; real disks are read + format only. Do not point the experimental
-> writer at a disk that holds data you care about.
+> documented profile. A physical removable USB disk mounted read-write passed
+> the manual DEV-1R qualification on **one tested device only** (Samsung Flash
+> Drive, USB BOT, 512/512-byte sectors). A fixed physical
+> `\\.\PhysicalDriveN` mounted read-write is **not qualified**: fixed disks stay
+> read + format only, 4Kn and UASP were not tested. Do not point the
+> experimental writer at a disk that holds data you care about.
 
 ## What it is
 
@@ -63,7 +66,7 @@ Three terms are used consistently below:
 
 | Term | Meaning |
 |---|---|
-| **Supported** | Read/write/recovery is exercised by CI against the tested profile; still image-file-only for RW. |
+| **Supported** | Read/write/recovery is exercised by CI against the tested image-file profile; physical devices are not part of that profile. One removable USB device has separate manual DEV-1R read-write evidence. |
 | **Experimental** | Implemented and tested locally/CI, but the API or on-disk workload is not yet part of the ordinary supported profile. |
 | **Unsupported / refused** | The reader may still open it, but a writable mount fails before the first write with the blocking feature named. |
 
@@ -356,9 +359,12 @@ single owner of each filesystem invariant.
 
 ## Current limitations
 
-* **Experimental raw-device writes.** PhysicalDrive mounted read-write is not
-  qualified. It is refused by default and reachable only through the explicit
-  device-write qualification opt-ins plus the device class opt-in.
+* **Experimental raw-device writes.** A physical fixed disk mounted read-write
+  is not qualified. It is refused by default and reachable only through the
+  explicit device-write qualification opt-ins plus the device-class opt-in.
+  The removable path has one-device DEV-1R evidence (Samsung Flash Drive, USB
+  BOT, 512/512-byte sectors, 2026-11-01); other removable devices, fixed
+  physical disks, UASP, 4Kn and media power-loss durability remain unqualified.
 * **No quotas, realtime devices, external logs, metadir or zoned filesystems**
   for writing. These remain readable where the parser supports them.
 * **No exchange-range operation.** The feature bit is accepted; XMI/XMD log
