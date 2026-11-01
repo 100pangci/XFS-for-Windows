@@ -113,29 +113,47 @@ function Wait-ServiceState([string]$Needle, [int]$TimeoutSeconds = 60) {
 
 # Touch the mounted drive from a disposable child process. A blocked WinFsp
 # request cannot be cancelled from the test process itself, so give every
-# attempt its own process that can be killed.
+# attempt its own process that can be killed. The probe runs in cmd.exe:
+# PowerShell's Join-Path/Test-Path resolve through a PSDrive snapshot taken at
+# process start, so a drive letter mounted afterwards (and by another session)
+# can be missed; the Win32 "if exist" check goes straight to the volume.
 function Test-DriveServable([string]$Drive, [int]$TimeoutSeconds = 20) {
-    $probeScript = Join-Path $script:UxTempDir 'ux-drive-probe.ps1'
+    $probeScript = Join-Path $script:UxTempDir 'ux-drive-probe.cmd'
     @'
-param([string]$Drive)
-if (Test-Path -LiteralPath (Join-Path $Drive 'hello.txt')) { exit 0 }
+@echo off
+if exist "%~1\hello.txt" exit 0
 exit 1
-'@ | Set-Content -Path $probeScript -Encoding utf8
-    $pwsh = (Get-Process -Id $PID).Path
+'@ | Set-Content -Path $probeScript -Encoding ascii
+    $comspec = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $outPath = Join-Path $script:UxArtifactDir 'drive-probe.out.log'
+    $errPath = Join-Path $script:UxArtifactDir 'drive-probe.err.log'
     $blocked = 0
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        $outPath = Join-Path $script:UxArtifactDir 'drive-probe.out.log'
-        $errPath = Join-Path $script:UxArtifactDir 'drive-probe.err.log'
-        $probe = Start-Process -FilePath $pwsh `
-            -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $probeScript,
-                            $Drive) `
-            -PassThru -NoNewWindow -RedirectStandardOutput $outPath `
-            -RedirectStandardError $errPath
-        if (-not $probe.WaitForExit(10000)) {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $comspec
+        # `call` keeps the quoted probe path intact; starting the /c line
+        # with a quote would make cmd strip the outer quotes itself.
+        $psi.Arguments = '/d /c call "' + $probeScript + '" "' + $Drive + '"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $probe = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $probe.StandardOutput.ReadToEndAsync()
+        $stderr = $probe.StandardError.ReadToEndAsync()
+        if (-not $probe.WaitForExit(5000)) {
             try { $probe.Kill($true) } catch { try { $probe.Kill() } catch {} }
+            $probe.WaitForExit()
             if (++$blocked -ge 2) { return 'blocked' }
             continue
+        }
+        $probe.WaitForExit()
+        foreach ($pair in @(@($outPath, $stdout), @($errPath, $stderr))) {
+            $text = $pair[1].Result
+            if (-not [string]::IsNullOrEmpty($text)) {
+                Add-Content -Path $pair[0] -Value $text -ErrorAction SilentlyContinue
+            }
         }
         if ($probe.ExitCode -eq 0) { return 'servable' }
         Start-Sleep -Milliseconds 500
@@ -357,6 +375,15 @@ try {
     $results.error = $_.Exception.Message
     throw
 } finally {
+    if ($results.status -ne 'passed') {
+        # Snapshot the live state before cleanup removes it: a mount that
+        # appeared at another letter, or one that vanished, is visible here
+        # even when the preferred-letter probe failed.
+        try {
+            Invoke-Automount -Arguments @('status', '--debug') `
+                -LogName 'failure-status' -TimeoutSeconds 45 | Out-Null
+        } catch {}
+    }
     try { Invoke-Automount -Arguments @('automount', 'stop') -LogName 'cleanup-stop' -TimeoutSeconds 30 | Out-Null } catch {}
     Detach-All-UxFixtures
     $mounted = @()
