@@ -68,8 +68,13 @@ Three terms are used consistently below:
 | **Unsupported / refused** | The reader may still open it, but a writable mount fails before the first write with the blocking feature named. |
 
 * **Image files:** format, read-only mount, experimental read-write.
-* **`\\.\PhysicalDriveN`:** read and format; **mounted read-write is not yet
-  qualified** and the CLI refuses it.
+* **Removable media:** the manual, identity-gated DEV-1R qualification passed on
+  one device (Samsung Flash Drive, 64,160,400,896 bytes, USB BOT, 512-byte
+  sectors) on 2026-11-01. See
+  [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md).
+* **`\\.\PhysicalDriveN`:** read and format; **fixed-disk mounted read-write
+  remains unqualified and is refused by default**; the removable-device path is
+  qualified only on the tested hardware.
 * **`\\.\HarddiskVolumeX`:** read; format is outside v1.
 * **WinFsp:** the mount adapter builds when the SDK is present; CI installs and
   exercises it on a Windows runner.
@@ -351,8 +356,9 @@ single owner of each filesystem invariant.
 
 ## Current limitations
 
-* **Experimental / image files only.** PhysicalDrive mounted read-write is not
-  qualified; the CLI refuses it.
+* **Experimental raw-device writes.** PhysicalDrive mounted read-write is not
+  qualified. It is refused by default and reachable only through the explicit
+  device-write qualification opt-ins plus the device class opt-in.
 * **No quotas, realtime devices, external logs, metadir or zoned filesystems**
   for writing. These remain readable where the parser supports them.
 * **No exchange-range operation.** The feature bit is accepted; XMI/XMD log
@@ -390,7 +396,8 @@ single owner of each filesystem invariant.
 | [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md) | measured modern `mkfs.xfs` profile |
 | [docs/TESTING.md](docs/TESTING.md) | fixtures, crash matrices, external oracles |
 | [docs/WINDOWS_BLOCK_DEVICE.md](docs/WINDOWS_BLOCK_DEVICE.md) | Windows open flags, volume ownership, geometry, flush, lifecycle, device policy |
-| [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 evidence, current NOT READY decision and remaining qualification steps |
+| [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 VHD evidence, fixed-disk NOT READY decision and remaining qualification steps |
+| [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md) | DEV-1R removable-media evidence ledger and manual qualification procedure (one-device hardware run passed 2026-11-01; fixed disks not ready) |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 
 ## Development

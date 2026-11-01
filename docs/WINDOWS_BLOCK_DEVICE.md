@@ -118,6 +118,19 @@ drive letter and forces the filesystem to stop using the volume.  Windows
 indexing, antivirus and other background services can hold volume handles and
 make the lock fail; that is a refusal, not a retry loop.
 
+Two volume states need explicit handling:
+
+* A system-managed pagefile is stored as `?:\pagefile.sys`.  The backend
+  resolves the `?` placeholder through the same system-disk lookup instead of
+  opening a device named `\\.\?`; the system disk remains a hard refusal.  An
+  unreadable pagefile configuration or an entry that cannot be resolved still
+  refuses the writable open.
+* A RAW volume can answer `FSCTL_IS_VOLUME_MOUNTED` with
+  `ERROR_INVALID_PARAMETER` after dismount instead of `ERROR_NOT_READY`.  The
+  backend records the mount state before locking and accepts that code only
+  when the pre-dismount query also reported no mounted filesystem.  Every other
+  combination refuses ownership.
+
 ## Sector geometry, alignment and I/O
 
 XFS blocks are not necessarily Windows sectors.  The backend therefore accepts
@@ -139,6 +152,11 @@ arbitrary byte offsets and sizes and does the alignment itself:
 * `ERROR_IO_PENDING` is resolved with `GetOverlappedResult(..., TRUE)`.
   `ERROR_HANDLE_EOF` and a zero-byte transfer are reported as failures to the
   caller; the filesystem turns them into `kIoError`/`kShortRead`.
+
+The bounce path is used for unaligned requests in every cache mode.  A raw
+disk handle still requires sector-aligned offsets and lengths at the driver
+boundary even when the handle is buffered; buffering changes cache and
+durability semantics, not the raw-disk alignment contract.
 
 Tested sector combinations:
 
@@ -266,18 +284,51 @@ before running the Linux script.
 
 ### Removable media (manual, opt-in)
 
-Removable qualification is never part of normal PR CI:
+Removable qualification is never part of normal PR CI. The prepared end-to-end
+procedure is `tests/scripts/qualify_removable_windows.ps1`; its evidence ledger
+is [`docs/DEV1_REMOVABLE_QUALIFICATION.md`](DEV1_REMOVABLE_QUALIFICATION.md).
+The script requires elevated PowerShell 7, WinFsp, an explicit
+`-PhysicalDriveNumber`, expected size and expected serial. It is currently pinned
+to the confirmed `PhysicalDrive2` candidate and never selects a replacement disk.
+The authoritative capacity is the exact `Get-Disk`/xfswin size; the script
+requires the expected size to match both and accepts `Win32_DiskDrive.Size` only
+within one CHS cylinder of that value, because WMI derives it from the legacy CHS
+geometry on some USB bridges. Both values are recorded.
+Review the freshly probed model, serial, stable ID, capacity, bus, removable
+classification, sector geometry and partition list, then enter the exact
+case-sensitive phrase `ERASE PhysicalDrive2`. The format phase erases the entire
+disk, including its existing partition layout.
 
-1. The user names the exact test device; the tool never auto-scans or picks
-   one.
-2. `xfswin device-info <device>` records class, geometry, serial and stable id.
-3. `xfswin device-selftest <device> --device-write-qualification
-   --allow-removable-disk-write --yes-i-really-mean-it` verifies exclusive
-   open, aligned/unaligned write, Flush and read-back.
-4. Format, mount through WinFsp, run the file operations, unmount cleanly.
-5. Reopen read-only, then hand the image to the Linux oracle.
-6. Physically remove the device during an operation and verify the mount
-   enters the invalid state without hanging or retrying.
+Before each destructive operation the script rechecks the identity against the
+initial probe. Each destructive CLI open also passes `--expect-serial`,
+`--expect-stable-id` and `--expect-size`; the backend compares them with the
+freshly probed identity before it locks a volume or writes, which closes the
+window in which a replacement device could take over `PhysicalDrive2`. Writes
+require both `--device-write-qualification` and `--allow-removable-disk-write`,
+and the backend must acquire exclusive volume ownership. System-disk and
+pagefile-disk refusals remain hard gates; offline, read-only, non-USB or
+non-removable devices are refused. There is no fixed-disk opt-in and no
+fixed-disk policy change.
+
+The phases cover default-policy refusal and removable opt-in, raw-device
+self-test and fault cases, all four cache modes, whole-device format and
+read/check, WinFsp create/write/readback/overwrite/truncate/grow/rename/delete
+with clean unmount, CLI fallback checks for hardlink/xattr/reflink, and physical
+removal while idle or during read, write and flush. Each removal scenario checks
+terminal invalidation, no reopen by path, an unsuccessful mount-host exit,
+reinsertion of the same identity and read-only journal/filesystem checks. A
+removal test is not a media power-loss durability test.
+
+The separate Linux oracle is `tests/scripts/verify_removable_linux.sh`. It
+requires an explicit `--device` or `--image` target and the schema-version-1
+semantic manifest (`removable-semantic-manifest.json`) generated by the Windows
+script from the final on-disk tree. Device mode validates the manifest and the
+live target identity and refuses an artifact path inside a mounted target before
+it creates artifacts. It runs guarded `xfs_repair -n` before and after a Linux
+writable mount, an independent raw probe, semantic checks, a Linux
+create/delete/hardlink/rename pass, `xfs_scrub -n` where supported, clean unmount
+and `xfs_logprint`. The operational Windows run record (`manifest.json`) is kept
+separately. The Linux VM and physical-device phase remain separate from CI.
 
 ### 4Kn
 

@@ -1167,8 +1167,84 @@ Portable tests (`--filter=device_`) cover:
   start gate so the lock interaction is exercised (the Windows raw backend
   uses the same `lifecycle_mutex_ -> flush_barrier_` order).
 
-Real-device evidence is produced by the three CI jobs above and recorded in
-`docs/DEV1_QUALIFICATION.md`.  That report is intentionally separate from the
-test matrix: passing unit tests does not prove Windows block-device semantics,
-and the report records the evidence actually obtained (the VHD/WinFsp and
-Linux oracle jobs and the resulting physical-disk write decision).
+Virtual-device evidence is produced by the three CI jobs above and recorded in
+`docs/DEV1_QUALIFICATION.md`. Removable-media hardware evidence is a separate,
+manual qualification recorded in
+[`docs/DEV1_REMOVABLE_QUALIFICATION.md`](DEV1_REMOVABLE_QUALIFICATION.md).
+Passing unit tests or VHD jobs does not prove removable-device behavior or
+change the fixed physical-disk write decision.
+
+### DEV-1R: manual removable-media qualification
+
+The hardware procedure is opt-in and destructive. It is pinned to the confirmed
+`PhysicalDrive2` candidate, requires an elevated PowerShell 7 terminal, WinFsp,
+an explicit expected size and serial, and exact case-sensitive erase
+confirmation. The expected size must match `Get-Disk` and xfswin exactly;
+`Win32_DiskDrive.Size` is CHS-derived on some USB bridges and is accepted only
+within one CHS cylinder, with the difference recorded. The format phase erases
+the complete device. Review the identity
+block before entering `ERASE PhysicalDrive2`; keep the executable and artifacts
+off the target disk. System/pagefile refusal, identity rechecks, no
+auto-selection and the existing fixed-disk refusal remain in force. Every
+destructive CLI open also carries `--expect-serial`, `--expect-stable-id` and
+`--expect-size`, and the backend compares them with the freshly probed device
+before locking a volume or writing. Do not treat script preparation as a test
+result.
+
+From the repository root, after building the WinFsp-enabled executable, the
+Windows run is:
+
+```powershell
+pwsh -File tests/scripts/qualify_removable_windows.ps1 `
+  -PhysicalDriveNumber 2 `
+  -ExpectedSize 64160400896 `
+  -ExpectedSerial AA00000000000489 `
+  -Xfswin build-winfsp\src\RelWithDebInfo\xfswin.exe `
+  -MountPoint Z: `
+  -Phase all `
+  -RemovalScenario all `
+  -ArtifactDir C:\temp\xfswin-removable-qualification
+```
+
+The `all` phase runs policy preflight, raw self-test and fault/cache matrices,
+whole-device format, WinFsp file operations, removal scenarios (`idle`, `read`,
+`write`, `flush`) with reinsertion checks, and then records a pending Linux
+handoff. Exit code 2 at that handoff means the external oracle remains pending.
+Other phases (`preflight`, `raw`, `format`, `winfsp`, `removal`, `oracle`) are
+available for controlled continuation; phases that require a preformatted
+filesystem run prerequisite checks. Every destructive step rechecks identity.
+The script is pinned to `PhysicalDrive2` and never follows a replacement disk
+number.
+
+After Windows completes, attach the same device to the Linux host and determine
+its current block path independently. The Linux verifier accepts only an
+explicit block device or raw filesystem image and the semantic manifest v1
+written by the Windows script:
+
+```bash
+sudo bash tests/scripts/verify_removable_linux.sh \
+  --device /dev/disk/by-id/REPLACE_WITH_VERIFIED_DEVICE \
+  --manifest /path/to/removable-semantic-manifest.json \
+  --artifacts /path/to/removable-linux-artifacts
+```
+
+For an image copy, replace `--device <path>` with
+`--image /path/to/raw-filesystem.img`. Device mode validates the manifest and
+the live target identity and safety state before it creates the artifact
+directory, refuses an artifact path inside a mounted target filesystem, and
+repeats the read-only identity preflight before each tool that reopens the
+device. Image mode validates its size, copies it to a work image, then uses a
+loop mount. Both modes run the independent raw probe, Linux semantic checks and
+mutation, scrub when supported, clean unmount, log check and two read-only
+`xfs_repair -n` checks. The wrapper refuses any `xfs_repair` invocation without
+`-n`; a recognized unsupported-kernel scrub result is recorded as skipped and
+the overall run remains incomplete.
+
+The Windows script keeps its operational run record in `manifest.json` and
+writes the Linux input as `removable-semantic-manifest.json`. The semantic
+manifest is generated from the final on-disk tree after the requested phases
+(`winfsp` or `all`): it hashes every regular file, records the retained
+truncate, rename, hardlink and xattr evidence, and carries the expected device
+identity. Archive it with the run record and the Linux artifacts. The hardware
+run and Linux VM phase both passed on 2026-11-01 for the one tested device; see
+[DEV1_REMOVABLE_QUALIFICATION.md](DEV1_REMOVABLE_QUALIFICATION.md).

@@ -5,12 +5,24 @@ Status date: 2026-11-01
 Decision: **NOT READY** for lifting the default that refuses writes to real
 fixed `\\.\PhysicalDriveN` disks.  The virtual-disk path (fixed VHD, 512/512
 sectors) is qualified end-to-end on Windows + MSVC and verified by the Linux
-XFS oracle.  No physical fixed disk, removable medium or 4Kn device was tested,
-so the conservative default stays: a physical fixed disk is still refused
-unless the operator passes both the qualification and fixed-disk opt-ins.
+XFS oracle. No physical fixed disk or 4Kn device was tested, so the
+conservative default stays: a physical fixed disk is still refused unless the
+operator passes both the qualification and fixed-disk opt-ins.
+The DEV-1R removable qualification passed on one physical USB device (Samsung
+Flash Drive, serial `AA00000000000489`, 64,160,400,896 bytes, USB BOT,
+512-byte sectors) on 2026-11-01; that result is recorded in the linked ledger
+and does not change the fixed-disk decision.
 
 This file records evidence, not intentions.  A claim without a command, log or
 artifact is marked "not run".
+
+## Status summary
+
+| Profile | Status | Evidence record |
+|---|---|---|
+| Fixed VHD, 512/512 | **READY** for the documented VHD qualification scope | This report and the CI evidence below |
+| DEV-1R removable media | **PASS on the one tested device (2026-11-01)** | [Removable qualification ledger](DEV1_REMOVABLE_QUALIFICATION.md); Windows phases and Linux XFS oracle both passed |
+| Fixed physical disk | **NOT READY** | No physical fixed-disk qualification; default refusal remains |
 
 ## 1. What changed
 
@@ -100,7 +112,9 @@ Artifacts: `dev1-vhd-device`, `dev1-vhd-winfsp`, `dev1-linux-oracle`
 | Cache mode | `buffered` |
 | Filesystem | XFS v5, block size 4096, inode size 512, 4 AGs x 32768 blocks, internal log at block 65540 |
 
-No physical fixed disk, USB/removable medium or 4Kn device was tested.
+No physical fixed disk or 4Kn device was tested. The separate DEV-1R
+removable-media run passed on one physical USB device; see the linked ledger in
+the status summary.
 
 ## 4. Self-test and fault matrix (real VHD)
 
@@ -181,22 +195,23 @@ Attached VHD/VHDX disks are writable only with
 `--allow-removable-disk-write`; fixed disks additionally need
 `--allow-fixed-disk-write`.
 
-The virtual-disk path is qualified (`READY` for the VHD/VHDX qualification
-scope).  The physical fixed-disk decision is **NOT READY**: the evidence
-covers disposable virtual disks only, and no physical disk, removable medium
-or 4Kn device was exercised.
+The VHD path is qualified (`READY` for the documented VHD scope). The
+physical fixed-disk decision is **NOT READY**: the evidence
+covers disposable virtual disks only, and no physical fixed disk or 4Kn
+device was exercised. The DEV-1R removable qualification passed on its one
+tested device, as recorded in the linked ledger; it does not lift the
+fixed-disk decision.
 
 ## 9. Remaining work
 
-1. Run the manual removable-device procedure, including physical removal
-   during I/O.
-2. Repeat on a real fixed disk in a disposable machine (never the host system
+1. Repeat on a real fixed disk in a disposable machine (never the host system
    disk) before changing the fixed-disk default.
-3. If a Hyper-V host is available, repeat with a 4Kn VHDX; otherwise keep the
+2. If a Hyper-V host is available, repeat with a 4Kn VHDX; otherwise keep the
    explicit "no 4Kn hardware tested" non-claim.
-4. Run the opt-in `windows-vhdx-large-device` job (`large_device=true`) to
+3. Run the opt-in `windows-vhdx-large-device` job (`large_device=true`) to
    exercise >2 TiB offsets through a real Windows disk handle; the portable
    image test already covers the 3 TiB path.
-5. Run `xfs_scrub -n` on a kernel with online scrub support; the GitHub runner
-   kernel cannot, so the oracle records a skip.
-6. Review the artifacts, then decide whether the fixed-disk default changes.
+4. Extend CI's scrub coverage to a kernel with online scrub support; the GitHub
+   runner kernel cannot, so CI oracles keep recording a skip. The DEV-1R
+   hardware run itself passed `xfs_scrub -n`.
+5. Review the artifacts, then decide whether the fixed-disk default changes.
