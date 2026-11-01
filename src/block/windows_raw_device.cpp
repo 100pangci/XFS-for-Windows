@@ -220,20 +220,33 @@ std::set<uint32_t> PagefileDiskNumbers(bool* complete = nullptr) {
   for (const WCHAR* p = pagefiles; *p;) {
     std::wstring entry(p);
     if (entry.size() >= 2 && entry[1] == L':') {
-      std::wstring volume = L"\\\\.\\";
-      volume.push_back(entry[0]);
-      volume.push_back(L':');
-      HANDLE h = CreateFileW(volume.c_str(), GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                             OPEN_EXISTING, 0, nullptr);
-      if (h != INVALID_HANDLE_VALUE) {
-        STORAGE_DEVICE_NUMBER sdn{};
-        if (QueryDeviceNumber(h, &sdn)) {
-          disks.insert(sdn.DeviceNumber);
-        } else if (complete) {
-          *complete = false;
+      uint32_t disk = 0xffffffff;
+      bool resolved = false;
+      if (entry[0] == L'?') {
+        // A system-managed pagefile is written as "?:\pagefile.sys".  Windows
+        // keeps it on the system volume, which the system-disk refusal already
+        // protects; resolve the placeholder through that same lookup instead
+        // of trying to open a device named "\\.\?".
+        disk = SystemDiskNumber();
+        resolved = disk != 0xffffffff;
+      } else {
+        std::wstring volume = L"\\\\.\\";
+        volume.push_back(entry[0]);
+        volume.push_back(L':');
+        HANDLE h = CreateFileW(volume.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+          STORAGE_DEVICE_NUMBER sdn{};
+          if (QueryDeviceNumber(h, &sdn)) {
+            disk = sdn.DeviceNumber;
+            resolved = true;
+          }
+          CloseHandle(h);
         }
-        CloseHandle(h);
+      }
+      if (resolved) {
+        disks.insert(disk);
       } else if (complete) {
         *complete = false;
       }
@@ -636,6 +649,18 @@ std::unique_ptr<WindowsRawBlockDevice> WindowsRawBlockDevice::Open(
     return close_and_fail("unusable device geometry: " + geometry_reason);
   }
 
+  // --- expected identity -------------------------------------------------
+  // Pin the freshly probed identity before the write-eligibility checks lock
+  // any volume.  A qualification run that passed --expect-serial/stable-id/
+  // size must never write to a replacement device that took over the same
+  // \\.\PhysicalDriveN after a removal.
+  std::string identity_reason;
+  if (!MatchesExpectedDeviceIdentity(dev->impl_->identity, geometry.size_bytes,
+                                     effective, &identity_reason)) {
+    return close_and_fail("device identity does not match the expected target: " +
+                          identity_reason + " (path " + WideToUtf8(path) + ")");
+  }
+
   // --- offline / read-only ---------------------------------------------
   bool offline = false;
   bool read_only_media = false;
@@ -907,6 +932,16 @@ bool WindowsRawBlockDevice::LockVolumes(std::string* error) {
     }
 
     DWORD returned = 0;
+    // Record the mount state before locking.  A RAW volume (no recognized
+    // filesystem) can answer FSCTL_IS_VOLUME_MOUNTED with
+    // ERROR_INVALID_PARAMETER after dismount instead of the documented
+    // ERROR_NOT_READY.  The pre-dismount answer tells the two cases apart;
+    // anything we cannot classify still refuses ownership.
+    DWORD pre_mount_error = ERROR_SUCCESS;
+    const bool was_mounted =
+        DeviceIoControl(volume, FSCTL_IS_VOLUME_MOUNTED, nullptr, 0, nullptr, 0,
+                        &returned, nullptr) != FALSE;
+    if (!was_mounted) pre_mount_error = GetLastError();
     if (!DeviceIoControl(volume, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0,
                          &returned, nullptr)) {
       ok = false;
@@ -931,8 +966,10 @@ bool WindowsRawBlockDevice::LockVolumes(std::string* error) {
     }
     // After a successful dismount the volume must report "not mounted".  A
     // mounted volume here means Windows remounted it between the two calls.
-    // FSCTL_IS_VOLUME_MOUNTED answers FALSE with ERROR_NOT_READY when the
-    // volume is not mounted; any other failure is unknown and must refuse
+    // A filesystem volume answers FALSE with ERROR_NOT_READY when it is not
+    // mounted.  A RAW volume instead answers ERROR_INVALID_PARAMETER, so that
+    // code is accepted only when the pre-dismount query also said the volume
+    // had no mounted filesystem.  Any other failure is unknown and must refuse
     // ownership rather than be read as "dismounted".
     if (DeviceIoControl(volume, FSCTL_IS_VOLUME_MOUNTED, nullptr, 0, nullptr, 0,
                         &returned, nullptr)) {
@@ -947,11 +984,20 @@ bool WindowsRawBlockDevice::LockVolumes(std::string* error) {
       break;
     }
     const DWORD mounted_error = GetLastError();
-    if (mounted_error != ERROR_NOT_READY) {
+    const bool not_mounted =
+        mounted_error == ERROR_NOT_READY ||
+        (mounted_error == ERROR_INVALID_PARAMETER && !was_mounted &&
+         (pre_mount_error == ERROR_NOT_READY ||
+          pre_mount_error == ERROR_INVALID_PARAMETER));
+    if (!not_mounted) {
       ok = false;
       if (error) {
         *error = "cannot verify that volume " + WideToUtf8(volume_name) +
                  " was dismounted" + FormatWinError(mounted_error);
+        if (!was_mounted) {
+          *error += " (pre-dismount query" + FormatWinError(pre_mount_error) +
+                    ")";
+        }
       }
       DeviceIoControl(volume, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0,
                       &returned, nullptr);
@@ -1076,12 +1122,10 @@ bool WindowsRawBlockDevice::RawTransfer(bool write, uint64_t offset,
   // addresses aligned to the physical sector size.  Use the physical size for
   // the bounce buffer address and for any continuation after a short
   // transfer; 4096 is a safe floor for devices that did not report it.
-  const size_t buffer_align =
-      unbuffered
-          ? std::max<size_t>({static_cast<size_t>(sector),
-                              static_cast<size_t>(info_.physical_sector_size),
-                              static_cast<size_t>(4096)})
-          : static_cast<size_t>(sector);
+  const size_t buffer_align = std::max<size_t>(
+      {static_cast<size_t>(sector),
+       static_cast<size_t>(info_.physical_sector_size),
+       static_cast<size_t>(4096)});
   const size_t short_unit = unbuffered ? buffer_align : sector;
 
   // Fault injection: make the first transfer of this logical operation short.
@@ -1103,32 +1147,17 @@ bool WindowsRawBlockDevice::RawTransfer(bool write, uint64_t offset,
     return got == remaining || got % short_unit == 0;
   };
 
-  if (!unbuffered) {
-    // Buffered handles accept arbitrary offsets, lengths and buffer addresses.
-    // The backend still chunks the transfer so no request exceeds the 32-bit
-    // Windows transfer size.
-    uint64_t pos = offset;
-    uint8_t* out = static_cast<uint8_t*>(buffer);
-    size_t remaining = size;
-    bool first = true;
-    while (remaining > 0) {
-      const size_t want =
-          maybe_shorten(std::min(remaining, kMaxTransferChunk), first);
-      size_t got = 0;
-      if (!RawTransferChunk(write, pos, out, want, &got, error)) return false;
-      pos += got;
-      out += got;
-      remaining -= got;
-      first = false;
-    }
-    return true;
-  }
-
-  // Unbuffered I/O: offsets and lengths must be logical-sector aligned and
-  // buffer addresses should be physical-sector aligned (some devices enforce
-  // it).  The alignment offset is required to be zero for writable whole-disk
-  // handles; read-only handles with a non-zero offset use buffered mode.
-  if (info_.alignment_offset != 0) {
+  // A raw disk handle requires logical-sector-aligned offsets and lengths at
+  // the driver boundary even when the handle is buffered.  Buffered mode only
+  // relaxes the cache/durability semantics; it does not make an unaligned
+  // request legal on a physical drive.  The common path below therefore uses
+  // the bounce buffer for any request that is not sector-aligned (and for an
+  // aligned request whose buffer address is not aligned).
+  //
+  // The alignment offset is required to be zero for writable whole-disk
+  // handles; read-only handles with a non-zero offset use buffered mode and
+  // still go through the sector-aligned bounce path.
+  if (unbuffered && info_.alignment_offset != 0) {
     if (error) {
       *error = "unbuffered I/O requested on a device with a non-zero "
                "alignment offset";

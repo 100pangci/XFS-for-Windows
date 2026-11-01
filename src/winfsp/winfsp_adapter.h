@@ -1,7 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-// XFS for Windows - WinFsp native API adapter (read-only and image-file read-write).
+// XFS for Windows - WinFsp native API adapter (read-only and experimental
+// read-write for an image or a qualified raw device).
 #pragma once
 
 #ifdef XFSWIN_HAS_WINFSP
@@ -19,9 +20,10 @@ struct MountConfig {
   std::wstring mount_point;  // e.g. L"X:"
   bool force_unsafe_ro = false;
   bool verbose = false;
-  // Read-write mount (images only; enforced by the CLI). The adapter enables
-  // the Write/Flush callbacks, reports writable file attributes and asks
-  // WinFsp to flush and purge its cache on cleanup.
+  // Read-write mount. The CLI and the raw-device policy decide whether the
+  // target is writable; the adapter enables the Write/Flush callbacks, reports
+  // writable file attributes and asks WinFsp to flush and purge its cache on
+  // cleanup.
   bool read_write = false;
   // Enable the optional performance counters for this mount.
   bool perf_stats = false;

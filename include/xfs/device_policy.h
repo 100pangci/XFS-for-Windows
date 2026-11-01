@@ -151,6 +151,17 @@ struct DeviceOpenPolicy {
 
   DeviceCacheMode cache_mode = DeviceCacheMode::kNoBuffering;
 
+  // Optional identity pin for destructive qualification runs.  An empty string
+  // or a zero size means "not specified".  The backend compares these values
+  // with the freshly probed device before it locks any volume or writes a
+  // byte, so a device that re-enumerated into the same disk number cannot
+  // inherit the previous target's authorization.  This guarantee requires a
+  // real serial or a DeviceGuid-derived stable id; the model/disk-number
+  // fallback stable id is diagnostic only and must not be the sole pin.
+  std::string expected_serial;
+  std::string expected_stable_id;
+  uint64_t expected_size_bytes = 0;
+
   // Conservative policy for an ordinary image-file read-write mount.
   static DeviceOpenPolicy ImageFileWritable() {
     DeviceOpenPolicy policy;
@@ -223,6 +234,16 @@ WriteEligibility EvaluateDeviceWriteEligibility(
     bool read_only_media, bool offline, bool is_system_disk, bool has_pagefile,
     bool ownership_confirmed, const DeviceOpenPolicy& policy,
     std::string* reason);
+
+// Compares a freshly probed identity with the optional expected values in
+// `policy`.  Returns true when every specified field matches; otherwise fills
+// `reason` with the first mismatch and the observed value.  This is a safety
+// gate for destructive qualification, not a device-discovery mechanism: it
+// never chooses or renames a target.
+bool MatchesExpectedDeviceIdentity(const DeviceIdentity& identity,
+                                   uint64_t size_bytes,
+                                   const DeviceOpenPolicy& policy,
+                                   std::string* reason);
 
 // ---------------------------------------------------------------------------
 // Windows error classification

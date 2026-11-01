@@ -40,10 +40,42 @@ function Assert([bool]$condition, [string]$message) {
 }
 
 function Invoke-Xfswin {
-    param([string[]]$Arguments, [string]$LogName)
+    param(
+        [string[]]$Arguments,
+        [string]$LogName,
+        [int]$TimeoutSeconds = 0
+    )
     $log = Join-Path $ArtifactDir "$LogName.log"
-    & $Xfswin @Arguments 2>&1 | Tee-Object -FilePath $log | Out-Null
-    return $LASTEXITCODE
+    if ($TimeoutSeconds -le 0) {
+        & $Xfswin @Arguments 2>&1 | Tee-Object -FilePath $log | Out-Null
+        return $LASTEXITCODE
+    }
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Xfswin
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "failed to start xfswin for $LogName" }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $process.Kill($true) } catch { $process.Kill() }
+        $process.WaitForExit()
+        $timedOutOutput = $stdoutTask.Result + $stderrTask.Result
+        $timedOutOutput | Tee-Object -FilePath $log | Out-Null
+        "TIMEOUT after $TimeoutSeconds seconds; process tree was stopped" |
+            Tee-Object -FilePath $log -Append | Out-Null
+        return 124
+    }
+    $output = $stdoutTask.Result + $stderrTask.Result
+    $output | Tee-Object -FilePath $log | Out-Null
+    return $process.ExitCode
 }
 
 $results = [ordered]@{
@@ -118,7 +150,8 @@ try {
     "== xfswin device-selftest (no faults) =="
     $code = Invoke-Xfswin -Arguments @(
         'device-selftest', $rawPath,
-        '--device-write-qualification', '--yes-i-really-mean-it') -LogName 'selftest'
+        '--device-write-qualification', '--yes-i-really-mean-it',
+        '--concurrency-rounds=3') -LogName 'selftest' -TimeoutSeconds 300
     Assert ($code -eq 0) "device-selftest failed: $code"
     $results.steps['selftest'] = $code
 
@@ -150,8 +183,17 @@ try {
         $results.steps["fault:$($fault.Name)"] = $code
     }
 
+    "== format without qualification is refused =="
+    $code = Invoke-Xfswin -Arguments @(
+        'format', $rawPath, '--yes-i-really-mean-it') `
+        -LogName 'format-no-qualification'
+    Assert ($code -eq 3) "format without --device-write-qualification was not refused: $code"
+    $results.steps['format-refused-without-qualification'] = $code
+
     "== format =="
-    $code = Invoke-Xfswin -Arguments @('format', $rawPath, '--yes-i-really-mean-it') -LogName 'format'
+    $code = Invoke-Xfswin -Arguments @(
+        'format', $rawPath, '--yes-i-really-mean-it',
+        '--device-write-qualification') -LogName 'format'
     Assert ($code -eq 0) "format failed: $code"
     $results.steps['format'] = $code
 

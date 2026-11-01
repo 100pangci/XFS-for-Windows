@@ -4,6 +4,7 @@
 // XFS for Windows - command line interface.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -18,9 +19,9 @@ struct Options {
   bool yes_i_really_mean_it = false;
   // Machine-readable output for `journal` (the recovery differential).
   bool json = false;
-  // Read-write mounting is experimental and restricted to image files: the
-  // RW-0 writer can only overwrite existing allocated blocks, metadata
-  // mutations (timestamps, allocation) are not implemented yet.
+  // Read-write commands are experimental.  Image files need this flag alone;
+  // a real device additionally needs device_write_qualification and the class
+  // opt-in, and the backend's device policy still applies.
   bool rw_experimental = false;
   // Formatter-only modern inode feature switches (RW-6A).
   bool finobt = false;
@@ -61,7 +62,14 @@ struct Options {
   bool device_write_qualification = false;
   bool allow_fixed_disk_write = false;
   bool allow_removable_disk_write = false;
+  int device_concurrency_rounds = 0;  // device-selftest concurrency matrix
   std::string device_cache_mode;  // buffered|write-through|no-buffering|both
+  // DEV-1R: bind a destructive run to one physical device.  The backend
+  // compares these values with the freshly probed identity before any volume
+  // is locked or any byte is written.
+  std::string expect_serial;
+  std::string expect_stable_id;
+  uint64_t expect_size_bytes = 0;
 };
 
 // Runs the CLI. argv excludes the program name.

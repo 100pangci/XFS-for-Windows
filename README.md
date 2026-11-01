@@ -10,9 +10,12 @@ path are C++20 in this repository; Linux and xfsprogs are used as external
 oracles in CI, not as runtime dependencies.
 
 > **Experimental read-write.** Image-file read-write is qualified in CI for the
-> documented profile. `\\.\PhysicalDriveN` mounted read-write is **not yet
-> qualified**; real disks are read + format only. Do not point the experimental
-> writer at a disk that holds data you care about.
+> documented profile. A physical removable USB disk mounted read-write passed
+> the manual DEV-1R qualification on **one tested device only** (Samsung Flash
+> Drive, USB BOT, 512/512-byte sectors). A fixed physical
+> `\\.\PhysicalDriveN` mounted read-write is **not qualified**: fixed disks stay
+> read + format only, 4Kn and UASP were not tested. Do not point the
+> experimental writer at a disk that holds data you care about.
 
 ## What it is
 
@@ -63,13 +66,18 @@ Three terms are used consistently below:
 
 | Term | Meaning |
 |---|---|
-| **Supported** | Read/write/recovery is exercised by CI against the tested profile; still image-file-only for RW. |
+| **Supported** | Read/write/recovery is exercised by CI against the tested image-file profile; physical devices are not part of that profile. One removable USB device has separate manual DEV-1R read-write evidence. |
 | **Experimental** | Implemented and tested locally/CI, but the API or on-disk workload is not yet part of the ordinary supported profile. |
 | **Unsupported / refused** | The reader may still open it, but a writable mount fails before the first write with the blocking feature named. |
 
 * **Image files:** format, read-only mount, experimental read-write.
-* **`\\.\PhysicalDriveN`:** read and format; **mounted read-write is not yet
-  qualified** and the CLI refuses it.
+* **Removable media:** the manual, identity-gated DEV-1R qualification passed on
+  one device (Samsung Flash Drive, 64,160,400,896 bytes, USB BOT, 512-byte
+  sectors) on 2026-11-01. See
+  [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md).
+* **`\\.\PhysicalDriveN`:** read and format; **fixed-disk mounted read-write
+  remains unqualified and is refused by default**; the removable-device path is
+  qualified only on the tested hardware.
 * **`\\.\HarddiskVolumeX`:** read; format is outside v1.
 * **WinFsp:** the mount adapter builds when the SDK is present; CI installs and
   exercises it on a Windows runner.
@@ -178,9 +186,12 @@ $exe = "build\src\RelWithDebInfo\xfswin.exe"
 & $exe check test.img
 ```
 
-`--rw-experimental` is the ordinary opt-in for image files. A real disk needs
-`--rw-experimental --device-write-qualification`; fixed and removable disks
-additionally need `--allow-fixed-disk-write` / `--allow-removable-disk-write`.
+`--rw-experimental` is the ordinary opt-in for image files. A writable mount
+or file-mutating command on a real disk needs `--rw-experimental
+--device-write-qualification`; fixed and removable disks additionally need
+`--allow-fixed-disk-write` / `--allow-removable-disk-write`. `recover` and
+`format` keep their own `--yes-i-really-mean-it` confirmation and also require
+`--device-write-qualification` for a real device.
 `device-info`, `device-check` and `device-selftest` expose the probed geometry
 and write policy. See `docs/WINDOWS_BLOCK_DEVICE.md`.
 
@@ -351,8 +362,12 @@ single owner of each filesystem invariant.
 
 ## Current limitations
 
-* **Experimental / image files only.** PhysicalDrive mounted read-write is not
-  qualified; the CLI refuses it.
+* **Experimental raw-device writes.** A physical fixed disk mounted read-write
+  is not qualified. It is refused by default and reachable only through the
+  explicit device-write qualification opt-ins plus the device-class opt-in.
+  The removable path has one-device DEV-1R evidence (Samsung Flash Drive, USB
+  BOT, 512/512-byte sectors, 2026-11-01); other removable devices, fixed
+  physical disks, UASP, 4Kn and media power-loss durability remain unqualified.
 * **No quotas, realtime devices, external logs, metadir or zoned filesystems**
   for writing. These remain readable where the parser supports them.
 * **No exchange-range operation.** The feature bit is accepted; XMI/XMD log
@@ -390,7 +405,8 @@ single owner of each filesystem invariant.
 | [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md) | measured modern `mkfs.xfs` profile |
 | [docs/TESTING.md](docs/TESTING.md) | fixtures, crash matrices, external oracles |
 | [docs/WINDOWS_BLOCK_DEVICE.md](docs/WINDOWS_BLOCK_DEVICE.md) | Windows open flags, volume ownership, geometry, flush, lifecycle, device policy |
-| [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 evidence, current NOT READY decision and remaining qualification steps |
+| [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 VHD evidence, fixed-disk NOT READY decision and remaining qualification steps |
+| [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md) | DEV-1R removable-media evidence ledger and manual qualification procedure (one-device hardware run passed 2026-11-01; fixed disks not ready) |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 
 ## Development
