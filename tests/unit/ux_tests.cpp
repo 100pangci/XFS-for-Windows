@@ -158,10 +158,35 @@ TEST(ux_probe_partition_offset) {
   CHECK(probe.state == XfsProbeState::kValid);
   CHECK(probe.filesystem_bytes > 0);
   CHECK(probe.filesystem_bytes <= source->Size());
+  // The journal scan must read through the same partition offset as the
+  // superblock. Reading the log at whole-disk coordinates finds neither the
+  // clean unmount record nor a dirty transaction and reports "unknown".
+  CHECK(probe.log_state == xfs::LogState::kClean ||
+        probe.log_state == xfs::LogState::kEmpty);
   // A partition that claims to be smaller than the filesystem is corrupt.
   auto truncated = ProbeXfsFilesystem(*target, kOffset, 1ull << 20, options);
   CHECK(truncated.state == XfsProbeState::kCorrupt);
   CHECK(truncated.magic_seen);
+
+  // The same offset must let the scanner find a real transaction record.
+  {
+    auto borrowed = std::make_unique<xfstest::BorrowedBlockDevice>(source.get());
+    xfs::MountOptions mount_options;
+    mount_options.read_write = true;
+    auto mounted =
+        xfs::XfsFilesystem::Mount(std::move(borrowed), mount_options);
+    CHECK(mounted.ok());
+    auto created = mounted.value()->CreateRegularFile(
+        mounted.value()->RootInode(), "dirty-partition-file", 0644, 0, 0);
+    CHECK(created.ok());
+    // Destroy without WriteCleanUnmountRecord: the newest log record is a
+    // transaction, and discovery must report it as dirty at this offset.
+  }
+  std::memcpy(target->bytes().data() + kOffset, source->bytes().data(),
+              source->bytes().size());
+  auto dirty = ProbeXfsFilesystem(*target, kOffset, source->Size(), options);
+  CHECK(dirty.state == XfsProbeState::kValid);
+  CHECK(dirty.log_state == xfs::LogState::kDirty);
   CHECK_EQ(target->write_calls(), 0u);
 }
 

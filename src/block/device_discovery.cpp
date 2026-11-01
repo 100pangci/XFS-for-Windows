@@ -136,7 +136,7 @@ XfsProbeResult ProbeXfsFilesystem(BlockDevice& device, uint64_t byte_offset,
       result.log_state = LogState::kUnknown;
       result.log_detail = "internal log lies outside the partition";
     } else {
-      auto log = CheckLogClean(device, geo, sb);
+      auto log = CheckLogClean(device, geo, sb, byte_offset);
       if (!log.ok()) {
         result.log_state = LogState::kUnknown;
         result.log_detail = log.error().Format();

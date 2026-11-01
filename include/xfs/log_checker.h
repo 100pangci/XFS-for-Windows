@@ -43,9 +43,14 @@ struct LogCheckResult {
   uint64_t lsn = 0;          // its h_lsn
 };
 
+// `dev` may be a whole-disk device. `device_offset` is the byte offset of the
+// XFS filesystem (partition) within `dev`; logstart and all geometry values are
+// filesystem-relative. Discovery probes a partition on a disk handle, so the
+// log scan must apply the same offset as ReadSuperblock.
 Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
                                      const XfsGeometry& geo,
-                                     const XfsSuperblock& sb);
+                                     const XfsSuperblock& sb,
+                                     uint64_t device_offset = 0);
 
 const char* ToString(LogState state);
 
