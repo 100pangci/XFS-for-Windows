@@ -2290,6 +2290,15 @@ int CommandMount(const std::string& target, const std::string& drive,
     return 3;
   }
 #ifdef XFSWIN_HAS_WINFSP
+  // Announce the mount like the interactive and --drive forms do. A user who
+  // runs the legacy form from a script still sees which mode and letter apply.
+  std::cout << "Mounting " << target << " at " << drive << " ("
+            << (options.rw_experimental ? "experimental read-write"
+                                        : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
   DeviceOpenPolicy raw_policy =
       BuildRawDevicePolicy(options, options.rw_experimental);
   return winfsp::RunMountHost(
