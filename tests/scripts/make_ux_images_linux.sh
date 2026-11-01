@@ -202,13 +202,13 @@ if [ "$STATE" != "dirty" ]; then
 fi
 
 echo "== manifest =="
-python3 - "$OUT" "$WORK/raw" <<'PY'
+python3 - "$OUT" "$WORK/raw" "$TOOLS" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+sys.path.insert(0, sys.argv[3])
 from ux_fixture_tools import summarize  # noqa: E402
 
 out = Path(sys.argv[1])
