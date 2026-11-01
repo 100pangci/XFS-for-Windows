@@ -470,3 +470,41 @@ TEST(image_device_concurrency_matrix) {
   dev->Close();
   CHECK_EQ(dev->State(), xfs::DeviceState::kClosed);
 }
+
+TEST(device_expected_identity_pin) {
+  xfs::DeviceIdentity identity;
+  identity.path = "\\\\.\\PhysicalDrive2";
+  identity.serial_number = "AA00000000000489";
+  identity.stable_id = "serial:AA00000000000489";
+  constexpr uint64_t kSize = 64160400896ull;
+
+  xfs::DeviceOpenPolicy policy;
+  std::string reason;
+  CHECK(xfs::MatchesExpectedDeviceIdentity(identity, kSize, policy, &reason));
+  CHECK(reason.empty());
+
+  policy.expected_serial = "AA00000000000489";
+  policy.expected_stable_id = "serial:AA00000000000489";
+  policy.expected_size_bytes = kSize;
+  CHECK(xfs::MatchesExpectedDeviceIdentity(identity, kSize, policy, &reason));
+
+  // A different device that re-enumerated into the same disk number must be
+  // refused on each pinned field independently.
+  policy.expected_serial = "AA00000000000488";
+  CHECK(!xfs::MatchesExpectedDeviceIdentity(identity, kSize, policy, &reason));
+  CHECK(reason.find("serial number") != std::string::npos);
+
+  policy.expected_serial = "AA00000000000489";
+  policy.expected_stable_id = "guid:00000000-0000-0000-0000-000000000000";
+  CHECK(!xfs::MatchesExpectedDeviceIdentity(identity, kSize, policy, &reason));
+  CHECK(reason.find("stable id") != std::string::npos);
+
+  policy.expected_stable_id = "serial:AA00000000000489";
+  policy.expected_size_bytes = kSize - 512;
+  CHECK(!xfs::MatchesExpectedDeviceIdentity(identity, kSize, policy, &reason));
+  CHECK(reason.find("size") != std::string::npos);
+
+  // A pinned size must not match a zero-sized or different device either.
+  policy.expected_size_bytes = kSize;
+  CHECK(!xfs::MatchesExpectedDeviceIdentity(identity, 0, policy, &reason));
+}

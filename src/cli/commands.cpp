@@ -10,6 +10,7 @@
 #include <io.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <thread>
 
 #include "xfs/block_device.h"
 #include "xfs/directory.h"
@@ -64,6 +66,10 @@ void PrintUsage() {
       "  device-check <device|image>   read-only geometry/policy validation\n"
       "  device-selftest <device>      destructive write/Flush/read-back test\n"
       "      --device-write-qualification --yes-i-really-mean-it\n"
+      "      [--concurrency-rounds=N]   run 0..1000 concurrency rounds (0 disables)\n"
+      "      [--expect-serial=S --expect-stable-id=ID --expect-size=BYTES]\n"
+      "                                refuse the open unless the probed device\n"
+      "                                matches this identity (pin the target)\n"
       "  check <device|image>          read-only consistency validation\n"
       "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
       "  refcount <device|image> [--ag=N]  typed refcountbt records\n"
@@ -297,6 +303,9 @@ DeviceOpenPolicy BuildRawDevicePolicy(const Options& options, bool writable) {
   policy.allow_fixed_disk = options.allow_fixed_disk_write;
   policy.require_volume_ownership = true;
   policy.qualification_override = options.device_write_qualification;
+  policy.expected_serial = options.expect_serial;
+  policy.expected_stable_id = options.expect_stable_id;
+  policy.expected_size_bytes = options.expect_size_bytes;
   policy.cache_mode = writable ? DeviceCacheMode::kNoBuffering
                                : DeviceCacheMode::kBuffered;
   if (!options.device_cache_mode.empty()) {
@@ -334,6 +343,25 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
              (open_error.empty() ? "" : " (" + open_error + ")");
   }
   return dev;
+}
+
+// Shared gate for the commands that mutate their target.  Image files need
+// only --rw-experimental.  A real device needs the same two opt-ins as a
+// writable mount, --rw-experimental and --device-write-qualification; the
+// device class policy (fixed/removable), the expected-identity pins, the
+// system/pagefile refusal and volume ownership are then enforced by the
+// backend when the device is opened.  Returning nonzero is a CLI exit code.
+int CheckRawWritableTarget(const std::string& target, const Options& options) {
+  if (!IsRawDevicePath(target) || options.device_write_qualification) {
+    return 0;
+  }
+  std::cerr
+      << "error: writable commands on a real device require both "
+         "--rw-experimental and --device-write-qualification.\n"
+         "       The class policy still applies: fixed disks need "
+         "--allow-fixed-disk-write and removable disks need "
+         "--allow-removable-disk-write.\n";
+  return 3;
 }
 
 void PrintError(const ErrorContext& error) {
@@ -617,8 +645,9 @@ int CommandDeviceSelfTest(const std::string& target, const Options& options) {
     return 3;
   }
   if (!options.yes_i_really_mean_it) {
-    std::cerr << "error: device-selftest overwrites the first and last "
-                 "sectors (restored afterwards); pass --yes-i-really-mean-it\n";
+    std::cerr << "error: device-selftest overwrites the first, middle, last, "
+                 "and scratch sectors (restored afterwards); pass "
+                 "--yes-i-really-mean-it\n";
     return 3;
   }
   std::string error;
@@ -632,28 +661,84 @@ int CommandDeviceSelfTest(const std::string& target, const Options& options) {
   const uint32_t sector = info.logical_sector_size;
   if (sector < 512 || sector > 65536 || (sector & (sector - 1)) != 0) {
     std::cerr << "error: unusable logical sector size " << sector << "\n";
+    dev->Close();
     return 1;
   }
   if (info.size_bytes < static_cast<uint64_t>(sector) * 2) {
     std::cerr << "error: device is too small for the self-test\n";
+    dev->Close();
     return 1;
   }
 
-  std::vector<uint8_t> first(sector);
-  std::vector<uint8_t> last(sector);
-  const uint64_t last_offset = info.size_bytes - sector;
-  bool saved = dev->Read(0, first.data(), sector);
-  if (saved) saved = dev->Read(last_offset, last.data(), sector);
-  if (!saved) {
-    std::cerr << "error: cannot save the sectors the self-test overwrites: "
-              << dev->LastError() << "\n";
-    return 1;
+  struct SavedRegion {
+    uint64_t offset = 0;
+    std::vector<uint8_t> bytes;
+    std::string label;
+  };
+  const uint64_t total_sectors = info.size_bytes / sector;
+  const uint64_t middle_sector = total_sectors / 2;
+  const uint64_t last_sector = total_sectors - 1;
+  const uint64_t last_offset = last_sector * sector;
+  const bool has_middle = middle_sector != 0 && middle_sector != last_sector;
+  // A 16-sector scratch region carries the multi-sector request used by the
+  // short-transfer fault matrix.  It must stay strictly inside the device and
+  // must not overlap the first, middle or last sector.  The region is saved
+  // and restored like every other byte the self-test touches.
+  constexpr uint64_t kScratchSectors = 16;
+  uint64_t scratch_sector = 0;
+  bool has_scratch = false;
+  if (total_sectors >= kScratchSectors + 2) {
+    if (middle_sector >= kScratchSectors + 1) {
+      // Sectors [1, 1 + kScratchSectors) are distinct from first, middle and
+      // last.
+      scratch_sector = 1;
+      has_scratch = true;
+    } else if (has_middle &&
+               middle_sector + kScratchSectors + 1 <= last_sector) {
+      // Otherwise use the sectors immediately after the middle one.
+      scratch_sector = middle_sector + 1;
+      has_scratch = true;
+    }
+  }
+  const uint64_t scratch_offset = scratch_sector * sector;
+  const size_t scratch_size = static_cast<size_t>(sector) * kScratchSectors;
+  std::vector<SavedRegion> saved_regions;
+  size_t scratch_saved_index = std::numeric_limits<size_t>::max();
+  if (has_scratch) {
+    // Save the scratch region first: it is the only multi-sector region, so
+    // the very first Read and the very first Write are large enough for the
+    // backend's read_short/write_short fault injection to split them.
+    scratch_saved_index = saved_regions.size();
+    saved_regions.push_back(
+        {scratch_offset, std::vector<uint8_t>(scratch_size), "scratch region"});
+  }
+  saved_regions.push_back({0, std::vector<uint8_t>(sector), "first sector"});
+  if (has_middle) {
+    saved_regions.push_back({middle_sector * sector,
+                             std::vector<uint8_t>(sector), "middle sector"});
+  }
+  saved_regions.push_back(
+      {last_offset, std::vector<uint8_t>(sector), "last sector"});
+
+  // Snapshot every byte the test can change before the first write.
+  for (auto& region : saved_regions) {
+    if (!dev->Read(region.offset, region.bytes.data(), region.bytes.size())) {
+      std::cerr << "error: cannot save " << region.label << " at offset "
+                << region.offset << ": " << dev->LastError() << "\n";
+      dev->Close();
+      return 1;
+    }
   }
 
   bool ok = true;
+  unsigned int step_failures = 0;
+  unsigned int concurrency_failures = 0;
   auto step = [&](bool condition, const std::string& what) {
     std::cout << (condition ? "ok   " : "FAIL ") << what << "\n";
-    if (!condition) ok = false;
+    if (!condition) {
+      ok = false;
+      ++step_failures;
+    }
   };
 
   std::vector<uint8_t> pattern(sector);
@@ -662,14 +747,62 @@ int CommandDeviceSelfTest(const std::string& target, const Options& options) {
   }
   std::vector<uint8_t> readback(sector);
 
+  // 0. Multi-sector aligned write + Flush + read-back.  This runs first so
+  // that a write_short or read_short fault plan splits a real multi-sector
+  // request instead of a single sector, which cannot be split.
+  bool multi_read_ok = false;
+  bool multi_ok = false;
+  if (has_scratch) {
+    std::vector<uint8_t> multi(scratch_size);
+    for (size_t i = 0; i < multi.size(); ++i) {
+      multi[i] = static_cast<uint8_t>((i * 13u + 0x3Cu) & 0xFFu);
+    }
+    std::vector<uint8_t> multi_read(multi.size(), 0);
+    const bool wrote = dev->Write(scratch_offset, multi.data(), multi.size());
+    const bool flushed = wrote && dev->Flush();
+    multi_read_ok =
+        flushed && dev->Read(scratch_offset, multi_read.data(), multi_read.size());
+    multi_ok = multi_read_ok &&
+               std::memcmp(multi_read.data(), multi.data(), multi.size()) == 0;
+    step(multi_ok, std::to_string(kScratchSectors) +
+                       "-sector aligned write + Flush + read-back");
+  } else {
+    std::cout << "skipped multi-sector write: no distinct "
+              << kScratchSectors << "-sector scratch region\n";
+  }
+
+  // The fault matrix is injected through the environment.  Report an explicit
+  // marker only when the injection was requested and the surrounding step
+  // actually completed; the trace separately proves the request size.
+  DeviceFaultPlan injected_faults;
+  {
+    char* fault_text = nullptr;
+    size_t fault_length = 0;
+    if (_dupenv_s(&fault_text, &fault_length, "XFSWIN_DEVICE_FAULT") == 0 &&
+        fault_text != nullptr) {
+      injected_faults = DeviceFaultPlan::Parse(fault_text);
+      std::free(fault_text);
+    }
+  }
+  if (info.is_raw_device && injected_faults.read_short_at != 0 && has_scratch &&
+      multi_read_ok) {
+    std::cout << "read short-transfer recovery: the injected short read was "
+                 "completed by the multi-sector read path\n";
+  }
+  if (info.is_raw_device && injected_faults.write_short_at != 0 && has_scratch &&
+      multi_ok) {
+    std::cout << "write short-transfer recovery: the injected short write was "
+                 "completed by the multi-sector write path\n";
+  }
+
   // 1. Sector-aligned write, Flush, read back.
   bool aligned = dev->Write(0, pattern.data(), sector) && dev->Flush() &&
                  dev->Read(0, readback.data(), sector) &&
                  std::memcmp(readback.data(), pattern.data(), sector) == 0;
   step(aligned, "aligned write + Flush + read-back");
 
-  // 2. Unaligned request through the bounce path.  The first sector is
-  //    restored from `first` at the end, so this is safe.
+  // 2. Unaligned request through the bounce path; it is covered by the first
+  // sector snapshot above.
   const size_t small_size = std::min<size_t>(16, sector - 1);
   std::vector<uint8_t> small(small_size, 0x5A);
   std::vector<uint8_t> small_read(small_size, 0);
@@ -679,14 +812,26 @@ int CommandDeviceSelfTest(const std::string& target, const Options& options) {
                                small.size()) == 0;
   step(unaligned, "unaligned write/read through the bounce path");
 
-  // 3. Last-sector write.  On a >2 TiB device this exercises 64-bit offsets.
+  // 3. Exercise a distinct middle logical sector when the geometry has one.
+  if (has_middle) {
+    const uint64_t middle_offset = middle_sector * sector;
+    bool middle = dev->Write(middle_offset, pattern.data(), sector) &&
+                  dev->Flush() &&
+                  dev->Read(middle_offset, readback.data(), sector) &&
+                  std::memcmp(readback.data(), pattern.data(), sector) == 0;
+    step(middle, "middle-sector write + Flush + read-back");
+  } else {
+    std::cout << "skipped middle-sector write: no distinct middle sector\n";
+  }
+
+  // 4. Last-sector write.  On a >2 TiB device this exercises 64-bit offsets.
   bool high = dev->Write(last_offset, pattern.data(), sector) && dev->Flush() &&
               dev->Read(last_offset, readback.data(), sector) &&
               std::memcmp(readback.data(), pattern.data(), sector) == 0;
   step(high, std::string("last-sector write/read") +
                  (last_offset > (1ull << 31) ? " (64-bit offset)" : ""));
 
-  // 4. Two write/Flush barriers in order, then verify both survived.
+  // 5. Two write/Flush barriers in order, then verify both survived.
   bool ordered = dev->Write(0, pattern.data(), sector) && dev->Flush() &&
                  dev->Write(last_offset, small.data(), small_size) &&
                  dev->Flush();
@@ -696,16 +841,305 @@ int CommandDeviceSelfTest(const std::string& target, const Options& options) {
   }
   step(ordered, "write/Flush ordering barrier");
 
-  // Restore the original first and last sectors, then flush.
-  bool restored = dev->Write(0, first.data(), first.size()) &&
-                  dev->Write(last_offset, last.data(), last.size()) &&
-                  dev->Flush();
-  step(restored, "original sectors restored and flushed");
-  if (!restored) {
-    std::cerr << "warning: the original sectors could not be restored: "
-              << dev->LastError() << "\n";
+  // 6. Aligned out-of-range reads and writes must fail without invalidating the
+  // device. The crossing request at the last sector is one sector past EOF.
+  auto check_rejected_request = [&](const std::string& label, uint64_t offset,
+                                    size_t request_size) {
+    std::vector<uint8_t> request(request_size, 0xC3);
+    std::vector<uint8_t> result(request_size, 0);
+    bool read_rejected = !dev->Read(offset, result.data(), result.size());
+    bool read_open = dev->State() == DeviceState::kOpen;
+    step(read_rejected && read_open,
+         label + " read rejected; device remains Open");
+    bool write_rejected =
+        !dev->Write(offset, request.data(), request.size());
+    bool write_open = dev->State() == DeviceState::kOpen;
+    step(write_rejected && write_open,
+         label + " write rejected; device remains Open");
+  };
+  check_rejected_request("out-of-range EOF", info.size_bytes, sector);
+  check_rejected_request("out-of-range past EOF", last_offset,
+                         static_cast<size_t>(sector) * 2);
+  const uint64_t max_aligned =
+      std::numeric_limits<uint64_t>::max() &
+      ~static_cast<uint64_t>(sector - 1);
+  check_rejected_request("out-of-range 64-bit overflow",
+                         max_aligned, sector);
+
+  auto restore_regions = [&](bool only_scratch) {
+    bool restored = true;
+    for (size_t i = 0; i < saved_regions.size(); ++i) {
+      const bool is_scratch = i == scratch_saved_index;
+      if (only_scratch && !is_scratch) continue;
+      const auto& region = saved_regions[i];
+      if (!dev->Write(region.offset, region.bytes.data(), region.bytes.size())) {
+        restored = false;
+        std::cerr << "error: failed to restore " << region.label
+                  << " at offset " << region.offset << ": "
+                  << dev->LastError() << "\n";
+      }
+    }
+    const bool flushed = dev->Flush();
+    if (!flushed) {
+      restored = false;
+      std::cerr << "error: Flush failed while restoring "
+                << (only_scratch ? "scratch region" : "original sectors")
+                << ": " << dev->LastError() << "\n";
+      for (size_t i = 0; i < saved_regions.size(); ++i) {
+        const bool is_scratch = i == scratch_saved_index;
+        if (!only_scratch || is_scratch) {
+          std::cerr << "error: durability unconfirmed for "
+                    << saved_regions[i].label << " at offset "
+                    << saved_regions[i].offset << "\n";
+        }
+      }
+    }
+    for (size_t i = 0; i < saved_regions.size(); ++i) {
+      const bool is_scratch = i == scratch_saved_index;
+      if (only_scratch && !is_scratch) continue;
+      const auto& region = saved_regions[i];
+      std::vector<uint8_t> verify(region.bytes.size());
+      const bool read_ok = dev->Read(region.offset, verify.data(), verify.size());
+      const bool matches =
+          read_ok &&
+          std::memcmp(verify.data(), region.bytes.data(), verify.size()) == 0;
+      if (!matches) {
+        restored = false;
+        std::cerr << "error: restore verification failed for " << region.label
+                  << " at offset " << region.offset;
+        if (!read_ok) std::cerr << ": " << dev->LastError();
+        std::cerr << "\n";
+      }
+    }
+    return restored;
+  };
+
+  // Restore and verify every byte the core tests touched independently before
+  // starting the concurrency phase. Flush is attempted even after any failed
+  // write.
+  bool core_restored = restore_regions(/*only_scratch=*/false);
+  step(core_restored,
+       "original first/middle/last/scratch sectors restored, flushed, and "
+       "verified");
+
+  std::cout << "concurrency rounds requested: "
+            << options.device_concurrency_rounds << "\n";
+  if (!core_restored) {
+    if (options.device_concurrency_rounds > 0) {
+      std::cout << "skipped concurrency matrix: core sector restoration failed\n";
+    } else {
+      std::cout << "concurrency matrix: skipped (0 rounds requested)\n";
+    }
+    std::cout << "concurrency rounds: " << options.device_concurrency_rounds
+              << ", failures: 0\n";
+    std::cout << "device-selftest failures: " << step_failures << "\n";
+    dev->Close();
+    return 1;
   }
-  dev->Close();
+  if (options.device_concurrency_rounds > 0 && !has_scratch) {
+    std::cout << "skipped concurrency matrix: no distinct 16-sector scratch region\n";
+  } else if (options.device_concurrency_rounds > 0) {
+    auto run_pair = [](auto&& first, auto&& second) {
+      std::atomic<int> ready{0};
+      std::atomic<bool> go{false};
+      std::atomic<int> pair_failures{0};
+      std::thread a([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        if (!first()) pair_failures.fetch_add(1, std::memory_order_relaxed);
+      });
+      std::thread b([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        if (!second()) pair_failures.fetch_add(1, std::memory_order_relaxed);
+      });
+      while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+      }
+      go.store(true, std::memory_order_release);
+      a.join();
+      b.join();
+      return pair_failures.load(std::memory_order_relaxed) == 0;
+    };
+    auto scratch_sector_offset = [&](size_t index) {
+      return scratch_offset + static_cast<uint64_t>(index) * sector;
+    };
+    auto read_matches = [&](size_t index, const std::vector<uint8_t>& expected) {
+      std::vector<uint8_t> actual(sector, 0);
+      const size_t expected_offset = index * static_cast<size_t>(sector);
+      return dev->Read(scratch_sector_offset(index), actual.data(), actual.size()) &&
+             std::memcmp(actual.data(), expected.data() + expected_offset,
+                         sector) == 0;
+    };
+    auto write_sector = [&](size_t index, const std::vector<uint8_t>& data) {
+      return dev->Write(scratch_sector_offset(index), data.data(), data.size());
+    };
+    auto update_expected = [&](std::vector<uint8_t>* expected, size_t index,
+                               const std::vector<uint8_t>& value) {
+      std::copy(value.begin(), value.end(),
+                expected->begin() +
+                    static_cast<std::ptrdiff_t>(index * sector));
+    };
+    std::vector<uint8_t> expected = saved_regions[scratch_saved_index].bytes;
+    auto concurrency_step = [&](bool condition, const std::string& label) {
+      if (!condition) ++concurrency_failures;
+      step(condition, label);
+    };
+    auto make_pattern = [&](uint8_t seed) {
+      std::vector<uint8_t> bytes(sector);
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<uint8_t>((seed + i * 31u) & 0xFFu);
+      }
+      return bytes;
+    };
+
+    for (int round = 0; round < options.device_concurrency_rounds; ++round) {
+      const std::string prefix = "concurrency round " +
+                                 std::to_string(round + 1) + "/" +
+                                 std::to_string(options.device_concurrency_rounds) +
+                                 " ";
+      bool read_read = run_pair(
+          [&] { return read_matches(0, expected); },
+          [&] { return read_matches(1, expected); });
+      read_read = read_read && read_matches(0, expected) &&
+                  read_matches(1, expected);
+      concurrency_step(read_read, prefix + "Read+Read");
+
+      std::vector<uint8_t> read_write_value =
+          make_pattern(static_cast<uint8_t>(0x31u + round));
+      bool read_write = run_pair(
+          [&] { return read_matches(0, expected); },
+          [&] { return write_sector(1, read_write_value); });
+      update_expected(&expected, 1, read_write_value);
+      read_write = read_write && read_matches(0, expected) &&
+                   read_matches(1, expected);
+      concurrency_step(read_write, prefix + "Read+Write");
+
+      std::vector<uint8_t> write_left =
+          make_pattern(static_cast<uint8_t>(0x61u + round));
+      std::vector<uint8_t> write_right =
+          make_pattern(static_cast<uint8_t>(0x91u + round));
+      bool write_write = run_pair(
+          [&] { return write_sector(2, write_left); },
+          [&] { return write_sector(3, write_right); });
+      update_expected(&expected, 2, write_left);
+      update_expected(&expected, 3, write_right);
+      write_write = write_write && read_matches(2, expected) &&
+                    read_matches(3, expected);
+      concurrency_step(write_write, prefix + "Write+Write");
+
+      std::vector<uint8_t> write_flush_value =
+          make_pattern(static_cast<uint8_t>(0xC1u + round));
+      bool write_flush = run_pair(
+          [&] { return write_sector(4, write_flush_value); },
+          [&] { return dev->Flush(); });
+      update_expected(&expected, 4, write_flush_value);
+      write_flush = write_flush && read_matches(4, expected);
+      concurrency_step(write_flush, prefix + "Write+Flush");
+    }
+
+    // Close races use a newly opened exclusive handle for each pair. The
+    // racing I/O may complete first or fail cleanly after Close wins.
+    dev->Close();
+    step(dev->State() == DeviceState::kClosed,
+         "device closed before Read/Write/Flush+Close pairs");
+    dev.reset();
+    auto run_close_pair = [&](const std::string& label, int mode,
+                              size_t scratch_index) {
+      std::unique_ptr<BlockDevice> close_device = OpenTarget(
+          target, /*writable=*/true, /*exclusive=*/true, &error, &options);
+      if (!close_device) {
+        std::cerr << "error: cannot open device for " << label << ": "
+                  << error << "\n";
+        ++concurrency_failures;
+        step(false, label + " could not open a fresh device instance");
+        return;
+      }
+      {
+        std::vector<uint8_t> seed = make_pattern(0xD7);
+        if (!close_device->Write(scratch_sector_offset(scratch_index),
+                                 seed.data(), seed.size()) ||
+            !close_device->Flush()) {
+          std::cerr << "error: cannot prepare scratch block for " << label
+                    << ": " << close_device->LastError() << "\n";
+          ++concurrency_failures;
+          step(false, label + " scratch preparation failed");
+          close_device->Close();
+          return;
+        }
+      }
+      BlockDevice* const close_device_ptr = close_device.get();
+      const uint64_t io_offset = scratch_sector_offset(scratch_index);
+      std::atomic<int> ready{0};
+      std::atomic<bool> go{false};
+      std::atomic<bool> operation_succeeded{false};
+      std::thread operation([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        bool result = false;
+        if (mode == 0) {
+          std::vector<uint8_t> buffer(sector, 0);
+          result = close_device_ptr->Read(io_offset, buffer.data(), buffer.size());
+        } else if (mode == 1) {
+          std::vector<uint8_t> buffer = make_pattern(0xE3);
+          result = close_device_ptr->Write(io_offset, buffer.data(), buffer.size());
+        } else {
+          result = close_device_ptr->Flush();
+        }
+        operation_succeeded.store(result, std::memory_order_release);
+      });
+      std::thread closer([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        close_device_ptr->Close();
+      });
+      while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+      }
+      go.store(true, std::memory_order_release);
+      operation.join();
+      closer.join();
+      const bool closed = close_device->State() == DeviceState::kClosed;
+      close_device->Close();
+      const bool still_closed = close_device->State() == DeviceState::kClosed;
+      const std::string outcome = operation_succeeded.load(std::memory_order_acquire)
+                                      ? "I/O completed"
+                                      : "I/O rejected during close";
+      const bool passed = closed && still_closed;
+      if (!passed) ++concurrency_failures;
+      step(passed, label + " (" + outcome + ", final state Closed)");
+      close_device.reset();
+    };
+    run_close_pair("Read+Close", 0, 0);
+    run_close_pair("Write+Close", 1, 5);
+    run_close_pair("Flush+Close", 2, 6);
+
+    // Reopen once after the close races and restore every saved scratch byte.
+    dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                     &options);
+    if (!dev) {
+      std::cerr << "error: cannot reopen device to restore scratch region at "
+                << "offset " << scratch_offset << ": " << error << "\n";
+      ++concurrency_failures;
+      step(false, "scratch region could not be reopened for restoration");
+    } else {
+      bool scratch_restored = restore_regions(/*scratch_only=*/true);
+      step(scratch_restored,
+           "original 16-sector scratch region restored, flushed, and verified");
+      dev->Close();
+      dev.reset();
+    }
+  } else {
+    std::cout << "concurrency matrix: skipped (0 rounds requested)\n";
+  }
+
+  if (dev) {
+    dev->Close();
+    dev.reset();
+  }
+  std::cout << "concurrency rounds: " << options.device_concurrency_rounds
+            << ", failures: " << concurrency_failures << "\n";
+  std::cout << "device-selftest failures: " << step_failures << "\n";
   return ok ? 0 : 1;
 }
 
@@ -1521,6 +1955,9 @@ int CommandFormat(const std::string& target, const Options& options) {
   auto report = mkfs::Format(*dev, format_options);
   if (!report.ok()) {
     PrintError(report.error());
+    if (!dev->LastError().empty()) {
+      std::cerr << "backend error: " << dev->LastError() << "\n";
+    }
     return 1;
   }
   const mkfs::FormatReport& r = report.value();
@@ -1621,14 +2058,11 @@ int CommandPwrite(const std::string& target, const std::string& path,
                   const std::string& offset_text, const std::string& text,
                   const std::string& from_file, const Options& options) {
   if (!options.rw_experimental) {
-    std::cerr << "error: pwrite modifies the image; pass --rw-experimental to confirm (image files only)\n";
+    std::cerr << "error: pwrite modifies the target; pass --rw-experimental to confirm\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: pwrite is restricted to image files in this version; "
-                 "read-write support for real devices is not enabled yet\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   if (text.empty() == from_file.empty()) {
     std::cerr << "error: pass exactly one data source: --text=<string> or "
                  "--from=<file>\n";
@@ -1680,7 +2114,8 @@ int CommandPwrite(const std::string& target, const std::string& path,
   }
 
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -1735,17 +2170,16 @@ int CommandExtend(const std::string& target, const std::string& path,
     std::cerr << "error: extend modifies the image; pass --rw-experimental\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: extend is restricted to image files in this version\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   uint64_t new_size = 0;
   if (!ParseU64(size_text, &new_size)) {
     std::cerr << "error: <size> must be a decimal or 0x-prefixed byte count\n";
     return 1;
   }
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -1805,18 +2239,16 @@ int CommandTruncate(const std::string& target, const std::string& path,
     std::cerr << "error: truncate modifies the image; pass --rw-experimental\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: truncate is restricted to image files in this "
-                 "version\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   uint64_t new_size = 0;
   if (!ParseU64(size_text, &new_size)) {
     std::cerr << "error: <size> must be a decimal or 0x-prefixed byte count\n";
     return 1;
   }
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -1854,7 +2286,8 @@ int CommandTruncate(const std::string& target, const std::string& path,
 namespace {
 
 // Shared front matter for fallocate/convert-unwritten: byte range arguments,
-// opt-in flag, image only, exclusive writable mount.
+// opt-in flag, exclusive writable mount.  A raw device also needs the
+// device-write qualification gate.
 int ParseRangeArguments(const std::string& target, const std::string& path,
                         const std::string& offset_text,
                         const std::string& length_text, const Options& options,
@@ -1864,11 +2297,8 @@ int ParseRangeArguments(const std::string& target, const std::string& path,
                  "--rw-experimental\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: this command is restricted to image files in this "
-                 "version\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   if (!ParseU64(offset_text, offset) || !ParseU64(length_text, length)) {
     std::cerr << "error: <offset> and <length> must be decimal or 0x-prefixed "
                  "byte counts\n";
@@ -1892,7 +2322,8 @@ int CommandFallocate(const std::string& target, const std::string& path,
                                    options, &offset, &length);
   if (parsed != 0) return parsed;
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -1938,7 +2369,8 @@ int CommandConvertUnwritten(const std::string& target,
                                    options, &offset, &length);
   if (parsed != 0) return parsed;
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -2072,22 +2504,21 @@ Result<std::pair<uint64_t, std::string>> ParentAndName(XfsFilesystem& fs,
   return std::make_pair(ino.value().ino, std::string(name));
 }
 
-// Shared front matter for the namespace commands: opt-in flag, image only,
-// exclusive read-write mount.
+// Shared front matter for the namespace commands: opt-in flag, exclusive
+// writable mount.  A raw device also needs the device-write qualification
+// gate; the class policy and identity pins are enforced by the backend.
 int OpenWritable(const std::string& target, const Options& options,
                  std::unique_ptr<XfsFilesystem>* fs_out) {
   if (!options.rw_experimental) {
     std::cerr << "error: this command modifies the image; pass "
-                 "--rw-experimental to confirm (images only)\n";
+                 "--rw-experimental to confirm\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: read-write commands are restricted to image files "
-                 "in this version\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -2155,8 +2586,8 @@ int CommandReflink(const std::string& target, const std::string& src_path,
 
 // ---------------------------------------------------------------------------
 // recover: journal replay as a standalone command (RW-5). Writes metadata, so
-// it demands --yes-i-really-mean-it; the same image-only policy as the other
-// read-write commands applies.
+// it demands --yes-i-really-mean-it; a raw device also needs the device-write
+// qualification gate and the class opt-in.
 // ---------------------------------------------------------------------------
 int CommandRecover(const std::string& target, const Options& options) {
   if (!options.yes_i_really_mean_it) {
@@ -2164,13 +2595,11 @@ int CommandRecover(const std::string& target, const Options& options) {
                  "pass --yes-i-really-mean-it to confirm\n";
     return 3;
   }
-  if (IsRawDevicePath(target)) {
-    std::cerr << "error: journal recovery is restricted to image files in "
-                 "this version\n";
-    return 3;
-  }
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
   std::string error;
-  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error);
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -2716,6 +3145,37 @@ int Run(const std::vector<std::string>& args) {
       options.allow_removable_disk_write = true;
     } else if (StartsWith(arg, "--device-cache-mode=")) {
       options.device_cache_mode = arg.substr(20);
+    } else if (StartsWith(arg, "--expect-serial=")) {
+      options.expect_serial = arg.substr(16);
+      if (options.expect_serial.empty()) {
+        std::cerr << "error: --expect-serial must not be empty\n";
+        return 1;
+      }
+    } else if (StartsWith(arg, "--expect-stable-id=")) {
+      options.expect_stable_id = arg.substr(19);
+      if (options.expect_stable_id.empty()) {
+        std::cerr << "error: --expect-stable-id must not be empty\n";
+        return 1;
+      }
+    } else if (StartsWith(arg, "--expect-size=")) {
+      uint64_t bytes = 0;
+      if (!ParseU64(arg.substr(14), &bytes) || bytes == 0) {
+        std::cerr << "error: --expect-size must be a positive byte count\n";
+        return 1;
+      }
+      options.expect_size_bytes = bytes;
+    } else if (StartsWith(arg, "--concurrency-rounds=")) {
+      const std::string value = arg.substr(21);
+      const bool decimal = !value.empty() &&
+                           std::all_of(value.begin(), value.end(), [](char c) {
+                             return c >= '0' && c <= '9';
+                           });
+      uint64_t rounds = 0;
+      if (!decimal || !ParseU64(value, &rounds) || rounds > 1000) {
+        std::cerr << "error: --concurrency-rounds must be an integer from 0 to 1000\n";
+        return 1;
+      }
+      options.device_concurrency_rounds = static_cast<int>(rounds);
     } else if (arg == "--json") {
       options.json = true;
     } else if (arg == "--replace") {
@@ -2866,7 +3326,8 @@ int Run(const std::vector<std::string>& args) {
   if (command == "device-selftest") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin device-selftest <device|image> "
-                   "--device-write-qualification --yes-i-really-mean-it\n";
+                   "--device-write-qualification --yes-i-really-mean-it "
+                   "[--concurrency-rounds=N]\n";
       return 1;
     }
     return CommandDeviceSelfTest(positional[1], options);

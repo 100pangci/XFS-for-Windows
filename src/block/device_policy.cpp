@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace xfs {
@@ -338,6 +339,36 @@ WriteEligibility EvaluateDeviceWriteEligibility(
   }
   if (reason) reason->clear();
   return WriteEligibility::kEligible;
+}
+
+bool MatchesExpectedDeviceIdentity(const DeviceIdentity& identity,
+                                   uint64_t size_bytes,
+                                   const DeviceOpenPolicy& policy,
+                                   std::string* reason) {
+  auto mismatch = [&](std::string message) {
+    if (reason) *reason = std::move(message);
+    return false;
+  };
+  if (!policy.expected_serial.empty() &&
+      identity.serial_number != policy.expected_serial) {
+    return mismatch("serial number '" + identity.serial_number +
+                    "' does not match expected '" + policy.expected_serial +
+                    "'");
+  }
+  if (!policy.expected_stable_id.empty() &&
+      identity.stable_id != policy.expected_stable_id) {
+    return mismatch("stable id '" + identity.stable_id +
+                    "' does not match expected '" + policy.expected_stable_id +
+                    "'");
+  }
+  if (policy.expected_size_bytes != 0 &&
+      size_bytes != policy.expected_size_bytes) {
+    return mismatch("size " + std::to_string(size_bytes) +
+                    " bytes does not match expected " +
+                    std::to_string(policy.expected_size_bytes) + " bytes");
+  }
+  if (reason) reason->clear();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
