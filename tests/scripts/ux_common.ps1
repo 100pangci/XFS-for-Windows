@@ -192,7 +192,10 @@ function Invoke-UxProcess {
 function Start-UxMount {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$InputText,
+        # A non-interactive form (the legacy `mount <device> X:` invocation)
+        # legitimately has no input. PowerShell refuses to bind an empty
+        # string to a Mandatory parameter, so the default must be empty.
+        [string]$InputText = '',
         [Parameter(Mandatory = $true)][string]$LogName
     )
     $stdoutPath = Join-Path $script:UxArtifactDir "$LogName.out.log"
