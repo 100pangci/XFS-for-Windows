@@ -1406,11 +1406,33 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
-          sc.exe query XFSWinAutomount
-          Get-Service -Name XFSWinAutomount -ErrorAction SilentlyContinue | Format-List *
-          Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
-            Where-Object { $_.ProviderName -match 'XFS|WinFsp' } |
-            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message
+          $ErrorActionPreference = 'Continue'
+          $report = Join-Path $PWD 'artifacts\service-diagnostics.txt'
+          New-Item -ItemType Directory -Force (Split-Path $report) | Out-Null
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add('== sc query XFSWinAutomount')
+          $lines.Add((sc.exe query XFSWinAutomount | Out-String))
+          $lines.Add('== sc qc XFSWinAutomount')
+          $lines.Add((sc.exe qc XFSWinAutomount | Out-String))
+          $lines.Add('== Get-Service XFSWinAutomount')
+          $lines.Add((Get-Service -Name XFSWinAutomount -ErrorAction SilentlyContinue |
+            Format-List * | Out-String))
+          $lines.Add('== Application log: XFS / WinFsp / crash records')
+          $lines.Add((Get-WinEvent -LogName Application -MaxEvents 80 -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.ProviderName -match 'XFS|WinFsp|Application Error|Windows Error Reporting'
+            } |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message | Out-String))
+          $lines.Add('== System log: Service Control Manager records for the service')
+          $lines.Add((Get-WinEvent -LogName System -MaxEvents 80 -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.ProviderName -eq 'Service Control Manager' -and
+              $_.Message -match 'XFSWinAutomount'
+            } |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message | Out-String))
+          $text = $lines -join "`n"
+          $text | Out-File -FilePath $report -Encoding utf8
+          $text
 
       - name: Upload the automount logs
         if: always()
