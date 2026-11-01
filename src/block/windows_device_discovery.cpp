@@ -128,6 +128,7 @@ PartitionLocation MakeLocation(const RawDiskInfo& disk,
   location.pagefile_disk = disk.has_pagefile;
   location.offline = disk.offline;
   location.read_only = disk.read_only;
+  location.disk_size_bytes = disk.size_bytes;
   if (partition) {
     location.partition_number = partition->number;
     location.offset_bytes = partition->offset_bytes;

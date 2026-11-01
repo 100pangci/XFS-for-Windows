@@ -60,6 +60,9 @@ struct PartitionLocation {
   std::string disk_path;  // \\.\PhysicalDriveN
   uint64_t offset_bytes = 0;
   uint64_t length_bytes = 0;
+  // Whole-disk capacity, independent of the partition length.  DEV-1 identity
+  // pins and the raw-device open policy are expressed against this value.
+  uint64_t disk_size_bytes = 0;
   bool removable = false;
   DeviceClass device_class = DeviceClass::kUnknown;
   DeviceBusType bus_type = DeviceBusType::kUnknown;
