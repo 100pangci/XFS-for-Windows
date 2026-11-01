@@ -24,7 +24,10 @@
 #include <thread>
 
 #include "xfs/block_device.h"
+#include "xfs/device_discovery.h"
+#include "xfs/device_selection.h"
 #include "xfs/directory.h"
+#include "xfs/drive_letter.h"
 #include "xfs/endian.h"
 #include "xfs/error.h"
 #include "xfs/filesystem.h"
@@ -38,6 +41,7 @@
 #include "xfs/rmap.h"
 #include "xfs/superblock.h"
 #include "xfs/win_name_map.h"
+#include "xfs/windows_volume.h"
 #include "xfs/perf_stats.h"
 #include "xfs/windows_raw_device.h"
 
@@ -130,6 +134,11 @@ void PrintUsage() {
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images, or a real device\n"
       "                                together with --device-write-qualification)\n"
+      "  mount                         choose an attached XFS filesystem and a\n"
+      "                                drive letter interactively\n"
+      "  mount <device|image>          mount to the first free drive letter\n"
+      "      --drive=<X:|auto>         preferred drive letter (default auto)\n"
+      "  devices                       list attached XFS filesystems\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -152,6 +161,8 @@ void PrintUsage() {
       "  xfswin info test.img\n"
       "  xfswin check test.img\n"
       "  xfswin ls test.img /\n"
+      "  xfswin devices\n"
+      "  xfswin mount\n"
       "  xfswin cat \\\\.\\PhysicalDrive2 /etc/hostname\n"
       "  xfswin mount test.img X:\n"
       "  xfswin mount test.img X: --rw-experimental\n";
@@ -1980,6 +1991,273 @@ int CommandFormat(const std::string& target, const Options& options) {
   return 0;
 }
 
+std::string DiscoveryErrorText(const ErrorContext& error) {
+  if (error.code == XfsError::kPermissionDenied) {
+    return "XFS device discovery requires administrator privileges. Run the "
+           "command from an elevated prompt.";
+  }
+  return "Device discovery failed: " + error.message;
+}
+
+void PrintDiscoveryWarnings(const DiscoveryReport& report,
+                            const Options& options) {
+  for (const auto& warning : report.warnings) {
+    std::cerr << "warning: " << warning << "\n";
+  }
+  if (report.incomplete) {
+    std::cerr << "warning: some devices could not be read; if a device was "
+                 "just inserted, wait for it to become ready and try again.\n";
+  }
+  if (options.debug && report.retryable_failures != 0) {
+    std::cerr << "debug: retryable discovery failures: "
+              << report.retryable_failures << "\n";
+  }
+}
+
+int CommandDevices(const Options& options) {
+  std::string error;
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &error);
+  if (!discovered.ok()) {
+    std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+    if (options.verbose) PrintError(discovered.error());
+    return 1;
+  }
+  const DiscoveryReport& report = discovered.value();
+  const auto lines = FormatDeviceMenu(report);
+  if (lines.empty()) {
+    std::cout << "No XFS filesystems are attached.\n";
+  } else {
+    std::cout << "XFS filesystems attached to this computer:\n";
+    for (const auto& line : lines) std::cout << line << "\n";
+  }
+  const auto rejected = FormatRejectedDevices(report);
+  if (!rejected.empty()) {
+    std::cout << "\nXFS candidates that cannot be mounted:\n";
+    for (const auto& line : rejected) std::cout << line << "\n";
+  }
+  PrintDiscoveryWarnings(report, options);
+  return 0;
+}
+
+#ifdef XFSWIN_HAS_WINFSP
+
+bool AllocateMountDrive(const std::string& preferred, std::string* drive,
+                        bool* fell_back, std::string* error) {
+  std::string letter_error;
+  const auto letters = EnumerateDriveLetters(&letter_error);
+  if (!letter_error.empty()) {
+    if (error) {
+      *error = "drive letters could not be enumerated: " + letter_error;
+    }
+    return false;
+  }
+  DriveLetterUsage usage;
+  for (const auto& letter : letters) {
+    if (letter.letter >= 'A' && letter.letter <= 'Z') {
+      const size_t index = static_cast<size_t>(letter.letter - 'A');
+      usage.used[index] = true;
+      usage.kinds[index] = letter.kind;
+      usage.targets[index] = letter.target;
+    }
+  }
+  auto choice = ChooseDriveLetter(preferred, usage);
+  if (!choice.ok()) {
+    if (error) {
+      *error = choice.error().code == XfsError::kNoSpace
+                   ? "no free drive letter is available"
+                   : choice.error().message;
+    }
+    return false;
+  }
+  if (drive) *drive = choice.value().drive;
+  if (fell_back) *fell_back = choice.value().preferred_unavailable;
+  return true;
+}
+
+int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
+                              const std::string& preferred,
+                              const Options& options) {
+  if (filesystem.xfswin_mounted) {
+    std::cerr << "error: this XFS filesystem is already mounted at "
+              << filesystem.xfswin_drive << " by xfswin.\n";
+    return 1;
+  }
+  if (filesystem.probe.log_state == LogState::kDirty ||
+      filesystem.probe.log_state == LogState::kUnknown) {
+    if (!options.force_unsafe_ro) {
+      std::cerr
+          << "error: the XFS journal is not clean, so a read-only mount is "
+             "unsafe.\n"
+             "       Recover the filesystem first, or pass --force-unsafe-ro "
+             "if you accept the risk.\n";
+      return 1;
+    }
+  }
+  const bool read_write = options.rw_experimental;
+  if (read_write && !options.device_write_qualification) {
+    std::cerr
+        << "error: writable mounting of a real device requires both "
+           "--rw-experimental and --device-write-qualification.\n"
+           "       The class policy still applies: fixed disks need "
+           "--allow-fixed-disk-write and removable disks need "
+           "--allow-removable-disk-write.\n";
+    return 3;
+  }
+
+  std::string drive;
+  bool fell_back = false;
+  std::string drive_error;
+  if (!AllocateMountDrive(preferred, &drive, &fell_back, &drive_error)) {
+    std::cerr << "error: " << drive_error << "\n";
+    return 1;
+  }
+  if (fell_back && !preferred.empty()) {
+    std::cout << "The configured drive letter " << preferred
+              << " is already in use. Mounted as " << drive << " instead.\n";
+  }
+
+  winfsp::MountTarget target;
+  target.path = filesystem.location.disk_path;
+  target.offset_bytes = filesystem.location.offset_bytes;
+  target.length_bytes =
+      filesystem.location.whole_disk ? 0 : filesystem.location.length_bytes;
+  const std::string label =
+      filesystem.probe.label.empty() ? "XFS filesystem"
+                                     : filesystem.probe.label;
+  std::cout << "Mounting " << label << " at " << drive << " ("
+            << (read_write ? "experimental read-write" : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
+  DeviceOpenPolicy raw_policy =
+      BuildRawDevicePolicy(options, read_write);
+  return winfsp::RunMountHost(
+      target, drive, options.force_unsafe_ro, options.verbose || options.debug,
+      read_write, options.perf_stats, options.rmapbt_qualification,
+      options.reflink_qualification, &raw_policy);
+}
+
+int CommandMountInteractive(const Options& options, bool drive_specified,
+                            const std::string& preferred) {
+  std::string error;
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &error);
+  if (!discovered.ok()) {
+    std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+    if (options.verbose) PrintError(discovered.error());
+    return 1;
+  }
+  const DiscoveryReport& report = discovered.value();
+  if (report.filesystems.empty()) {
+    const auto rejected = FormatRejectedDevices(report);
+    for (const auto& line : rejected) std::cout << line << "\n";
+    std::cout << "No mountable XFS filesystems are attached.\n";
+    PrintDiscoveryWarnings(report, options);
+    return 1;
+  }
+
+  std::cout << "XFS filesystems attached to this computer:\n";
+  for (const auto& line : FormatDeviceMenu(report)) std::cout << line << "\n";
+  const auto rejected = FormatRejectedDevices(report);
+  if (!rejected.empty()) {
+    std::cout << "\nXFS candidates that cannot be mounted:\n";
+    for (const auto& line : rejected) std::cout << line << "\n";
+  }
+  PrintDiscoveryWarnings(report, options);
+
+  std::cout << "\nSelect a filesystem by number, UUID, or label: ";
+  std::cout.flush();
+  std::string selection;
+  if (!std::getline(std::cin, selection)) {
+    std::cerr << "\nerror: no selection was entered\n";
+    return 1;
+  }
+  auto index = SelectDiscoveredFilesystem(selection, report.filesystems);
+  if (!index.ok()) {
+    std::cerr << "error: " << index.error().message << "\n";
+    return 1;
+  }
+  const DiscoveredFilesystem& filesystem = report.filesystems[index.value()];
+  if (filesystem.xfswin_mounted) {
+    std::cerr << "error: this XFS filesystem is already mounted at "
+              << filesystem.xfswin_drive << " by xfswin.\n";
+    return 1;
+  }
+
+  std::string chosen = preferred;
+  if (!drive_specified) {
+    std::cout << "Drive letter [auto]: ";
+    std::cout.flush();
+    std::string answer;
+    if (!std::getline(std::cin, answer)) answer.clear();
+    auto parsed = ParseDriveSelection(answer);
+    if (!parsed.ok()) {
+      std::cerr << "error: " << parsed.error().message << "\n";
+      return 1;
+    }
+    chosen = parsed.value().drive;
+  }
+  return MountDiscoveredFilesystem(filesystem, chosen, options);
+}
+
+int CommandMountAutoDrive(const std::string& target,
+                          const std::string& preferred,
+                          const Options& options) {
+  const bool raw = IsRawDevicePath(target);
+  if (raw && options.rw_experimental &&
+      !options.device_write_qualification) {
+    std::cerr
+        << "error: writable mounting of a real device requires both "
+           "--rw-experimental and --device-write-qualification.\n"
+           "       The class policy still applies: fixed disks need "
+           "--allow-fixed-disk-write and removable disks need "
+           "--allow-removable-disk-write.\n";
+    return 3;
+  }
+  std::string drive;
+  bool fell_back = false;
+  std::string drive_error;
+  if (!AllocateMountDrive(preferred, &drive, &fell_back, &drive_error)) {
+    std::cerr << "error: " << drive_error << "\n";
+    return 1;
+  }
+  if (fell_back && !preferred.empty()) {
+    std::cout << "The configured drive letter " << preferred
+              << " is already in use. Mounted as " << drive << " instead.\n";
+  }
+  std::cout << "Mounting " << target << " at " << drive << " ("
+            << (options.rw_experimental ? "experimental read-write"
+                                        : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
+  DeviceOpenPolicy raw_policy =
+      BuildRawDevicePolicy(options, options.rw_experimental);
+  winfsp::MountTarget whole;
+  whole.path = target;
+  return winfsp::RunMountHost(
+      whole, drive, options.force_unsafe_ro, options.verbose || options.debug,
+      options.rw_experimental, options.perf_stats,
+      options.rmapbt_qualification, options.reflink_qualification,
+      raw ? &raw_policy : nullptr);
+}
+
+#else  // !XFSWIN_HAS_WINFSP
+
+int CommandMountInteractive(const Options&, bool, const std::string&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+int CommandMountAutoDrive(const std::string&, const std::string&,
+                          const Options&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+#endif  // XFSWIN_HAS_WINFSP
+
 int CommandMount(const std::string& target, const std::string& drive,
                  const Options& options) {
   // DEV-1: a raw device is never writable merely because its path looks like
@@ -3131,6 +3409,8 @@ int Run(const std::vector<std::string>& args) {
   int rmap_ag = -1;
   bool explicit_rw = false;
   bool replace_existing = false;
+  std::string drive_option;
+  bool drive_option_given = false;
   for (const auto& arg : args) {
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
@@ -3238,6 +3518,9 @@ int Run(const std::vector<std::string>& args) {
       options.nrext64 = true;
     } else if (arg == "--rw") {
       explicit_rw = true;
+    } else if (StartsWith(arg, "--drive=")) {
+      drive_option = arg.substr(8);
+      drive_option_given = true;
     } else if (StartsWith(arg, "--text=")) {
       pwrite_text = arg.substr(7);
     } else if (StartsWith(arg, "--from=")) {
@@ -3311,6 +3594,13 @@ int Run(const std::vector<std::string>& args) {
   const std::string& command = positional[0];
 
   if (command == "list") return CommandList();
+  if (command == "devices") {
+    if (positional.size() != 1) {
+      std::cerr << "usage: xfswin devices\n";
+      return 1;
+    }
+    return CommandDevices(options);
+  }
   if (command == "info") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin info <device|image>\n";
@@ -3591,11 +3881,32 @@ int Run(const std::vector<std::string>& args) {
     return CommandFormat(positional[1], options);
   }
   if (command == "mount") {
-    if (positional.size() != 3) {
-      std::cerr << "usage: xfswin mount <device|image> <drive-letter|directory>\n";
-      return 1;
+    std::string preferred;
+    if (drive_option_given) {
+      auto parsed = ParseDriveSelection(drive_option);
+      if (!parsed.ok()) {
+        std::cerr << "error: " << parsed.error().message << "\n";
+        return 1;
+      }
+      preferred = parsed.value().drive;
     }
-    return CommandMount(positional[1], positional[2], options);
+    if (positional.size() == 1) {
+      return CommandMountInteractive(options, drive_option_given, preferred);
+    }
+    if (positional.size() == 2) {
+      return CommandMountAutoDrive(positional[1], preferred, options);
+    }
+    if (positional.size() == 3) {
+      if (drive_option_given) {
+        std::cerr << "error: use either the positional drive letter or "
+                     "--drive=, not both\n";
+        return 1;
+      }
+      return CommandMount(positional[1], positional[2], options);
+    }
+    std::cerr << "usage: xfswin mount [<device|image> [<drive-letter>]] "
+                 "[--drive=<letter|auto>]\n";
+    return 1;
   }
   if (command == "unmount") {
     if (positional.size() != 2) {
