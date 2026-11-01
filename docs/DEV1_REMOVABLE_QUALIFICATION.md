@@ -410,10 +410,15 @@ sources were last modified before that build. The qualification script was
 edited after the run completed, and the run manifest does not record a script
 hash. The archived command lines and marker assertions show the current
 script's checks were active, but the exact run-time script text cannot be
-cryptographically pinned. Final PR HEAD changes only documentation, comments,
-CLI diagnostic text and test/tooling after that binary; it does not change
-device behavior, so the hardware result applies to the device path in final
-HEAD.
+cryptographically pinned. Final PR HEAD changes documentation, comments, CLI
+diagnostic text and test/tooling after that binary, and adds a CLI-only
+qualification gate for destructive format. The gate refuses a raw format that
+does not pass `--device-write-qualification`; the hardware run's format step
+already passed that flag, so its successful format path is unchanged. The new
+refusal path is exercised by CI's fixed-VHD qualification, not by a new
+destructive hardware run. The backend device policy, raw I/O, lifecycle and
+volume ownership code is unchanged, so the hardware result applies to the
+device path in final HEAD.
 
 ### Windows
 
