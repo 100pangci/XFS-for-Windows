@@ -114,6 +114,9 @@ xfs_format "$WORK/raw/same-b.img" 384 UX1-SAME \
 
 echo "== non-XFS payload =="
 ext4_format "$WORK/raw/ext4.img" 320 UX1-NOT-XFS
+# The middle partition of the multi-partition disk is 32 MiB, so it gets its
+# own complete ext4 filesystem instead of the truncated large payload.
+ext4_format "$WORK/raw/ext4-small.img" 32 UX1-MIDDLE
 
 echo "== assembled disks =="
 # single: one 384 MiB XFS partition at the conventional 1 MiB offset.
@@ -135,7 +138,7 @@ sgdisk -n 1:2048:+786432 -t 1:8300 -c 1:UX1-PART-A \
        -n 3:854016:+786432 -t 3:8300 -c 3:UX1-PART-B \
        "$WORK/raw/multi.disk" >/dev/null
 write_at_mib "$WORK/raw/part-a.img" "$WORK/raw/multi.disk" 1
-write_at_mib "$WORK/raw/ext4.img" "$WORK/raw/multi.disk" 385
+write_at_mib "$WORK/raw/ext4-small.img" "$WORK/raw/multi.disk" 385
 write_at_mib "$WORK/raw/part-b.img" "$WORK/raw/multi.disk" 417
 
 echo "== corrupt and unsupported superblocks =="

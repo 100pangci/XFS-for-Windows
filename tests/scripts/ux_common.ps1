@@ -118,12 +118,18 @@ function Detach-UxFixture($info) {
 select vdisk file="$($info.path)"
 detach vdisk
 "@ | Set-Content -Path $diskpart -Encoding ascii
-    & diskpart /s $diskpart | Out-Null
+    $output = & diskpart /s $diskpart 2>&1
+    $code = $LASTEXITCODE
     Remove-Item $diskpart -ErrorAction SilentlyContinue
+    Assert ($code -eq 0) `
+        ("diskpart detach failed for $($info.spec.file): $code " +
+         "($($output -join ' '))")
     for ($i = 0; $i -lt 40; ++$i) {
         Start-Sleep -Milliseconds 250
         if (-not (Get-Disk -Number $info.number -ErrorAction SilentlyContinue)) { break }
     }
+    Assert (-not (Get-Disk -Number $info.number -ErrorAction SilentlyContinue)) `
+        "disk $($info.number) is still present after detaching $($info.spec.file)"
     $script:UxAttached = @($script:UxAttached | Where-Object { $_.name -ne $info.name })
     $script:UxFixturePaths.Remove($info.spec.file) | Out-Null
 }
