@@ -2386,8 +2386,13 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
 
   // Free everything a failed Start() prepared. The waiter thread is only
   // started after every fallible step, so this never races with cleanup.
+  bool dispatcher_started = false;
   auto teardown = [&]() {
     if (impl->winfsp) {
+      if (dispatcher_started) {
+        FspFileSystemStopDispatcher(impl->winfsp);
+        dispatcher_started = false;
+      }
       FspFileSystemRemoveMountPoint(impl->winfsp);
       FspFileSystemDelete(impl->winfsp);
       impl->winfsp = nullptr;
@@ -2527,18 +2532,6 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
   FspFileSystemSetOperationGuardStrategy(
       impl->winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
 
-  status = FspFileSystemSetMountPoint(
-      impl->winfsp, const_cast<PWSTR>(config.mount_point.c_str()));
-  if (status != STATUS_SUCCESS) {
-    return fail(XFS_ERR(XfsError::kInternal,
-                        "failed to mount XFS at " +
-                            WideToUtf8(config.mount_point) +
-                            " (NTSTATUS 0x" +
-                            std::to_string(static_cast<uint32_t>(status)) +
-                            "); is WinFsp installed and is the drive letter "
-                            "free?"));
-  }
-
   // Create the stop event before the dispatcher can run any callback, and
   // keep its handle open until the session is destroyed: RequestStop() and
   // another process's `xfswin unmount` may race with cleanup.
@@ -2558,12 +2551,30 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
         "the XFS device failed before the WinFsp mount became visible"));
   }
 
+  // Start serving before the drive letter exists. Once the mount point is
+  // created, Windows and other processes may issue requests immediately;
+  // WinFsp documents that this race has caused failed or blocked access right
+  // after mounting. A running dispatcher handles those requests instead of
+  // queueing them behind mount-point creation.
   status = FspFileSystemStartDispatcher(impl->winfsp, 0);
   if (status != STATUS_SUCCESS) {
     return fail(XFS_ERR(XfsError::kInternal,
                         "failed to start the WinFsp dispatcher (NTSTATUS 0x" +
                             std::to_string(static_cast<uint32_t>(status)) +
                             ")"));
+  }
+  dispatcher_started = true;
+
+  status = FspFileSystemSetMountPoint(
+      impl->winfsp, const_cast<PWSTR>(config.mount_point.c_str()));
+  if (status != STATUS_SUCCESS) {
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "failed to mount XFS at " +
+                            WideToUtf8(config.mount_point) +
+                            " (NTSTATUS 0x" +
+                            std::to_string(static_cast<uint32_t>(status)) +
+                            "); is WinFsp installed and is the drive letter "
+                            "free?"));
   }
 
   // The waiter owns the clean unmount for the whole session lifetime.
