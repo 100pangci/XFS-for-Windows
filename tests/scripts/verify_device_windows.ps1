@@ -183,8 +183,17 @@ try {
         $results.steps["fault:$($fault.Name)"] = $code
     }
 
+    "== format without qualification is refused =="
+    $code = Invoke-Xfswin -Arguments @(
+        'format', $rawPath, '--yes-i-really-mean-it') `
+        -LogName 'format-no-qualification'
+    Assert ($code -eq 3) "format without --device-write-qualification was not refused: $code"
+    $results.steps['format-refused-without-qualification'] = $code
+
     "== format =="
-    $code = Invoke-Xfswin -Arguments @('format', $rawPath, '--yes-i-really-mean-it') -LogName 'format'
+    $code = Invoke-Xfswin -Arguments @(
+        'format', $rawPath, '--yes-i-really-mean-it',
+        '--device-write-qualification') -LogName 'format'
     Assert ($code -eq 0) "format failed: $code"
     $results.steps['format'] = $code
 

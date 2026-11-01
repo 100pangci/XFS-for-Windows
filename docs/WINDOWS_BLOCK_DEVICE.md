@@ -356,9 +356,10 @@ states that CI did not prove real 4Kn hardware.
 selects the open mode for the qualification matrix.  The default for raw
 writes is `no-buffering`.
 
-`xfswin format` still requires `--yes-i-really-mean-it`.  A fixed-disk format
-additionally requires `--device-write-qualification
---allow-fixed-disk-write`; the default remains refusal.
+`xfswin format` still requires `--yes-i-really-mean-it`. A real-device format
+additionally requires `--device-write-qualification`; fixed and removable
+disks then require `--allow-fixed-disk-write` or
+`--allow-removable-disk-write`, and physical disks remain refused by default.
 
 ## Default PhysicalDrive write policy
 

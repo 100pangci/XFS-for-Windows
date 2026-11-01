@@ -186,9 +186,12 @@ $exe = "build\src\RelWithDebInfo\xfswin.exe"
 & $exe check test.img
 ```
 
-`--rw-experimental` is the ordinary opt-in for image files. A real disk needs
-`--rw-experimental --device-write-qualification`; fixed and removable disks
-additionally need `--allow-fixed-disk-write` / `--allow-removable-disk-write`.
+`--rw-experimental` is the ordinary opt-in for image files. A writable mount
+or file-mutating command on a real disk needs `--rw-experimental
+--device-write-qualification`; fixed and removable disks additionally need
+`--allow-fixed-disk-write` / `--allow-removable-disk-write`. `recover` and
+`format` keep their own `--yes-i-really-mean-it` confirmation and also require
+`--device-write-qualification` for a real device.
 `device-info`, `device-check` and `device-selftest` expose the probed geometry
 and write policy. See `docs/WINDOWS_BLOCK_DEVICE.md`.
 

@@ -1929,6 +1929,12 @@ int CommandFormat(const std::string& target, const Options& options) {
     return 2;
   }
 
+  // The dry run above makes no write.  A real destructive format needs the
+  // same explicit raw-device qualification opt-in as the other writable
+  // commands; the class policy then decides whether this disk may be touched.
+  const int raw_gate = CheckRawWritableTarget(target, options);
+  if (raw_gate != 0) return raw_gate;
+
   auto dev = OpenTarget(target, true, true, &error, &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
