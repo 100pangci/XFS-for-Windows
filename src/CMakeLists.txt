@@ -37,6 +37,11 @@ add_library(xfs_core STATIC
   core/concurrency_hooks.cpp
   block/image_device.cpp
   block/device_policy.cpp
+  block/partition_device.cpp
+  block/drive_letter.cpp
+  block/windows_volume.cpp
+  block/device_discovery.cpp
+  block/windows_device_discovery.cpp
   block/windows_raw_device.cpp
   mkfs/geometry.cpp
   mkfs/ag_builder.cpp
