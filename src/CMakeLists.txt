@@ -36,6 +36,7 @@ add_library(xfs_core STATIC
   core/invalidation.cpp
   core/concurrency_hooks.cpp
   block/image_device.cpp
+  block/device_policy.cpp
   block/windows_raw_device.cpp
   mkfs/geometry.cpp
   mkfs/ag_builder.cpp

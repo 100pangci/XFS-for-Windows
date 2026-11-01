@@ -35,8 +35,13 @@ bool StartsWith(std::string_view s, std::string_view prefix) {
 }
 
 std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
-                                        bool writable, std::string* error) {
+                                        bool writable,
+                                        const DeviceOpenPolicy* device_policy,
+                                        std::string* error) {
   if (StartsWith(target, "\\\\") || StartsWith(target, "//")) {
+    if (device_policy) {
+      return OpenRawDevice(Utf8ToWide(target), *device_policy, error);
+    }
     return OpenRawDevice(Utf8ToWide(target), /*writable=*/writable,
                         /*exclusive=*/writable, error);
   }
@@ -56,7 +61,8 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
 int RunMountHost(const std::string& target, const std::string& drive,
                  bool force_unsafe_ro, bool verbose, bool read_write,
                  bool perf_stats, bool allow_rmapbt_qualification,
-                 bool allow_reflink_qualification) {
+                 bool allow_reflink_qualification,
+                 const DeviceOpenPolicy* device_policy) {
   // Delay-loaded WinFsp runtime: fail cleanly if it is not available.
   HMODULE winfsp_dll = LoadLibraryW(L"winfsp-x64.dll");
   if (!winfsp_dll) {
@@ -71,7 +77,8 @@ int RunMountHost(const std::string& target, const std::string& drive,
   FreeLibrary(winfsp_dll);
 
   std::string error;
-  auto device = OpenTarget(target, /*writable=*/read_write, &error);
+  auto device = OpenTarget(target, /*writable=*/read_write, device_policy,
+                           &error);
   if (!device) {
     std::cerr << "error: " << error << "\n";
     return 1;
@@ -118,7 +125,7 @@ int StopMountHost(const std::string& drive) {
 
 namespace xfs::winfsp {
 int RunMountHost(const std::string&, const std::string&, bool, bool, bool,
-                 bool, bool, bool) {
+                 bool, bool, bool, const DeviceOpenPolicy*) {
   return 1;
 }
 int StopMountHost(const std::string&) { return 1; }

@@ -27,6 +27,11 @@ on:
         type: boolean
         required: false
         default: false
+      large_device:
+        description: Also run the >2 TiB expandable-VHD device qualification
+        type: boolean
+        required: false
+        default: false
       soak_steps:
         description: Operations per soak sequence
         required: false
@@ -126,7 +131,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install xfsprogs
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Configure (concurrency hooks on)
         run: >
@@ -255,7 +260,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install xfsprogs
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Configure (concurrency hooks on)
         run: >
@@ -312,7 +317,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install xfsprogs
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Configure fuzz harnesses
         run: >
@@ -368,8 +373,8 @@ jobs:
 
       - name: Install the reference xfsprogs (parent pointers)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -489,8 +494,8 @@ jobs:
 
       - name: Install the reference xfsprogs (parent pointers)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -530,10 +535,10 @@ jobs:
   # Windows: build, unit/integration tests, formatter round-trip, structural
   # probe, and artifacts for the Linux verification job.
   # ---------------------------------------------------------------------------
-  windows-build-test:
+  windows-build:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -548,9 +553,67 @@ jobs:
         shell: pwsh
         run: cmake --build build --config $env:BUILD_CONFIG
 
+      - name: Upload xfswin.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfswin-exe
+          path: build/src/${{ env.BUILD_CONFIG }}/xfswin.exe
+          if-no-files-found: error
+
+      - name: Upload the test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfswin-tests
+          path: build/tests/${{ env.BUILD_CONFIG }}/xfs_tests.exe
+          if-no-files-found: error
+
+      - name: Upload the stateful fuzz runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateful-fuzz-exe
+          path: build/tests/${{ env.BUILD_CONFIG }}/stateful_fuzz.exe
+          if-no-files-found: error
+
+  windows-build-test:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (test registration; binaries are downloaded)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: build/src/${{ env.BUILD_CONFIG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-tests
+          path: build/tests/${{ env.BUILD_CONFIG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stateful-fuzz-exe
+          path: build/tests/${{ env.BUILD_CONFIG }}
+
       - name: Unit and integration tests
         shell: pwsh
         run: ctest --test-dir build -C $env:BUILD_CONFIG --output-on-failure
+
+      - name: DEV-1 device policy and 64-bit I/O tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "build\tests\$env:BUILD_CONFIG\xfs_tests.exe" --filter=device_
+          if ($LASTEXITCODE -ne 0) { throw "DEV-1 device tests failed" }
 
       - name: FUZZ-2 stateful sequences (Windows writer)
         shell: pwsh
@@ -953,20 +1016,6 @@ jobs:
           path: crash-rw4/
           if-no-files-found: error
 
-      - name: Upload xfswin.exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: xfswin-exe
-          path: build/src/${{ env.BUILD_CONFIG }}/xfswin.exe
-          if-no-files-found: error
-
-      - name: Upload the stateful fuzz runner
-        uses: actions/upload-artifact@v4
-        with:
-          name: stateful-fuzz-exe
-          path: build/tests/${{ env.BUILD_CONFIG }}/stateful_fuzz.exe
-          if-no-files-found: error
-
       - name: Upload Windows-formatted image
         uses: actions/upload-artifact@v4
         with:
@@ -1091,7 +1140,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install xfsprogs
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - uses: actions/download-artifact@v4
         with:
@@ -1136,8 +1185,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Create and populate the modern-inode image
         run: |
@@ -1171,8 +1220,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows-formatted modern profile
         run: |
@@ -1199,8 +1248,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows sparse-chunk fixture
         run: |
@@ -1229,8 +1278,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows-formatted rmapbt image with Linux
         run: |
@@ -1252,8 +1301,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Create and populate the rmapbt fixture
         run: |
@@ -1275,7 +1324,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-read-rw6b-rmap:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    needs: [windows-build, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -1313,7 +1362,7 @@ jobs:
 
   windows-rw6b-tree:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    needs: [windows-build, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -1349,7 +1398,7 @@ jobs:
         with:
           name: rw6b-tree
           path: rw6b-tree
-      - run: sudo apt-get update && sudo apt-get install -y xfsprogs
+      - run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
       - name: Verify the grown and collapsed Linux-origin tree
         run: |
           for image in rw6b-tree/*.img; do
@@ -1367,7 +1416,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6b-mutation:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    needs: [windows-build, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -1418,8 +1467,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify and then mutate the Windows image with Linux
         run: |
@@ -1502,8 +1551,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Final Linux acceptance and reverse churn
         run: |
@@ -1526,7 +1575,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6b-enospc:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rmap]
+    needs: [windows-build, linux-generate-rw6b-rmap]
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -1573,8 +1622,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the near-ENOSPC image with Linux
         run: |
@@ -1593,8 +1642,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Build the Linux rmapbt crash fixture
         run: |
@@ -1612,7 +1661,7 @@ jobs:
 
   windows-rw6b-crash:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-crash]
+    needs: [windows-build, linux-generate-rw6b-crash]
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -1649,6 +1698,10 @@ jobs:
     needs: windows-rw6b-crash
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@v4
 
@@ -1659,12 +1712,12 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
-      - name: Replay every crash image with Linux
+      - name: Replay crash images (shard ${{ matrix.shard }}/2)
         run: |
-          sudo bash tests/scripts/verify_rw6b_crash_linux.sh crash-rw6b
+          sudo bash tests/scripts/verify_rw6b_crash_linux.sh crash-rw6b ${{ matrix.shard }} 2
 
   # ---------------------------------------------------------------------------
   # RW-6B: capture a genuine Linux log with a committed RUI that survives
@@ -1680,8 +1733,8 @@ jobs:
 
       - name: Install xfsprogs and device-mapper
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs dmsetup
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs dmsetup
 
       - name: Capture a surviving RUI
         run: |
@@ -1707,7 +1760,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-recover-rw6b-rui:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rui]
+    needs: [windows-build, linux-generate-rw6b-rui]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -1760,8 +1813,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows RUI completion with Linux
         run: |
@@ -1776,7 +1829,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6b-rui-crash:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6b-rui]
+    needs: [windows-build, linux-generate-rw6b-rui]
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -1821,8 +1874,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify every restarted RUI completion on Linux
         run: |
@@ -1847,7 +1900,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6-modern-roundtrip:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6-modern]
+    needs: [windows-build, linux-generate-rw6-modern]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -1896,8 +1949,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows mutation with Linux and xfs_repair
         run: |
@@ -1950,7 +2003,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6-crash:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: windows-build-test
+    needs: windows-build
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -1989,8 +2042,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify recovered crash images with Linux
         run: |
@@ -2023,8 +2076,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Capture modern-profile dirty logs
         run: |
@@ -2041,7 +2094,7 @@ jobs:
 
   windows-recover-rw6-dirty:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6-dirty]
+    needs: [windows-build, linux-generate-rw6-dirty]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -2091,8 +2144,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify Windows-recovered modern logs with Linux
         run: |
@@ -2188,8 +2241,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Probe and verify the Windows-formatted image
         run: |
@@ -2419,7 +2472,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install xfsprogs
-        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - uses: actions/download-artifact@v4
         with:
@@ -2466,8 +2519,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows read-write modification
         run: |
@@ -2502,8 +2555,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Replay and verify every crash window
         run: |
@@ -2530,8 +2583,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Mount, replay and verify every RW-2 image
         run: |
@@ -2565,8 +2618,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Replay and verify every RW-2 crash window
         run: |
@@ -2643,8 +2696,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Mount, replay and verify every RW-3 image
         run: |
@@ -2652,11 +2705,31 @@ jobs:
           sudo bash tests/scripts/verify_rw3_linux.sh rw3
 
       - name: Upload the reverse-interoperability image
+        id: upload-rw3-reverse
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: rw3-reverse
           path: rw3/reverse.img
           if-no-files-found: error
+
+      # Artifact storage occasionally resets the connection (ECONNRESET) even
+      # though the job itself succeeded. Retry once; downstream jobs need this
+      # artifact, so a second failure still fails the job.
+      - name: Retry the reverse-interoperability image upload
+        id: retry-rw3-reverse
+        if: steps.upload-rw3-reverse.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw3-reverse
+          path: rw3/reverse.img
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Fail if the reverse-interoperability image was not uploaded
+        if: steps.upload-rw3-reverse.outcome == 'failure' && steps.retry-rw3-reverse.outcome == 'failure'
+        run: exit 1
 
   # ---------------------------------------------------------------------------
   # Linux replays every RW-3 crash image: create, mkdir, unlink and rmdir at
@@ -2679,8 +2752,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Replay and verify every RW-3 crash window
         run: |
@@ -2763,8 +2836,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Mount, replay and verify every RW-4 image
         run: |
@@ -2800,8 +2873,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Replay and verify every RW-4 crash window
         run: |
@@ -2845,7 +2918,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rawdevice-vhd:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: windows-build-test
+    needs: windows-build
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -2890,8 +2963,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Strip the VHD footer and verify with the real xfsprogs
         run: |
@@ -2899,6 +2972,190 @@ jobs:
           head -c $((size - 512)) vhd/xfswin.vhd > rawdevice.img
           ls -l rawdevice.img
           sudo bash tests/scripts/verify_windows_image_linux.sh rawdevice.img
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: device qualification on a disposable fixed VHD, without WinFsp.
+  # Covers geometry/policy probes, the destructive self-test, the fault matrix,
+  # format through \\.\PhysicalDriveN and the post-format checks.
+  # ---------------------------------------------------------------------------
+  windows-vhd-device:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: Device qualification on a real (virtual) disk
+        shell: pwsh
+        env:
+          XFSWIN_DEVICE_TRACE: ${{ github.workspace }}\artifacts\device-trace.jsonl
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 512
+
+      - name: Upload the VHD and qualification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-vhd-device
+          path: |
+            vhd/dev1.vhd
+            artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: the same VHD through the real WinFsp mount path.  WinFsp is
+  # installed here because the main build job does not have the SDK.
+  # ---------------------------------------------------------------------------
+  windows-vhd-winfsp:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinFsp runtime and extract the SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+          $p = Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$PWD\sdk") -Wait -PassThru
+          "sdk extract exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "WinFsp SDK extraction failed with $($p.ExitCode)" }
+          if (-not (Test-Path "$PWD\sdk\DYNAMIC\inc\winfsp\winfsp.h")) {
+            throw "SDK layout unexpected: DYNAMIC/inc/winfsp/winfsp.h not found"
+          }
+
+      - name: Build with WinFsp support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_WINFSP_ROOT="$PWD\sdk\DYNAMIC"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config $env:BUILD_CONFIG
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Provide winfsp-x64.dll next to the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem 'C:\Program Files (x86)\WinFsp' -Recurse -Filter 'winfsp-x64.dll' |
+                 Select-Object -First 1
+          if (-not $dll) { throw "winfsp-x64.dll not found after installation" }
+          Copy-Item $dll.FullName "build\src\$env:BUILD_CONFIG\"
+
+      - name: WinFsp read-write qualification on a real (virtual) disk
+        shell: pwsh
+        env:
+          XFSWIN_DEVICE_TRACE: ${{ github.workspace }}\artifacts\device-trace.jsonl
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "build\src\$env:BUILD_CONFIG\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1-winfsp.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 512 -RequireWinFsp
+
+      - name: Upload the WinFsp VHD and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-vhd-winfsp
+          path: |
+            vhd/dev1-winfsp.vhd
+            artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: Linux is the external oracle for the image Windows produced through
+  # the real WinFsp path.  The chain is xfs_repair, an independent Python raw
+  # probe, a kernel mount with semantic checks, xfs_scrub, a clean unmount,
+  # xfs_logprint and a second xfs_repair.
+  # ---------------------------------------------------------------------------
+  linux-verify-windows-vhd:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-vhd-device, windows-vhd-winfsp]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev1-vhd-winfsp
+          path: dev1
+
+      - name: Install xfsprogs
+        run: |
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
+
+      - name: Run the Linux XFS oracle on the WinFsp VHD
+        run: |
+          sudo bash tests/scripts/verify_device_linux.sh \
+            dev1/vhd/dev1-winfsp.vhd dev1-linux-oracle
+
+      - name: Upload the Linux oracle artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-linux-oracle
+          path: dev1-linux-oracle/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # DEV-1: scheduled/manual >2 TiB device qualification.  An expandable VHD is
+  # sparse on the host, so the 3 TiB nominal disk does not need 3 TiB of runner
+  # disk.  This exercises the 64-bit offset path on a real Windows disk handle
+  # (the unit test covers the image backend).  The VHD itself is not uploaded.
+  # ---------------------------------------------------------------------------
+  windows-vhdx-large-device:
+    if: github.event_name == 'schedule' || github.event.inputs.large_device == 'true'
+    needs: windows-build
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-exe
+          path: bin
+
+      - name: ">2 TiB device qualification (expandable VHD)"
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_device_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -VhdPath "$PWD\vhd\dev1-large.vhd" `
+            -ArtifactDir "$PWD\artifacts" `
+            -SizeMB 3145728 -VhdType expandable
+
+      - name: Upload the large-device artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev1-large-device-artifacts
+          path: artifacts/
+          if-no-files-found: error
 
   # ===========================================================================
   # RW-5: Windows-native journal recovery.
@@ -2977,8 +3234,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows-recovered images with the Linux kernel
         run: |
@@ -3047,8 +3304,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the crash-restarted recoveries on Linux
         run: |
@@ -3068,8 +3325,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Generate the Linux dirty-log operation matrix
         run: |
@@ -3091,7 +3348,7 @@ jobs:
 
   windows-recover-linux-logs:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [linux-generate-dirty-logs, windows-build-test]
+    needs: [linux-generate-dirty-logs, windows-build]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -3144,8 +3401,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Linux verifies the Windows replay of its own logs
         run: |
@@ -3172,8 +3429,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Capture real Linux buffer-cancel logs
         run: |
@@ -3191,7 +3448,7 @@ jobs:
 
   windows-recover-linux-buffer-cancel:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [linux-generate-buffer-cancel, windows-build-test]
+    needs: [linux-generate-buffer-cancel, windows-build]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -3240,8 +3497,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Linux verifies the Windows recovery of Linux cancels
         run: |
@@ -3261,7 +3518,7 @@ jobs:
 
   windows-generate-buffer-cancel:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: windows-build-test
+    needs: windows-build
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -3331,8 +3588,8 @@ jobs:
 
       - name: Install the reference xfsprogs (modern Windows image features)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -3395,8 +3652,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows-formatted reflink image with Linux
         run: |
@@ -3417,8 +3674,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Create both reflink fixtures
         run: |
@@ -3442,7 +3699,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6c-roundtrip:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6c]
+    needs: [windows-build, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 60
     strategy:
@@ -3505,8 +3762,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows mutation with Linux
         run: |
@@ -3596,8 +3853,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the final image with Linux
         run: |
@@ -3612,7 +3869,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6c-crash:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: windows-build-test
+    needs: windows-build
     runs-on: windows-2022
     timeout-minutes: 90
     strategy:
@@ -3665,8 +3922,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Validate the crash summary
         run: |
@@ -3707,7 +3964,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6c-refusal:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6c]
+    needs: [windows-build, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -3755,7 +4012,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6c-enospc:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6c]
+    needs: [windows-build, linux-generate-rw6c]
     runs-on: windows-2022
     timeout-minutes: 90
     strategy:
@@ -3816,8 +4073,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the ENOSPC image with Linux
         run: |
@@ -3838,8 +4095,8 @@ jobs:
 
       - name: Install xfsprogs and dmsetup
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs dmsetup
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs dmsetup
 
       - name: Capture a surviving CUI
         run: |
@@ -3864,7 +4121,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-recover-rw6c-cui:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6c-cui]
+    needs: [windows-build, linux-generate-rw6c-cui]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -3914,8 +4171,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows CUI completion with Linux
         run: |
@@ -3928,7 +4185,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6c-cui-crash:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6c-cui]
+    needs: [windows-build, linux-generate-rw6c-cui]
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -3981,8 +4238,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify every restarted CUI recovery with Linux
         run: |
@@ -4031,8 +4288,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Record the default and parent=0 profiles
         run: |
@@ -4248,8 +4505,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows-created fixture and mutations
         run: |
@@ -4281,8 +4538,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Create both xattr fixtures
         run: |
@@ -4304,7 +4561,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6d-roundtrip:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-generate-rw6d]
+    needs: [windows-build, linux-generate-rw6d]
     runs-on: windows-2022
     timeout-minutes: 60
     strategy:
@@ -4371,8 +4628,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the Windows mutation with Linux
         run: |
@@ -4470,8 +4727,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Verify the final image with Linux
         run: |
@@ -4499,8 +4756,8 @@ jobs:
 
       - name: Install xfsprogs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfsprogs
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
 
       - name: Validate the crash summary
         run: |
@@ -4564,8 +4821,8 @@ jobs:
 
       - name: Install build dependencies and xfsprogs 7.2.0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -4610,8 +4867,8 @@ jobs:
 
       - name: Install build dependencies and xfsprogs 7.2.0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -4648,7 +4905,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-rw6e-linux-roundtrip:
     if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
-    needs: [windows-build-test, linux-rw6e-parent]
+    needs: [windows-build, linux-rw6e-parent]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -4762,8 +5019,8 @@ jobs:
 
       - name: Install build dependencies and xfsprogs 7.2.0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
@@ -4815,8 +5072,8 @@ jobs:
 
       - name: Install the reference xfsprogs (parent pointers)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl libinih-dev uuid-dev \
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
             liburcu-dev libblkid-dev libicu-dev
           sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
           echo "/usr/local/sbin" >> "$GITHUB_PATH"

@@ -47,7 +47,7 @@ WinFsp adapter / xfswin CLI            (Windows-only product surfaces)
 | `src/mkfs/` | creating a complete filesystem image and its initial metadata | opening or mutating an existing filesystem |
 | `src/write/` | transactions, allocator, inode lifecycle, namespace, xattr/reflink/CoW mutation, recovery completion | parsing rules, WinFsp callbacks, CLI formatting |
 | `src/recovery/` | log head/tail discovery, record validation, transaction reconstruction, pass1/pass2 replay | deciding whether a recovered filesystem is writable, intent completion transactions |
-| `src/block/` | positioned I/O, device lifecycle, durability flush | filesystem metadata semantics |
+| `src/block/` | positioned I/O, device lifecycle, durability flush, device class/geometry/write policy (`device_policy.cpp`) | filesystem metadata semantics |
 | `src/winfsp/` | Windows handle/path/security/attribute semantics, mounted-service lifecycle | filesystem correctness, journal semantics |
 | `src/cli/` | argument parsing, diagnostics, command orchestration | mutation algorithms (commands call `XfsFilesystem`) |
 

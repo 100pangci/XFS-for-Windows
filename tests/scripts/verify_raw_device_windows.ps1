@@ -77,8 +77,11 @@ try {
     Assert ($LASTEXITCODE -eq 0) "ls failed with $LASTEXITCODE"
     Assert ($listing.Count -eq 0) "expected an empty root directory, got $($listing.Count) entries"
 
-    "== refusing a non-system disk with partitions (safety check) =="
-    # (the blank VHD has no partitions; this only documents the dry-run path)
+    "== volume ownership =="
+    # The blank VHD has no volumes, so the writable open has nothing to lock.
+    # Mounted-volume conflicts are exercised by the DEV-1 qualification job
+    # (tests/scripts/verify_device_windows.ps1); this legacy job only proves
+    # that the \\.\PhysicalDriveN path works end to end.
     "RAW DEVICE CHECKS PASSED"
 } finally {
     "== detaching VHD =="

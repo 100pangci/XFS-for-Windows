@@ -60,13 +60,16 @@ void PrintUsage() {
       "commands:\n"
       "  list                          list physical disks (with safety info)\n"
       "  info <device|image>           show superblock and geometry\n"
+      "  device-info <device|image>    device class, geometry, policy [--json]\n"
+      "  device-check <device|image>   read-only geometry/policy validation\n"
+      "  device-selftest <device>      destructive write/Flush/read-back test\n"
+      "      --device-write-qualification --yes-i-really-mean-it\n"
       "  check <device|image>          read-only consistency validation\n"
       "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
       "  refcount <device|image> [--ag=N]  typed refcountbt records\n"
       "  reflink <image> <src> <dst> <off> <len>  shared-extent clone\n"
-      "      --rw-experimental         writable mount (images only; create,\n"
-      "                                overwrite, extend, truncate, delete, rename,\n"
-      "                                links, symlinks, xattrs and reflinks)\n"
+      "      --rw-experimental         writable mount (images; real devices\n"
+      "                                need --device-write-qualification)\n"
       "  journal <device|image>        dump the internal log structure\n"
       "      --json                    machine-readable (recovery differential)\n"
       "  mkimage <file> <size>         create a sparse test image (e.g. 300M)\n"
@@ -119,9 +122,8 @@ void PrintUsage() {
       "      [--parent]                parent pointers (implies exchange-range)\n"
       "      [--modern-default-profile] the xfsprogs 7.2 default feature set\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
-      "      --rw-experimental         writable mount (images only; create,\n"
-      "                                overwrite, extend, truncate, delete, rename,\n"
-      "                                links, symlinks, xattrs and reflinks)\n"
+      "      --rw-experimental         writable mount (images, or a real device\n"
+      "                                together with --device-write-qualification)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -129,7 +131,13 @@ void PrintUsage() {
       "  --debug                       detailed parser traversal output\n"
       "  --perf-stats                  collect I/O, journal, cache and lock counters\n"
       "  --force-unsafe-ro             allow mounting a dirty/unknown log\n"
-      "  --yes-i-really-mean-it        required for destructive format\n"
+      "  --yes-i-really-mean-it        required for destructive format/selftest\n"
+      "  --device-write-qualification  allow writable access to a real disk\n"
+      "                                under the DEV-1 device policy\n"
+      "  --allow-fixed-disk-write      additionally allow a fixed disk\n"
+      "  --allow-removable-disk-write  additionally allow a removable disk\n"
+      "  --device-cache-mode=<mode>    buffered | write-through | no-buffering |\n"
+      "                                no-buffering-write-through\n"
       "  --help                        this message\n"
       "\n"
       "examples:\n"
@@ -276,11 +284,42 @@ std::filesystem::path ToPath(const std::string& utf8) {
   return std::filesystem::path(std::u8string(p, utf8.size()));
 }
 
+// Builds the DEV-1 policy for a raw device from the CLI options.  A writable
+// raw open is always exclusive and requires volume ownership; the device class
+// still has to pass the policy, so a fixed disk is refused unless the caller
+// passed --allow-fixed-disk-write as well.
+DeviceOpenPolicy BuildRawDevicePolicy(const Options& options, bool writable) {
+  DeviceOpenPolicy policy;
+  policy.writable = writable;
+  policy.exclusive = writable;
+  policy.allow_virtual_disk = true;
+  policy.allow_removable_disk = options.allow_removable_disk_write;
+  policy.allow_fixed_disk = options.allow_fixed_disk_write;
+  policy.require_volume_ownership = true;
+  policy.qualification_override = options.device_write_qualification;
+  policy.cache_mode = writable ? DeviceCacheMode::kNoBuffering
+                               : DeviceCacheMode::kBuffered;
+  if (!options.device_cache_mode.empty()) {
+    DeviceCacheMode mode = policy.cache_mode;
+    if (ParseDeviceCacheMode(options.device_cache_mode, &mode)) {
+      policy.cache_mode = mode;
+    }
+  }
+  return policy;
+}
+
 // Opens a target (raw device or image) read-only unless `writable`.
+// `options` selects the raw-device write policy; without it the conservative
+// legacy policy applies (virtual disks only).
 std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
                                         bool writable, bool exclusive,
-                                        std::string* error) {
+                                        std::string* error,
+                                        const Options* options = nullptr) {
   if (IsRawDevicePath(target)) {
+    if (options) {
+      return OpenRawDevice(ToWide(target),
+                           BuildRawDevicePolicy(*options, writable), error);
+    }
     return OpenRawDevice(ToWide(target), writable, exclusive, error);
   }
   std::filesystem::path path = ToPath(target);
@@ -351,8 +390,9 @@ int CommandList() {
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  std::printf("%-6s %-12s %-6s %-6s %-8s %-18s %s\n", "Drive", "Size",
-              "Sector", "Phys", "System", "Model", "Partitions");
+  std::printf("%-6s %-12s %-6s %-6s %-13s %-12s %-8s %-18s %s\n", "Drive",
+              "Size", "Sector", "Phys", "Class", "Bus", "System", "Model",
+              "Partitions");
   for (const auto& disk : disks) {
     std::string parts;
     for (const auto& p : disk.partitions) {
@@ -362,15 +402,25 @@ int CommandList() {
     }
     if (parts.empty()) parts = "(none)";
     std::string model = disk.model.empty() ? disk.device_path : disk.model;
-    std::printf("%-6u %-12s %-6u %-6u %-8s %-18s %s%s\n", disk.disk_number,
-                HumanBytes(disk.size_bytes).c_str(), disk.logical_sector_size,
-                disk.physical_sector_size,
+    std::string flags;
+    if (disk.is_removable) flags += " [removable]";
+    if (disk.offline) flags += " [offline]";
+    if (disk.read_only) flags += " [read-only]";
+    if (disk.has_pagefile) flags += " [pagefile]";
+    std::printf("%-6u %-12s %-6u %-6u %-13s %-12s %-8s %-18s %s%s\n",
+                disk.disk_number, HumanBytes(disk.size_bytes).c_str(),
+                disk.logical_sector_size, disk.physical_sector_size,
+                ToString(disk.device_class), ToString(disk.bus_type),
                 disk.is_system_disk ? "YES" : "-", model.c_str(),
-                parts.c_str(), disk.has_pagefile ? " [pagefile]" : "");
+                parts.c_str(), flags.c_str());
     if (disk.is_system_disk) {
       std::cout << "       \\-> system disk: formatting is refused\n";
     }
   }
+  std::cout << "\nwritable by default: virtual disks (VHD/VHDX) only; fixed and "
+               "removable disks need\n"
+               "--device-write-qualification plus their explicit "
+               "--allow-*-disk-write flag.\n";
   return 0;
 }
 
@@ -401,6 +451,262 @@ int CommandInfo(const std::string& target) {
   }
   std::cout << "  mountable        : yes (read-only, v5 supported subset)\n";
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// DEV-1 device qualification commands.
+// ---------------------------------------------------------------------------
+void PrintDeviceInfo(const BlockDevice& dev, const Options& options) {
+  const DeviceInfo& info = dev.Info();
+  if (options.json) {
+    std::cout << "{\"description\":\"" << JsonEscape(info.description) << "\""
+              << ",\"size_bytes\":" << info.size_bytes
+              << ",\"logical_sector_size\":" << info.logical_sector_size
+              << ",\"physical_sector_size\":" << info.physical_sector_size
+              << ",\"alignment_offset\":" << info.alignment_offset
+              << ",\"class\":\"" << ToString(info.device_class) << "\""
+              << ",\"bus\":\"" << ToString(info.bus_type) << "\""
+              << ",\"cache_mode\":\"" << ToString(info.cache_mode) << "\""
+              << ",\"writable\":" << (info.writable ? "true" : "false")
+              << ",\"raw\":" << (info.is_raw_device ? "true" : "false")
+              << ",\"removable\":" << (info.removable_media ? "true" : "false")
+              << ",\"offline\":" << (info.offline ? "true" : "false")
+              << ",\"read_only_media\":"
+              << (info.read_only_media ? "true" : "false")
+              << ",\"ownership_confirmed\":"
+              << (info.ownership_confirmed ? "true" : "false")
+              << ",\"system_disk\":" << (info.is_system_disk ? "true" : "false")
+              << ",\"pagefile_disk\":"
+              << (info.has_pagefile ? "true" : "false")
+              << ",\"disk_number\":" << info.disk_number
+              << ",\"partition_number\":" << info.partition_number
+              << ",\"stable_id\":\"" << JsonEscape(info.stable_id) << "\""
+              << ",\"serial\":\"" << JsonEscape(info.serial_number) << "\""
+              << ",\"state\":\"" << ToString(dev.State()) << "\""
+              << ",\"last_error_kind\":\""
+              << ToString(dev.LastErrorKind()) << "\""
+              << "}\n";
+    return;
+  }
+  std::cout << "device\n";
+  std::cout << "  description       : " << info.description << "\n";
+  std::cout << "  class             : " << ToString(info.device_class) << "\n";
+  std::cout << "  bus               : " << ToString(info.bus_type) << "\n";
+  std::cout << "  size              : " << HumanBytes(info.size_bytes) << " ("
+            << info.size_bytes << " bytes)\n";
+  std::cout << "  logical sector    : " << info.logical_sector_size
+            << " bytes\n";
+  std::cout << "  physical sector   : " << info.physical_sector_size
+            << " bytes\n";
+  std::cout << "  alignment offset  : " << info.alignment_offset << " bytes\n";
+  std::cout << "  cache mode        : " << ToString(info.cache_mode) << "\n";
+  std::cout << "  writable          : " << (info.writable ? "yes" : "no")
+            << "\n";
+  std::cout << "  raw device        : " << (info.is_raw_device ? "yes" : "no")
+            << "\n";
+  std::cout << "  removable         : " << (info.removable_media ? "yes" : "no")
+            << "\n";
+  std::cout << "  offline           : " << (info.offline ? "yes" : "no") << "\n";
+  std::cout << "  read-only media   : "
+            << (info.read_only_media ? "yes" : "no") << "\n";
+  std::cout << "  volume ownership  : "
+            << (info.ownership_confirmed ? "confirmed" : "not held") << "\n";
+  std::cout << "  system disk       : " << (info.is_system_disk ? "YES" : "no")
+            << "\n";
+  std::cout << "  pagefile disk     : " << (info.has_pagefile ? "YES" : "no")
+            << "\n";
+  std::cout << "  disk/partition    : " << info.disk_number << " / "
+            << info.partition_number << "\n";
+  std::cout << "  stable id         : "
+            << (info.stable_id.empty() ? "(unknown)" : info.stable_id) << "\n";
+  std::cout << "  serial            : "
+            << (info.serial_number.empty() ? "(unknown)" : info.serial_number)
+            << "\n";
+  std::cout << "  lifecycle state   : " << ToString(dev.State()) << "\n";
+  std::cout << "  last error kind   : " << ToString(dev.LastErrorKind())
+            << "\n";
+
+  DeviceOpenPolicy policy = BuildRawDevicePolicy(options, /*writable=*/true);
+  DeviceGeometry geometry;
+  geometry.size_bytes = info.size_bytes;
+  geometry.logical_sector_size = info.logical_sector_size;
+  geometry.physical_sector_size = info.physical_sector_size;
+  geometry.alignment_offset = info.alignment_offset;
+  std::string reason;
+  WriteEligibility eligibility = EvaluateDeviceWriteClass(
+      info.device_class, geometry, info.read_only_media, info.offline,
+      info.is_system_disk, info.has_pagefile, policy, &reason);
+  std::cout << "  write eligible    : " << ToString(eligibility)
+            << (reason.empty() ? "" : (" (" + reason + ")")) << "\n";
+  if (eligibility == WriteEligibility::kEligible) {
+    const bool needs_ownership =
+        info.device_class == DeviceClass::kVirtualDisk ||
+        info.device_class == DeviceClass::kRemovableDisk ||
+        info.device_class == DeviceClass::kFixedDisk;
+    if (needs_ownership) {
+      std::cout << "  note              : a writable open must still acquire "
+                   "volume ownership\n";
+    }
+  }
+}
+
+int CommandDeviceInfo(const std::string& target, const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/false, /*exclusive=*/false,
+                        &error, &options);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  PrintDeviceInfo(*dev, options);
+  if (!dev->LastError().empty()) {
+    std::cerr << "last backend error: " << dev->LastError() << "\n";
+  }
+  return 0;
+}
+
+int CommandDeviceCheck(const std::string& target, const Options& options) {
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/false, /*exclusive=*/false,
+                        &error, &options);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  const DeviceInfo& info = dev->Info();
+  bool ok = true;
+  auto check = [&](bool condition, const std::string& what) {
+    std::cout << (condition ? "ok   " : "FAIL ") << what << "\n";
+    if (!condition) ok = false;
+  };
+  DeviceGeometry geometry;
+  geometry.size_bytes = info.size_bytes;
+  geometry.logical_sector_size = info.logical_sector_size;
+  geometry.physical_sector_size = info.physical_sector_size;
+  geometry.alignment_offset = info.alignment_offset;
+  std::string geometry_reason;
+  check(IsValidDeviceGeometry(geometry, &geometry_reason),
+        "geometry is sane" +
+            (geometry_reason.empty() ? "" : (": " + geometry_reason)));
+  check(info.logical_sector_size != 0,
+        info.is_raw_device
+            ? "logical sector size was probed (not assumed)"
+            : "logical sector size is configured for the image backend");
+  check(info.physical_sector_size >= info.logical_sector_size,
+        "physical sector >= logical sector");
+  check(info.size_bytes % info.logical_sector_size == 0,
+        "device size is a whole number of logical sectors");
+  check(info.alignment_offset == 0 || info.device_class == DeviceClass::kImageFile,
+        "whole-device alignment offset is zero");
+
+  DeviceOpenPolicy policy = BuildRawDevicePolicy(options, /*writable=*/true);
+  std::string reason;
+  WriteEligibility eligibility = EvaluateDeviceWriteClass(
+      info.device_class, geometry, info.read_only_media, info.offline,
+      info.is_system_disk, info.has_pagefile, policy, &reason);
+  std::cout << "write policy       : " << ToString(eligibility)
+            << (reason.empty() ? "" : (" (" + reason + ")")) << "\n";
+  if (eligibility != WriteEligibility::kEligible) ok = false;
+  return ok ? 0 : 2;
+}
+
+int CommandDeviceSelfTest(const std::string& target, const Options& options) {
+  if (!options.device_write_qualification) {
+    std::cerr << "error: device-selftest writes to the device; pass "
+                 "--device-write-qualification\n";
+    return 3;
+  }
+  if (!options.yes_i_really_mean_it) {
+    std::cerr << "error: device-selftest overwrites the first and last "
+                 "sectors (restored afterwards); pass --yes-i-really-mean-it\n";
+    return 3;
+  }
+  std::string error;
+  auto dev = OpenTarget(target, /*writable=*/true, /*exclusive=*/true, &error,
+                        &options);
+  if (!dev) {
+    std::cerr << "error: " << error << "\n";
+    return 1;
+  }
+  const DeviceInfo& info = dev->Info();
+  const uint32_t sector = info.logical_sector_size;
+  if (sector < 512 || sector > 65536 || (sector & (sector - 1)) != 0) {
+    std::cerr << "error: unusable logical sector size " << sector << "\n";
+    return 1;
+  }
+  if (info.size_bytes < static_cast<uint64_t>(sector) * 2) {
+    std::cerr << "error: device is too small for the self-test\n";
+    return 1;
+  }
+
+  std::vector<uint8_t> first(sector);
+  std::vector<uint8_t> last(sector);
+  const uint64_t last_offset = info.size_bytes - sector;
+  bool saved = dev->Read(0, first.data(), sector);
+  if (saved) saved = dev->Read(last_offset, last.data(), sector);
+  if (!saved) {
+    std::cerr << "error: cannot save the sectors the self-test overwrites: "
+              << dev->LastError() << "\n";
+    return 1;
+  }
+
+  bool ok = true;
+  auto step = [&](bool condition, const std::string& what) {
+    std::cout << (condition ? "ok   " : "FAIL ") << what << "\n";
+    if (!condition) ok = false;
+  };
+
+  std::vector<uint8_t> pattern(sector);
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    pattern[i] = static_cast<uint8_t>((i * 31u + 0xA5u) & 0xFFu);
+  }
+  std::vector<uint8_t> readback(sector);
+
+  // 1. Sector-aligned write, Flush, read back.
+  bool aligned = dev->Write(0, pattern.data(), sector) && dev->Flush() &&
+                 dev->Read(0, readback.data(), sector) &&
+                 std::memcmp(readback.data(), pattern.data(), sector) == 0;
+  step(aligned, "aligned write + Flush + read-back");
+
+  // 2. Unaligned request through the bounce path.  The first sector is
+  //    restored from `first` at the end, so this is safe.
+  const size_t small_size = std::min<size_t>(16, sector - 1);
+  std::vector<uint8_t> small(small_size, 0x5A);
+  std::vector<uint8_t> small_read(small_size, 0);
+  bool unaligned = dev->Write(1, small.data(), small.size()) && dev->Flush() &&
+                   dev->Read(1, small_read.data(), small_read.size()) &&
+                   std::memcmp(small_read.data(), small.data(),
+                               small.size()) == 0;
+  step(unaligned, "unaligned write/read through the bounce path");
+
+  // 3. Last-sector write.  On a >2 TiB device this exercises 64-bit offsets.
+  bool high = dev->Write(last_offset, pattern.data(), sector) && dev->Flush() &&
+              dev->Read(last_offset, readback.data(), sector) &&
+              std::memcmp(readback.data(), pattern.data(), sector) == 0;
+  step(high, std::string("last-sector write/read") +
+                 (last_offset > (1ull << 31) ? " (64-bit offset)" : ""));
+
+  // 4. Two write/Flush barriers in order, then verify both survived.
+  bool ordered = dev->Write(0, pattern.data(), sector) && dev->Flush() &&
+                 dev->Write(last_offset, small.data(), small_size) &&
+                 dev->Flush();
+  if (ordered) {
+    ordered = dev->Read(0, readback.data(), sector) &&
+              std::memcmp(readback.data(), pattern.data(), sector) == 0;
+  }
+  step(ordered, "write/Flush ordering barrier");
+
+  // Restore the original first and last sectors, then flush.
+  bool restored = dev->Write(0, first.data(), first.size()) &&
+                  dev->Write(last_offset, last.data(), last.size()) &&
+                  dev->Flush();
+  step(restored, "original sectors restored and flushed");
+  if (!restored) {
+    std::cerr << "warning: the original sectors could not be restored: "
+              << dev->LastError() << "\n";
+  }
+  dev->Close();
+  return ok ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,23 +1493,18 @@ int CommandFormat(const std::string& target, const Options& options) {
     return 2;
   }
 
-  auto dev = OpenTarget(target, true, true, &error);
+  auto dev = OpenTarget(target, true, true, &error, &options);
   if (!dev) {
     std::cerr << "error: " << error << "\n";
     return 1;
   }
-  if (is_raw) {
-    auto* raw = dynamic_cast<WindowsRawBlockDevice*>(dev.get());
-    if (!raw) {
-      std::cerr << "error: internal error (unexpected device backend)\n";
-      return 1;
-    }
-    std::string lock_error;
-    if (!raw->LockVolumes(&lock_error)) {
-      std::cerr << "error: cannot obtain exclusive access: " << lock_error
-                << "\n       close all programs using this disk and retry\n";
-      return 1;
-    }
+  // A writable raw open already acquired volume ownership in the backend.
+  // Refuse to continue if a backend that cannot prove ownership accepted the
+  // handle anyway.
+  if (is_raw && !dev->Info().ownership_confirmed) {
+    std::cerr << "error: cannot prove exclusive volume ownership; refusing "
+                 "to format\n";
+    return 1;
   }
 
   mkfs::FormatOptions format_options;
@@ -1236,22 +1537,29 @@ int CommandFormat(const std::string& target, const Options& options) {
 
 int CommandMount(const std::string& target, const std::string& drive,
                  const Options& options) {
-  // Safety policy, enforced regardless of whether this build has WinFsp:
-  // read-write mounting is restricted to image files until the writer has
-  // passed crash-consistency and interoperability testing.
-  if (options.rw_experimental && IsRawDevicePath(target)) {
-    std::cerr << "error: writable mounting of real devices is not enabled in "
-                 "this version.\n"
-                 "       Read-write support is restricted to image files "
-                 "(--rw-experimental).\n";
+  // DEV-1: a raw device is never writable merely because its path looks like
+  // \\.\PhysicalDriveN.  The caller must ask for a writable mount AND for
+  // device-write qualification; the device class policy then decides whether
+  // that particular disk may be written (fixed and removable disks have their
+  // own opt-in flags).
+  const bool raw = IsRawDevicePath(target);
+  if (raw && options.rw_experimental &&
+      !options.device_write_qualification) {
+    std::cerr
+        << "error: writable mounting of a real device requires both "
+           "--rw-experimental and --device-write-qualification.\n"
+           "       The class policy still applies: fixed disks need "
+           "--allow-fixed-disk-write and removable disks need "
+           "--allow-removable-disk-write.\n";
     return 3;
   }
 #ifdef XFSWIN_HAS_WINFSP
-  return winfsp::RunMountHost(target, drive, options.force_unsafe_ro,
-                              options.verbose || options.debug,
-                              options.rw_experimental, options.perf_stats,
-                              options.rmapbt_qualification,
-                              options.reflink_qualification);
+  DeviceOpenPolicy raw_policy =
+      BuildRawDevicePolicy(options, options.rw_experimental);
+  return winfsp::RunMountHost(
+      target, drive, options.force_unsafe_ro, options.verbose || options.debug,
+      options.rw_experimental, options.perf_stats, options.rmapbt_qualification,
+      options.reflink_qualification, raw ? &raw_policy : nullptr);
 #else
   (void)target;
   (void)drive;
@@ -2400,6 +2708,14 @@ int Run(const std::vector<std::string>& args) {
       options.yes_i_really_mean_it = true;
     } else if (arg == "--rw-experimental") {
       options.rw_experimental = true;
+    } else if (arg == "--device-write-qualification") {
+      options.device_write_qualification = true;
+    } else if (arg == "--allow-fixed-disk-write") {
+      options.allow_fixed_disk_write = true;
+    } else if (arg == "--allow-removable-disk-write") {
+      options.allow_removable_disk_write = true;
+    } else if (StartsWith(arg, "--device-cache-mode=")) {
+      options.device_cache_mode = arg.substr(20);
     } else if (arg == "--json") {
       options.json = true;
     } else if (arg == "--replace") {
@@ -2499,6 +2815,22 @@ int Run(const std::vector<std::string>& args) {
   }
 
   if (options.perf_stats) xfs::PerfStats::Get().SetEnabled(true);
+  if (!options.device_cache_mode.empty()) {
+    DeviceCacheMode mode;
+    if (!ParseDeviceCacheMode(options.device_cache_mode, &mode)) {
+      std::cerr << "error: --device-cache-mode must be one of buffered, "
+                   "write-through, no-buffering, no-buffering-write-through\n";
+      return 1;
+    }
+  }
+  if ((options.allow_fixed_disk_write ||
+       options.allow_removable_disk_write) &&
+      !options.device_write_qualification) {
+    std::cerr << "error: --allow-fixed-disk-write and "
+                 "--allow-removable-disk-write are only valid together with "
+                 "--device-write-qualification\n";
+    return 1;
+  }
   log::SetLevel(options.debug ? log::Level::kDebug
                               : (options.verbose ? log::Level::kInfo
                                                  : log::Level::kWarn));
@@ -2516,6 +2848,28 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandInfo(positional[1]);
+  }
+  if (command == "device-info") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin device-info <device|image> [--json]\n";
+      return 1;
+    }
+    return CommandDeviceInfo(positional[1], options);
+  }
+  if (command == "device-check") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin device-check <device|image>\n";
+      return 1;
+    }
+    return CommandDeviceCheck(positional[1], options);
+  }
+  if (command == "device-selftest") {
+    if (positional.size() != 2) {
+      std::cerr << "usage: xfswin device-selftest <device|image> "
+                   "--device-write-qualification --yes-i-really-mean-it\n";
+      return 1;
+    }
+    return CommandDeviceSelfTest(positional[1], options);
   }
   if (command == "check") {
     if (positional.size() != 2) {

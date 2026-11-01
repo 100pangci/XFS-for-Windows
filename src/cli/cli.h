@@ -55,6 +55,13 @@ struct Options {
   bool xattr_value_is_hex = false;  // --value-hex input
   std::string xattr_value_file;   // binary value input
   std::string xattr_output;       // binary value output
+  // DEV-1 device qualification.  A raw device is writable only when the caller
+  // explicitly asks for qualification, and each risky device class needs its
+  // own opt-in.  The defaults refuse fixed and removable disks.
+  bool device_write_qualification = false;
+  bool allow_fixed_disk_write = false;
+  bool allow_removable_disk_write = false;
+  std::string device_cache_mode;  // buffered|write-through|no-buffering|both
 };
 
 // Runs the CLI. argv excludes the program name.

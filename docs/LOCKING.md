@@ -45,7 +45,8 @@ The block device has its own independent hierarchy:
 
 ```text
 lifecycle_mutex_ (shared for I/O, exclusive for Close)
-    -> flush_barrier_ (shared for Write, exclusive for Flush)
+    -> flush_barrier_ (shared for ImageBlockDevice writes; exclusive for Flush
+       and for WindowsRawBlockDevice writes; reads do not take it)
 ```
 
 No filesystem lock is ever acquired while a block-device lock is held.
@@ -211,23 +212,44 @@ before a mutation cannot publish a stale chunk.
 
 ### Block device
 
-`ImageBlockDevice` (Windows):
+`ImageBlockDevice` and `WindowsRawBlockDevice` share the same lifecycle
+contract:
 
-- `FILE_FLAG_OVERLAPPED` handle; every request has its own `OVERLAPPED` and
-  completion event (`thread_local` event reused per thread).
-- `Read`/`Write` hold `lifecycle_mutex_` shared and (for writes)
-  `flush_barrier_` shared. Different offsets run concurrently.
+- Positioned I/O (`FILE_FLAG_OVERLAPPED` on Windows, `pread`/`pwrite` on
+  POSIX); every request has its own `OVERLAPPED` and completion event
+  (`thread_local` event reused per thread).
+- `Read` holds `lifecycle_mutex_` shared. Reads do not participate in the
+  flush barrier, so they continue during a flush.
+- `Write` holds `lifecycle_mutex_` shared and `flush_barrier_`.  The image
+  backend takes the barrier shared (buffered file writes at distinct offsets
+  are independent); the raw backend takes it exclusively because an unaligned
+  write is a read-modify-write of the enclosing sector block, so concurrent
+  writers could lose updates.  Either way the barrier keeps a write from
+  starting in the middle of a durable flush.
 - `Flush` holds `lifecycle_mutex_` shared and `flush_barrier_` exclusively,
-  then calls `FlushFileBuffers`. It waits for every write that started earlier
-  and excludes new writes while the barrier is held.
-- `Close` holds `lifecycle_mutex_` exclusively, so no in-flight request can
-  outlive the handle.
+  then calls `FlushFileBuffers` (or `fsync`). It waits for every write that
+  started earlier and excludes new writes while the barrier is held.
+- `Close` holds `lifecycle_mutex_` exclusively, so no in-flight request or
+  Flush can outlive the handle. It is idempotent.
+- Lock order is `lifecycle_mutex_ -> flush_barrier_`. No filesystem lock is
+  acquired while either is held; the filesystem takes `write_barrier_` first
+  and calls `device_->Flush()` last.
+- A terminal device error (`kDeviceRemoved`, `kMediaChanged`,
+  `kInvalidHandle`) moves the device to `kInvalid`; later operations fail
+  without touching the handle. The backend never reconnects by path or disk
+  number.
 - Backend error text is copied under the base `BlockDevice` error lock;
   concurrent failures can never tear `LastError()` and successful I/O does not
   clear the last diagnostic.
 
+`WindowsRawBlockDevice` additionally serializes volume ownership through
+`Impl::ownership_mutex` and takes `lifecycle_mutex_` exclusively while
+locking/dismounting volumes. The ownership mutex is never held while a
+filesystem lock is held.
+
 POSIX uses `pread`/`pwrite`/`fsync` on a file descriptor with the same lock
-semantics. The host NTFS cache is not bypassed.
+semantics. The host NTFS cache is not bypassed for image files; raw devices
+default to `FILE_FLAG_NO_BUFFERING` (see `docs/WINDOWS_BLOCK_DEVICE.md`).
 
 ## Deadlock rules
 

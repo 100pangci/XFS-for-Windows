@@ -9,10 +9,17 @@
 # log, then unmounted and checked with xfs_repair -n and the independent
 # forward-derived rmap ownership oracle.  The log must be clean afterwards.
 #
-# usage: verify_rw6b_crash_linux.sh <crash-dir>
+# usage: verify_rw6b_crash_linux.sh <crash-dir> [shard-index shard-count]
 set -euo pipefail
 
-DIR=${1:?usage: verify_rw6b_crash_linux.sh <crash-dir>}
+DIR=${1:?usage: verify_rw6b_crash_linux.sh <crash-dir> [shard-index shard-count]}
+SHARD_INDEX=${2:-0}
+SHARD_COUNT=${3:-1}
+if [ "$SHARD_COUNT" -lt 1 ] || [ "$SHARD_INDEX" -lt 0 ] || \
+        [ "$SHARD_INDEX" -ge "$SHARD_COUNT" ]; then
+    echo "invalid shard $SHARD_INDEX/$SHARD_COUNT" >&2
+    exit 1
+fi
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d)
 MNT="$WORK/mnt"
@@ -28,10 +35,14 @@ if [ ! -f "$DIR/cases.json" ]; then
     echo "missing $DIR/cases.json" >&2
     exit 1
 fi
-expected=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' \
-    "$DIR/cases.json")
+expected=$(python3 -c '
+import json, sys
+index, count = int(sys.argv[2]), int(sys.argv[3])
+cases = json.load(open(sys.argv[1]))
+print(sum(1 for i in range(len(cases)) if i % count == index))
+' "$DIR/cases.json" "$SHARD_INDEX" "$SHARD_COUNT")
 if [ "$expected" -eq 0 ]; then
-    echo "crash manifest is empty" >&2
+    echo "crash shard $SHARD_INDEX/$SHARD_COUNT has no cases" >&2
     exit 1
 fi
 
@@ -113,12 +124,14 @@ while IFS= read -r archive; do
     checked=$((checked + 1))
 done < <(python3 -c '
 import json, sys
-for case in json.load(open(sys.argv[1])):
-    print(case["file"])
-' "$DIR/cases.json")
+index, count = int(sys.argv[2]), int(sys.argv[3])
+for i, case in enumerate(json.load(open(sys.argv[1]))):
+    if i % count == index:
+        print(case["file"])
+' "$DIR/cases.json" "$SHARD_INDEX" "$SHARD_COUNT")
 
 if [ "$checked" -ne "$expected" ] || [ "$failed" -ne 0 ]; then
-    echo "RW-6B crash replay FAILED ($failed failures, $checked/$expected clean)" >&2
+    echo "RW-6B crash replay FAILED (shard $SHARD_INDEX/$SHARD_COUNT: $failed failures, $checked/$expected clean)" >&2
     exit 1
 fi
-echo "RW-6B crash replay OK ($checked images)"
+echo "RW-6B crash replay OK (shard $SHARD_INDEX/$SHARD_COUNT: $checked images)"

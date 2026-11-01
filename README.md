@@ -165,7 +165,7 @@ $exe = "build\src\RelWithDebInfo\xfswin.exe"
 & $exe mount test.img X:          # requires a WinFsp build
 ```
 
-### Experimental read-write (image files only)
+### Experimental read-write (images; real devices under DEV-1 qualification)
 
 ```powershell
 & $exe mount test.img X: --rw-experimental
@@ -178,8 +178,14 @@ $exe = "build\src\RelWithDebInfo\xfswin.exe"
 & $exe check test.img
 ```
 
-`--rw-experimental` is the ordinary opt-in. `--rw-parent-qualification` is a
-legacy development switch accepted as a no-op.
+`--rw-experimental` is the ordinary opt-in for image files. A real disk needs
+`--rw-experimental --device-write-qualification`; fixed and removable disks
+additionally need `--allow-fixed-disk-write` / `--allow-removable-disk-write`.
+`device-info`, `device-check` and `device-selftest` expose the probed geometry
+and write policy. See `docs/WINDOWS_BLOCK_DEVICE.md`.
+
+`--rw-parent-qualification` is a legacy development switch accepted as a
+no-op.
 
 ### Formatting modern / parent-pointer images
 
@@ -258,8 +264,11 @@ cancellation, inode/icreate/buffer items, EFI/RUI/BUI/CUI and ATTRI/ATTRD
   before the metadata that references them commits.
 * **No repair-as-validation.** Images are checked before and after mutation.
   If recovery cannot prove a state, it refuses instead of “repairing” it.
-* **Image files only for mounted RW.** Real disks remain read-only when
-  mounted; the CLI rejects the attempt.
+* **Image files are the default writable target.** Real disks are writable only
+  under the DEV-1 policy: exclusive share mode, probed geometry, volume
+  ownership (every volume on the disk locked and dismounted), and an explicit
+  class opt-in. A `\\.\PhysicalDriveN` path alone never enables writes; fixed
+  disks are refused by default. See `docs/WINDOWS_BLOCK_DEVICE.md`.
 * **Experimental.** This is not a drop-in production XFS driver. Keep backups.
 
 ## Validation / why trust it
@@ -380,6 +389,8 @@ single owner of each filesystem invariant.
 | [docs/PARENT_POINTERS.md](docs/PARENT_POINTERS.md) | parent-pointer format, lifecycles, oracle, ledger |
 | [docs/DEFAULT_PROFILE.md](docs/DEFAULT_PROFILE.md) | measured modern `mkfs.xfs` profile |
 | [docs/TESTING.md](docs/TESTING.md) | fixtures, crash matrices, external oracles |
+| [docs/WINDOWS_BLOCK_DEVICE.md](docs/WINDOWS_BLOCK_DEVICE.md) | Windows open flags, volume ownership, geometry, flush, lifecycle, device policy |
+| [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 evidence, current NOT READY decision and remaining qualification steps |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 
 ## Development
