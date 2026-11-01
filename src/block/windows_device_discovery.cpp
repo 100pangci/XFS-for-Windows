@@ -74,6 +74,12 @@ std::vector<ActiveXfsMount> FindActiveXfsMounts(
     XFS_DEBUG("discovery: inspecting drive " << letter.letter << ":");
     if (!GetVolumeInformationW(root.c_str(), label, 260, &serial, nullptr,
                                nullptr, fs_name, 260)) {
+      // A drive letter can exist while its volume refuses access (for example
+      // a mount owned by another account).  Report why instead of silently
+      // treating it as a non-XFS volume.
+      XFS_DEBUG("discovery: drive " << letter.letter
+                                    << ": volume information failed (error "
+                                    << GetLastError() << ")");
       continue;
     }
     XFS_DEBUG("discovery: drive " << letter.letter
