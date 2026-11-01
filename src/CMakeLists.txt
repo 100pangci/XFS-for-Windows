@@ -138,14 +138,17 @@ if(XFSWIN_BUILD_WINFSP)
   )
   target_sources(xfswin PRIVATE
     winfsp/mount_host.cpp
+    automount/windows_automount_service.cpp
   )
   target_include_directories(xfs_core PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_include_directories(xfswin PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_link_libraries(xfs_core PRIVATE ${XFSWIN_WINFSP_LIBRARY})
   target_link_libraries(xfswin PRIVATE ${XFSWIN_WINFSP_LIBRARY})
-  # SDDL security descriptors
+  # SDDL security descriptors and Service Control Manager access
   target_link_libraries(xfs_core PRIVATE advapi32)
   target_link_libraries(xfswin PRIVATE advapi32)
+  # Configuration Manager device arrival/removal notifications
+  target_link_libraries(xfswin PRIVATE cfgmgr32)
   # Delay-load the WinFsp runtime so all other commands work without it.
   if(MSVC)
     target_link_options(xfswin PRIVATE "/DELAYLOAD:winfsp-x64.dll")
