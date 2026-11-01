@@ -184,9 +184,16 @@ done
 
 echo "== independent format checks =="
 for file in "$OUT"/*.vhd "$OUT"/*.vhdx; do
-    qemu-img info --output=json "$file" | python3 -c \
+    case "$file" in
+        *.vhdx) format=vhdx ;;
+        *) format=vpc ;;
+    esac
+    # A fixed VHD has no leading magic, so qemu's content probe reports "raw".
+    # Naming the format is what makes qemu validate the footer, geometry and
+    # block table instead of treating the image as a raw file.
+    qemu-img info -f "$format" --output=json "$file" | python3 -c \
         'import json,sys; d=json.load(sys.stdin); assert d["format"] in ("vpc","vhdx"), d'
-    qemu-img check "$file" >/dev/null
+    qemu-img check -f "$format" "$file" >/dev/null
 done
 
 echo "== Linux XFS oracle on the pristine payloads =="
