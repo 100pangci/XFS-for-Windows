@@ -2250,6 +2250,41 @@ namespace {
 // live WinFsp mount to the automount service.
 std::atomic<uint64_t> g_session_sequence{0};
 
+// WinFsp does not copy the interface table: FspFileSystemCreate stores the
+// pointer for the lifetime of the file system object.  A stack-local table is
+// only safe while the creating stack frame survives; the automount service
+// creates mounts on its worker thread, whose stack is reused immediately
+// afterwards.  The callbacks are stateless (the per-mount state lives in
+// FileSystem->UserContext), so one immutable table with static storage serves
+// every session.
+const FSP_FILE_SYSTEM_INTERFACE* FileSystemInterface() {
+  static const FSP_FILE_SYSTEM_INTERFACE interface = [] {
+    FSP_FILE_SYSTEM_INTERFACE table{};
+    table.GetVolumeInfo = GetVolumeInfo;
+    table.SetVolumeLabel = SetVolumeLabel;
+    table.GetSecurityByName = GetSecurityByName;
+    table.Create = Create;
+    table.Open = Open;
+    table.Overwrite = Overwrite;
+    table.Cleanup = Cleanup;
+    table.Close = Close;
+    table.Read = Read;
+    table.Write = Write;
+    table.Flush = Flush;
+    table.GetFileInfo = GetFileInfo;
+    table.SetBasicInfo = SetBasicInfo;
+    table.SetFileSize = SetFileSize;
+    table.CanDelete = CanDelete;
+    table.SetDelete = SetDelete;
+    table.Rename = Rename;
+    table.GetSecurity = GetSecurity;
+    table.SetSecurity = SetSecurity;
+    table.ReadDirectory = ReadDirectory;
+    return table;
+  }();
+  return &interface;
+}
+
 }  // namespace
 
 struct MountSession::Impl {
@@ -2488,34 +2523,13 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
   wcscpy_s(params.FileSystemName,
            sizeof(params.FileSystemName) / sizeof(WCHAR), L"XFS");
 
-  FSP_FILE_SYSTEM_INTERFACE interface{};
-  interface.GetVolumeInfo = GetVolumeInfo;
-  interface.SetVolumeLabel = SetVolumeLabel;
-  interface.GetSecurityByName = GetSecurityByName;
-  interface.Create = Create;
-  interface.Open = Open;
-  interface.Overwrite = Overwrite;
-  interface.Cleanup = Cleanup;
-  interface.Close = Close;
-  interface.Read = Read;
-  interface.Write = Write;
-  interface.Flush = Flush;
-  interface.GetFileInfo = GetFileInfo;
-  interface.SetBasicInfo = SetBasicInfo;
-  interface.SetFileSize = SetFileSize;
-  interface.CanDelete = CanDelete;
-  interface.SetDelete = SetDelete;
-  interface.Rename = Rename;
-  interface.GetSecurity = GetSecurity;
-  interface.SetSecurity = SetSecurity;
-  interface.ReadDirectory = ReadDirectory;
-
   // The device path must be the WinFsp control device (FSP_FSCTL_DISK_DEVICE_NAME
   // is a narrow literal; the L"" prefix makes the concatenation wide). The FSD
   // derives a unique volume device from the mount point.
   static const wchar_t kDiskDeviceName[] = L"" FSP_FSCTL_DISK_DEVICE_NAME;
   NTSTATUS status = FspFileSystemCreate(
-      const_cast<PWSTR>(kDiskDeviceName), &params, &interface, &impl->winfsp);
+      const_cast<PWSTR>(kDiskDeviceName), &params, FileSystemInterface(),
+      &impl->winfsp);
   if (status != STATUS_SUCCESS) {
     return fail(XFS_ERR(XfsError::kInternal,
                         "FspFileSystemCreate failed (NTSTATUS 0x" +
