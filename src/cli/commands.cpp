@@ -139,14 +139,14 @@ void PrintUsage() {
       "  mount                         choose an attached XFS filesystem and a\n"
       "                                drive letter interactively\n"
       "  mount <device|image>          mount to the first free drive letter\n"
-      "      --drive=<X:|auto>         preferred drive letter (default auto)\n"
+      "      --drive <X:|auto>         preferred drive letter (default auto)\n"
       "  devices                       list attached XFS filesystems\n"
       "  status                        automount service state and mounted XFS\n"
       "  automount install|uninstall   install/remove the resident service\n"
       "  automount start|stop          start/stop the resident service\n"
       "  automount status              same view as `xfswin status`\n"
       "  automount enable [<fs>]       mount a configured XFS automatically\n"
-      "      --drive=<X:|auto>         preferred drive letter (default auto)\n"
+      "      --drive <X:|auto>         preferred drive letter (default auto)\n"
       "      --rw-experimental --device-write-qualification\n"
       "      [--allow-removable-disk-write]\n"
       "                                enroll for qualified read-write access\n"
@@ -3529,7 +3529,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
                            const std::string& drive_option) {
   if (args.size() > 3) {
     std::cerr << "usage: xfswin automount enable [<uuid|label|number>] "
-                 "[--drive=<letter|auto>] [--rw-experimental "
+                 "[--drive <letter|auto>] [--rw-experimental "
                  "--device-write-qualification]\n";
     return 1;
   }
@@ -3861,7 +3861,8 @@ int Run(const std::vector<std::string>& args) {
   bool replace_existing = false;
   std::string drive_option;
   bool drive_option_given = false;
-  for (const auto& arg : args) {
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string& arg = args[i];
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
     } else if (arg == "--perf-stats") {
@@ -3970,6 +3971,16 @@ int Run(const std::vector<std::string>& args) {
       explicit_rw = true;
     } else if (StartsWith(arg, "--drive=")) {
       drive_option = arg.substr(8);
+      drive_option_given = true;
+    } else if (arg == "--drive") {
+      // `--drive E:` has always been the documented spelling; accept it
+      // alongside `--drive=E:`. The value is never a flag, so a following
+      // option means the value is missing.
+      if (i + 1 >= args.size() || StartsWith(args[i + 1], "--")) {
+        std::cerr << "error: --drive requires a drive letter or 'auto'\n";
+        return 1;
+      }
+      drive_option = args[++i];
       drive_option_given = true;
     } else if (StartsWith(arg, "--text=")) {
       pwrite_text = arg.substr(7);
@@ -4360,13 +4371,13 @@ int Run(const std::vector<std::string>& args) {
     if (positional.size() == 3) {
       if (drive_option_given) {
         std::cerr << "error: use either the positional drive letter or "
-                     "--drive=, not both\n";
+                     "--drive, not both\n";
         return 1;
       }
       return CommandMount(positional[1], positional[2], options);
     }
     std::cerr << "usage: xfswin mount [<device|image> [<drive-letter>]] "
-                 "[--drive=<letter|auto>]\n";
+                 "[--drive <letter|auto>]\n";
     return 1;
   }
   if (command == "unmount") {
