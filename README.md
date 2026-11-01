@@ -162,6 +162,41 @@ cmake --build build --config RelWithDebInfo
 $exe = "build\src\RelWithDebInfo\xfswin.exe"
 ```
 
+### Mounting XFS media attached to Windows
+
+Run these commands from an elevated PowerShell; discovery opens raw disks
+read-only and therefore needs Administrator rights.
+
+```powershell
+& $exe devices                 # what XFS filesystems are attached
+& $exe mount                   # pick one from the menu, drive letter [auto]
+& $exe unmount E:
+```
+
+Optionally let a resident service do it whenever the media is inserted:
+
+```powershell
+& $exe automount install
+& $exe automount enable 11111111-1111-4111-8111-111111111111 --drive=auto
+& $exe automount start
+```
+
+Insert the device and it appears in Explorer as a normal drive; `$exe status`
+shows the service state, configured filesystems and live mounts. Automount is
+**read-only by default**. Read-write enrollment still requires explicit
+`--rw-experimental --device-write-qualification` plus the DEV-1 device-class
+opt-ins; fixed physical disks are refused, and removable disks need
+`--allow-removable-disk-write`. The only removable hardware with DEV-1R
+evidence is the Samsung Flash Drive (serial `AA00000000000489`, USB BOT,
+512/512-byte sectors); other removable devices and all fixed physical-disk
+read-write remain **NOT READY**.
+
+The configuration is `%ProgramData%\xfswin\automount.ini` (UUID-keyed and
+versioned). To disable automount completely, run `automount disable <uuid>`,
+`automount stop`, `automount uninstall`, and remove that file. See
+[docs/UX.md](docs/UX.md) for the drive-letter rules, Explorer volume
+properties, event/retry semantics, troubleshooting and the CI coverage.
+
 ### Read-only mount and inspection
 
 ```powershell
@@ -368,6 +403,11 @@ single owner of each filesystem invariant.
   The removable path has one-device DEV-1R evidence (Samsung Flash Drive, USB
   BOT, 512/512-byte sectors, 2026-11-01); other removable devices, fixed
   physical disks, UASP, 4Kn and media power-loss durability remain unqualified.
+* **Automount is read-only by default.** The service can mount qualified
+  virtual disks and the DEV-1R removable profile read-write only after an
+  explicit enrollment, identity pins and device-class opt-in. It never
+  declares a new removable device qualified and never enables fixed
+  physical-disk read-write.
 * **No quotas, realtime devices, external logs, metadir or zoned filesystems**
   for writing. These remain readable where the parser supports them.
 * **No exchange-range operation.** The feature bit is accepted; XMI/XMD log
@@ -407,6 +447,7 @@ single owner of each filesystem invariant.
 | [docs/WINDOWS_BLOCK_DEVICE.md](docs/WINDOWS_BLOCK_DEVICE.md) | Windows open flags, volume ownership, geometry, flush, lifecycle, device policy |
 | [docs/DEV1_QUALIFICATION.md](docs/DEV1_QUALIFICATION.md) | DEV-1 VHD evidence, fixed-disk NOT READY decision and remaining qualification steps |
 | [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md) | DEV-1R removable-media evidence ledger and manual qualification procedure (one-device hardware run passed 2026-11-01; fixed disks not ready) |
+| [docs/UX.md](docs/UX.md) | native Windows discovery, interactive mounting, drive letters, Explorer volume information, automount service and its read-only/DEV-1 boundary |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 
 ## Development

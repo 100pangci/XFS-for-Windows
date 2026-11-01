@@ -738,6 +738,97 @@ The portable policy/geometry/lifecycle and >2 TiB image tests
 unit job.  Removable media and real fixed disks are manual qualifications; see
 `docs/WINDOWS_BLOCK_DEVICE.md`.
 
+### UX-1 device discovery, interactive mount and automount jobs
+
+UX-1 adds a fixture generator and five Windows verification scripts.  The
+fixtures are real filesystems created on Linux, so discovery and mounting are
+exercised against bytes the Windows formatter did not produce.
+
+`tests/scripts/make_ux_images_linux.sh` (root; needs `mkfs.xfs`, `mkfs.ext4`,
+`sgdisk`, `qemu-img`, `losetup`, `xfs_repair`, `xfs_db` and `python3`) creates:
+
+* a 384 MiB minimal-profile XFS partition labelled `UX1-SINGLE`;
+* a GPT disk with two XFS partitions (`UX1-PART-A`, `UX1-PART-B`) and an ext4
+  partition between them;
+* a whole-disk XFS image (no partition table);
+* a 352 MiB GPT disk whose only partition is ext4 (`UX1-NOT-XFS`);
+* two XFS filesystems with the same label `UX1-SAME` and different UUIDs;
+* corrupt-superblock and unsupported-feature derivatives of `UX1-SINGLE`;
+* a genuinely dirty journal, captured by
+  `make_dirty_logs_linux.sh` (`SCENARIOS=create`) from a real interrupted
+  write.
+
+Each XFS fixture contains `hello.txt`, a deterministic 256 KiB `payload.bin`
+and its `payload.sha256`.  The generator wraps the raw disks as fixed VHD and
+VHDX, runs `qemu-img check`, `xfs_repair -n` on the pristine payloads and the
+dirty-journal probe, and writes `ux-fixtures.json` (format, expectations,
+partition offsets/lengths, UUIDs, labels, filesystem/free bytes, journal
+state, SHA-256).  `tests/tools/ux_fixture_tools.py` provides the VHD footer,
+corrupt-superblock and unsupported-feature transformations.
+
+`tests/scripts/ux_common.ps1` holds the shared helpers: fixture transfer
+verification (every file hashed against the manifest), read-only VHD/VHDX
+attachment through `diskpart`, shared-read process capture, mount start/stop,
+and `Assert-UxNoWrites`, which re-hashes the fixture files after a scenario.
+Because the disks are attached read-only and the images are hashed before and
+after, any write performed by discovery or a read-only mount fails the test.
+
+The verification scripts, all requiring elevation and a WinFsp-enabled
+`xfswin.exe` with `winfsp-x64.dll` next to it:
+
+* `verify_ux_discovery_windows.ps1` — `xfswin devices` over `no-xfs`,
+  `single-vhdx`, `whole-disk-vhd`, `multi-partition` (exactly two XFS entries,
+  the ext4 partition ignored), `multiple-disks`, `same-label-different-uuid`,
+  `corrupt-superblock` (reported as damaged, not mountable),
+  `unsupported-feature` (reported with the unsupported feature) and
+  `dirty-journal` (valid entry plus `[journal dirty]`).
+* `verify_ux_interactive_windows.ps1` — real console prompts driven through
+  redirected stdin: number, UUID and label selection; automatic and explicit
+  drive letters; a preferred letter occupied by `subst` (fallback message,
+  SUBST untouched); a failed mount leaving no drive letter; and the legacy
+  `xfswin mount <raw device> <letter>` form.
+* `verify_ux_explorer_windows.ps1` — `GetVolumeInformationW`,
+  `GetDiskFreeSpaceExW`, `.NET DriveInfo` and `Win32_LogicalDisk` against a
+  mounted VHD: file system `XFS`, XFS label, UUID-derived serial,
+  `FILE_READ_ONLY_VOLUME`, capacity equal to `dblocks * block_size` and free
+  space equal to `fdblocks * block_size` from the superblock (not the VHD
+  size), plus a refused write.
+* `verify_ux_automount_windows.ps1` — installs the real SCM service and
+  replaces the machine-wide `%ProgramData%\xfswin\automount.ini` (backed up
+  and restored): install/uninstall/status, start with the device already
+  inserted, default read-only, service restart, removal and immediate
+  reinsertion (fresh mount, one session only), preferred letter `C:`
+  fallback, two same-label/different-UUID devices with independent mounts and
+  serial numbers, and read-write enrollment refused without
+  `--device-write-qualification`.  This script is CI-only.
+* `windows-automount-events` runs the injected event sequences through
+  `xfs_tests --filter=ux_automount`: debounce/coalescing, bounded retry for a
+  not-ready device, no retry for filesystem/policy refusals, removal,
+  reinsertion, identity-pin mismatch and one failure not disturbing another
+  session.  No USB hardware is involved.
+
+The CI jobs are named exactly:
+
+* **linux-verify-ux-images** (ubuntu-24.04, root) — builds and independently
+  verifies the fixtures and uploads the `ux-images` artifact;
+* **windows-ux-build** (windows-2022) — the shared WinFsp build
+  (`xfswin-winfsp`);
+* **windows-device-discovery** (windows-2022, Administrator);
+* **windows-interactive-mount** (windows-2022, Administrator) — runs
+  `--filter=ux_selection`, `--filter=ux_drive_letter` and the interactive
+  script;
+* **windows-automount-events** (windows-2022) — `--filter=ux_automount` and
+  the whole `ux_` matrix;
+* **windows-automount-vhd** (windows-2022, Administrator);
+* **windows-explorer-volume-info** (windows-2022, Administrator).
+
+The selection/drive-answer logic, the drive-letter allocator, the discovery
+record formatting, the automount configuration model and the event state
+machine are portable and also run in every Linux unit job.  Real USB
+insertion/removal and the DEV-1R removable write profile remain manual
+evidence; see `docs/UX.md` and
+`docs/DEV1_REMOVABLE_QUALIFICATION.md`.
+
 ## RW-5: journal recovery
 
 The recovery milestone adds three independent verification layers on top of the
