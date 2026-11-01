@@ -1609,6 +1609,7 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
 
   for (uint32_t number = 0; number < 64; ++number) {
     std::wstring path = L"\\\\.\\PhysicalDrive" + std::to_wstring(number);
+    XFS_DEBUG("discovery: physical drive " << number << ": opening");
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
@@ -1742,6 +1743,9 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
       }
     }
 
+    XFS_DEBUG("discovery: physical drive " << number << ": partitions="
+                                          << info.partitions.size()
+                                          << " size=" << info.size_bytes);
     disks.push_back(std::move(info));
     CloseHandle(h);
   }

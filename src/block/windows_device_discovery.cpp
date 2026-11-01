@@ -6,6 +6,7 @@
 // This file owns enumeration only.  Verification and policy are in
 // device_discovery.cpp; the raw-device lifecycle is DEV-1's backend.
 #include "xfs/device_discovery.h"
+#include "xfs/log.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -70,10 +71,13 @@ std::vector<ActiveXfsMount> FindActiveXfsMounts(
     wchar_t fs_name[261] = {};
     wchar_t label[261] = {};
     DWORD serial = 0;
+    XFS_DEBUG("discovery: inspecting drive " << letter.letter << ":");
     if (!GetVolumeInformationW(root.c_str(), label, 260, &serial, nullptr,
                                nullptr, fs_name, 260)) {
       continue;
     }
+    XFS_DEBUG("discovery: drive " << letter.letter
+                                  << ": filesystem=" << WideToUtf8(fs_name));
     if (!EqualsAsciiCaseInsensitive(WideToUtf8(fs_name), "XFS")) continue;
     ActiveXfsMount mount;
     mount.drive = std::string(1, letter.letter) + ":";
@@ -158,7 +162,9 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
     const DiscoveryOptions& options, std::string* error) {
   DiscoveryReport report;
   std::string enumerate_error;
+  XFS_DEBUG("discovery: enumerating physical drives");
   auto disks = EnumeratePhysicalDrives(&enumerate_error);
+  XFS_DEBUG("discovery: physical drives=" << disks.size());
   if (disks.empty() && !enumerate_error.empty()) {
     if (error) *error = enumerate_error;
     return XFS_ERR(XfsError::kPermissionDenied, enumerate_error)
@@ -167,9 +173,13 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
   if (!enumerate_error.empty()) report.warnings.push_back(enumerate_error);
 
   std::string volume_error;
+  XFS_DEBUG("discovery: enumerating volumes");
   auto volumes = EnumerateVolumes(&volume_error);
+  XFS_DEBUG("discovery: volumes=" << volumes.size());
   if (!volume_error.empty()) report.warnings.push_back(volume_error);
+  XFS_DEBUG("discovery: inspecting drive letters");
   report.active_mounts = FindActiveXfsMounts(&report.warnings);
+  XFS_DEBUG("discovery: xfswin mounts=" << report.active_mounts.size());
 
   for (const auto& disk : disks) {
     if (disk.offline) {

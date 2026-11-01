@@ -5,6 +5,8 @@
 
 #ifdef _WIN32
 
+#include "xfs/log.h"
+
 #include <windows.h>
 #include <winioctl.h>
 
@@ -159,6 +161,8 @@ std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
     std::wstring open_path(volume_name);
     if (!open_path.empty() && open_path.back() == L'\\') open_path.pop_back();
     info.device_path = WideToUtf8(open_path);
+    XFS_DEBUG("discovery: volume " << info.volume_name
+                                   << ": querying mount points");
     info.mount_points = QueryMountPoints(volume_name);
 
     // The volume properties are optional: a RAW volume has no label or
@@ -167,6 +171,8 @@ std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
     wchar_t label[261] = {};
     wchar_t fs_name[261] = {};
     DWORD serial = 0;
+    XFS_DEBUG("discovery: volume " << info.volume_name
+                                   << ": querying volume information");
     if (GetVolumeInformationW(volume_name, label, 260, &serial, nullptr,
                               nullptr, fs_name, 260)) {
       info.label = WideToUtf8(label);
@@ -175,6 +181,7 @@ std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
       info.has_filesystem = true;
     }
 
+    XFS_DEBUG("discovery: volume " << info.volume_name << ": opening");
     HANDLE volume = CreateFileW(open_path.c_str(), GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                 OPEN_EXISTING, 0, nullptr);
@@ -240,12 +247,16 @@ std::vector<DriveLetterInfo> EnumerateDriveLetters(std::string* error) {
 
     DriveLetterInfo info;
     info.letter = static_cast<char>(letter);
+    XFS_DEBUG("discovery: drive letter " << info.letter << ": querying type");
     const DWORD type = GetDriveTypeW(root.c_str());
     wchar_t target[MAX_PATH + 1] = {};
     const std::wstring device = std::wstring(1, letter) + L":";
     if (QueryDosDeviceW(device.c_str(), target, MAX_PATH) != 0) {
       info.target = WideToUtf8(target);
     }
+    XFS_DEBUG("discovery: drive letter " << info.letter
+                                         << ": type=" << type
+                                         << " target=" << info.target);
     info.kind = ClassifyDriveTarget(type, info.target);
     letters.push_back(std::move(info));
   }

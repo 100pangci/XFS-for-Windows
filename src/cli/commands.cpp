@@ -3438,6 +3438,10 @@ std::optional<bool> DriveReportsReadOnly(const std::string& drive) {
 }
 
 int CommandStatus(const Options& options) {
+  // A status query may have to wait on a device or a volume that does not
+  // answer. Keep every completed section visible in redirected logs so a
+  // timeout can be attributed to the step that blocked.
+  std::cout << std::unitbuf;
   std::cout << "XFS for Windows status\n";
   const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
   std::cout << "Automount service : " << ToString(service.state);
@@ -3463,7 +3467,13 @@ int CommandStatus(const Options& options) {
   }
 
   std::string discovery_error;
+  if (options.verbose) {
+    std::cerr << "[status] discovering attached filesystems\n";
+  }
   auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &discovery_error);
+  if (options.verbose) {
+    std::cerr << "[status] device discovery finished\n";
+  }
 
   std::cout << "Configured automatic mounts:\n";
   bool any_configured = false;

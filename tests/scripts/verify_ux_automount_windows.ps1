@@ -65,7 +65,7 @@ function Assert-AutomountOk($Result, [string]$What) {
 }
 
 function Get-Status {
-    $result = Invoke-Automount -Arguments @('status') -LogName 'status'
+    $result = Invoke-Automount -Arguments @('status', '--debug') -LogName 'status'
     Assert-AutomountOk $result 'xfswin status'
     return $result
 }
@@ -103,12 +103,44 @@ function Wait-DriveGone([string]$Drive, [int]$TimeoutSeconds = 60) {
 
 function Wait-ServiceState([string]$Needle, [int]$TimeoutSeconds = 60) {
     for ($i = 0; $i -lt ($TimeoutSeconds * 2); ++$i) {
-        $status = Invoke-Automount -Arguments @('automount', 'status') `
+        $status = Invoke-Automount -Arguments @('automount', 'status', '--debug') `
             -LogName 'automount-status-wait'
         if ($status.code -eq 0 -and $status.output.Contains($Needle)) { return $true }
         Start-Sleep -Milliseconds 500
     }
     return $false
+}
+
+# Touch the mounted drive from a disposable child process. A blocked WinFsp
+# request cannot be cancelled from the test process itself, so give every
+# attempt its own process that can be killed.
+function Test-DriveServable([string]$Drive, [int]$TimeoutSeconds = 20) {
+    $probeScript = Join-Path $script:UxTempDir 'ux-drive-probe.ps1'
+    @'
+param([string]$Drive)
+if (Test-Path -LiteralPath (Join-Path $Drive 'hello.txt')) { exit 0 }
+exit 1
+'@ | Set-Content -Path $probeScript -Encoding utf8
+    $pwsh = (Get-Process -Id $PID).Path
+    $blocked = 0
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $outPath = Join-Path $script:UxArtifactDir 'drive-probe.out.log'
+        $errPath = Join-Path $script:UxArtifactDir 'drive-probe.err.log'
+        $probe = Start-Process -FilePath $pwsh `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $probeScript,
+                            $Drive) `
+            -PassThru -NoNewWindow -RedirectStandardOutput $outPath `
+            -RedirectStandardError $errPath
+        if (-not $probe.WaitForExit(10000)) {
+            try { $probe.Kill($true) } catch { try { $probe.Kill() } catch {} }
+            if (++$blocked -ge 2) { return 'blocked' }
+            continue
+        }
+        if ($probe.ExitCode -eq 0) { return 'servable' }
+        Start-Sleep -Milliseconds 500
+    }
+    return 'not-mounted'
 }
 
 function Assert-Marker([string]$Drive) {
@@ -186,6 +218,11 @@ try {
     Assert-AutomountOk (Invoke-Automount -Arguments @('automount', 'start') -LogName 'start') 'automount start'
     Assert (Wait-ServiceState 'Automount service : running') `
         "the service did not report running"
+    $results.session_id = (Get-Process -Id $PID).SessionId
+    $servable = Test-DriveServable $preferred 20
+    $results.drive_probe = $servable
+    Assert ($servable -eq 'servable') `
+        "the automounted drive $preferred is not usable ($servable)"
     $drive = Wait-MountedDrive $singleUuid 90
     Assert (-not [string]::IsNullOrEmpty($drive)) `
         "the service did not mount the attached filesystem"
@@ -320,10 +357,10 @@ try {
     $results.error = $_.Exception.Message
     throw
 } finally {
-    try { Invoke-Automount -Arguments @('automount', 'stop') -LogName 'cleanup-stop' | Out-Null } catch {}
+    try { Invoke-Automount -Arguments @('automount', 'stop') -LogName 'cleanup-stop' -TimeoutSeconds 30 | Out-Null } catch {}
     Detach-All-UxFixtures
     $mounted = @()
-    $status = Invoke-Automount -Arguments @('status') -LogName 'cleanup-status'
+    $status = Invoke-Automount -Arguments @('status') -LogName 'cleanup-status' -TimeoutSeconds 30
     if ($status -and $status.output) {
         $mounted = @($status.output -split "`r?`n" |
             Where-Object { $_ -match '^\s+[A-Z]:\s' } |
