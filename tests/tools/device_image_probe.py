@@ -114,6 +114,7 @@ def main(argv):
         inodesize = be16(sb, 104)
         inopblock = be16(sb, 106)
         blocklog = sb[120]
+        agblklog = sb[124]
         uuid = sb[32:48]
 
         assert block_size >= 1024 and (block_size & (block_size - 1)) == 0, \
@@ -125,9 +126,22 @@ def main(argv):
         assert inopblock * inodesize == block_size, "inopblock mismatch"
         assert agcount >= 1, "zero AG count"
         assert agblocks * agcount >= dblocks, "AG geometry does not cover dblocks"
+        assert 0 < agblklog < 32, f"bad agblklog {agblklog}"
+        assert agblocks <= (1 << agblklog), "agblocks does not fit agblklog"
         assert rootino != 0, "zero root inode"
         assert logblocks >= 512 and logblocks <= dblocks, "bad log size"
-        assert logstart + logblocks <= dblocks, "log outside the data device"
+        # sb_logstart is an fsblock number, and fsblock numbers pack the AG
+        # number in the high bits and the AG block number in the low bits:
+        # fsb = (agno << agblklog) | agbno.  AGs are physically contiguous, so
+        # the byte offset is (agno * agblocks + agbno) << blocklog, not
+        # logstart << blocklog.  See docs/DESIGN.md.
+        log_agno = logstart >> agblklog
+        log_agbno = logstart & ((1 << agblklog) - 1)
+        assert log_agno < agcount, (
+            f"log AG {log_agno} is outside the filesystem ({agcount} AGs)")
+        assert log_agbno + logblocks <= agblocks, (
+            f"log ({logblocks} blocks at agbno {log_agbno}) does not fit in "
+            f"AG {log_agno} ({agblocks} blocks)")
         assert any(uuid), "zero uuid"
         assert file_size >= dblocks * block_size, \
             f"image is shorter than sb_dblocks ({file_size} < {dblocks * block_size})"
@@ -153,7 +167,7 @@ def main(argv):
             check_crc(agfl, AGFL_CRC_OFF, f"AG {agno} AGFL")
 
         # Journal: the first log record header must be recognizable.
-        log_byte = logstart * block_size
+        log_byte = (log_agno * agblocks + log_agbno) * block_size
         header = read_at(f, log_byte, 512)
         assert be32(header, 0) == XLOG_MAGIC, "bad log record magic"
         h_size = be32(header, 12)
@@ -171,7 +185,8 @@ def main(argv):
     print(f"  inode size      : {inodesize}")
     print(f"  dblocks         : {dblocks}")
     print(f"  allocation groups: {agcount} x {agblocks} blocks")
-    print(f"  internal log    : start {logstart}, {logblocks} blocks")
+    print(f"  internal log    : fsb {logstart} (AG {log_agno}, block {log_agbno}), "
+          f"{logblocks} blocks")
     print(f"  root inode      : {rootino}")
     print(f"  uuid            : {uuid.hex()}")
     return 0
