@@ -328,7 +328,10 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     mount.free_bytes = session.free_bytes;
     mount.mode = session.mode;
     mount.configured_mode = session.configured_mode;
-    mount.mode_note = session.mode_note;
+    // The published session snapshot is what `xfswin status` shows as the
+    // mount's Note.  It has to include the drive-letter explanation (taken
+    // over / preferred letter occupied), not only the read-only fallback.
+    mount.mode_note = CombineNotes(session.drive_note, session.mode_note);
     mount.read_write = session.mode == AutomountMode::kExperimentalReadWrite;
     mount.drive_taken_over = TakeoverWasOwned(session.takeover);
     mount.original_windows_drive = session.takeover.original_drive;
