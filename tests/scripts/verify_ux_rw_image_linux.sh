@@ -11,7 +11,7 @@
 # and the files created/renamed/truncated/deleted through Windows have exactly
 # the expected shape.  xfs_scrub -n runs when the distribution ships it.
 #
-# usage: verify_ux_rw_image_linux.sh <rw-ux-single.vhdx> <artifact-dir>
+# usage: verify_ux_rw_image_linux.sh <rw-ux-single-basic.vhdx> <artifact-dir>
 
 set -euo pipefail
 

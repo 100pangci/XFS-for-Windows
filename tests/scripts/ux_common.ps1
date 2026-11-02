@@ -424,25 +424,32 @@ function Remove-UxDriveLetter([string]$Drive) {
 function Get-UxVolumeFilesystem([string]$Drive) {
     # For a live WinFsp mount, GetVolumeInformation (what DriveInfo uses) is
     # the same path the Explorer test verifies.  A RAW Windows volume is not
-    # ready, so fall back to the Storage module, which reports "RAW".
+    # ready, so fall back to the Storage module, which reports "RAW" (or
+    # "Unknown" through DriveInfo on some builds).  Normalize all of those to
+    # RAW so the takeover assertions have one spelling to compare.
+    $normalize = {
+        param([string]$value)
+        if ([string]::IsNullOrWhiteSpace($value) -or
+            $value -match '^(raw|unknown|unformatted)$') { return 'RAW' }
+        return $value
+    }
     try {
         $info = [System.IO.DriveInfo]::new($Drive + '\')
         if ($info.IsReady -and -not [string]::IsNullOrWhiteSpace($info.DriveFormat)) {
-            return $info.DriveFormat
+            return (& $normalize ([string]$info.DriveFormat))
         }
     } catch {}
     $volume = Get-Volume -DriveLetter $Drive.Substring(0, 1).ToUpperInvariant() `
         -ErrorAction SilentlyContinue
-    if (-not $volume) { return '' }
-    if ([string]::IsNullOrWhiteSpace($volume.FileSystemType)) { return 'RAW' }
-    return [string]$volume.FileSystemType
+    if (-not $volume) { return 'RAW' }
+    return (& $normalize ([string]$volume.FileSystemType))
 }
 
 function Wait-UxRawVolumeAt([string]$Drive, [int]$TimeoutSeconds = 30) {
     for ($i = 0; $i -lt ($TimeoutSeconds * 2); ++$i) {
         if (Test-UxLetterInUse $Drive) {
             $filesystem = Get-UxVolumeFilesystem $Drive
-            if ($filesystem -eq 'RAW' -or $filesystem -eq '') { return $true }
+            if ($filesystem -eq 'RAW') { return $true }
         }
         Start-Sleep -Milliseconds 500
     }

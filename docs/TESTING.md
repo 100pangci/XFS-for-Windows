@@ -773,8 +773,9 @@ and `Assert-UxNoWrites`, which re-hashes the fixture files after a scenario.
 Because the disks are attached read-only and the images are hashed before and
 after, any write performed by discovery or a read-only mount fails the test.
 
-The verification scripts, all requiring elevation and a WinFsp-enabled
-`xfswin.exe` with `winfsp-x64.dll` next to it:
+The Windows verification scripts, all requiring elevation and a WinFsp-enabled
+`xfswin.exe` with `winfsp-x64.dll` next to it (the Linux oracle runs on the
+artifact instead):
 
 * `verify_ux_discovery_windows.ps1` — `xfswin devices` over `no-xfs`,
   `single-vhdx`, `whole-disk-vhd`, `multi-partition` (exactly two XFS entries,
@@ -801,6 +802,22 @@ The verification scripts, all requiring elevation and a WinFsp-enabled
   fallback, two same-label/different-UUID devices with independent mounts and
   serial numbers, and read-write enrollment refused without
   `--device-write-qualification`.  This script is CI-only.
+* `verify_ux_takeover_windows.ps1` — the drive-letter takeover and persistent
+  read-write pass on the `single-basic` fixture (the XFS payload on a
+  Microsoft basic-data partition, the only partition type Windows gives a RAW
+  volume and a drive letter): same-letter takeover, preferred/RAW release
+  ordering, an occupied preferred letter, an injected WinFsp failure after
+  `DeleteVolumeMountPointW` (rollback restores the RAW mount point), service
+  stop/restart, physical removal without restoring a dead volume,
+  `automount enable --rw` enrollment, Win32 file operations, the
+  identity-mismatch read-only fallback, and a final RW pass whose VHDX is
+  handed to the Linux oracle.  CI-only; it replaces the machine-wide
+  automount configuration (backed up and restored).
+* `verify_ux_rw_image_linux.sh` — the independent Linux XFS oracle for that
+  VHDX: `qemu-img check`, conversion, GPT partition mapping, `xfs_repair -n`,
+  a read-only kernel mount with semantic file checks, and `xfs_scrub -n` when
+  the runner kernel provides the online scrub ioctl (otherwise recorded as a
+  skip).
 * `windows-automount-events` runs the injected event sequences through
   `xfs_tests --filter=ux_automount`: debounce/coalescing, bounded retry for a
   not-ready device, no retry for filesystem/policy refusals, removal,
@@ -820,6 +837,11 @@ The CI jobs are named exactly:
 * **windows-automount-events** (windows-2022) — `--filter=ux_automount` and
   the whole `ux_` matrix;
 * **windows-automount-vhd** (windows-2022, Administrator);
+* **windows-automount-takeover** (windows-2022, Administrator) — the RAW
+  drive-letter takeover, rollback, service stop/restart, removal/reinsertion
+  and persistent read-write enrollment of `verify_ux_takeover_windows.ps1`;
+* **linux-verify-ux-rw-image** (ubuntu-24.04, root) — the Linux XFS oracle on
+  the VHDX the Windows read-write mount produced;
 * **windows-explorer-volume-info** (windows-2022, Administrator).
 
 The selection/drive-answer logic, the drive-letter allocator, the discovery
