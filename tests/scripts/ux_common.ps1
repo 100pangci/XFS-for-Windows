@@ -70,17 +70,48 @@ function Assert-UxFixtureTransfer {
     }
 }
 
-function Attach-UxFixture([string]$name) {
+function Attach-UxFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$name,
+        # Read-write attachment is needed by the UX-1 takeover/RW tests.  The
+        # pristine fixture is never attached writable: a copy is made in
+        # -CopyDir and that copy becomes the disk under test.
+        [switch]$ReadWrite,
+        [string]$CopyDir = ''
+    )
     $fixture = Get-UxFixture $name
-    $key = $fixture.spec.file
+    $key = $fixture.spec.file + ':' + [bool]$ReadWrite
     if ($script:UxFixturePaths.ContainsKey($key)) { return $script:UxFixturePaths[$key] }
+
+    $path = $fixture.path
+    if ($ReadWrite) {
+        Assert (-not [string]::IsNullOrWhiteSpace($CopyDir)) `
+            "a read-write fixture attachment requires -CopyDir"
+        New-Item -ItemType Directory -Force $CopyDir | Out-Null
+        $copyPath = Join-Path $CopyDir ('rw-' + $fixture.spec.file)
+        $copied = $false
+        for ($attempt = 0; $attempt -lt 20 -and -not $copied; ++$attempt) {
+            try {
+                Copy-Item -Path $fixture.path -Destination $copyPath -Force `
+                    -ErrorAction Stop
+                $copied = $true
+            } catch {
+                # The storage stack may still hold the old copy briefly after
+                # a detach; retry instead of failing the run.
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        Assert $copied "could not replace the read-write copy at $copyPath"
+        $path = (Resolve-Path $copyPath).Path
+    }
 
     $before = @(Get-Disk | Select-Object -ExpandProperty Number)
     $diskpart = Join-Path $script:UxTempDir `
         ("ux-attach-" + [guid]::NewGuid().ToString('N') + '.txt')
+    $attachMode = if ($ReadWrite) { 'attach vdisk' } else { 'attach vdisk readonly' }
     @"
-select vdisk file="$($fixture.path)"
-attach vdisk readonly
+select vdisk file="$path"
+$attachMode
 "@ | Set-Content -Path $diskpart -Encoding ascii
     & diskpart /s $diskpart | Out-Null
     $code = $LASTEXITCODE
@@ -98,11 +129,17 @@ attach vdisk readonly
     }
     Assert ($null -ne $disk) "disk for $($fixture.spec.file) did not appear"
     Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction SilentlyContinue
+    if ($ReadWrite) {
+        Set-Disk -Number $disk.Number -IsReadOnly $false -ErrorAction SilentlyContinue
+    }
 
     $info = [pscustomobject]@{
         name = $name
+        key = $key
         spec = $fixture.spec
-        path = $fixture.path
+        path = $path
+        pristine = $fixture.path
+        read_write = [bool]$ReadWrite
         number = $disk.Number
         raw = "\\.\PhysicalDrive$($disk.Number)"
     }
@@ -130,8 +167,8 @@ detach vdisk
     }
     Assert (-not (Get-Disk -Number $info.number -ErrorAction SilentlyContinue)) `
         "disk $($info.number) is still present after detaching $($info.spec.file)"
-    $script:UxAttached = @($script:UxAttached | Where-Object { $_.name -ne $info.name })
-    $script:UxFixturePaths.Remove($info.spec.file) | Out-Null
+    $script:UxAttached = @($script:UxAttached | Where-Object { $_.key -ne $info.key })
+    $script:UxFixturePaths.Remove($info.key) | Out-Null
 }
 
 function Detach-All-UxFixtures {
@@ -299,4 +336,87 @@ function Get-UxFirstFreeDrives {
         if ($free.Count -ge $Count) { return $free }
     }
     throw "no free drive letter is available from D: to Z:"
+}
+# ---------------------------------------------------------------------------
+# RAW volume letters.  UX-1 takes over the letter Windows assigned to the
+# underlying RAW/XFS volume, so the tests have to assign one explicitly (CI
+# virtual disks are not mounted by Windows on their own).
+# ---------------------------------------------------------------------------
+
+function Get-UxLogicalLetters {
+    $letters = @()
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if ($drive.Name.Length -ge 2) {
+            $letters += $drive.Name.Substring(0, 1).ToUpperInvariant()
+        }
+    }
+    return $letters
+}
+
+function Test-UxLetterInUse([string]$Drive) {
+    if ([string]::IsNullOrWhiteSpace($Drive) -or $Drive.Length -lt 1) { return $false }
+    return (Get-UxLogicalLetters) -contains $Drive.Substring(0, 1).ToUpperInvariant()
+}
+
+function Wait-UxLetterInUse([string]$Drive, [bool]$InUse, [int]$TimeoutSeconds = 30) {
+    for ($i = 0; $i -lt ($TimeoutSeconds * 2); ++$i) {
+        if ((Test-UxLetterInUse $Drive) -eq $InUse) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Set-UxRawVolumeLetter {
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][string]$Drive
+    )
+    $letter = $Drive.Substring(0, 1).ToUpperInvariant()
+    $diskpart = Join-Path $script:UxTempDir `
+        ("ux-assign-" + [guid]::NewGuid().ToString('N') + '.txt')
+    @"
+select disk $DiskNumber
+select partition $PartitionNumber
+assign letter=$letter
+"@ | Set-Content -Path $diskpart -Encoding ascii
+    $output = & diskpart /s $diskpart 2>&1
+    $code = $LASTEXITCODE
+    Remove-Item $diskpart -ErrorAction SilentlyContinue
+    Assert ($code -eq 0) `
+        ("diskpart assign letter=$letter failed: $code ($($output -join ' '))")
+    Assert (Wait-UxLetterInUse $Drive $true 30) `
+        "drive letter $Drive did not appear after diskpart assigned it"
+}
+
+function Remove-UxDriveLetter([string]$Drive) {
+    & mountvol ("$Drive\") /D | Out-Null
+}
+
+function Get-UxVolumeFilesystem([string]$Drive) {
+    # For a live WinFsp mount, GetVolumeInformation (what DriveInfo uses) is
+    # the same path the Explorer test verifies.  A RAW Windows volume is not
+    # ready, so fall back to the Storage module, which reports "RAW".
+    try {
+        $info = [System.IO.DriveInfo]::new($Drive + '\')
+        if ($info.IsReady -and -not [string]::IsNullOrWhiteSpace($info.DriveFormat)) {
+            return $info.DriveFormat
+        }
+    } catch {}
+    $volume = Get-Volume -DriveLetter $Drive.Substring(0, 1).ToUpperInvariant() `
+        -ErrorAction SilentlyContinue
+    if (-not $volume) { return '' }
+    if ([string]::IsNullOrWhiteSpace($volume.FileSystemType)) { return 'RAW' }
+    return [string]$volume.FileSystemType
+}
+
+function Wait-UxRawVolumeAt([string]$Drive, [int]$TimeoutSeconds = 30) {
+    for ($i = 0; $i -lt ($TimeoutSeconds * 2); ++$i) {
+        if (Test-UxLetterInUse $Drive) {
+            $filesystem = Get-UxVolumeFilesystem $Drive
+            if ($filesystem -eq 'RAW' -or $filesystem -eq '') { return $true }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }

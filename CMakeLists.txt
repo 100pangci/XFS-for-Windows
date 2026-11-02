@@ -19,6 +19,9 @@ option(XFSWIN_BUILD_FUZZERS "Build the libFuzzer parser harnesses (Clang only)" 
 option(XFSWIN_CONCURRENCY_HOOKS
        "Compile the deterministic concurrency scheduler hooks (CONC-1 tests)"
        OFF)
+option(XFSWIN_TEST_HOOKS
+       "Compile the one-shot failure-injection hooks used by the Windows UX integration tests"
+       OFF)
 
 # The canonical CI builds turn warnings into errors. MSVC applies /WX to
 # xfs_core in src/CMakeLists.txt (the product library); GCC/Clang get the same

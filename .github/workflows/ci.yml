@@ -1194,6 +1194,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
             -DXFSWIN_BUILD_TESTS=OFF -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_TEST_HOOKS=ON `
             -DXFSWIN_WINFSP_ROOT="$PWD\sdk\DYNAMIC"
           if ($LASTEXITCODE -ne 0) { throw "configure failed" }
           cmake --build build --config $env:BUILD_CONFIG
@@ -1440,6 +1441,128 @@ jobs:
         with:
           name: ux-automount-artifacts
           path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # UX-1 FINALIZATION: native drive-letter takeover and persistent read-write
+  # automount over a real Windows RAW volume letter.  The WinFsp build carries
+  # the one-shot failure-injection hook used for the rollback case; the test
+  # leaves the VHDX it wrote through the WinFsp mount for the Linux oracle
+  # below.
+  # ---------------------------------------------------------------------------
+  windows-automount-takeover:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: [windows-ux-build, linux-verify-ux-images]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xfswin-winfsp
+          path: bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: fixtures
+
+      - name: Install the WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = Join-Path $PWD 'winfsp.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          "runtime install exit=$($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WinFsp runtime install failed with $($p.ExitCode)"
+          }
+
+      - name: Drive-letter takeover and read-write automount
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/scripts/verify_ux_takeover_windows.ps1 `
+            -Xfswin "bin\xfswin.exe" `
+            -FixtureDir "$PWD\fixtures" `
+            -ArtifactDir "$PWD\artifacts"
+
+      - name: Service and event-log diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $report = Join-Path $PWD 'artifacts\service-diagnostics.txt'
+          New-Item -ItemType Directory -Force (Split-Path $report) | Out-Null
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add('== sc query XFSWinAutomount')
+          $lines.Add((sc.exe query XFSWinAutomount | Out-String))
+          $lines.Add('== Get-Service XFSWinAutomount')
+          $lines.Add((Get-Service -Name XFSWinAutomount -ErrorAction SilentlyContinue |
+            Format-List * | Out-String))
+          $lines.Add('== Application log: XFS / WinFsp / crash records')
+          $lines.Add((Get-WinEvent -LogName Application -MaxEvents 120 -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.ProviderName -match 'XFS|WinFsp|Application Error|Windows Error Reporting'
+            } |
+            Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message | Out-String))
+          $text = $lines -join "`n"
+          $text | Out-File -FilePath $report -Encoding utf8
+          $text
+
+      - name: Upload the takeover logs and the RW image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-takeover-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # UX-1 FINALIZATION: the independent Linux XFS oracle for the image written
+  # through the real WinFsp read-write mount.  xfs_repair -n, a read-only
+  # kernel mount and the semantic file checks; xfs_scrub -n when available.
+  # ---------------------------------------------------------------------------
+  linux-verify-ux-rw-image:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs: windows-automount-takeover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xfsprogs, qemu-utils and util-linux
+        run: |
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 \
+            xfsprogs qemu-utils util-linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-takeover-artifacts
+          path: ux-takeover-artifacts
+
+      - name: Verify the WinFsp-written image with the Linux XFS oracle
+        run: |
+          set -euo pipefail
+          image=$(find ux-takeover-artifacts/rw-image -name '*.vhdx' -print -quit)
+          if [ -z "$image" ]; then
+            echo "the Windows job did not leave an RW VHDX artifact" >&2
+            exit 1
+          fi
+          sudo bash tests/scripts/verify_ux_rw_image_linux.sh \
+            "$image" "$PWD/ux-rw-oracle"
+
+      - name: Upload the oracle logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-rw-oracle-artifacts
+          path: ux-rw-oracle/
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
