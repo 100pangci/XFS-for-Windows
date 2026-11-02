@@ -10,6 +10,8 @@
 # hand-assembled approximation:
 #
 #   single/no-xfs          VHDX, GPT, one XFS / one ext4 partition
+#   single-basic           VHDX, the same XFS payload on a Microsoft
+#                          basic-data partition (for the drive-letter takeover)
 #   multi-partition        VHD, GPT, two XFS partitions and one ext4 partition
 #   whole-disk             VHD, XFS formatted directly on the disk
 #   corrupt                VHD, XFS magic with a broken superblock CRC
@@ -125,6 +127,14 @@ sgdisk -n 1:2048:+786432 -t 1:8300 -c 1:UX1-SINGLE \
     "$WORK/raw/single.disk" >/dev/null
 write_at_mib "$WORK/raw/single.img" "$WORK/raw/single.disk" 1
 
+# single-basic: the same XFS payload on a Microsoft basic-data partition
+# (GPT type 0700).  Windows only creates a volume object -- and therefore a
+# RAW drive letter -- for partition types it treats as data partitions.  This
+# is the fixture that exercises the drive-letter takeover; the Linux-type 8300
+# partition above is invisible as a Windows volume and cannot carry a letter.
+cp --sparse=always "$WORK/raw/single.disk" "$WORK/raw/single-basic.disk"
+sgdisk -t 1:0700 "$WORK/raw/single-basic.disk" >/dev/null
+
 # no-xfs: one 320 MiB ext4 partition.  No XFS magic anywhere.
 gpt_disk "$WORK/raw/no-xfs.disk" 352
 sgdisk -n 1:2048:+655360 -t 1:8300 -c 1:UX1-NOT-XFS \
@@ -164,6 +174,12 @@ qemu-img convert -f raw -O vhdx -o subformat=fixed,block_size=1M \
     rm -f "$OUT/ux-single.vhdx"
     qemu-img convert -f raw -O vhdx \
         "$WORK/raw/single.disk" "$OUT/ux-single.vhdx"
+}
+qemu-img convert -f raw -O vhdx -o subformat=fixed,block_size=1M \
+    "$WORK/raw/single-basic.disk" "$OUT/ux-single-basic.vhdx" 2>/dev/null || {
+    rm -f "$OUT/ux-single-basic.vhdx"
+    qemu-img convert -f raw -O vhdx \
+        "$WORK/raw/single-basic.disk" "$OUT/ux-single-basic.vhdx"
 }
 qemu-img convert -f raw -O vhdx -o subformat=fixed,block_size=1M \
     "$WORK/raw/no-xfs.disk" "$OUT/ux-no-xfs.vhdx" 2>/dev/null || {
@@ -260,6 +276,14 @@ fixtures = [
     {
         "name": "single",
         "file": "ux-single.vhdx",
+        "format": "vhdx",
+        "expect": "valid",
+        "partitions": [partition(raw / "single.img", "UX1-SINGLE", 1 * mib,
+                                 384 * mib, number=1)],
+    },
+    {
+        "name": "single-basic",
+        "file": "ux-single-basic.vhdx",
         "format": "vhdx",
         "expect": "valid",
         "partitions": [partition(raw / "single.img", "UX1-SINGLE", 1 * mib,

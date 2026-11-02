@@ -86,11 +86,15 @@ if command -v xfs_scrub >/dev/null 2>&1; then
     if xfs_scrub -n "$MNT" >"$OUT/xfs-scrub.log" 2>&1; then
         echo "PASS: xfs_scrub -n"
         pass=$((pass + 1))
+    elif grep -q 'Kernel metadata scrubbing facility is not available' \
+            "$OUT/xfs-scrub.log"; then
+        # The runner kernel has no XFS_IOC_SCRUB_METADATA; record a skip
+        # instead of a pass, exactly like the DEV-1 oracle does.
+        echo "SKIP: the runner kernel has no online scrub facility" \
+            | tee "$OUT/xfs-scrub-skipped.txt"
     else
-        code=$?
-        # 4 means the scrub found something it could not fix; report it, but
-        # keep the log so the failure is diagnosable.
-        echo "FAIL: xfs_scrub -n exited $code (see xfs-scrub.log)" >&2
+        # A real scrub rejection means the filesystem is not clean.
+        echo "FAIL: xfs_scrub rejected the mounted filesystem (see xfs-scrub.log)" >&2
         fail=$((fail + 1))
     fi
 else

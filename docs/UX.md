@@ -378,8 +378,10 @@ The UX-1 CI jobs are:
   insertion/removal, service restart, preferred-letter fallback and two
   same-label/different-UUID devices;
 * `windows-automount-takeover` — a real Windows RAW letter assigned to the XFS
-  partition, then same-letter takeover, preferred/RAW release ordering, an
-  occupied preferred letter, an injected WinFsp failure after
+  partition (the fixture puts the XFS payload on a Microsoft basic-data
+  partition, the only partition type Windows gives a volume and a letter),
+  then same-letter takeover, preferred/RAW release ordering, an occupied
+  preferred letter, an injected WinFsp failure after
   `DeleteVolumeMountPointW` (rollback restores the RAW mount point), service
   stop/restart, removal without restoring a dead volume, RW enrollment,
   Win32/Explorer file operations and the identity-mismatch read-only fallback.

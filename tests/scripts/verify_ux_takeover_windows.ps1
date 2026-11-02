@@ -290,11 +290,14 @@ try {
     }
 
     # The RW test must not modify the pristine fixture, so it owns a copy.
+    # single-basic puts the XFS payload on a Microsoft basic-data partition:
+    # only such a partition gets a Windows volume object and therefore a RAW
+    # drive letter, which is exactly the takeover scenario.
     $rwCopyDir = Join-Path $script:UxArtifactDir 'rw-image'
-    $single = Attach-UxFixture 'single' -ReadWrite -CopyDir $rwCopyDir
+    $single = Attach-UxFixture 'single-basic' -ReadWrite -CopyDir $rwCopyDir
     $uuid = $single.spec.partitions[0].uuid
     $partitionNumber = $single.spec.partitions[0].partition_number
-    Assert ($partitionNumber -ne 0) "the single fixture has no partition number"
+    Assert ($partitionNumber -ne 0) "the single-basic fixture has no partition number"
     $rawLetter = Get-UxFreeDrive
     Set-UxRawVolumeLetter -DiskNumber $single.number `
         -PartitionNumber $partitionNumber -Drive $rawLetter
@@ -436,11 +439,23 @@ try {
         "status still reports a taken-over letter after removal: $($status.output)"
     Assert (-not (Test-UxLetterInUse $rawLetter)) `
         "the removed volume's letter $rawLetter is still defined"
-    $single = Attach-UxFixture 'single' -ReadWrite -CopyDir $rwCopyDir
+    $single = Attach-UxFixture 'single-basic' -ReadWrite -CopyDir $rwCopyDir
     $drive = Wait-MountedDrive $uuid 90
-    Assert ($drive -eq $rawLetter) `
-        "reinsertion mounted at $drive, expected the same RAW letter $rawLetter"
+    Assert (-not [string]::IsNullOrEmpty($drive)) `
+        "the service did not mount the reinserted device"
+    # Windows may hand a RAW volume a different letter after the takeover
+    # removed its mount point; reusing the original letter is recorded, and the
+    # rest of the run follows the letter Windows (or the service) settled on.
+    $results.reinsertion_reused_original_letter = ($drive -eq $rawLetter)
+    if ($drive -ne $rawLetter) {
+        $results.reinsertion_drive = $drive
+        $rawLetter = $drive
+    }
+    Assert-XfsAt $drive 'reinsertion takeover'
     Assert-Marker $drive
+    $status = Wait-StatusContains 'taken over from the Windows volume' 30
+    Assert ($null -ne $status) `
+        "the reinserted volume was not mounted as a takeover: $(Get-Status | Select-Object -ExpandProperty output)"
     $results.steps['removal-reinsertion'] = 'passed'
 
     # -----------------------------------------------------------------------
@@ -541,7 +556,7 @@ try {
     }
     if (Test-Path $runtimePath) { Remove-Item $runtimePath -Force }
     # The pristine fixture must be untouched: every write went to the copy.
-    Assert-UxNoWrites @('single')
+    Assert-UxNoWrites @('single-basic')
     $results | ConvertTo-Json -Depth 8 |
         Set-Content -Path (Join-Path $script:UxArtifactDir 'ux-takeover-results.json')
 }

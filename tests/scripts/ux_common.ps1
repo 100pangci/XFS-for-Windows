@@ -372,21 +372,49 @@ function Set-UxRawVolumeLetter {
         [Parameter(Mandatory = $true)][int]$PartitionNumber,
         [Parameter(Mandatory = $true)][string]$Drive
     )
+    # diskpart's `assign letter` needs a selected *volume*; on a partition
+    # whose filesystem Windows cannot read, `select partition` + `assign` fails
+    # with "There is no volume specified".  The Storage cmdlets address the
+    # partition directly, and the volume (with its RAW filesystem) may appear a
+    # moment after the disk does, so retry until Windows accepts the letter.
     $letter = $Drive.Substring(0, 1).ToUpperInvariant()
-    $diskpart = Join-Path $script:UxTempDir `
-        ("ux-assign-" + [guid]::NewGuid().ToString('N') + '.txt')
-    @"
-select disk $DiskNumber
-select partition $PartitionNumber
-assign letter=$letter
-"@ | Set-Content -Path $diskpart -Encoding ascii
-    $output = & diskpart /s $diskpart 2>&1
-    $code = $LASTEXITCODE
-    Remove-Item $diskpart -ErrorAction SilentlyContinue
-    Assert ($code -eq 0) `
-        ("diskpart assign letter=$letter failed: $code ($($output -join ' '))")
-    Assert (Wait-UxLetterInUse $Drive $true 30) `
-        "drive letter $Drive did not appear after diskpart assigned it"
+    $lastError = ''
+    for ($attempt = 0; $attempt -lt 60; ++$attempt) {
+        try {
+            Set-Partition -DiskNumber $DiskNumber `
+                -PartitionNumber $PartitionNumber -NewDriveLetter $letter `
+                -ErrorAction Stop
+            # Windows may have auto-assigned another letter when the volume
+            # arrived.  The takeover test needs exactly one Windows letter on
+            # the volume, so drop anything else the helper just displaced.
+            $partition = Get-Partition -DiskNumber $DiskNumber `
+                -PartitionNumber $PartitionNumber -ErrorAction Stop
+            foreach ($path in @($partition.AccessPaths)) {
+                if ($path -match '^([A-Za-z]):' -and `
+                    $Matches[1].ToUpperInvariant() -ne $letter) {
+                    Remove-PartitionAccessPath -DiskNumber $DiskNumber `
+                        -PartitionNumber $PartitionNumber -AccessPath $path `
+                        -ErrorAction SilentlyContinue
+                }
+            }
+            $partition = Get-Partition -DiskNumber $DiskNumber `
+                -PartitionNumber $PartitionNumber -ErrorAction Stop
+            $letters = @($partition.AccessPaths |
+                Where-Object { $_ -match '^[A-Za-z]:' } |
+                ForEach-Object { $_.Substring(0, 1).ToUpperInvariant() })
+            if ((Wait-UxLetterInUse $Drive $true 10) -and
+                $letters.Count -eq 1 -and $letters[0] -eq $letter) {
+                return
+            }
+            $lastError = "the volume's drive letters are '$($letters -join ',')'"
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Assert $false `
+        ("could not assign drive letter $Drive to disk $DiskNumber partition " +
+         "${PartitionNumber}: $lastError")
 }
 
 function Remove-UxDriveLetter([string]$Drive) {
