@@ -20,8 +20,8 @@ qualification boundary.
 
    Select a filesystem by number, UUID, or label: 1
    Drive letter [auto]:
-   Mounting UX1-SINGLE at E: (read-only).
-   Run `xfswin unmount E:` to stop.
+   Mounting UX1-SINGLE at D: (read-only).
+   Run `xfswin unmount D:` to stop.
    ```
 
    The filesystem is now a normal drive in Explorer.
@@ -69,13 +69,18 @@ logic is separated from console input/output and is unit tested.
 Everything except the legacy `xfswin mount <device> X:` form goes through one
 allocator:
 
-* automatic (`--drive auto` or an empty answer) counts down from `Z:` and
-  chooses the first free letter;
-* an explicit `--drive E:` is a preference, not an override: if `E:` is used
-  by a volume, a network mapping, SUBST or another DOS mapping, `xfswin`
-  mounts at the next free letter and prints
+* a preferred letter — an explicit `--drive E:` answer or the letter stored for
+  an automount entry — is used when it is free;
+* otherwise, including `--drive auto` and an empty interactive answer, the
+  allocator checks `D:` through `Z:` in order and chooses the first free
+  letter; `A:`, `B:` and `C:` are never chosen automatically;
+* a preferred letter is a preference, not an override: if it is used by a
+  volume, a network mapping, SUBST, a DOS device or another mounted
+  filesystem, `xfswin` never evicts it. It mounts at the first free letter from
+  `D:` through `Z:` — even when that letter is lower than the preferred one —
+  and prints
 
-  `The configured drive letter E: is already in use. Mounted as F: instead.`
+  `The configured drive letter G: is already in use. Mounted as D: instead.`
 
 * `A:` and `B:` are refused;
 * a failed mount leaves no drive letter behind, and a clean unmount releases
@@ -83,6 +88,10 @@ allocator:
 * the automount preference is stored against the XFS **UUID**, never against
   `PhysicalDriveN`, so a disk number change does not move the preference to a
   different device.
+
+A letter counts as used when Windows lists it as a logical drive or a DOS
+mapping: local volumes, network mappings, optical and RAM drives, SUBST/DOS
+devices and xfswin's own mounts are all respected.
 
 The legacy form keeps working: `xfswin mount \\.\PhysicalDriveN X:`. It also
 refuses an existing drive letter rather than overwriting it.
@@ -241,7 +250,7 @@ manually mounted drives (`xfswin mount`) are left alone.
 |---|---|
 | `device discovery requires administrator privileges` | Run from an elevated PowerShell. Discovery opens raw disks read-only. |
 | `This build was compiled without WinFsp support` | Reconfigure with `-DXFSWIN_BUILD_WINFSP=ON` and the WinFsp SDK, and make `winfsp-x64.dll` available. |
-| `The configured drive letter E: is already in use` | Informational: the mount used the reported fallback letter. |
+| `The configured drive letter G: is already in use` | Informational: the mount used the first free letter from `D:` through `Z:` instead. |
 | `the XFS journal is not clean` | Repair/recover the filesystem, or pass `--force-unsafe-ro` for a manual read-only mount. Automount never overrides this. |
 | Service status is `stopped` | No automatic mounts happen. Start it with `xfswin automount start`. |
 | Device inserted but nothing mounted | Check `xfswin status`; if the UUID is not configured, enroll it. If it is configured, read the event log entry for the mount attempt and its result. |

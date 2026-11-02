@@ -170,7 +170,7 @@ read-only and therefore needs Administrator rights.
 ```powershell
 & $exe devices                 # what XFS filesystems are attached
 & $exe mount                   # pick one from the menu, drive letter [auto]
-& $exe unmount E:
+& $exe unmount D:
 ```
 
 Optionally let a resident service do it whenever the media is inserted:
