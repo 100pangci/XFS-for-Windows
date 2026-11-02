@@ -303,10 +303,13 @@ try {
     Assert-AutomountOk (Invoke-Automount -Arguments @('automount', 'stop') -LogName 'stop-fallback') 'automount stop'
     Assert (Wait-DriveGone $drive) "drive $drive survived service stop"
     Enroll-ReadOnly $singleUuid 'C:'
+    $expectedFallback = @(Get-UxFirstFreeDrives -Count 1)[0]
     Assert-AutomountOk (Invoke-Automount -Arguments @('automount', 'start') -LogName 'start-fallback') 'automount start'
     $fallback = Wait-MountedDrive $singleUuid 90
     Assert (-not [string]::IsNullOrEmpty($fallback)) "the service did not mount with the preferred letter occupied"
     Assert ($fallback -ne 'C:') "the service mounted over the system drive C:"
+    Assert ($fallback -eq $expectedFallback) `
+        "the fallback used $fallback, expected the first free letter $expectedFallback"
     Assert (Test-Path 'C:\') "the system drive C: disappeared"
     Assert-Marker $fallback
     $results.steps['preferred-letter-fallback'] = 'passed'
@@ -328,12 +331,17 @@ try {
     Assert ($uuidA -ne $uuidB) "the same-label fixtures have the same UUID"
     Enroll-ReadOnly $uuidA 'auto'
     Enroll-ReadOnly $uuidB 'auto'
+    $expectedDrives = @(Get-UxFirstFreeDrives -Count 2)
     Assert-AutomountOk (Invoke-Automount -Arguments @('automount', 'start') -LogName 'start-two') 'automount start'
     $driveA = Wait-MountedDrive $uuidA 90
     $driveB = Wait-MountedDrive $uuidB 90
     Assert (-not [string]::IsNullOrEmpty($driveA)) "the first same-label device did not mount"
     Assert (-not [string]::IsNullOrEmpty($driveB)) "the second same-label device did not mount"
     Assert ($driveA -ne $driveB) "both same-label devices were mounted at $driveA"
+    $mountedPair = (@($driveA, $driveB) | Sort-Object) -join ','
+    $expectedPair = ($expectedDrives | Sort-Object) -join ','
+    Assert ($mountedPair -eq $expectedPair) `
+        "the same-label devices mounted at $mountedPair, expected the first free letters $expectedPair"
     Assert-Marker $driveA
     Assert-Marker $driveB
     $labelA = (Get-VolumeInformationLabel $driveA)

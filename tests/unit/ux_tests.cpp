@@ -214,40 +214,79 @@ TEST(ux_probe_dirty_journal_is_reported) {
   CHECK_EQ(device->flush_calls(), 0u);
 }
 
-TEST(ux_drive_letter_auto_and_preferred) {
+TEST(ux_drive_letter_auto_prefers_the_lowest_free_letter) {
   DriveLetterUsage usage;
+  // C: is the system drive and is never chosen automatically; D: is the first
+  // automatic candidate even when it is free.
   auto choice = xfs::ChooseDriveLetter("", usage);
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "D:");
+  CHECK(!choice.value().preferred_unavailable);
+
+  usage.used['D' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("", usage);
   CHECK(choice.ok());
   CHECK_STR_EQ(choice.value().drive, "E:");
 
   usage.used['E' - 'A'] = true;
-  usage.kinds['E' - 'A'] = DriveLetterKind::kNetwork;
   choice = xfs::ChooseDriveLetter("", usage);
   CHECK(choice.ok());
   CHECK_STR_EQ(choice.value().drive, "F:");
+}
 
-  // An explicit preferred letter is honored when free and normalized.
-  choice = xfs::ChooseDriveLetter("g", usage);
+TEST(ux_drive_letter_occupied_kinds_block_the_letter) {
+  DriveLetterUsage usage;
+  usage.used['D' - 'A'] = true;
+  usage.kinds['D' - 'A'] = DriveLetterKind::kNetwork;
+  usage.used['E' - 'A'] = true;
+  usage.kinds['E' - 'A'] = DriveLetterKind::kSubst;
+  usage.used['F' - 'A'] = true;
+  usage.kinds['F' - 'A'] = DriveLetterKind::kCdrom;
+  const auto choice = xfs::ChooseDriveLetter("", usage);
   CHECK(choice.ok());
   CHECK_STR_EQ(choice.value().drive, "G:");
+}
 
-  // The preferred letter being occupied never evicts the existing device.
+TEST(ux_drive_letter_preferred_and_fallback) {
+  DriveLetterUsage usage;
+  // A free preferred letter wins over the automatic order.
+  auto choice = xfs::ChooseDriveLetter("g", usage);
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "G:");
+  CHECK(!choice.value().preferred_unavailable);
+
+  // An occupied preferred letter falls back to the first free letter from
+  // D: through Z:, even when that letter is below the preference.
   usage.used['G' - 'A'] = true;
+  usage.kinds['G' - 'A'] = DriveLetterKind::kNetwork;
   choice = xfs::ChooseDriveLetter("G:", usage);
   CHECK(choice.ok());
-  CHECK_STR_EQ(choice.value().drive, "H:");
+  CHECK_STR_EQ(choice.value().drive, "D:");
   CHECK(choice.value().preferred_unavailable);
   CHECK(choice.value().note.find("already in use") != std::string::npos);
+
+  // The fallback skips occupied letters in ascending order.
+  usage.used['D' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("E:", usage);
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "E:");
+  CHECK(!choice.value().preferred_unavailable);
+  usage.used['E' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("E:", usage);
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK(choice.value().preferred_unavailable);
 }
 
 TEST(ux_drive_letter_auto_order_and_exhaustion) {
   DriveLetterUsage usage;
-  for (char c = 'E'; c <= 'Z'; ++c) usage.used[c - 'A'] = true;
+  for (char c = 'D'; c <= 'Z'; ++c) usage.used[c - 'A'] = true;
   auto choice = xfs::ChooseDriveLetter("", usage);
-  CHECK(choice.ok());
-  CHECK_STR_EQ(choice.value().drive, "D:");
-  usage.used['D' - 'A'] = true;
-  choice = xfs::ChooseDriveLetter("", usage);
+  CHECK(!choice.ok());
+  CHECK(choice.error().code == xfs::XfsError::kNoSpace);
+
+  // An occupied preferred letter uses the same exhausted D:..Z: range.
+  choice = xfs::ChooseDriveLetter("E:", usage);
   CHECK(!choice.ok());
   CHECK(choice.error().code == xfs::XfsError::kNoSpace);
 }
@@ -685,11 +724,11 @@ TEST(ux_automount_start_mounts_configured_filesystem) {
 
   CHECK_EQ(platform.sessions.size(), 1u);
   const auto& session = platform.sessions.begin()->second;
-  CHECK_STR_EQ(session.drive, "E:");
+  CHECK_STR_EQ(session.drive, "D:");
   CHECK(session.entry.enabled);
   CHECK(session.entry.mode == xfs::AutomountMode::kReadOnly);
   CHECK_EQ(engine.status().mounts.size(), 1u);
-  CHECK_STR_EQ(engine.status().mounts.front().drive, "E:");
+  CHECK_STR_EQ(engine.status().mounts.front().drive, "D:");
   CHECK_STR_EQ(engine.status().mounts.front().label, "USB1");
   CHECK_EQ(engine.status().entries.size(), 1u);
   CHECK(engine.status().entries.front().state ==
@@ -714,7 +753,7 @@ TEST(ux_automount_preferred_letter_fallback_is_reported) {
   engine.Tick(kStart);
 
   CHECK_EQ(platform.sessions.size(), 1u);
-  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "F:");
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "D:");
   CHECK(engine.status().entries.front().detail.find("already in use") !=
         std::string::npos);
 }
@@ -744,8 +783,50 @@ TEST(ux_automount_two_filesystems_same_label_are_independent) {
       second_drive = session.drive;
     }
   }
-  CHECK_STR_EQ(first_drive, "E:");
-  CHECK_STR_EQ(second_drive, "F:");
+  CHECK_STR_EQ(first_drive, "D:");
+  CHECK_STR_EQ(second_drive, "E:");
+}
+
+TEST(ux_automount_reinsertion_reclaims_the_preferred_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid first = TestUuid(0x32);
+  const xfs::Uuid second = TestUuid(0x52);
+  platform.devices.push_back({TestFilesystem(first, "USB", 1, "SN1"), true});
+  platform.devices.push_back({TestFilesystem(second, "USB", 2, "SN2"), true});
+
+  xfs::AutomountEngine engine(platform);
+  // Both prefer D:.  The second device must not collide with the first, and
+  // the first device must get D: back after a removal/reinsertion cycle.
+  engine.SetConfig(ConfigWith(
+      {EngineEntry(first, "D:"), EngineEntry(second, "D:")}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  auto drive_for = [&platform](const xfs::Uuid& uuid) {
+    for (const auto& [id, session] : platform.sessions) {
+      (void)id;
+      if (xfs::UuidEqual(session.filesystem.probe.superblock.uuid, uuid)) {
+        return session.drive;
+      }
+    }
+    return std::string();
+  };
+  CHECK_STR_EQ(drive_for(first), "D:");
+  CHECK_STR_EQ(drive_for(second), "E:");
+
+  // Removing the D: device leaves the other mount alone.
+  platform.devices[0].present = false;
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+  CHECK_STR_EQ(drive_for(first), "");
+  CHECK_STR_EQ(drive_for(second), "E:");
+
+  // Reinserting it reclaims the preferred letter without touching the other.
+  platform.devices[0].present = true;
+  engine.NotifyDeviceChanged(At(2000));
+  engine.Tick(At(2000));
+  CHECK_STR_EQ(drive_for(first), "D:");
+  CHECK_STR_EQ(drive_for(second), "E:");
 }
 
 TEST(ux_automount_removal_then_reinsertion_uses_a_fresh_session) {

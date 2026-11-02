@@ -57,11 +57,11 @@ Result<std::string> NormalizeDriveLetter(std::string_view text) {
 
 Result<DriveLetterChoice> ChooseDriveLetter(std::string_view preferred,
                                             const DriveLetterUsage& usage) {
-  std::string normalized;
+  std::string requested;
   if (!preferred.empty()) {
     auto result = NormalizeDriveLetter(preferred);
     if (!result.ok()) return result.error();
-    normalized = result.value();
+    requested = result.value();
   }
 
   auto letter_is_free = [&](char letter) {
@@ -69,41 +69,34 @@ Result<DriveLetterChoice> ChooseDriveLetter(std::string_view preferred,
   };
   auto make = [](char letter) { return std::string(1, letter) + ":"; };
 
-  if (!normalized.empty()) {
-    const char letter = normalized[0];
-    if (letter_is_free(letter)) {
-      return DriveLetterChoice{normalized, false, {}};
-    }
-    // Preferred letter is occupied: never evict the existing device.  Report
-    // the conflict and find the next free auto letter.
-    const std::string requested = normalized;
-    // Start looking after the requested letter.
-    for (int step = 1; step < 26; ++step) {
-      const char candidate =
-          static_cast<char>('A' + ((letter - 'A' + step) % 26));
-      if (candidate == 'A' || candidate == 'B' || candidate == 'C') continue;
-      if (letter_is_free(candidate)) {
-        return DriveLetterChoice{
-            make(candidate), true,
-            "drive " + requested +
-                " is already in use; choosing " + make(candidate) + " instead"};
-      }
-    }
-    return XFS_ERR(XfsError::kNoSpace,
-                   "no free drive letter is available (requested " +
-                       requested + " is in use)")
-        .Metadata("drive letter");
+  if (!requested.empty() && letter_is_free(requested[0])) {
+    return DriveLetterChoice{requested, false, {}};
   }
 
-  // Auto order: E:..Z:, then D:.  C: is the system drive; A:/B: are reserved
-  // for removable floppy-class devices and WinFsp drive mounts are not
-  // appropriate there.
-  for (char letter = 'E'; letter <= 'Z'; ++letter) {
-    if (letter_is_free(letter)) return DriveLetterChoice{make(letter), false, {}};
+  // Auto order: D:..Z:.  C: is the system drive; A:/B: are reserved for
+  // removable floppy-class devices and WinFsp drive mounts are not appropriate
+  // there.  The same scan serves as the fallback when a preferred letter is
+  // occupied: it always starts at D:, never at the letter after the
+  // preference, so a blocked E: can still fall back to a free D:.
+  for (char letter = 'D'; letter <= 'Z'; ++letter) {
+    if (!letter_is_free(letter)) continue;
+    const std::string chosen = make(letter);
+    if (requested.empty()) {
+      return DriveLetterChoice{chosen, false, {}};
+    }
+    return DriveLetterChoice{
+        chosen, true,
+        "drive " + requested + " is already in use; choosing " + chosen +
+            " instead"};
   }
-  if (letter_is_free('D')) return DriveLetterChoice{"D:", false, {}};
+  if (requested.empty()) {
+    return XFS_ERR(XfsError::kNoSpace,
+                   "no free drive letter is available")
+        .Metadata("drive letter");
+  }
   return XFS_ERR(XfsError::kNoSpace,
-                 "no free drive letter is available")
+                 "no free drive letter is available (requested " + requested +
+                     " is in use)")
       .Metadata("drive letter");
 }
 

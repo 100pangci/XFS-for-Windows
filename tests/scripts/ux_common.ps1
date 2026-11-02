@@ -279,3 +279,24 @@ function Get-UxFreeDrive {
     }
     throw "no free drive letter is available for the test"
 }
+
+# The letters the product allocator would pick automatically: D: through Z:,
+# skipping every letter Windows lists as a logical drive.  DriveInfo.GetDrives
+# is backed by GetLogicalDrives, so it also sees network mappings, SUBST/DOS
+# mappings and optical drives without media (Test-Path does not).
+function Get-UxFirstFreeDrives {
+    param([int]$Count = 1)
+    $used = @{}
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if ($drive.Name.Length -ge 2) {
+            $used[$drive.Name.Substring(0, 1).ToUpperInvariant()] = $true
+        }
+    }
+    $free = @()
+    foreach ($letter in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
+        if ($used.ContainsKey([string]$letter)) { continue }
+        $free += "${letter}:"
+        if ($free.Count -ge $Count) { return $free }
+    }
+    throw "no free drive letter is available from D: to Z:"
+}

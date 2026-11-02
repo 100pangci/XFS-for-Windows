@@ -86,11 +86,15 @@ try {
     $single = Attach-UxFixture 'single'
     $partition = $single.spec.partitions[0]
 
-    # 1. Number selection with automatic drive allocation.
+    # 1. Number selection with automatic drive allocation.  The allocator must
+    #    pick the first free letter from D: through Z:, not a fixed letter.
     "== number selection, automatic drive =="
+    $expectedAuto = @(Get-UxFirstFreeDrives -Count 1)[0]
     $activeMount = Start-And-Wait -Arguments @('mount') `
         -InputText "1`n`n" -LogName 'mount-number-auto'
     $activeDrive = $activeMount.drive
+    Assert ($activeDrive -eq $expectedAuto) `
+        "automatic allocation used $activeDrive, expected the first free letter $expectedAuto"
     $output = Read-Mount-Output $activeMount.mount
     Assert ($output.stdout.Contains('Select a filesystem by number, UUID, or label:')) `
         "the selection prompt did not go to stdout: $($output.stdout)"
@@ -132,11 +136,14 @@ try {
     Assert ($LASTEXITCODE -eq 0) "subst $preferred failed: $LASTEXITCODE"
     $substDrive = $preferred
     Assert (Test-Path "$preferred\") "the SUBST drive $preferred is not visible"
+    $expectedFallback = @(Get-UxFirstFreeDrives -Count 1)[0]
     $activeMount = Start-And-Wait -Arguments @('mount', '--drive', $preferred) `
         -InputText ("$($partition.label)`n") -LogName 'mount-label-fallback'
     $activeDrive = $activeMount.drive
     Assert ($activeDrive -ne $preferred) `
         "the allocator mounted over the SUBST drive $preferred"
+    Assert ($activeDrive -eq $expectedFallback) `
+        "the fallback used $activeDrive, expected the first free letter $expectedFallback"
     Assert (Wait-UxDriveReady $preferred $activeMount.mount 1) `
         "the SUBST drive $preferred disappeared"
     $output = Read-Mount-Output $activeMount.mount

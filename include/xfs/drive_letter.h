@@ -33,10 +33,11 @@ Result<std::string> NormalizeDriveLetter(std::string_view text);
 // True for a normalized single letter in A..Z.
 bool IsValidDriveLetter(std::string_view text);
 
-// Chooses a free drive letter.  Auto order is E:..Z:, then D:; A:, B: and C:
-// are never chosen automatically.  An explicit `preferred` letter is honored
-// when free; if occupied the allocator falls back to the auto order and
-// reports it in `note` so the caller can tell the user.
+// Chooses a free drive letter.  Auto order is the first free letter from D:
+// through Z:; A:, B: and C: are never chosen automatically.  An explicit
+// `preferred` letter is honored when free; if occupied the allocator falls
+// back to the same D:..Z: order (starting at D:, not after the preference)
+// and reports it in `note` so the caller can tell the user.
 Result<DriveLetterChoice> ChooseDriveLetter(std::string_view preferred,
                                             const DriveLetterUsage& usage);
 
