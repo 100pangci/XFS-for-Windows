@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "support/fixture_device.h"
@@ -19,6 +20,7 @@
 #include "xfs/device_discovery.h"
 #include "xfs/device_selection.h"
 #include "xfs/drive_letter.h"
+#include "xfs/drive_letter_takeover.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/ondisk.h"
@@ -299,6 +301,62 @@ TEST(ux_drive_letter_validation) {
   CHECK_STR_EQ(xfs::NormalizeDriveLetter("e").value(), "E:");
   CHECK(xfs::IsValidDriveLetter("Z:"));
   CHECK(!xfs::IsValidDriveLetter("Z"));
+  CHECK(xfs::IsDriveLetterRoot("F:"));
+  CHECK(xfs::IsDriveLetterRoot("f:\\"));
+  CHECK(!xfs::IsDriveLetterRoot("F:\\dir"));
+  CHECK(!xfs::IsDriveLetterRoot("\\\\?\\Volume{test}\\"));
+}
+
+TEST(ux_drive_letter_takeover_priority) {
+  DriveLetterUsage usage;
+  usage.used['F' - 'A'] = true;  // the RAW volume's Windows letter
+
+  // No preference: take over the existing same-volume letter.
+  auto choice = xfs::ChooseDriveLetter("", usage, "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK_STR_EQ(choice.value().release_drive, "F:");
+
+  // A free preferred letter wins, but the original RAW letter is still
+  // released so no unusable RAW drive remains.
+  choice = xfs::ChooseDriveLetter("G:", usage, "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "G:");
+  CHECK_STR_EQ(choice.value().release_drive, "F:");
+  CHECK(choice.value().note.find("released") != std::string::npos);
+
+  // An occupied preferred letter keeps the existing same-volume letter
+  // instead of allocating an unrelated one.
+  usage.used['G' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("G:", usage, "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK_STR_EQ(choice.value().release_drive, "F:");
+  CHECK(choice.value().preferred_unavailable);
+
+  // No existing same-volume letter: ordinary allocation, starting at D:.
+  choice = xfs::ChooseDriveLetter("G:", usage, "");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "D:");
+  CHECK(choice.value().release_drive.empty());
+
+  // A: / B: / C: are never taken over, and a syntactically valid but
+  // non-takeover candidate is ignored rather than released.
+  for (const char* letter : {"A:", "B:", "C:"}) {
+    choice = xfs::ChooseDriveLetter("", usage, letter);
+    CHECK(choice.ok());
+    CHECK(choice.value().release_drive.empty());
+    CHECK_STR_EQ(choice.value().drive, "D:");
+  }
+}
+
+TEST(ux_drive_letter_single_mount_point) {
+  CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"E:\\"}), "E:");
+  CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"e:\\", "D:\\dir"}), "E:");
+  CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"D:\\dir"}), "");
+  // Two drive letters must never be silently reduced to one.
+  CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"E:\\", "F:\\"}), "");
+  CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({}), "");
 }
 
 namespace {
@@ -582,6 +640,7 @@ struct FakeSession {
   std::string drive;
   xfs::DiscoveredFilesystem filesystem;
   xfs::AutomountEntry entry;
+  xfs::AutomountMode mode = xfs::AutomountMode::kReadOnly;
 };
 
 class FakeAutomountPlatform final : public xfs::AutomountPlatform {
@@ -603,6 +662,13 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
   int stop_calls = 0;
   int stop_failures = 0;
   int retryable_mount_failures = 0;
+  int mount_failures = 0;
+  int takeover_calls = 0;
+  int restore_calls = 0;
+  int restore_failures = 0;
+  bool takeover_fails = false;
+  bool volume_present = true;
+  std::vector<xfs::DriveLetterChoice> takeover_choices;
   std::map<std::string, FakeSession> sessions;
   std::vector<std::string> started_session_ids;
   std::vector<AutomountLogRecord> logs;
@@ -641,10 +707,66 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
     return letters;
   }
 
+  xfs::TakeoverResult TakeOverDriveLetter(
+      const xfs::DiscoveredFilesystem& filesystem,
+      const xfs::DriveLetterChoice& choice) override {
+    ++takeover_calls;
+    takeover_choices.push_back(choice);
+    xfs::TakeoverResult result;
+    result.takeover.drive = choice.drive;
+    if (choice.release_drive.empty()) {
+      result.takeover.state = xfs::TakeoverState::kNone;
+      return result;
+    }
+    if (takeover_fails) {
+      result.status = xfs::XFS_ERR(xfs::XfsError::kIoError,
+                                   "the drive-letter takeover failed");
+      result.takeover.state = xfs::TakeoverState::kFailed;
+      return result;
+    }
+    result.takeover.state = xfs::TakeoverState::kOriginalRemoved;
+    result.takeover.mount_point = choice.release_drive + "\\";
+    result.takeover.original_drive = choice.release_drive;
+    result.takeover.volume_name = filesystem.volume_device_path + "\\";
+    result.takeover.volume_device_path = filesystem.volume_device_path;
+    result.takeover.fs_uuid = xfs::FormatUuid(
+        filesystem.probe.superblock.uuid);
+    result.takeover.disk_number = filesystem.location.disk_number;
+    result.takeover.offset_bytes = filesystem.location.offset_bytes;
+    result.takeover.length_bytes = filesystem.location.length_bytes;
+    result.takeover.volume_present = true;
+    return result;
+  }
+
+  xfs::Status RestoreDriveLetterTakeover(
+      xfs::DriveLetterTakeover* takeover) override {
+    ++restore_calls;
+    if (!takeover) return xfs::OkStatus();
+    if (restore_failures > 0) {
+      --restore_failures;
+      takeover->state = xfs::TakeoverState::kRestorePending;
+      takeover->error = "injected restore failure";
+      return xfs::XFS_ERR(xfs::XfsError::kIoError,
+                          "injected restore failure");
+    }
+    takeover->volume_present = volume_present;
+    takeover->state = xfs::TakeoverState::kRestored;
+    takeover->error.clear();
+    return xfs::OkStatus();
+  }
+
   AutomountMountStart StartMount(const xfs::DiscoveredFilesystem& filesystem,
                                  const xfs::AutomountEntry& entry,
+                                 xfs::AutomountMode mode,
                                  const std::string& drive) override {
     ++start_calls;
+    if (mount_failures > 0) {
+      --mount_failures;
+      AutomountMountStart failed;
+      failed.status = xfs::XFS_ERR(xfs::XfsError::kIoError,
+                                   "injected WinFsp mount failure");
+      return failed;
+    }
     if (retryable_mount_failures > 0) {
       --retryable_mount_failures;
       AutomountMountStart failed;
@@ -658,6 +780,7 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
     session.drive = drive;
     session.filesystem = filesystem;
     session.entry = entry;
+    session.mode = mode;
     sessions[session.id] = session;
     started_session_ids.push_back(session.id);
     AutomountMountStart started;
@@ -1351,4 +1474,610 @@ TEST(ux_selection_lists_rejected_xfs_candidates) {
   CHECK(lines.front().find("damaged") != std::string::npos);
   CHECK(lines.front().find("BROKEN") != std::string::npos);
   CHECK(lines.front().find("partition 1") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Drive-letter takeover transaction (portable state machine, fake Win32 ops).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+xfs::DiscoveredFilesystem TakeoverCandidate(const xfs::Uuid& uuid) {
+  xfs::DiscoveredFilesystem fs = TestFilesystem(uuid, "TAKEOVER", 2, "SN-T");
+  fs.windows_volume_found = true;
+  fs.volume_identity_exact = true;
+  fs.volume_unrecognized_raw = true;
+  fs.volume_device_path = "\\\\?\\Volume{00000000-0000-0000-0000-000000000001}";
+  fs.mount_points = {"F:\\"};
+  return fs;
+}
+
+class FakeTakeoverOps final : public xfs::TakeoverOps {
+ public:
+  bool fail_capture = false;
+  bool fail_remove = false;
+  bool remove_verification_fails = false;
+  bool volume_present = true;
+  bool fail_restore = false;
+  bool removed = false;
+  bool restored = false;
+  int capture_calls = 0;
+  int remove_calls = 0;
+  int restore_calls = 0;
+
+  xfs::Status VerifyAndCapture(const xfs::DiscoveredFilesystem& filesystem,
+                               std::string_view,
+                               std::string_view release_drive,
+                               xfs::DriveLetterTakeover* takeover) override {
+    ++capture_calls;
+    if (fail_capture) {
+      return xfs::XFS_ERR(xfs::XfsError::kIoError, "injected capture failure");
+    }
+    takeover->mount_point = std::string(release_drive) + "\\";
+    takeover->original_drive = std::string(release_drive);
+    takeover->volume_name = "\\\\?\\Volume{test}\\";
+    takeover->volume_device_path = filesystem.volume_device_path;
+    takeover->volume_present = true;
+    takeover->other_mount_points = {"D:\\xfswin-mount"};
+    return xfs::OkStatus();
+  }
+
+  xfs::Status RemoveMountPoint(xfs::DriveLetterTakeover*) override {
+    ++remove_calls;
+    if (fail_remove) {
+      return xfs::XFS_ERR(xfs::XfsError::kIoError,
+                          "injected mount-point removal failure");
+    }
+    removed = true;
+    return xfs::OkStatus();
+  }
+
+  xfs::Status VerifyRemoved(const xfs::DriveLetterTakeover&) override {
+    if (remove_verification_fails) {
+      return xfs::XFS_ERR(xfs::XfsError::kAlreadyExists,
+                          "the mount point is still attached");
+    }
+    return removed ? xfs::OkStatus()
+                   : xfs::XFS_ERR(xfs::XfsError::kNotFound,
+                                  "the mount point is not removed");
+  }
+
+  bool VolumePresent(const xfs::DriveLetterTakeover&) override {
+    return volume_present;
+  }
+
+  xfs::Status RestoreMountPoint(xfs::DriveLetterTakeover*) override {
+    ++restore_calls;
+    if (fail_restore) {
+      return xfs::XFS_ERR(xfs::XfsError::kIoError,
+                          "injected mount-point restore failure");
+    }
+    restored = true;
+    removed = false;
+    return xfs::OkStatus();
+  }
+
+  xfs::Status VerifyRestored(const xfs::DriveLetterTakeover&) override {
+    return restored ? xfs::OkStatus()
+                    : xfs::XFS_ERR(xfs::XfsError::kNotFound,
+                                   "the mount point is not restored");
+  }
+};
+
+}  // namespace
+
+TEST(ux_takeover_transaction_success_and_state_machine) {
+  FakeTakeoverOps ops;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x31));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kOriginalRemoved);
+  CHECK_STR_EQ(result.takeover.drive, "F:");
+  CHECK_STR_EQ(result.takeover.mount_point, "F:\\");
+  CHECK_STR_EQ(result.takeover.original_drive, "F:");
+  CHECK_STR_EQ(result.takeover.volume_device_path,
+               filesystem.volume_device_path);
+  CHECK_EQ(result.takeover.other_mount_points.size(), 1u);
+  CHECK(xfs::TakeoverNeedsRestore(result.takeover));
+  CHECK_EQ(ops.capture_calls, 1);
+  CHECK_EQ(ops.remove_calls, 1);
+
+  xfs::MarkTakeoverMounting(&result.takeover);
+  CHECK(result.takeover.state == xfs::TakeoverState::kMounting);
+  xfs::MarkTakeoverOwned(&result.takeover);
+  CHECK(result.takeover.state == xfs::TakeoverState::kOwned);
+  CHECK_STR_EQ(xfs::ToString(result.takeover.state), "owned");
+
+  // A different WinFsp letter than the released Windows letter is valid: the
+  // original letter is still restored on removal.
+  auto other = xfs::PrepareDriveLetterTakeover(ops, filesystem, "G:", "F:");
+  CHECK(other.status.ok());
+  CHECK_STR_EQ(other.takeover.drive, "G:");
+  CHECK_STR_EQ(other.takeover.mount_point, "F:\\");
+}
+
+TEST(ux_takeover_noop_without_windows_letter) {
+  FakeTakeoverOps ops;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x32));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "D:", "");
+  CHECK(result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kNone);
+  CHECK(!xfs::TakeoverNeedsRestore(result.takeover));
+  CHECK_EQ(ops.remove_calls, 0);
+  xfs::MarkTakeoverMounting(&result.takeover);
+  CHECK(result.takeover.state == xfs::TakeoverState::kNone);
+}
+
+TEST(ux_takeover_refuses_unsafe_candidates) {
+  FakeTakeoverOps ops;
+  xfs::DiscoveredFilesystem filesystem = TakeoverCandidate(TestUuid(0x33));
+
+  // C: is the Windows system drive and is never taken over.
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "C:", "C:");
+  CHECK(!result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kFailed);
+  CHECK_EQ(ops.remove_calls, 0);
+
+  // A recognized filesystem is never detached.
+  filesystem.volume_unrecognized_raw = false;
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+  filesystem.volume_unrecognized_raw = true;
+
+  // A correlation that is not an exact extent match is display-only.
+  filesystem.volume_identity_exact = false;
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+  filesystem.volume_identity_exact = true;
+
+  // Multiple drive letters must never be silently reduced to one.
+  filesystem.mount_points = {"E:\\", "F:\\"};
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+  filesystem.mount_points = {"F:\\"};
+
+  // The requested release letter must be the volume's own letter.
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "E:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+
+  // The XFS verification must have passed.
+  filesystem.probe.state = xfs::XfsProbeState::kCorrupt;
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+}
+
+TEST(ux_takeover_capture_failure_has_no_side_effects) {
+  FakeTakeoverOps ops;
+  ops.fail_capture = true;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x34));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kFailed);
+  CHECK_EQ(ops.remove_calls, 0);
+  CHECK(!xfs::TakeoverNeedsRestore(result.takeover));
+}
+
+TEST(ux_takeover_removal_failure_with_verified_removal_succeeds) {
+  FakeTakeoverOps ops;
+  ops.fail_remove = true;
+  ops.removed = true;  // DeleteVolumeMountPointW failed but the point is gone
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x35));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kOriginalRemoved);
+}
+
+TEST(ux_takeover_verification_failure_rolls_back) {
+  FakeTakeoverOps ops;
+  ops.remove_verification_fails = true;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x36));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kRestored);
+  CHECK_EQ(ops.restore_calls, 1);
+  CHECK(!xfs::TakeoverNeedsRestore(result.takeover));
+}
+
+TEST(ux_takeover_restore_skips_a_removed_volume) {
+  FakeTakeoverOps ops;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x37));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(result.status.ok());
+  ops.volume_present = false;
+  xfs::Status restored = xfs::RestoreDriveLetterTakeover(ops, &result.takeover);
+  CHECK(restored.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kRestored);
+  CHECK(!result.takeover.volume_present);
+  // Never call SetVolumeMountPointW for a device that is no longer attached.
+  CHECK_EQ(ops.restore_calls, 0);
+
+  // A repeated restore is idempotent.
+  CHECK(xfs::RestoreDriveLetterTakeover(ops, &result.takeover).ok());
+  CHECK_EQ(ops.restore_calls, 0);
+}
+
+TEST(ux_takeover_restore_failure_is_pending_and_retryable) {
+  FakeTakeoverOps ops;
+  const xfs::DiscoveredFilesystem filesystem =
+      TakeoverCandidate(TestUuid(0x38));
+  auto result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(result.status.ok());
+  ops.fail_restore = true;
+  xfs::Status failed = xfs::RestoreDriveLetterTakeover(ops, &result.takeover);
+  CHECK(!failed.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kRestorePending);
+  CHECK(xfs::TakeoverNeedsRestore(result.takeover));
+  CHECK_EQ(ops.restore_calls, 1);
+
+  ops.fail_restore = false;
+  CHECK(xfs::RetryDriveLetterRestore(ops, &result.takeover).ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kRestored);
+  CHECK_EQ(ops.restore_calls, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Automount engine: native drive-letter takeover and read-write fallback.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A discovered XFS filesystem whose Windows volume is still RAW and has the
+// single drive letter F:.
+xfs::DiscoveredFilesystem MountedTakeoverFilesystem(const xfs::Uuid& uuid) {
+  xfs::DiscoveredFilesystem fs = TakeoverCandidate(uuid);
+  fs.location.disk_size_bytes = 64ull << 30;
+  fs.location.length_bytes = 64ull << 30;
+  fs.probe.filesystem_bytes = (64ull << 30) - (64ull << 20);
+  return fs;
+}
+
+xfs::AutomountEntry RwEngineEntry(const xfs::Uuid& uuid,
+                                  uint64_t disk_size = 64ull << 30) {
+  xfs::AutomountEntry entry =
+      EngineEntry(uuid, "", true, xfs::AutomountMode::kExperimentalReadWrite);
+  entry.expected_serial = "SN-T";
+  entry.expected_stable_id = "stable-SN-T";
+  entry.expected_size_bytes = disk_size;
+  entry.expected_device_class = xfs::DeviceClass::kRemovableDisk;
+  entry.device_qualification = true;
+  entry.allow_removable_disk = true;
+  return entry;
+}
+
+}  // namespace
+
+TEST(ux_automount_takes_over_the_raw_volume_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x41);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  xfs::DriveLetterInfo raw_letter;
+  raw_letter.letter = 'F';
+  raw_letter.kind = xfs::DriveLetterKind::kRemovable;
+  platform.occupied_letters.push_back(raw_letter);
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK_EQ(platform.takeover_calls, 1);
+  CHECK_EQ(platform.takeover_choices.size(), 1u);
+  CHECK_STR_EQ(platform.takeover_choices.front().drive, "F:");
+  CHECK_STR_EQ(platform.takeover_choices.front().release_drive, "F:");
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "F:");
+  CHECK(platform.sessions.begin()->second.mode ==
+        xfs::AutomountMode::kReadOnly);
+
+  const auto& mount = engine.status().mounts.front();
+  CHECK(mount.drive_taken_over);
+  CHECK_STR_EQ(mount.original_windows_drive, "F:");
+  CHECK(!mount.read_write);
+  CHECK(engine.status().entries.front().drive_taken_over);
+  CHECK(platform.CountLogs("drive-letter-takeover", "taken-over") == 1);
+}
+
+TEST(ux_automount_takeover_failure_does_not_mount) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x42);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  platform.takeover_fails = true;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.start_calls, 0);
+  CHECK(platform.CountLogs("entry-refused", "failed") >= 1);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kFailed);
+}
+
+TEST(ux_automount_winfsp_failure_restores_the_windows_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x43);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  platform.mount_failures = 1;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.takeover_calls, 1);
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK(platform.CountLogs("drive-letter-restore", "restored") == 1);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kFailed);
+}
+
+TEST(ux_automount_removal_does_not_restore_to_a_dead_volume) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x44);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(platform.restore_calls, 0);
+
+  platform.devices.front().present = false;
+  platform.volume_present = false;
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK(platform.CountLogs("drive-letter-restore", "skipped-removed") == 1);
+}
+
+TEST(ux_automount_service_stop_restores_the_windows_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x45);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+
+  engine.Stop(At(1000));
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK(platform.CountLogs("drive-letter-restore", "restored") == 1);
+  CHECK(!engine.running());
+}
+
+TEST(ux_automount_rw_identity_mismatch_falls_back_to_read_only) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x46);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+
+  xfs::AutomountEntry entry = RwEngineEntry(uuid);
+  entry.expected_serial = "A-DIFFERENT-DEVICE";
+  entry.expected_stable_id = "stable-A-DIFFERENT-DEVICE";
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({entry}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK(platform.sessions.begin()->second.mode ==
+        xfs::AutomountMode::kReadOnly);
+  const auto& mount = engine.status().mounts.front();
+  CHECK(!mount.read_write);
+  CHECK(mount.mode == xfs::AutomountMode::kReadOnly);
+  CHECK(mount.configured_mode == xfs::AutomountMode::kExperimentalReadWrite);
+  CHECK(mount.mode_note.find("read-only") != std::string::npos);
+  CHECK(engine.status().entries.front().effective_mode ==
+        xfs::AutomountMode::kReadOnly);
+
+  // The effective mode is stable across the periodic reconciliation: the
+  // requested mode did not change, so the session must not be remounted.
+  engine.Tick(At(61000));
+  CHECK_EQ(platform.start_calls, 1);
+  CHECK_EQ(platform.stop_calls, 0);
+  CHECK_EQ(platform.sessions.size(), 1u);
+}
+
+TEST(ux_automount_rw_class_mismatch_falls_back_to_read_only) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x47);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+
+  xfs::AutomountEntry entry = RwEngineEntry(uuid);
+  entry.expected_device_class = xfs::DeviceClass::kVirtualDisk;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({entry}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK(platform.sessions.begin()->second.mode ==
+        xfs::AutomountMode::kReadOnly);
+  CHECK(engine.status().mounts.front().mode_note.find("class") !=
+        std::string::npos);
+}
+
+TEST(ux_automount_rw_matching_identity_mounts_read_write) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x48);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({RwEngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK(platform.sessions.begin()->second.mode ==
+        xfs::AutomountMode::kExperimentalReadWrite);
+  CHECK(engine.status().mounts.front().read_write);
+  CHECK(engine.status().mounts.front().drive_taken_over);
+}
+
+TEST(ux_automount_rw_refuses_a_disk_with_another_filesystem) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x49);
+  xfs::DiscoveredFilesystem filesystem = MountedTakeoverFilesystem(uuid);
+  filesystem.disk_has_other_filesystems = true;
+  platform.devices.push_back({filesystem, true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({RwEngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK(platform.sessions.empty());
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kRefused);
+  CHECK(engine.status().entries.front().detail.find("same physical disk") !=
+        std::string::npos);
+}
+
+TEST(ux_automount_restore_pending_blocks_the_next_mount_attempt) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x4a);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  platform.mount_failures = 1;
+  platform.restore_failures = 2;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK_EQ(platform.start_calls, 1);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kFailed);
+  CHECK(engine.status().entries.front().detail.find("restored") !=
+        std::string::npos);
+
+  // The restore is retried; while it keeps failing, no new mount is started.
+  engine.Tick(At(61000));
+  CHECK_EQ(platform.restore_calls, 2);
+  CHECK_EQ(platform.start_calls, 1);
+  CHECK(platform.sessions.empty());
+
+  // Once the restore succeeds, the next reconciliation may mount again.
+  engine.Tick(At(121000));
+  CHECK_EQ(platform.restore_calls, 3);
+  CHECK_EQ(platform.start_calls, 2);
+  CHECK_EQ(platform.sessions.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// RW enrollment: device-class pin persistence.
+// ---------------------------------------------------------------------------
+
+TEST(ux_automount_config_device_class_roundtrip) {
+  const std::string text =
+      "version = 1\n"
+      "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+      "enabled = true\n"
+      "mode = experimental-rw\n"
+      "drive = F:\n"
+      "expected-serial = SN1\n"
+      "expected-stable-id = stable-SN1\n"
+      "expected-size = 64160400896\n"
+      "expected-device-class = removable-disk\n"
+      "device-qualification = true\n"
+      "allow-removable-disk = true\n";
+  auto parsed = xfs::ParseAutomountConfig(text);
+  CHECK(parsed.ok());
+  const xfs::AutomountEntry* entry = parsed.value().config.entries.empty()
+                                         ? nullptr
+                                         : &parsed.value().config.entries[0];
+  CHECK(entry != nullptr);
+  CHECK(entry->expected_device_class == xfs::DeviceClass::kRemovableDisk);
+  const std::string serialized =
+      xfs::SerializeAutomountConfig(parsed.value().config);
+  CHECK(serialized.find("expected-device-class = removable-disk") !=
+        std::string::npos);
+
+  xfs::AutomountConfig catalog;
+  catalog.entries.push_back(*entry);
+  const std::string normalized = xfs::SerializeAutomountConfig(catalog);
+  auto reparsed = xfs::ParseAutomountConfig(normalized);
+  CHECK(reparsed.ok());
+  CHECK(reparsed.value().config.entries.front().expected_device_class ==
+        xfs::DeviceClass::kRemovableDisk);
+}
+
+TEST(ux_automount_config_refuses_unsafe_device_class_pins) {
+  auto parse_entry = [](const std::string& class_line, bool allow_removable,
+                        bool qualification) {
+    std::string text =
+        "version = 1\n"
+        "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+        "enabled = true\n"
+        "mode = experimental-rw\n"
+        "expected-serial = SN1\n"
+        "expected-stable-id = stable-SN1\n"
+        "expected-size = 64160400896\n" +
+        class_line + "device-qualification = " +
+        (qualification ? "true" : "false") + "\n"
+        "allow-removable-disk = " + (allow_removable ? "true" : "false") +
+        "\n";
+    return xfs::ParseAutomountConfig(text);
+  };
+
+  CHECK(!parse_entry("expected-device-class = fixed-disk\n", true, true).ok());
+  CHECK(!parse_entry("expected-device-class = removable-disk\n", false, true)
+             .ok());
+  CHECK(!parse_entry("expected-device-class = made-up\n", true, true).ok());
+  CHECK(parse_entry("expected-device-class = removable-disk\n", true, true)
+            .ok());
+  CHECK(parse_entry("expected-device-class = virtual-disk\n", false, true)
+            .ok());
+}
+
+TEST(ux_automount_config_virtual_disk_needs_no_serial) {
+  auto parse = [](const std::string& serial_line,
+                  const std::string& class_line) {
+    const std::string text =
+        "version = 1\n"
+        "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+        "enabled = true\n"
+        "mode = experimental-rw\n" +
+        serial_line + "expected-stable-id = stable-SN1\n"
+        "expected-size = 64160400896\n" +
+        class_line + "device-qualification = true\n"
+        "allow-removable-disk = true\n";
+    return xfs::ParseAutomountConfig(text);
+  };
+
+  // Windows exposes no serial number for VHD/VHDX; the stable id, size and
+  // class are the identity pins there.
+  auto virtual_disk =
+      parse("", "expected-device-class = virtual-disk\n");
+  CHECK(virtual_disk.ok());
+  CHECK(virtual_disk.value().config.entries.front().expected_serial.empty());
+
+  // Every physical device class still has to pin a serial.
+  CHECK(!parse("", "expected-device-class = removable-disk\n").ok());
+  CHECK(parse("expected-serial = SN1\n",
+              "expected-device-class = removable-disk\n")
+            .ok());
 }
