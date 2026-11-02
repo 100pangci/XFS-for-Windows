@@ -82,6 +82,21 @@ struct DiscoveredFilesystem {
   // Volume correlation from FindFirstVolumeW.  `volume_paths` may contain
   // several paths if Windows mounted one volume more than once.
   bool windows_volume_found = false;
+  // Exact Windows-volume identity for drive-letter takeover.  True only when
+  // a Windows volume's disk extent matches this candidate's disk number,
+  // starting offset and length exactly.  A volume correlated only by
+  // partition number is usable for display but never for takeover.
+  bool volume_identity_exact = false;
+  // True only when GetVolumeInformationW failed with
+  // ERROR_UNRECOGNIZED_VOLUME: the volume exists but Windows has no usable
+  // filesystem there.  Access-denied / not-ready volumes are not RAW.
+  bool volume_unrecognized_raw = false;
+  // "\\?\Volume{...}" of the correlated volume, for restore operations.
+  std::string volume_device_path;
+  // True when a different volume on the same physical disk has a recognized
+  // Windows filesystem.  The DEV-1 read-write open locks and dismounts every
+  // volume on the disk, so such a disk is refused for automount read-write.
+  bool disk_has_other_filesystems = false;
   std::vector<std::string> volume_paths;
   std::vector<std::string> mount_points;  // "E:\\" or a directory mount
   std::string volume_label;

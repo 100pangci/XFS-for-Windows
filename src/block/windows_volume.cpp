@@ -11,6 +11,7 @@
 #include <winioctl.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -142,6 +143,91 @@ DriveLetterKind ClassifyDriveTarget(DWORD drive_type,
   return DriveLetterKind::kUnknown;
 }
 
+std::wstring Utf8ToWide(const std::string& s) {
+  if (s.empty()) return {};
+  int len = MultiByteToWideChar(CP_UTF8, 0, s.data(),
+                                static_cast<int>(s.size()), nullptr, 0);
+  std::wstring out(static_cast<size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                      out.data(), len);
+  return out;
+}
+
+std::string NormalizedVolumePath(std::string_view device_path) {
+  std::string path(device_path);
+  while (!path.empty() && path.back() == '\\') path.pop_back();
+  std::transform(path.begin(), path.end(), path.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return path;
+}
+
+bool SamePathIgnoreCase(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const auto ca = static_cast<unsigned char>(a[i]);
+    const auto cb = static_cast<unsigned char>(b[i]);
+    if (std::tolower(ca) != std::tolower(cb)) return false;
+  }
+  return true;
+}
+
+// Normalizes "f:" / "F:\\" to "F:\\" for the mount-point APIs.  Returns an
+// empty string for anything that is not a normal drive-letter root.
+std::wstring DriveLetterMountPointW(std::string_view mount_point) {
+  if (mount_point.empty()) return {};
+  char letter = mount_point[0];
+  if (letter >= 'a' && letter <= 'z') letter = static_cast<char>(letter - 32);
+  if (letter < 'A' || letter > 'Z') return {};
+  if (mount_point.size() > 1 && mount_point[1] != ':') return {};
+  if (mount_point.size() > 2 && mount_point[2] != '\\') return {};
+  if (mount_point.size() > 3) return {};
+  std::wstring out;
+  out.push_back(static_cast<wchar_t>(letter));
+  out.push_back(L':');
+  out.push_back(L'\\');
+  return out;
+}
+
+std::string MountPointText(std::string_view mount_point) {
+  const std::wstring wide = DriveLetterMountPointW(mount_point);
+  return wide.empty() ? std::string() : WideToUtf8(wide);
+}
+
+bool VolumeHasPath(const std::wstring& volume_name, const std::string& path) {
+  for (const auto& current : QueryMountPoints(volume_name)) {
+    if (SamePathIgnoreCase(current, path)) return true;
+  }
+  return false;
+}
+
+// Both directions: the volume lists the mount point, and the mount point
+// resolves back to the same volume GUID.  A match in one direction only is not
+// proof that the original association is intact.
+bool VolumeOwnsMountPoint(const std::wstring& volume_name,
+                          const std::string& mount_text) {
+  if (!VolumeHasPath(volume_name, mount_text)) return false;
+  auto reverse = QueryVolumeNameForMountPoint(mount_text);
+  if (!reverse.ok()) return false;
+  return SamePathIgnoreCase(
+      NormalizedVolumePath(reverse.value()),
+      NormalizedVolumePath(WideToUtf8(volume_name)));
+}
+
+bool DriveLetterInUse(std::string_view drive) {
+  if (drive.size() < 1) return false;
+  char letter = drive[0];
+  if (letter >= 'a' && letter <= 'z') letter = static_cast<char>(letter - 32);
+  if (letter < 'A' || letter > 'Z') return false;
+  SetLastError(ERROR_SUCCESS);
+  const DWORD mask = GetLogicalDrives();
+  if (mask == 0 && GetLastError() != ERROR_SUCCESS) {
+    // Cannot prove the letter is free; fail closed rather than let a restore
+    // or takeover overwrite an existing association.
+    return true;
+  }
+  return (mask & (1UL << (letter - 'A'))) != 0;
+}
+
 }  // namespace
 
 std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
@@ -179,6 +265,13 @@ std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
       info.filesystem = WideToUtf8(fs_name);
       info.serial_number = static_cast<uint32_t>(serial);
       info.has_filesystem = true;
+    } else {
+      info.volume_info_error = GetLastError();
+      // Only this error means "a volume with no filesystem Windows can use".
+      // Access-denied / not-ready / I/O errors must never make a volume a
+      // takeover candidate.
+      info.unrecognized_filesystem =
+          info.volume_info_error == ERROR_UNRECOGNIZED_VOLUME;
     }
 
     XFS_DEBUG("discovery: volume " << info.volume_name << ": opening");
@@ -263,6 +356,218 @@ std::vector<DriveLetterInfo> EnumerateDriveLetters(std::string* error) {
   return letters;
 }
 
+const RawVolumeInfo* FindVolumeByDevicePath(
+    const std::vector<RawVolumeInfo>& volumes, std::string_view device_path) {
+  const std::string wanted = NormalizedVolumePath(device_path);
+  if (wanted.empty()) return nullptr;
+  for (const auto& volume : volumes) {
+    if (NormalizedVolumePath(volume.device_path) == wanted) return &volume;
+  }
+  return nullptr;
+}
+
+Result<VolumePathState> QueryVolumePathState(std::string_view device_path,
+                                             std::string* error) {
+  std::string enumeration_error;
+  const auto volumes = EnumerateVolumes(&enumeration_error);
+  if (!enumeration_error.empty() && error) *error = enumeration_error;
+  const RawVolumeInfo* volume = FindVolumeByDevicePath(volumes, device_path);
+  if (!volume) {
+    if (error) {
+      *error = "volume " + std::string(device_path) +
+               " is no longer attached" +
+               (enumeration_error.empty() ? std::string()
+                                          : " (" + enumeration_error + ")");
+    }
+    return XFS_ERR(XfsError::kNotFound,
+                   "volume is no longer attached")
+        .Metadata("volume");
+  }
+  VolumePathState state;
+  state.volume_name = volume->volume_name;
+  state.device_path = volume->device_path;
+  state.mount_points = volume->mount_points;
+  state.has_filesystem = volume->has_filesystem;
+  state.unrecognized_filesystem = volume->unrecognized_filesystem;
+  state.volume_info_error = volume->volume_info_error;
+  state.filesystem = volume->filesystem;
+  state.readable = volume->readable;
+  state.disk_number = volume->disk_number;
+  state.partition_number = volume->partition_number;
+  state.extents = volume->extents;
+  return state;
+}
+
+Status RemoveDriveLetterMountPoint(std::string_view mount_point,
+                                   std::string* error) {
+  const std::wstring wide = DriveLetterMountPointW(mount_point);
+  if (wide.empty()) {
+    if (error) *error = "not a drive-letter mount point: " +
+                        std::string(mount_point);
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "not a drive-letter mount point")
+        .Metadata("volume mount point");
+  }
+  if (DeleteVolumeMountPointW(wide.c_str())) {
+    return OkStatus();
+  }
+  const DWORD code = GetLastError();
+  // These mean the association is already gone; that is the desired state.
+  if (code == ERROR_PATH_NOT_FOUND || code == ERROR_FILE_NOT_FOUND ||
+      code == ERROR_NOT_FOUND) {
+    return OkStatus();
+  }
+  if (error) {
+    *error = "cannot remove the mount point " + WideToUtf8(wide) +
+             WinErrorSuffix(code);
+  }
+  return XFS_ERR(XfsError::kIoError,
+                 "cannot remove the Windows drive-letter mount point")
+      .Metadata("volume mount point")
+      .Actual(code);
+}
+
+Status RestoreDriveLetterMountPoint(std::string_view mount_point,
+                                    std::string_view volume_name,
+                                    std::string* error) {
+  const std::wstring mount_wide = DriveLetterMountPointW(mount_point);
+  if (mount_wide.empty()) {
+    if (error) *error = "not a drive-letter mount point";
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "not a drive-letter mount point")
+        .Metadata("volume mount point");
+  }
+  std::wstring volume_wide = Utf8ToWide(std::string(volume_name));
+  if (volume_wide.empty() || volume_wide.back() != L'\\') {
+    volume_wide.push_back(L'\\');
+  }
+  const std::string mount_text = WideToUtf8(mount_wide);
+
+  // Already restored: keep it, but verify both directions of the association.
+  if (VolumeOwnsMountPoint(volume_wide, mount_text)) {
+    return OkStatus();
+  }
+  if (VolumeHasPath(volume_wide, mount_text)) {
+    if (error) {
+      *error = "the volume lists " + mount_text +
+               " but the letter resolves to a different volume";
+    }
+    return XFS_ERR(XfsError::kBadValue,
+                   "the drive letter does not resolve to the recorded volume")
+        .Metadata("volume mount point");
+  }
+  if (DriveLetterInUse(mount_text)) {
+    if (error) {
+      *error = "the drive letter " + mount_text +
+               " is now in use by another volume; the original Windows mount "
+               "point was not overwritten";
+    }
+    return XFS_ERR(XfsError::kAlreadyExists,
+                   "the drive letter is now in use by another volume")
+        .Metadata("volume mount point");
+  }
+  if (!SetVolumeMountPointW(mount_wide.c_str(), volume_wide.c_str())) {
+    const DWORD code = GetLastError();
+    if (error) {
+      *error = "cannot restore the mount point " + mount_text +
+               WinErrorSuffix(code);
+    }
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot restore the original Windows mount point")
+        .Metadata("volume mount point")
+        .Actual(code);
+  }
+  // SetVolumeMountPointW can succeed while the mount manager resolves the
+  // association asynchronously; require both directions to be visible before
+  // telling the caller the restoration is complete.
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    if (VolumeOwnsMountPoint(volume_wide, mount_text)) return OkStatus();
+    Sleep(50);
+  }
+  if (error) {
+    *error = "the mount point " + mount_text +
+             " was accepted but the volume does not list it";
+  }
+  return XFS_ERR(XfsError::kIoError,
+                 "the original Windows mount point was not restored")
+      .Metadata("volume mount point");
+}
+
+bool IsVolumePresent(std::string_view device_path) {
+  std::string error;
+  const auto volumes = EnumerateVolumes(&error);
+  return FindVolumeByDevicePath(volumes, device_path) != nullptr;
+}
+
+bool WaitForDriveLetterRelease(std::string_view drive, uint32_t timeout_ms) {
+  if (drive.empty()) return false;
+  char letter = drive[0];
+  if (letter >= 'a' && letter <= 'z') letter = static_cast<char>(letter - 32);
+  if (letter < 'A' || letter > 'Z') return false;
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  for (;;) {
+    SetLastError(ERROR_SUCCESS);
+    const DWORD mask = GetLogicalDrives();
+    if (mask == 0 && GetLastError() != ERROR_SUCCESS) {
+      // The query failed; the letter's state is unknown, so it is not released.
+      return false;
+    }
+    if ((mask & (1UL << (letter - 'A'))) == 0) return true;
+    if (GetTickCount64() >= deadline) return false;
+    Sleep(50);
+  }
+}
+
+bool QueryDriveVolumeInformation(std::string_view drive,
+                                 std::string* filesystem, uint32_t* serial,
+                                 std::string* error) {
+  if (drive.empty()) {
+    if (error) *error = "empty drive letter";
+    return false;
+  }
+  char letter = drive[0];
+  if (letter >= 'a' && letter <= 'z') letter = static_cast<char>(letter - 32);
+  if (letter < 'A' || letter > 'Z') {
+    if (error) *error = "invalid drive letter: " + std::string(drive);
+    return false;
+  }
+  const std::wstring root = std::wstring(1, static_cast<wchar_t>(letter)) +
+                            L":\\";
+  wchar_t fs_name[261] = {};
+  DWORD serial_number = 0;
+  if (!GetVolumeInformationW(root.c_str(), nullptr, 0, &serial_number, nullptr,
+                             nullptr, fs_name, 260)) {
+    if (error) {
+      *error = "cannot read drive " + WideToUtf8(root) + " volume information" +
+               WinErrorSuffix(GetLastError());
+    }
+    return false;
+  }
+  if (filesystem) *filesystem = WideToUtf8(fs_name);
+  if (serial) *serial = static_cast<uint32_t>(serial_number);
+  return true;
+}
+
+Result<std::string> QueryVolumeNameForMountPoint(std::string_view mount_point) {
+  const std::wstring wide = DriveLetterMountPointW(mount_point);
+  if (wide.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "not a drive-letter mount point")
+        .Metadata("volume mount point");
+  }
+  std::vector<wchar_t> buffer(MAX_PATH + 1, L'\0');
+  if (!GetVolumeNameForVolumeMountPointW(wide.c_str(), buffer.data(),
+                                         static_cast<DWORD>(buffer.size()))) {
+    const DWORD code = GetLastError();
+    return XFS_ERR(XfsError::kNotFound,
+                   "cannot resolve the volume of " + WideToUtf8(wide) +
+                       WinErrorSuffix(code))
+        .Metadata("volume mount point")
+        .Actual(code);
+  }
+  return WideToUtf8(buffer.data());
+}
+
 }  // namespace xfs
 
 #else  // !_WIN32
@@ -277,6 +582,67 @@ std::vector<RawVolumeInfo> EnumerateVolumes(std::string* error) {
 std::vector<DriveLetterInfo> EnumerateDriveLetters(std::string* error) {
   if (error) *error = "drive-letter enumeration is only supported on Windows";
   return {};
+}
+
+const RawVolumeInfo* FindVolumeByDevicePath(
+    const std::vector<RawVolumeInfo>& volumes, std::string_view device_path) {
+  (void)volumes;
+  (void)device_path;
+  return nullptr;
+}
+
+Result<VolumePathState> QueryVolumePathState(std::string_view device_path,
+                                             std::string* error) {
+  (void)device_path;
+  if (error) *error = "volume queries are only supported on Windows";
+  return XFS_ERR(XfsError::kUnsupportedFeature,
+                 "volume queries are only supported on Windows");
+}
+
+Status RemoveDriveLetterMountPoint(std::string_view mount_point,
+                                   std::string* error) {
+  (void)mount_point;
+  if (error) *error = "mount-point changes are only supported on Windows";
+  return XFS_ERR(XfsError::kUnsupportedFeature,
+                 "mount-point changes are only supported on Windows");
+}
+
+Status RestoreDriveLetterMountPoint(std::string_view mount_point,
+                                    std::string_view volume_name,
+                                    std::string* error) {
+  (void)mount_point;
+  (void)volume_name;
+  if (error) *error = "mount-point changes are only supported on Windows";
+  return XFS_ERR(XfsError::kUnsupportedFeature,
+                 "mount-point changes are only supported on Windows");
+}
+
+bool IsVolumePresent(std::string_view device_path) {
+  (void)device_path;
+  return false;
+}
+
+bool WaitForDriveLetterRelease(std::string_view drive, uint32_t timeout_ms) {
+  (void)drive;
+  (void)timeout_ms;
+  return false;
+}
+
+bool QueryDriveVolumeInformation(std::string_view drive,
+                                 std::string* filesystem, uint32_t* serial,
+                                 std::string* error) {
+  (void)drive;
+  (void)filesystem;
+  (void)serial;
+  if (error) *error = "volume queries are only supported on Windows";
+  return false;
+}
+
+Result<std::string> QueryVolumeNameForMountPoint(
+    std::string_view mount_point) {
+  (void)mount_point;
+  return XFS_ERR(XfsError::kUnsupportedFeature,
+                 "volume queries are only supported on Windows");
 }
 
 }  // namespace xfs

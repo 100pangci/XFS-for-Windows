@@ -29,15 +29,19 @@ typedef NTSTATUS* PNTSTATUS;
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -264,6 +268,262 @@ bool OpenErrorMayBeTransient(const std::string& error) {
          error.find("error 3:") != std::string::npos;
 }
 
+bool SameTextIgnoreCase(const std::string& a, const std::string& b) {
+  std::string left(a);
+  std::string right(b);
+  for (char& c : left) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  for (char& c : right) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return left == right;
+}
+
+std::string NormalizedVolumePath(std::string text) {
+  while (!text.empty() && text.back() == '\\') text.pop_back();
+  return text;
+}
+
+bool EqualsAsciiCaseInsensitive(const std::string& a, const char* b) {
+  const size_t length = std::strlen(b);
+  if (a.size() != length) return false;
+  for (size_t i = 0; i < length; ++i) {
+    char ca = a[i];
+    char cb = b[i];
+    if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
+    if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 32);
+    if (ca != cb) return false;
+  }
+  return true;
+}
+
+uint32_t XfsVolumeSerial(const XfsSuperblock& sb) {
+  return static_cast<uint32_t>(sb.uuid[0] | (sb.uuid[1] << 8) |
+                               (sb.uuid[2] << 16) |
+                               (static_cast<uint32_t>(sb.uuid[3]) << 24));
+}
+
+// One-shot failure injection for the Windows integration tests.  The service
+// runs as LocalSystem, so a sentinel file in the administrator-only
+// configuration directory is used instead of an environment variable that an
+// SCM-started process would never inherit.
+bool ConsumeTestHook(const wchar_t* name) {
+#ifdef XFSWIN_TEST_HOOKS
+  wchar_t program_data[MAX_PATH + 1] = {};
+  const DWORD length =
+      GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH + 1);
+  std::filesystem::path directory;
+  if (length > 0 && length <= MAX_PATH) {
+    directory = std::filesystem::path(program_data) / L"xfswin" / L"test-hooks";
+  } else {
+    directory = std::filesystem::path(L"C:\\ProgramData") / L"xfswin" /
+                L"test-hooks";
+  }
+  std::error_code ec;
+  const std::filesystem::path sentinel = directory / name;
+  if (!std::filesystem::exists(sentinel, ec)) return false;
+  std::filesystem::remove(sentinel, ec);
+  return true;
+#else
+  (void)name;
+  return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Drive-letter takeover against live Windows state
+// ---------------------------------------------------------------------------
+
+class WindowsTakeoverOps final : public TakeoverOps {
+ public:
+  Status VerifyAndCapture(const DiscoveredFilesystem& filesystem,
+                          std::string_view drive,
+                          std::string_view release_drive,
+                          DriveLetterTakeover* takeover) override {
+    if (!takeover) {
+      return XFS_ERR(XfsError::kInvalidArgument, "missing takeover record");
+    }
+    auto normalized = NormalizeDriveLetter(release_drive);
+    if (!normalized.ok()) return normalized.error();
+    const std::string release = normalized.value();
+    if (!filesystem.volume_identity_exact) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the Windows volume is not an exact extent match")
+          .Metadata("drive-letter takeover");
+    }
+    if (filesystem.probe.state != XfsProbeState::kValid ||
+        IsNullUuid(filesystem.probe.superblock.uuid)) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the XFS filesystem did not verify")
+          .Metadata("drive-letter takeover");
+    }
+
+    std::string error;
+    auto state = QueryVolumePathState(filesystem.volume_device_path, &error);
+    if (!state.ok()) {
+      return XFS_ERR(state.error().code,
+                     "the Windows volume disappeared before the takeover: " +
+                         state.error().Format())
+          .Metadata("drive-letter takeover");
+    }
+    const VolumePathState& volume = state.value();
+
+    // Fail closed: only ERROR_UNRECOGNIZED_VOLUME made this volume a
+    // candidate.  A recognized filesystem can appear between discovery and
+    // takeover only if the volume was reformatted or replaced; never detach
+    // its letter in either case.
+    if (volume.has_filesystem || !volume.unrecognized_filesystem) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the Windows volume no longer reports an unrecognized "
+                     "filesystem")
+          .Metadata("drive-letter takeover");
+    }
+    if (volume.extents.size() != 1) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the Windows volume does not have exactly one disk extent")
+          .Metadata("drive-letter takeover");
+    }
+    const VolumeExtent& extent = volume.extents.front();
+    if (extent.disk_number != filesystem.location.disk_number ||
+        extent.starting_offset != filesystem.location.offset_bytes ||
+        extent.length_bytes != filesystem.location.length_bytes) {
+      return XFS_ERR(XfsError::kBadValue,
+                     "the Windows volume's disk extent no longer matches the "
+                     "XFS candidate")
+          .Metadata("drive-letter takeover");
+    }
+
+    std::vector<std::string> drive_roots;
+    std::vector<std::string> directory_mounts;
+    for (const auto& mount : volume.mount_points) {
+      if (IsDriveLetterRoot(mount)) {
+        drive_roots.push_back(mount);
+      } else {
+        directory_mounts.push_back(mount);
+      }
+    }
+    if (drive_roots.size() != 1) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the Windows volume does not have exactly one "
+                     "drive-letter mount point")
+          .Metadata("drive-letter takeover");
+    }
+    const std::string only = SingleDriveLetterMountPoint(drive_roots);
+    if (only != release) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "drive " + release +
+                         " is not the Windows volume's drive letter")
+          .Metadata("drive-letter takeover");
+    }
+    auto reverse = QueryVolumeNameForMountPoint(release);
+    if (!reverse.ok() ||
+        !SameTextIgnoreCase(NormalizedVolumePath(reverse.value()),
+                            NormalizedVolumePath(volume.volume_name))) {
+      return XFS_ERR(XfsError::kBadValue,
+                     "drive " + release +
+                         " does not resolve back to the recorded volume GUID")
+          .Metadata("drive-letter takeover");
+    }
+
+    takeover->drive = std::string(drive);
+    takeover->mount_point = release + "\\";
+    takeover->original_drive = release;
+    takeover->volume_name = volume.volume_name;
+    takeover->volume_device_path = volume.device_path;
+    takeover->fs_uuid = FormatUuid(filesystem.probe.superblock.uuid);
+    takeover->disk_number = extent.disk_number;
+    takeover->partition_number = filesystem.location.partition_number;
+    takeover->offset_bytes = extent.starting_offset;
+    takeover->length_bytes = extent.length_bytes;
+    takeover->volume_present = true;
+    takeover->other_mount_points = std::move(directory_mounts);
+    return OkStatus();
+  }
+
+  Status RemoveMountPoint(DriveLetterTakeover* takeover) override {
+    if (!takeover) {
+      return XFS_ERR(XfsError::kInvalidArgument, "missing takeover record");
+    }
+    std::string error;
+    Status removed = RemoveDriveLetterMountPoint(takeover->mount_point, &error);
+    if (!removed.ok()) {
+      if (!error.empty()) takeover->error = error;
+      return removed;
+    }
+    // DeleteVolumeMountPointW returns before every observer has refreshed its
+    // DOS-device snapshot.  WinFsp refuses an occupied letter, so wait (bounded)
+    // for the letter to disappear before the mount is attempted.
+    if (!WaitForDriveLetterRelease(takeover->original_drive, 5000)) {
+      return XFS_ERR(XfsError::kIoError,
+                     "the Windows drive letter " + takeover->original_drive +
+                         " is still listed after the mount point was removed")
+          .Metadata("drive-letter takeover");
+    }
+    return OkStatus();
+  }
+
+  Status VerifyRemoved(const DriveLetterTakeover& takeover) override {
+    std::string error;
+    auto state = QueryVolumePathState(takeover.volume_device_path, &error);
+    if (!state.ok()) {
+      // The device was removed in the meantime.  The mount point cannot exist
+      // and the later restore will skip re-creating it.
+      return OkStatus();
+    }
+    for (const auto& mount : state.value().mount_points) {
+      if (SameTextIgnoreCase(mount, takeover.mount_point)) {
+        return XFS_ERR(XfsError::kAlreadyExists,
+                       "the Windows mount point " + takeover.mount_point +
+                           " is still attached to the volume")
+            .Metadata("drive-letter takeover");
+      }
+    }
+    if (!WaitForDriveLetterRelease(takeover.original_drive, 0)) {
+      return XFS_ERR(XfsError::kAlreadyExists,
+                     "the Windows drive letter " + takeover.original_drive +
+                         " is still listed")
+          .Metadata("drive-letter takeover");
+    }
+    return OkStatus();
+  }
+
+  bool VolumePresent(const DriveLetterTakeover& takeover) override {
+    return IsVolumePresent(takeover.volume_device_path);
+  }
+
+  Status RestoreMountPoint(DriveLetterTakeover* takeover) override {
+    if (!takeover) {
+      return XFS_ERR(XfsError::kInvalidArgument, "missing takeover record");
+    }
+    std::string error;
+    Status restored = RestoreDriveLetterMountPoint(
+        takeover->mount_point, takeover->volume_name, &error);
+    if (!restored.ok()) {
+      if (!error.empty()) takeover->error = error;
+      return restored;
+    }
+    return OkStatus();
+  }
+
+  Status VerifyRestored(const DriveLetterTakeover& takeover) override {
+    std::string error;
+    auto state = QueryVolumePathState(takeover.volume_device_path, &error);
+    if (!state.ok()) {
+      // The volume vanished between the restore and this check.  The restore
+      // itself succeeded; there is nothing further to verify.
+      return OkStatus();
+    }
+    for (const auto& mount : state.value().mount_points) {
+      if (SameTextIgnoreCase(mount, takeover.mount_point)) return OkStatus();
+    }
+    return XFS_ERR(XfsError::kNotFound,
+                   "the Windows mount point " + takeover.mount_point +
+                       " is not present after the restore")
+        .Metadata("drive-letter takeover");
+  }
+};
+
 class WindowsAutomountPlatform final : public AutomountPlatform {
  public:
   WindowsAutomountPlatform() = default;
@@ -293,8 +553,22 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     return EnumerateDriveLetters(error);
   }
 
+  TakeoverResult TakeOverDriveLetter(
+      const DiscoveredFilesystem& filesystem,
+      const DriveLetterChoice& choice) override {
+    WindowsTakeoverOps ops;
+    return PrepareDriveLetterTakeover(ops, filesystem, choice.drive,
+                                      choice.release_drive);
+  }
+
+  Status RestoreDriveLetterTakeover(DriveLetterTakeover* takeover) override {
+    WindowsTakeoverOps ops;
+    return xfs::RestoreDriveLetterTakeover(ops, takeover);
+  }
+
   AutomountMountStart StartMount(const DiscoveredFilesystem& filesystem,
                                  const AutomountEntry& entry,
+                                 AutomountMode mode,
                                  const std::string& drive) override {
     AutomountMountStart result;
     if (filesystem.location.disk_path.empty()) {
@@ -302,8 +576,21 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
                               "the discovered filesystem has no raw device path");
       return result;
     }
-    const bool read_write =
-        entry.mode == AutomountMode::kExperimentalReadWrite;
+    const bool read_write = mode == AutomountMode::kExperimentalReadWrite;
+    if (read_write && entry.expected_device_class != DeviceClass::kUnknown &&
+        filesystem.location.device_class != entry.expected_device_class) {
+      result.status = XFS_ERR(XfsError::kPermissionDenied,
+                              "the attached device class does not match the "
+                              "enrolled class; refusing read-write");
+      return result;
+    }
+    if (read_write && filesystem.disk_has_other_filesystems) {
+      result.status = XFS_ERR(XfsError::kPermissionDenied,
+                              "another volume on the same physical disk has a "
+                              "Windows filesystem; a read-write mount would "
+                              "dismount it");
+      return result;
+    }
 
     // DEV-1: the entry's explicit qualification and identity pins are the only
     // way an automount session may write.  Fixed disks are never writable, and
@@ -369,12 +656,51 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     config.read_write = read_write;
     config.verbose = false;
     config.perf_stats = false;
+
+    // The RAW mount point was detached before this call by the takeover
+    // transaction.  A CI-only one-shot sentinel exercises the rollback path
+    // after the detachment and before WinFsp owns the letter.
+    if (ConsumeTestHook(L"fail-next-winfsp-start")) {
+      result.status = XFS_ERR(XfsError::kInternal,
+                              "injected WinFsp mount failure (test hook)");
+      return result;
+    }
+
     auto session = winfsp::MountSession::Start(std::move(mounted.value()),
                                                config);
     if (!session.ok()) {
       result.status = session.error();
       return result;
     }
+
+    // Verify the WinFsp volume really is the XFS filesystem, not a stale RAW
+    // view of the old volume or another mount that raced us for the letter.
+    const uint32_t expected_serial = XfsVolumeSerial(filesystem.probe.superblock);
+    std::string mounted_filesystem;
+    uint32_t mounted_serial = 0;
+    std::string drive_error;
+    bool verified = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      if (QueryDriveVolumeInformation(drive, &mounted_filesystem,
+                                      &mounted_serial, &drive_error) &&
+          EqualsAsciiCaseInsensitive(mounted_filesystem, "XFS") &&
+          mounted_serial == expected_serial) {
+        verified = true;
+        break;
+      }
+      Sleep(100);
+    }
+    if (!verified) {
+      session.value()->Stop();
+      result.status =
+          XFS_ERR(XfsError::kIoError,
+                  "the WinFsp mount at " + drive +
+                      " could not be verified as the expected XFS filesystem" +
+                      (drive_error.empty() ? "" : ": " + drive_error))
+              .Metadata("automount mount");
+      return result;
+    }
+
     const std::string id = session.value()->id();
     {
       std::lock_guard<std::mutex> lock(session_mutex_);
@@ -472,6 +798,46 @@ struct ServiceRuntime {
     }
   }
 
+  // Publishes the small session snapshot the CLI uses for `xfswin status`.
+  // Written only when the effective state changes, and cleared on service
+  // stop so a stale file cannot claim a live mount.
+  void PublishRuntimeStatus() {
+    if (!platform || !engine) return;
+    std::vector<AutomountRuntimeMount> mounts;
+    std::string fingerprint;
+    if (engine->running()) {
+      for (const auto& mount : engine->status().mounts) {
+        AutomountRuntimeMount item;
+        item.fs_uuid = mount.fs_uuid;
+        item.label = mount.label;
+        item.drive = mount.drive;
+        item.mode = ToString(mount.mode);
+        item.configured_mode = ToString(mount.configured_mode);
+        item.drive_taken_over = mount.drive_taken_over;
+        item.original_windows_drive = mount.original_windows_drive;
+        item.detail = mount.mode_note;
+        fingerprint += FormatUuid(item.fs_uuid) + '\t' + item.drive + '\t' +
+                       item.mode + '\t' + item.configured_mode + '\t' +
+                       (item.drive_taken_over ? "1" : "0") + '\t' +
+                       item.original_windows_drive + '\t' + item.label + '\t' +
+                       item.detail + '\n';
+        mounts.push_back(std::move(item));
+      }
+    }
+    if (fingerprint == last_runtime_fingerprint) return;
+    const Status saved = SaveAutomountRuntimeStatus(
+        paths.directory / L"sessions.ini", mounts);
+    if (!saved.ok()) {
+      AutomountLogRecord record;
+      record.level = AutomountLogLevel::kWarn;
+      record.event = "status-publish";
+      record.result = "failed";
+      record.detail = saved.error().Format();
+      platform->EmitLog(record);
+    }
+    last_runtime_fingerprint = std::move(fingerprint);
+  }
+
   HANDLE stop_event = nullptr;
   HANDLE device_event = nullptr;
   HANDLE config_notify = nullptr;
@@ -481,6 +847,7 @@ struct ServiceRuntime {
   std::unique_ptr<WindowsAutomountPlatform> platform;
   std::unique_ptr<AutomountEngine> engine;
   std::thread worker;
+  std::string last_runtime_fingerprint = "<unpublished>";
 };
 
 CONFIGRET RegisterInterfaceNotifications(const GUID& interface_class,
@@ -539,6 +906,7 @@ void WorkerMain(ServiceRuntime& runtime) {
   enum class WakeKind : uint8_t { kStop, kDevice, kConfig };
   while (true) {
     runtime.engine->Tick(AutomountClock::now());
+    runtime.PublishRuntimeStatus();
     const AutomountTimePoint now = AutomountClock::now();
     const DWORD timeout =
         WaitTimeoutFor(runtime.engine->NextWake(now), now);
@@ -594,6 +962,7 @@ void WorkerMain(ServiceRuntime& runtime) {
     }
   }
   runtime.engine->Stop(AutomountClock::now());
+  runtime.PublishRuntimeStatus();
 }
 
 NTSTATUS OnServiceStart(FSP_SERVICE* service, ULONG, PWSTR*) {
@@ -711,6 +1080,127 @@ AutomountServicePaths DefaultAutomountServicePaths() {
   paths.directory = std::filesystem::path(program_data) / L"xfswin";
   paths.config_file = paths.directory / L"automount.ini";
   return paths;
+}
+
+std::filesystem::path DefaultAutomountRuntimeStatusPath() {
+  const AutomountServicePaths paths = DefaultAutomountServicePaths();
+  return paths.directory / L"sessions.ini";
+}
+
+namespace {
+
+std::string SanitizeRuntimeField(std::string text) {
+  for (char& c : text) {
+    if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+  }
+  return text;
+}
+
+}  // namespace
+
+Status SaveAutomountRuntimeStatus(
+    const std::filesystem::path& path,
+    const std::vector<AutomountRuntimeMount>& mounts) {
+  std::ostringstream out;
+  out << "xfswin-sessions 1\n";
+  for (const auto& mount : mounts) {
+    out << FormatUuid(mount.fs_uuid) << '\t'
+        << SanitizeRuntimeField(mount.drive) << '\t'
+        << SanitizeRuntimeField(mount.mode) << '\t'
+        << SanitizeRuntimeField(mount.configured_mode) << '\t'
+        << (mount.drive_taken_over ? '1' : '0') << '\t'
+        << SanitizeRuntimeField(mount.original_windows_drive) << '\t'
+        << SanitizeRuntimeField(mount.label) << '\t'
+        << SanitizeRuntimeField(mount.detail) << '\n';
+  }
+  std::error_code ec;
+  if (path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+      return XFS_ERR(XfsError::kIoError,
+                     "cannot create the runtime status directory: " +
+                         ec.message());
+    }
+  }
+  const std::filesystem::path temporary = path.string() + ".tmp";
+  {
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    if (!file) {
+      return XFS_ERR(XfsError::kIoError,
+                     "cannot write the runtime status: " + temporary.string());
+    }
+    file << out.str();
+    file.flush();
+    if (!file) {
+      std::filesystem::remove(temporary, ec);
+      return XFS_ERR(XfsError::kIoError,
+                     "cannot flush the runtime status: " + temporary.string());
+    }
+  }
+  std::filesystem::rename(temporary, path, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot replace the runtime status: " + ec.message());
+  }
+  return OkStatus();
+}
+
+Result<AutomountRuntimeStatus> LoadAutomountRuntimeStatus(
+    const std::filesystem::path& path) {
+  AutomountRuntimeStatus status;
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    if (ec) {
+      return XFS_ERR(XfsError::kIoError,
+                     "cannot inspect the runtime status: " + ec.message());
+    }
+    return status;  // loaded=false: no snapshot
+  }
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot open the runtime status: " + path.string());
+  }
+  std::string header;
+  if (!std::getline(file, header) || header != "xfswin-sessions 1") {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "the runtime status has an unknown version");
+  }
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty()) continue;
+    std::vector<std::string> fields;
+    size_t begin = 0;
+    for (;;) {
+      const size_t tab = line.find('\t', begin);
+      fields.push_back(line.substr(begin, tab == std::string::npos
+                                               ? std::string::npos
+                                               : tab - begin));
+      if (tab == std::string::npos) break;
+      begin = tab + 1;
+    }
+    if (fields.size() != 8) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the runtime status has a malformed entry");
+    }
+    AutomountRuntimeMount mount;
+    if (!ParseUuid(fields[0], &mount.fs_uuid)) {
+      return XFS_ERR(XfsError::kInvalidArgument,
+                     "the runtime status has an invalid filesystem UUID");
+    }
+    mount.drive = fields[1];
+    mount.mode = fields[2];
+    mount.configured_mode = fields[3];
+    mount.drive_taken_over = fields[4] == "1";
+    mount.original_windows_drive = fields[5];
+    mount.label = fields[6];
+    mount.detail = fields[7];
+    status.mounts.push_back(std::move(mount));
+  }
+  status.loaded = true;
+  return status;
 }
 
 Status EnsureAutomountServicePaths(const AutomountServicePaths& paths) {

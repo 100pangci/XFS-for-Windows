@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "xfs/device_policy.h"
 #include "xfs/error.h"
 #include "xfs/uuid.h"
 
@@ -38,6 +39,11 @@ struct AutomountEntry {
   std::string expected_serial;
   std::string expected_stable_id;
   uint64_t expected_size_bytes = 0;
+  // Expected physical device class.  kUnknown means "not pinned" (the
+  // read-only entries written by older versions).  A writable entry pins the
+  // class it was enrolled against; a different class on a later insertion
+  // falls back to read-only instead of writing to an unexpected device.
+  DeviceClass expected_device_class = DeviceClass::kUnknown;
   // Explicit qualification acknowledgements.  `device_qualification` mirrors
   // the CLI's --device-write-qualification.  The class flags mirror
   // --allow-removable-disk-write / --allow-fixed-disk-write; fixed physical

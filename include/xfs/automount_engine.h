@@ -30,6 +30,7 @@
 #include "xfs/automount_config.h"
 #include "xfs/device_discovery.h"
 #include "xfs/drive_letter.h"
+#include "xfs/drive_letter_takeover.h"
 #include "xfs/error.h"
 
 namespace xfs {
@@ -78,8 +79,19 @@ class AutomountPlatform {
   virtual Result<DiscoveryReport> Discover(
       const DiscoveryOptions& options) = 0;
   virtual std::vector<DriveLetterInfo> ListDriveLetters(std::string* error) = 0;
+  // Takes over the Windows drive letter of the RAW volume, if the selection
+  // asked for one (choice.release_drive non-empty).  Returns a kNone record
+  // when there is nothing to take over.  On failure the record still describes
+  // what Windows state may need to be restored; the engine schedules the retry.
+  virtual TakeoverResult TakeOverDriveLetter(
+      const DiscoveredFilesystem& filesystem,
+      const DriveLetterChoice& choice) = 0;
+  // Restores an original Windows mount point after the session ended (or after
+  // a failed mount).  Safe to call repeatedly.
+  virtual Status RestoreDriveLetterTakeover(DriveLetterTakeover* takeover) = 0;
   virtual AutomountMountStart StartMount(const DiscoveredFilesystem& filesystem,
                                          const AutomountEntry& entry,
+                                         AutomountMode mode,
                                          const std::string& drive) = 0;
   virtual Status StopMount(const std::string& session_id) = 0;
   virtual bool IsSessionAlive(const std::string& session_id) = 0;
@@ -106,7 +118,16 @@ struct AutomountMountStatus {
   uint64_t device_size_bytes = 0;
   uint64_t filesystem_bytes = 0;
   uint64_t free_bytes = 0;
+  // Effective mode.  It is read-only when a configured read-write entry fell
+  // back because the attached device no longer matches its identity pins.
+  AutomountMode mode = AutomountMode::kReadOnly;
+  AutomountMode configured_mode = AutomountMode::kReadOnly;
+  std::string mode_note;
   bool read_write = false;
+  // True when the drive letter was taken over from the RAW Windows volume,
+  // false when it was freshly allocated.
+  bool drive_taken_over = false;
+  std::string original_windows_drive;  // "F:" when taken over
   std::string device_path;
 };
 
@@ -125,11 +146,15 @@ const char* ToString(AutomountEntryState state);
 struct AutomountEntryStatus {
   Uuid fs_uuid{};
   bool enabled = false;
-  AutomountMode mode = AutomountMode::kReadOnly;
+  AutomountMode mode = AutomountMode::kReadOnly;  // configured
+  AutomountMode effective_mode = AutomountMode::kReadOnly;
+  std::string mode_note;
   std::string preferred_drive;
   AutomountEntryState state = AutomountEntryState::kWaitingForDevice;
   std::string label;
   std::string drive;
+  bool drive_taken_over = false;
+  std::string original_windows_drive;
   std::string detail;
   uint32_t retry_attempt = 0;
 };
@@ -204,11 +229,14 @@ class AutomountEngine {
     std::string drive;
     std::string session_id;
     std::string preferred_drive;
-    AutomountMode mode = AutomountMode::kReadOnly;
+    AutomountMode configured_mode = AutomountMode::kReadOnly;
+    AutomountMode mode = AutomountMode::kReadOnly;  // effective
+    std::string mode_note;
     PartitionLocation location;
     uint64_t filesystem_bytes = 0;
     uint64_t free_bytes = 0;
     std::string drive_note;
+    DriveLetterTakeover takeover;
   };
 
   struct RetryState {
@@ -221,6 +249,17 @@ class AutomountEngine {
     std::string drive;
     std::string uuid;
     uint32_t attempts = 0;
+    // Restored only after StopMount confirms the WinFsp letter is free.  The
+    // volume may be gone by then; the restore operation decides.
+    DriveLetterTakeover takeover;
+  };
+
+  struct PendingRestore {
+    DriveLetterTakeover takeover;
+    std::string uuid;
+    std::string reason;
+    uint32_t attempts = 0;
+    AutomountTimePoint next_at{};
   };
 
   void Reconcile(AutomountTimePoint now, bool reload_config);
@@ -233,10 +272,19 @@ class AutomountEngine {
   void StopSession(MountedSession& session, AutomountTimePoint now,
                    const std::string& reason);
   void RetryStoppingSessions(AutomountTimePoint now);
+  // Restores after a session ends.  Failures become pending restores that are
+  // retried by reconciliation; success is logged, never assumed.
+  void RestoreTakeover(DriveLetterTakeover* takeover, const std::string& uuid,
+                       AutomountTimePoint now, const std::string& reason);
+  void RetryPendingRestores(AutomountTimePoint now);
   bool ChooseDrive(const DiscoveredFilesystem& filesystem,
                    const AutomountEntry& entry, DriveLetterUsage& usage,
-                   bool usage_ready, std::string* drive,
-                   bool* preferred_unavailable, std::string* error);
+                   bool usage_ready, DriveLetterChoice* choice,
+                   std::string* error);
+  AutomountMode EffectiveMode(const AutomountEntry& entry,
+                              const DiscoveredFilesystem& filesystem,
+                              std::string* note) const;
+  bool TakeoverEligible(const DiscoveredFilesystem& filesystem) const;
   void Log(AutomountLogLevel level, std::string event, std::string uuid,
            std::string drive, std::string device, std::string result,
            std::string detail);
@@ -244,6 +292,7 @@ class AutomountEngine {
                        const std::string& result, const std::string& detail);
   bool EntryPolicyAccepts(const AutomountEntry& entry,
                           const DiscoveredFilesystem& filesystem,
+                          AutomountMode effective_mode,
                           std::string* refusal) const;
   bool EntryIdentityMatches(const AutomountEntry& entry,
                             const PartitionLocation& location,
@@ -262,6 +311,7 @@ class AutomountEngine {
 
   std::vector<MountedSession> mounts_;
   std::vector<StoppingSession> stopping_;
+  std::vector<PendingRestore> pending_restores_;
   std::map<std::string, RetryState> retries_;
   std::map<std::string, bool> exhausted_;
   // Last refusal text per entry, so an unchanged refusal is logged once

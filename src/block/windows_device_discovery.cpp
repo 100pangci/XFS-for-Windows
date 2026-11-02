@@ -96,23 +96,50 @@ std::vector<ActiveXfsMount> FindActiveXfsMounts(
 
 const RawVolumeInfo* FindVolumeForCandidate(
     const std::vector<RawVolumeInfo>& volumes, uint32_t disk_number,
-    uint64_t offset_bytes, uint32_t partition_number, bool* found) {
-  *found = false;
-  // Offset is the authoritative relationship for a normal partition.  The
-  // partition number is a fallback for drivers that do not report extents.
+    uint64_t offset_bytes, uint64_t length_bytes, uint32_t partition_number,
+    bool* exact) {
+  *exact = false;
+  // Exact identity: one extent whose disk, starting offset and length all
+  // equal the XFS candidate.  Only this relationship may authorize a drive
+  // letter takeover; a match by partition number alone is display data.
+  const RawVolumeInfo* exact_volume = nullptr;
+  size_t exact_matches = 0;
+  for (const auto& volume : volumes) {
+    if (volume.extents.size() != 1) continue;
+    const VolumeExtent& extent = volume.extents.front();
+    if (extent.disk_number != disk_number) continue;
+    if (extent.starting_offset != offset_bytes) continue;
+    if (extent.length_bytes != length_bytes) continue;
+    if (partition_number != 0 && volume.partition_number != 0 &&
+        volume.partition_number != partition_number) {
+      continue;
+    }
+    ++exact_matches;
+    exact_volume = &volume;
+  }
+  if (exact_matches == 1) {
+    *exact = true;
+    return exact_volume;
+  }
+  if (exact_matches > 1) {
+    // Two Windows volumes claiming the same extent is not a relationship we
+    // can act on.  Return no correlation rather than guessing.
+    return nullptr;
+  }
+  // Approximate correlation for display: same disk and starting offset but a
+  // different reported extent length (for example a multi-extent volume).
   for (const auto& volume : volumes) {
     for (const auto& extent : volume.extents) {
       if (extent.disk_number == disk_number &&
           extent.starting_offset == offset_bytes) {
-        *found = true;
         return &volume;
       }
     }
   }
+  // Last resort for drivers that do not report extents at all.
   for (const auto& volume : volumes) {
     if (partition_number != 0 && volume.partition_number == partition_number &&
         volume.disk_number == disk_number) {
-      *found = true;
       return &volume;
     }
   }
@@ -155,6 +182,31 @@ uint32_t XfsVolumeSerial(const XfsSuperblock& sb) {
   return static_cast<uint32_t>(sb.uuid[0] | (sb.uuid[1] << 8) |
                                (sb.uuid[2] << 16) |
                                (static_cast<uint32_t>(sb.uuid[3]) << 24));
+}
+
+bool VolumeTouchesDisk(const RawVolumeInfo& volume, uint32_t disk_number) {
+  if (!volume.extents.empty()) {
+    for (const auto& extent : volume.extents) {
+      if (extent.disk_number == disk_number) return true;
+    }
+    return false;
+  }
+  return volume.disk_number == disk_number;
+}
+
+// True when a volume other than `candidate` on the same physical disk has a
+// filesystem Windows recognizes.  The DEV-1 read-write open locks/dismounts
+// every volume on the disk, so mounting XFS read-write there would disturb
+// that filesystem.
+bool DiskHasOtherFilesystems(const std::vector<RawVolumeInfo>& volumes,
+                             const RawVolumeInfo* candidate,
+                             uint32_t disk_number) {
+  for (const auto& volume : volumes) {
+    if (&volume == candidate) continue;
+    if (!volume.has_filesystem) continue;
+    if (VolumeTouchesDisk(volume, disk_number)) return true;
+  }
+  return false;
 }
 
 std::string DiskLabel(const RawDiskInfo& disk) {
@@ -244,10 +296,10 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
       }
       if (probe.state == XfsProbeState::kNoXfs) continue;
 
-      bool volume_found = false;
+      bool volume_exact = false;
       const RawVolumeInfo* volume = FindVolumeForCandidate(
-          volumes, disk.disk_number, candidate.offset, candidate.number,
-          &volume_found);
+          volumes, disk.disk_number, candidate.offset, candidate.length,
+          candidate.number, &volume_exact);
 
       if (probe.state == XfsProbeState::kValid) {
         DiscoveredFilesystem fs;
@@ -255,6 +307,11 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
         fs.probe = std::move(probe);
         if (volume) {
           fs.windows_volume_found = true;
+          fs.volume_identity_exact = volume_exact;
+          fs.volume_unrecognized_raw = volume->unrecognized_filesystem;
+          fs.volume_device_path = volume->device_path;
+          fs.disk_has_other_filesystems = DiskHasOtherFilesystems(
+              volumes, volume, disk.disk_number);
           if (!volume->device_path.empty()) {
             fs.volume_paths.push_back(volume->device_path);
           }

@@ -60,6 +60,16 @@ void AddWarning(std::vector<std::string>* warnings, const std::string& text) {
   }
 }
 
+std::string CombineNotes(const std::string& first, const std::string& second) {
+  if (first.empty()) return second;
+  if (second.empty()) return first;
+  return first + " " + second;
+}
+
+bool TakeoverWasOwned(const DriveLetterTakeover& takeover) {
+  return takeover.state == TakeoverState::kOwned;
+}
+
 }  // namespace
 
 const char* ToString(AutomountLogLevel level) {
@@ -136,6 +146,17 @@ void AutomountEngine::Stop(AutomountTimePoint now) {
   mounts_.clear();
   RetryStoppingSessions(now);
   stopping_.clear();
+  for (auto& pending : pending_restores_) pending.next_at = now;
+  RetryPendingRestores(now);
+  for (const auto& pending : pending_restores_) {
+    if (pending.takeover.mount_point.empty()) continue;
+    Log(AutomountLogLevel::kError, "drive-letter-restore", pending.uuid,
+        pending.takeover.original_drive, "", "failed",
+        "the original Windows mount point " + pending.takeover.mount_point +
+            " could not be restored before the service stopped: " +
+            pending.takeover.error);
+  }
+  pending_restores_.clear();
   retries_.clear();
   exhausted_.clear();
   pending_reconcile_.reset();
@@ -204,6 +225,9 @@ std::optional<AutomountTimePoint> AutomountEngine::NextWake(
   for (const auto& [key, retry] : retries_) {
     (void)key;
     consider(retry.next_at);
+  }
+  for (const auto& pending : pending_restores_) {
+    consider(pending.next_at);
   }
   if (earliest && *earliest < now) return now;
   return earliest;
@@ -291,11 +315,33 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
   status_.last_reconcile = now;
   status_.last_reconcile_valid = true;
 
+  auto make_mount_status = [](const MountedSession& session) {
+    AutomountMountStatus mount;
+    mount.fs_uuid = session.fs_uuid;
+    mount.label = session.label;
+    mount.drive = session.drive;
+    mount.session_id = session.session_id;
+    mount.serial_number = session.location.serial_number;
+    mount.stable_id = session.location.stable_id;
+    mount.device_size_bytes = session.location.disk_size_bytes;
+    mount.filesystem_bytes = session.filesystem_bytes;
+    mount.free_bytes = session.free_bytes;
+    mount.mode = session.mode;
+    mount.configured_mode = session.configured_mode;
+    mount.mode_note = session.mode_note;
+    mount.read_write = session.mode == AutomountMode::kExperimentalReadWrite;
+    mount.drive_taken_over = TakeoverWasOwned(session.takeover);
+    mount.original_windows_drive = session.takeover.original_drive;
+    mount.device_path = session.location.disk_path;
+    return mount;
+  };
+
   // A missing/changed configuration is picked up on every pass.  The service
   // additionally calls NotifySettingsChanged for immediate application.
   ReloadConfig(now);
   PruneRetries();
   RetryStoppingSessions(now);
+  RetryPendingRestores(now);
 
   const auto period =
       std::chrono::seconds(std::max<uint32_t>(1, config_.reconcile_seconds));
@@ -326,26 +372,14 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     }
 
     for (const auto& session : mounts_) {
-      AutomountMountStatus mount;
-      mount.fs_uuid = session.fs_uuid;
-      mount.label = session.label;
-      mount.drive = session.drive;
-      mount.session_id = session.session_id;
-      mount.serial_number = session.location.serial_number;
-      mount.stable_id = session.location.stable_id;
-      mount.device_size_bytes = session.location.disk_size_bytes;
-      mount.filesystem_bytes = session.filesystem_bytes;
-      mount.free_bytes = session.free_bytes;
-      mount.read_write =
-          session.mode == AutomountMode::kExperimentalReadWrite;
-      mount.device_path = session.location.disk_path;
-      status_.mounts.push_back(std::move(mount));
+      status_.mounts.push_back(make_mount_status(session));
     }
     for (const auto& entry : config_.entries) {
       AutomountEntryStatus es;
       es.fs_uuid = entry.fs_uuid;
       es.enabled = entry.enabled;
       es.mode = entry.mode;
+      es.effective_mode = entry.mode;
       es.preferred_drive = entry.preferred_drive;
       const MountedSession* mounted = nullptr;
       for (const auto& current : mounts_) {
@@ -360,7 +394,11 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
         es.state = AutomountEntryState::kMounted;
         es.drive = mounted->drive;
         es.label = mounted->label;
-        es.detail = mounted->drive_note;
+        es.effective_mode = mounted->mode;
+        es.mode_note = mounted->mode_note;
+        es.drive_taken_over = TakeoverWasOwned(mounted->takeover);
+        es.original_windows_drive = mounted->takeover.original_drive;
+        es.detail = CombineNotes(mounted->drive_note, mounted->mode_note);
       } else {
         es.state = AutomountEntryState::kWaitingForDevice;
         es.detail = "device discovery is unavailable";
@@ -407,7 +445,7 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       } else if (!entry->enabled) {
         drop = true;
         reason = "automatic mounting was disabled";
-      } else if (entry->mode != session.mode) {
+      } else if (entry->mode != session.configured_mode) {
         drop = true;
         reason = "the configured mount mode changed";
       } else if (entry->preferred_drive != session.preferred_drive) {
@@ -440,19 +478,7 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
   mounts_ = std::move(survivors);
 
   for (const auto& session : mounts_) {
-    AutomountMountStatus mount;
-    mount.fs_uuid = session.fs_uuid;
-    mount.label = session.label;
-    mount.drive = session.drive;
-    mount.session_id = session.session_id;
-    mount.serial_number = session.location.serial_number;
-    mount.stable_id = session.location.stable_id;
-    mount.device_size_bytes = session.location.disk_size_bytes;
-    mount.filesystem_bytes = session.filesystem_bytes;
-    mount.free_bytes = session.free_bytes;
-    mount.read_write = session.mode == AutomountMode::kExperimentalReadWrite;
-    mount.device_path = session.location.disk_path;
-    status_.mounts.push_back(std::move(mount));
+    status_.mounts.push_back(make_mount_status(session));
   }
 
   // 2. Build a drive-letter view that includes Windows' mappings, our live
@@ -490,6 +516,7 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     es.fs_uuid = entry.fs_uuid;
     es.enabled = entry.enabled;
     es.mode = entry.mode;
+    es.effective_mode = entry.mode;
     es.preferred_drive = entry.preferred_drive;
     const std::string key = UuidKey(entry.fs_uuid);
 
@@ -511,7 +538,11 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       es.state = AutomountEntryState::kMounted;
       es.drive = mounted->drive;
       es.label = mounted->label;
-      es.detail = mounted->drive_note;
+      es.effective_mode = mounted->mode;
+      es.mode_note = mounted->mode_note;
+      es.drive_taken_over = TakeoverWasOwned(mounted->takeover);
+      es.original_windows_drive = mounted->takeover.original_drive;
+      es.detail = CombineNotes(mounted->drive_note, mounted->mode_note);
       status_.entries.push_back(std::move(es));
       continue;
     }
@@ -527,6 +558,26 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     if (stopping_previous) {
       es.state = AutomountEntryState::kRetrying;
       es.detail = "waiting for the previous mount session to stop";
+      status_.entries.push_back(std::move(es));
+      continue;
+    }
+
+    // A failed restoration left the original Windows mount point detached.
+    // Starting another WinFsp mount for the same filesystem would take a
+    // second letter while the first restore is still outstanding, so
+    // automatic mounting stays suspended until the restore succeeds.  The
+    // retry itself runs at the top of every reconciliation.
+    const bool has_pending_restore = [&]() {
+      for (const auto& pending : pending_restores_) {
+        if (pending.uuid == key) return true;
+      }
+      return false;
+    }();
+    if (has_pending_restore) {
+      es.state = AutomountEntryState::kFailed;
+      es.detail =
+          "the original Windows drive letter could not be restored yet; "
+          "automatic mounting is suspended until it is";
       status_.entries.push_back(std::move(es));
       continue;
     }
@@ -589,8 +640,19 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       continue;
     }
 
+    std::string mode_note;
+    const AutomountMode effective_mode =
+        EffectiveMode(entry, *filesystem, &mode_note);
+
+    // A read-only entry with pins is a strict selection: a mismatch means the
+    // attached device is not the one that was enrolled.  A read-write entry
+    // instead falls back to read-only: writing to an unexpected device is
+    // never acceptable, but hiding the data is not necessary either.  Policy
+    // refusals below (journal, system/pagefile, fixed disk, unsupported
+    // profile) remain absolute and are not softened by the fallback.
     std::string mismatch;
-    if (!EntryIdentityMatches(entry, filesystem->location, &mismatch)) {
+    if (!EntryIdentityMatches(entry, filesystem->location, &mismatch) &&
+        entry.mode != AutomountMode::kExperimentalReadWrite) {
       es.state = AutomountEntryState::kRefused;
       es.detail = mismatch;
       LogEntryRefusal(entry, "identity:" + mismatch, "refused", mismatch);
@@ -599,13 +661,15 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     }
 
     std::string refusal;
-    if (!EntryPolicyAccepts(entry, *filesystem, &refusal)) {
+    if (!EntryPolicyAccepts(entry, *filesystem, effective_mode, &refusal)) {
       es.state = AutomountEntryState::kRefused;
       es.detail = refusal;
       LogEntryRefusal(entry, "policy:" + refusal, "refused", refusal);
       status_.entries.push_back(std::move(es));
       continue;
     }
+    es.effective_mode = effective_mode;
+    es.mode_note = mode_note;
 
     if (!RetryDue(entry.fs_uuid, now)) {
       const auto it = retries_.find(key);
@@ -616,11 +680,10 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       continue;
     }
 
-    std::string drive;
-    bool preferred_unavailable = false;
+    DriveLetterChoice selection;
     std::string allocation_error;
-    if (!ChooseDrive(*filesystem, entry, usage, usage_ready, &drive,
-                     &preferred_unavailable, &allocation_error)) {
+    if (!ChooseDrive(*filesystem, entry, usage, usage_ready, &selection,
+                     &allocation_error)) {
       es.state = AutomountEntryState::kFailed;
       es.detail = allocation_error;
       LogEntryRefusal(entry, "drive:" + allocation_error, "failed",
@@ -629,27 +692,67 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       continue;
     }
 
-    Log(AutomountLogLevel::kInfo, "mount-attempt", key, drive,
+    Log(AutomountLogLevel::kInfo, "mount-attempt", key, selection.drive,
         LocationText(filesystem->location), "starting",
-        std::string("mode ") + ToString(entry.mode));
-    AutomountMountStart started =
-        platform_.StartMount(*filesystem, entry, drive);
+        std::string("mode ") + ToString(effective_mode) +
+            (mode_note.empty() ? "" : "; " + mode_note));
+
+    // The takeover detaches the Windows mount point of the RAW volume, if any,
+    // before the WinFsp mount.  It is a no-op (kNone) for a volume Windows has
+    // not mounted.  The platform re-verifies the volume identity itself; the
+    // engine never authorizes a takeover from a drive letter alone.
+    TakeoverResult takeover =
+        platform_.TakeOverDriveLetter(*filesystem, selection);
+    if (!takeover.status.ok()) {
+      if (TakeoverNeedsRestore(takeover.takeover)) {
+        RestoreTakeover(&takeover.takeover, key, now,
+                        "the drive-letter takeover failed");
+      }
+      es.state = AutomountEntryState::kFailed;
+      es.detail = "the Windows drive letter could not be taken over: " +
+                  takeover.status.error().Format();
+      LogEntryRefusal(entry, "drive-takeover:" + es.detail, "failed",
+                      es.detail);
+      status_.entries.push_back(std::move(es));
+      continue;
+    }
+    MarkTakeoverMounting(&takeover.takeover);
+    if (TakeoverNeedsRestore(takeover.takeover)) {
+      Log(AutomountLogLevel::kInfo, "drive-letter-takeover", key,
+          takeover.takeover.original_drive,
+          LocationText(filesystem->location), "taken-over",
+          "released the Windows mount point " +
+              takeover.takeover.mount_point + " of volume " +
+              takeover.takeover.volume_name + " before mounting at " +
+              selection.drive);
+    }
+
+    AutomountMountStart started = platform_.StartMount(
+        *filesystem, entry, effective_mode, selection.drive);
     if (started.status.ok() && !started.session_id.empty()) {
+      MarkTakeoverOwned(&takeover.takeover);
       MountedSession session;
       session.fs_uuid = entry.fs_uuid;
       session.label = filesystem->probe.label;
-      session.drive = drive;
+      session.drive = selection.drive;
       session.session_id = started.session_id;
       session.preferred_drive = entry.preferred_drive;
-      session.mode = entry.mode;
+      session.configured_mode = entry.mode;
+      session.mode = effective_mode;
+      session.mode_note = mode_note;
       session.location = filesystem->location;
       session.filesystem_bytes = filesystem->probe.filesystem_bytes;
       session.free_bytes = filesystem->probe.free_bytes;
-      if (preferred_unavailable) {
+      session.takeover = takeover.takeover;
+      if (selection.preferred_unavailable) {
         session.drive_note = "The configured drive letter " +
                              entry.preferred_drive +
-                             " was already in use; mounted as " + drive +
-                             " instead.";
+                             " was already in use; mounted as " +
+                             selection.drive + " instead.";
+      }
+      if (!selection.note.empty() &&
+          !selection.preferred_unavailable) {
+        session.drive_note = CombineNotes(session.drive_note, selection.note);
       }
       mounts_.push_back(session);
       retries_.erase(key);
@@ -657,55 +760,76 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       logged_refusals_.erase(key);
 
       es.state = AutomountEntryState::kMounted;
-      es.drive = drive;
-      es.detail = session.drive_note;
-      AutomountMountStatus mount;
-      mount.fs_uuid = session.fs_uuid;
-      mount.label = session.label;
-      mount.drive = session.drive;
-      mount.session_id = session.session_id;
-      mount.serial_number = session.location.serial_number;
-      mount.stable_id = session.location.stable_id;
-      mount.device_size_bytes = session.location.disk_size_bytes;
-      mount.filesystem_bytes = session.filesystem_bytes;
-      mount.free_bytes = session.free_bytes;
-      mount.read_write = session.mode == AutomountMode::kExperimentalReadWrite;
-      mount.device_path = session.location.disk_path;
-      status_.mounts.push_back(std::move(mount));
+      es.drive = session.drive;
+      es.effective_mode = session.mode;
+      es.mode_note = session.mode_note;
+      es.drive_taken_over = TakeoverWasOwned(session.takeover);
+      es.original_windows_drive = session.takeover.original_drive;
+      es.detail = CombineNotes(session.drive_note, session.mode_note);
+      status_.mounts.push_back(make_mount_status(session));
 
-      std::string detail = std::string("mounted ") + ToString(entry.mode);
-      if (preferred_unavailable) {
-        detail += "; " + session.drive_note;
+      std::string detail = std::string("mounted ") + ToString(session.mode);
+      if (TakeoverWasOwned(session.takeover)) {
+        detail += "; took over the Windows drive letter " +
+                  session.takeover.original_drive;
       }
-      Log(AutomountLogLevel::kInfo, "mount-result", key, drive,
+      if (!session.drive_note.empty()) detail += "; " + session.drive_note;
+      if (!session.mode_note.empty()) detail += "; " + session.mode_note;
+      Log(AutomountLogLevel::kInfo, "mount-result", key, session.drive,
           LocationText(session.location), "mounted", detail);
       status_.entries.push_back(std::move(es));
       continue;
     }
 
+    // The WinFsp mount did not produce a session.  Stop a partially created
+    // one, then restore the original Windows mount point before deciding
+    // whether a retry is allowed: mounting another letter while Windows still
+    // has no mount point on the volume would leave an unusable RAW volume.
     const std::string failure = started.status.ok()
                                     ? "the mount session started without an id"
                                     : started.status.error().Format();
+    if (!started.session_id.empty()) {
+      Status stopped = platform_.StopMount(started.session_id);
+      if (!stopped.ok()) {
+        Log(AutomountLogLevel::kWarn, "mount-failed", key, selection.drive,
+            LocationText(filesystem->location), "stop-pending",
+            "the partially started mount session did not stop: " +
+                stopped.error().Format());
+      }
+    }
+    if (TakeoverNeedsRestore(takeover.takeover)) {
+      RestoreTakeover(&takeover.takeover, key, now,
+                      "the WinFsp mount failed");
+    }
+    const bool restore_pending = TakeoverNeedsRestore(takeover.takeover);
+
     uint32_t attempts = 0;
-    if (started.retryable &&
+    if (started.retryable && !restore_pending &&
         ScheduleRetry(entry.fs_uuid, now, &attempts)) {
       es.state = AutomountEntryState::kRetrying;
       es.retry_attempt = attempts;
       es.detail = "the device is not ready yet; retrying";
-      Log(AutomountLogLevel::kWarn, "mount-retry", key, drive,
+      Log(AutomountLogLevel::kWarn, "mount-retry", key, selection.drive,
           LocationText(filesystem->location), "retry",
           failure + " (attempt " + std::to_string(attempts) + ")");
     } else {
       retries_.erase(key);
-      if (started.retryable) {
+      if (restore_pending) {
+        es.state = AutomountEntryState::kFailed;
+        es.detail = "the original Windows drive letter could not be restored "
+                    "yet; automatic mounting is suspended until it is";
+        LogEntryRefusal(entry, "restore-pending:" + takeover.takeover.error,
+                        "failed", es.detail);
+      } else if (started.retryable) {
         es.state = AutomountEntryState::kFailed;
         es.detail =
             "the device did not become ready after the bounded retries";
+        LogEntryRefusal(entry, "mount:" + failure, "failed", es.detail);
       } else {
         es.state = AutomountEntryState::kFailed;
         es.detail = failure;
+        LogEntryRefusal(entry, "mount:" + failure, "failed", es.detail);
       }
-      LogEntryRefusal(entry, "mount:" + failure, "failed", es.detail);
     }
     status_.entries.push_back(std::move(es));
   }
@@ -714,34 +838,65 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       "periodic reconciliation scheduled");
 }
 
+bool AutomountEngine::TakeoverEligible(
+    const DiscoveredFilesystem& filesystem) const {
+  // The platform repeats every one of these checks against live state.  Here
+  // they only decide whether the Windows drive letter is offered to the
+  // allocator as take-over-able instead of "occupied".
+  if (!filesystem.windows_volume_found) return false;
+  if (!filesystem.volume_identity_exact) return false;
+  if (!filesystem.volume_unrecognized_raw) return false;
+  if (filesystem.volume_device_path.empty()) return false;
+  // More than one drive letter on the volume: leave the configuration alone
+  // and allocate a free letter instead of guessing which RAW root to detach.
+  return !SingleDriveLetterMountPoint(filesystem.mount_points).empty();
+}
+
 bool AutomountEngine::ChooseDrive(const DiscoveredFilesystem& filesystem,
                                   const AutomountEntry& entry,
                                   DriveLetterUsage& usage, bool usage_ready,
-                                  std::string* drive,
-                                  bool* preferred_unavailable,
+                                  DriveLetterChoice* choice,
                                   std::string* error) {
-  (void)filesystem;
   if (!usage_ready) {
     if (error) *error = "drive letters could not be enumerated";
     return false;
   }
-  auto choice = ChooseDriveLetter(entry.preferred_drive, usage);
-  if (!choice.ok()) {
+  const std::string existing_same_volume =
+      TakeoverEligible(filesystem)
+          ? SingleDriveLetterMountPoint(filesystem.mount_points)
+          : std::string();
+  auto selected = ChooseDriveLetter(entry.preferred_drive, usage,
+                                    existing_same_volume);
+  if (!selected.ok()) {
     if (error) {
-      *error = choice.error().code == XfsError::kNoSpace
+      *error = selected.error().code == XfsError::kNoSpace
                    ? "no free drive letter is available"
-                   : choice.error().message;
+                   : selected.error().message;
     }
     return false;
   }
-  if (drive) *drive = choice.value().drive;
-  if (preferred_unavailable) {
-    *preferred_unavailable = choice.value().preferred_unavailable;
-  }
-  if (choice.value().drive.size() == 2) {
-    usage.used[static_cast<size_t>(choice.value().drive[0] - 'A')] = true;
+  if (choice) *choice = std::move(selected.value());
+  if (choice && choice->drive.size() == 2) {
+    usage.used[static_cast<size_t>(choice->drive[0] - 'A')] = true;
   }
   return true;
+}
+
+AutomountMode AutomountEngine::EffectiveMode(
+    const AutomountEntry& entry, const DiscoveredFilesystem& filesystem,
+    std::string* note) const {
+  if (entry.mode != AutomountMode::kExperimentalReadWrite) {
+    return AutomountMode::kReadOnly;
+  }
+  std::string mismatch;
+  if (EntryIdentityMatches(entry, filesystem.location, &mismatch)) {
+    return AutomountMode::kExperimentalReadWrite;
+  }
+  if (note) {
+    *note = "The configured read-write identity does not match this device (" +
+            mismatch + "); mounted read-only.";
+  }
+  return AutomountMode::kReadOnly;
 }
 
 const DiscoveredFilesystem* AutomountEngine::SelectFilesystem(
@@ -799,12 +954,20 @@ bool AutomountEngine::EntryIdentityMatches(
     }
     return false;
   }
+  if (entry.expected_device_class != DeviceClass::kUnknown &&
+      location.device_class != entry.expected_device_class) {
+    if (mismatch) {
+      *mismatch = "the attached device's class does not match the expected "
+                  "value";
+    }
+    return false;
+  }
   return true;
 }
 
 bool AutomountEngine::EntryPolicyAccepts(
     const AutomountEntry& entry, const DiscoveredFilesystem& filesystem,
-    std::string* refusal) const {
+    AutomountMode effective_mode, std::string* refusal) const {
   auto refuse = [refusal](const std::string& message) {
     if (refusal) *refusal = message;
     return false;
@@ -828,6 +991,21 @@ bool AutomountEngine::EntryPolicyAccepts(
 
   if (entry.mode != AutomountMode::kExperimentalReadWrite) {
     return true;
+  }
+  if (effective_mode != AutomountMode::kExperimentalReadWrite) {
+    // The identity pins did not match, so the entry runs read-only.  The
+    // read-only policy has no class, system/pagefile or writable-profile
+    // requirements beyond the journal and XFS verification already checked.
+    return true;
+  }
+
+  // A read-write open of the raw device locks and dismounts every volume on
+  // the physical disk.  Refuse when a different volume on the same disk has a
+  // Windows filesystem: that volume must never be disturbed by this mount.
+  if (filesystem.disk_has_other_filesystems) {
+    return refuse(
+        "another volume on the same physical disk has a Windows filesystem; "
+        "a read-write mount would dismount it");
   }
 
   switch (filesystem.location.device_class) {
@@ -871,36 +1049,112 @@ bool AutomountEngine::EntryPolicyAccepts(
 void AutomountEngine::StopSession(MountedSession& session,
                                   AutomountTimePoint now,
                                   const std::string& reason) {
-  Log(AutomountLogLevel::kInfo, "unmount", UuidKey(session.fs_uuid),
+  const std::string uuid = UuidKey(session.fs_uuid);
+  Log(AutomountLogLevel::kInfo, "unmount", uuid,
       session.drive, LocationText(session.location), "stopping", reason);
   Status stopped = platform_.StopMount(session.session_id);
-  if (stopped.ok()) {
-    Log(AutomountLogLevel::kInfo, "unmount", UuidKey(session.fs_uuid),
-        session.drive, LocationText(session.location), "unmounted", reason);
+  if (!stopped.ok()) {
+    Log(AutomountLogLevel::kWarn, "unmount", uuid,
+        session.drive, LocationText(session.location), "pending",
+        stopped.error().Format());
+    StoppingSession stopping;
+    stopping.session_id = session.session_id;
+    stopping.drive = session.drive;
+    stopping.uuid = uuid;
+    stopping.attempts = 1;
+    stopping.takeover = session.takeover;
+    stopping_.push_back(std::move(stopping));
+    // A session that did not stop immediately still owns its drive letter.
+    // Ask the loop to retry shortly instead of waiting for the next periodic
+    // reconciliation.  The original Windows mount point is restored only
+    // after the WinFsp letter is free.
+    ScheduleReconcile(now + std::chrono::seconds(1));
     return;
   }
-  Log(AutomountLogLevel::kWarn, "unmount", UuidKey(session.fs_uuid),
-      session.drive, LocationText(session.location), "pending",
-      stopped.error().Format());
-  StoppingSession stopping;
-  stopping.session_id = session.session_id;
-  stopping.drive = session.drive;
-  stopping.uuid = UuidKey(session.fs_uuid);
-  stopping.attempts = 1;
-  stopping_.push_back(std::move(stopping));
-  // A session that did not stop immediately still owns its drive letter.
-  // Ask the loop to retry shortly instead of waiting for the next periodic
-  // reconciliation.
-  ScheduleReconcile(now + std::chrono::seconds(1));
+  Log(AutomountLogLevel::kInfo, "unmount", uuid,
+      session.drive, LocationText(session.location), "unmounted", reason);
+  // Restore only after the WinFsp session is gone: SetVolumeMountPointW must
+  // not race a WinFsp mount that still defines the same letter.
+  RestoreTakeover(&session.takeover, uuid, now, reason);
+}
+
+void AutomountEngine::RestoreTakeover(DriveLetterTakeover* takeover,
+                                      const std::string& uuid,
+                                      AutomountTimePoint now,
+                                      const std::string& reason) {
+  if (!takeover || !TakeoverNeedsRestore(*takeover)) return;
+  const std::string original = takeover->original_drive;
+  Status restored = platform_.RestoreDriveLetterTakeover(takeover);
+  if (restored.ok()) {
+    std::string detail;
+    if (takeover->volume_present) {
+      detail = "restored the original Windows mount point " +
+               takeover->mount_point + " of volume " + takeover->volume_name;
+    } else {
+      detail = "the volume was removed; the original Windows mount point " +
+               takeover->mount_point +
+               " was not re-created (the letter stays free instead of being "
+               "bound to a dead volume)";
+    }
+    Log(AutomountLogLevel::kInfo, "drive-letter-restore", uuid, original, "",
+        takeover->volume_present ? "restored" : "skipped-removed",
+        detail + " (" + reason + ")");
+    return;
+  }
+  PendingRestore pending;
+  pending.takeover = *takeover;
+  pending.uuid = uuid;
+  pending.reason = reason;
+  pending.attempts = 1;
+  pending.next_at =
+      now + std::chrono::seconds(std::max<uint32_t>(5,
+                                                    config_.reconcile_seconds));
+  pending_restores_.push_back(std::move(pending));
+  Log(AutomountLogLevel::kError, "drive-letter-restore", uuid, original, "",
+      "restore-pending",
+      "the original Windows mount point " + takeover->mount_point +
+          " could not be restored: " + restored.error().Format() +
+          "; retrying during reconciliation (" + reason + ")");
+  ScheduleReconcile(pending_restores_.back().next_at);
+}
+
+void AutomountEngine::RetryPendingRestores(AutomountTimePoint now) {
+  if (pending_restores_.empty()) return;
+  const auto period = std::chrono::seconds(
+      std::max<uint32_t>(5, config_.reconcile_seconds));
+  for (auto it = pending_restores_.begin(); it != pending_restores_.end();) {
+    if (now < it->next_at) {
+      ++it;
+      continue;
+    }
+    Status restored = platform_.RestoreDriveLetterTakeover(&it->takeover);
+    if (restored.ok()) {
+      Log(AutomountLogLevel::kInfo, "drive-letter-restore", it->uuid,
+          it->takeover.original_drive, "", "restored",
+          "the original Windows mount point " + it->takeover.mount_point +
+              " was restored after " + std::to_string(it->attempts) +
+              " attempt(s)");
+      it = pending_restores_.erase(it);
+      continue;
+    }
+    ++it->attempts;
+    it->next_at = now + period;
+    Log(AutomountLogLevel::kError, "drive-letter-restore", it->uuid,
+        it->takeover.original_drive, "", "restore-pending",
+        "attempt " + std::to_string(it->attempts) + " failed: " +
+            restored.error().Format());
+    ++it;
+  }
 }
 
 void AutomountEngine::RetryStoppingSessions(AutomountTimePoint now) {
-  (void)now;
   for (auto it = stopping_.begin(); it != stopping_.end();) {
     Status stopped = platform_.StopMount(it->session_id);
     if (stopped.ok()) {
       Log(AutomountLogLevel::kInfo, "unmount", it->uuid, it->drive, "",
           "unmounted", "the pending session released its drive letter");
+      RestoreTakeover(&it->takeover, it->uuid, now,
+                      "a pending unmount completed");
       it = stopping_.erase(it);
       continue;
     }
@@ -909,6 +1163,11 @@ void AutomountEngine::RetryStoppingSessions(AutomountTimePoint now) {
       Log(AutomountLogLevel::kError, "unmount", it->uuid, it->drive, "",
           "terminal", stopped.error().Format() +
                           " (giving up after repeated attempts)");
+      // The WinFsp letter may still be defined.  Keep the restoration intent:
+      // it is retried by reconciliation and refuses to overwrite a letter that
+      // now belongs to another volume.
+      RestoreTakeover(&it->takeover, it->uuid, now,
+                      "the mount session could not be stopped");
       it = stopping_.erase(it);
       continue;
     }

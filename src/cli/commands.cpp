@@ -3475,6 +3475,29 @@ int CommandStatus(const Options& options) {
     PrintAutomountWarnings(loaded.value().warnings);
   }
 
+  // The engine lives in the service process.  Its small session snapshot is
+  // the only way to distinguish a taken-over drive letter from an allocated
+  // one and an effective read-only fallback from the configured mode.
+  AutomountRuntimeStatus runtime_status;
+  if (service.state == AutomountServiceState::kRunning) {
+    const std::filesystem::path sessions =
+        DefaultAutomountRuntimeStatusPath();
+    auto runtime = LoadAutomountRuntimeStatus(sessions);
+    if (runtime.ok()) {
+      runtime_status = std::move(runtime.value());
+    } else if (options.verbose) {
+      std::cerr << "[status] runtime sessions unavailable: "
+                << runtime.error().Format() << "\n";
+    }
+  }
+  auto runtime_mount_for = [&runtime_status](const Uuid& uuid)
+      -> const AutomountRuntimeMount* {
+    for (const auto& mount : runtime_status.mounts) {
+      if (UuidEqual(mount.fs_uuid, uuid)) return &mount;
+    }
+    return nullptr;
+  };
+
   std::string discovery_error;
   if (options.verbose) {
     std::cerr << "[status] discovering attached filesystems\n";
@@ -3505,6 +3528,18 @@ int CommandStatus(const Options& options) {
                                                  : entry.preferred_drive)
                 << "  " << ToString(entry.mode) << "  "
                 << (entry.enabled ? "enabled" : "disabled") << "\n";
+      if (!entry.expected_serial.empty() ||
+          !entry.expected_stable_id.empty() ||
+          entry.expected_device_class != DeviceClass::kUnknown ||
+          entry.expected_size_bytes != 0) {
+        std::cout << "    identity pinned: serial="
+                  << (entry.expected_serial.empty() ? "(none)"
+                                                    : entry.expected_serial)
+                  << " class=" << ToString(entry.expected_device_class)
+                  << " size=" << entry.expected_size_bytes
+                  << " qualification="
+                  << (entry.device_qualification ? "yes" : "no") << "\n";
+      }
     }
   }
   if (!any_configured) std::cout << "  none\n";
@@ -3521,13 +3556,16 @@ int CommandStatus(const Options& options) {
         continue;
       }
       any_mounted = true;
+      const Uuid& uuid = filesystem.probe.superblock.uuid;
+      const AutomountEntry* entry = config ? config->Find(uuid) : nullptr;
+      const AutomountRuntimeMount* runtime_mount = runtime_mount_for(uuid);
       std::cout << "  " << filesystem.xfswin_drive << "  "
                 << (filesystem.probe.label.empty() ? "(no label)"
                                                    : filesystem.probe.label)
-                << "  " << FormatUuid(filesystem.probe.superblock.uuid);
-      const AutomountEntry* entry =
-          config ? config->Find(filesystem.probe.superblock.uuid) : nullptr;
-      if (entry) {
+                << "  " << FormatUuid(uuid);
+      if (runtime_mount) {
+        std::cout << "  " << runtime_mount->mode;
+      } else if (entry) {
         std::cout << "  " << ToString(entry->mode);
       } else {
         const auto read_only = DriveReportsReadOnly(filesystem.xfswin_drive);
@@ -3536,6 +3574,44 @@ int CommandStatus(const Options& options) {
         }
       }
       std::cout << "\n";
+      std::cout << "    Device      : " << filesystem.location.disk_path
+                << "  serial "
+                << (filesystem.location.serial_number.empty()
+                        ? "(none)"
+                        : filesystem.location.serial_number)
+                << "  stable id "
+                << (filesystem.location.stable_id.empty()
+                        ? "(none)"
+                        : filesystem.location.stable_id)
+                << "\n";
+      if (runtime_mount) {
+        std::cout << "    Mode        : " << runtime_mount->mode;
+        if (runtime_mount->configured_mode != runtime_mount->mode) {
+          std::cout << " (configured " << runtime_mount->configured_mode
+                    << ")";
+        }
+        std::cout << "\n";
+        if (!runtime_mount->detail.empty()) {
+          std::cout << "    Note        : " << runtime_mount->detail << "\n";
+        }
+        std::cout << "    Drive letter: "
+                  << (runtime_mount->drive_taken_over
+                          ? "taken over from the Windows volume " +
+                                runtime_mount->original_windows_drive
+                          : std::string("allocated (no Windows drive letter "
+                                        "was taken over)"))
+                  << "\n";
+        std::cout << "    Automount   : "
+                  << (entry && entry->enabled ? "enabled" : "disabled")
+                  << "\n";
+      } else {
+        std::cout << "    Drive letter: allocated or managed outside the "
+                     "running service\n";
+        if (entry) {
+          std::cout << "    Automount   : "
+                    << (entry->enabled ? "enabled" : "disabled") << "\n";
+        }
+      }
     }
     if (!any_mounted) std::cout << "  none\n";
     PrintDiscoveryWarnings(discovered.value(), options);
@@ -3543,22 +3619,128 @@ int CommandStatus(const Options& options) {
   return 0;
 }
 
+std::string TrimAscii(std::string text) {
+  auto not_space = [](unsigned char c) { return !std::isspace(c); };
+  text.erase(text.begin(),
+             std::find_if(text.begin(), text.end(), not_space));
+  text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(),
+             text.end());
+  return text;
+}
+
+bool PromptYesNo(const std::string& prompt, bool default_value) {
+  std::cout << prompt;
+  std::cout.flush();
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    std::cout << "\n";
+    return default_value;
+  }
+  std::string answer = TrimAscii(line);
+  for (char& c : answer) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (answer.empty()) return default_value;
+  if (answer == "y" || answer == "yes") return true;
+  if (answer == "n" || answer == "no") return false;
+  std::cout << "Please answer yes or no; using the default.\n";
+  return default_value;
+}
+
+int PromptMountMode() {
+  std::cout << "Mode [1=read-only, 2=read-write] [1]: ";
+  std::cout.flush();
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    std::cout << "\n";
+    return 1;
+  }
+  const std::string answer = TrimAscii(line);
+  if (answer.empty() || answer == "1" || answer == "ro" ||
+      answer == "read-only") {
+    return 1;
+  }
+  if (answer == "2" || answer == "rw" || answer == "read-write") {
+    return 2;
+  }
+  std::cout << "Unrecognized mode; using read-only.\n";
+  return 1;
+}
+
+// Shows exactly which physical device the read-write authorization would be
+// bound to and asks for a separate confirmation.  The default is No; EOF and
+// unrecognized input never authorize a writable enrollment.
+bool ConfirmRwEnrollment(const DiscoveredFilesystem& filesystem,
+                         bool terminal, bool assume_yes) {
+  const PartitionLocation& location = filesystem.location;
+  std::cout << "Read-write identity to pin:\n"
+            << "  filesystem UUID : "
+            << FormatUuid(filesystem.probe.superblock.uuid) << "\n"
+            << "  label           : "
+            << (filesystem.probe.label.empty() ? "(none)"
+                                               : filesystem.probe.label)
+            << "\n"
+            << "  device          : " << location.disk_path << "\n"
+            << "  model           : "
+            << (location.model.empty() ? "(none)" : location.model) << "\n"
+            << "  serial          : "
+            << (location.serial_number.empty() ? "(none)"
+                                               : location.serial_number)
+            << "\n"
+            << "  stable id       : "
+            << (location.stable_id.empty() ? "(none)" : location.stable_id)
+            << "\n"
+            << "  whole disk size : " << location.disk_size_bytes << " bytes ("
+            << HumanBytes(location.disk_size_bytes) << ")\n"
+            << "  device class    : " << ToString(location.device_class)
+            << "\n";
+  if (location.serial_number.empty() &&
+      location.device_class == DeviceClass::kVirtualDisk) {
+    std::cout << "  identity note   : this virtual disk exposes no serial "
+                 "number; the stable id, size and class are the pins\n";
+  }
+  if (assume_yes) {
+    std::cout << "Read-write enrollment confirmed by --yes-i-really-mean-it.\n";
+    return true;
+  }
+  if (!terminal) return false;
+  return PromptYesNo(
+      "Pin this device identity and enable automatic read-write? [y/N] ",
+      false);
+}
+
 int CommandAutomountEnable(const std::vector<std::string>& args,
                            const Options& options, bool drive_specified,
                            const std::string& drive_option) {
   if (args.size() > 3) {
     std::cerr << "usage: xfswin automount enable [<uuid|label|number>] "
+                 "[--drive <letter|auto>] [--rw [--yes-i-really-mean-it]]\n"
+                 "       xfswin automount enable [<uuid|label|number>] "
                  "[--drive <letter|auto>] [--rw-experimental "
                  "--device-write-qualification]\n";
     return 1;
   }
-  const bool read_write = options.rw_experimental;
-  if (read_write && !options.device_write_qualification) {
+  const bool terminal = _isatty(_fileno(stdin)) != 0;
+  // The legacy engineering spelling keeps its explicit qualification
+  // requirements.  The ordinary `--rw` spelling asks for the identity
+  // confirmation instead (or requires --yes-i-really-mean-it in a script).
+  if (options.rw_experimental && !options.device_write_qualification) {
     std::cerr << "error: enrolling a filesystem for automatic read-write "
-                 "mounting requires --device-write-qualification and the DEV-1 "
-                 "identity pins (recorded automatically from the device).\n";
+                 "mounting with --rw-experimental requires "
+                 "--device-write-qualification and the DEV-1 identity pins "
+                 "(recorded automatically from the device).\n";
     return 3;
   }
+  if (options.automount_rw && !terminal && !options.yes_i_really_mean_it) {
+    std::cerr << "error: --rw needs an explicit identity confirmation. Run it "
+                 "in a terminal, or pass --yes-i-really-mean-it for unattended "
+                 "enrollment.\n";
+    return 3;
+  }
+  const bool interactive_enrollment =
+      args.size() == 2 && terminal && !options.rw_experimental &&
+      !options.automount_rw;
+  bool read_write = options.rw_experimental || options.automount_rw;
 
   const AutomountServicePaths paths = DefaultAutomountServicePaths();
   Status directory = EnsureAutomountServicePaths(paths);
@@ -3648,6 +3830,30 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
     uuid = selected->probe.superblock.uuid;
   }
 
+  if (interactive_enrollment) {
+    std::cout << "\n";
+    if (!PromptYesNo(
+            "Mount this filesystem automatically when it is inserted? [Y/n] ",
+            true)) {
+      std::cout << "No change was made.\n";
+      return 0;
+    }
+    if (PromptMountMode() == 2) read_write = true;
+  }
+  if (read_write && !options.rw_experimental) {
+    if (!selected) {
+      std::cerr << "error: the filesystem must be attached before read-write "
+                   "access can be enrolled.\n";
+      return 1;
+    }
+    if (!ConfirmRwEnrollment(*selected, terminal,
+                             options.yes_i_really_mean_it)) {
+      std::cout << "Read-write enrollment was not confirmed; no change was "
+                   "made.\n";
+      return 1;
+    }
+  }
+
   const AutomountEntry* existing = config.Find(uuid);
   AutomountEntry entry = existing ? *existing : AutomountEntry{};
   entry.fs_uuid = uuid;
@@ -3672,15 +3878,29 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
       return 1;
     }
     const PartitionLocation& location = selected->location;
+    // Absolute refusals: there is no flag or confirmation that can authorize
+    // writing to the Windows system or page-file disk.
+    if (location.system_disk) {
+      std::cerr << "error: the Windows system disk is never eligible for "
+                   "automatic read-write mounting.\n";
+      return 3;
+    }
+    if (location.pagefile_disk) {
+      std::cerr << "error: a disk holding the Windows page file is never "
+                   "eligible for automatic read-write mounting.\n";
+      return 3;
+    }
     if (location.device_class == DeviceClass::kFixedDisk) {
       std::cerr << "error: fixed physical disks are not qualified for "
                    "automatic read-write mounting.\n";
       return 3;
     }
-    if (location.device_class == DeviceClass::kRemovableDisk &&
+    if (options.rw_experimental &&
+        location.device_class == DeviceClass::kRemovableDisk &&
         !options.allow_removable_disk_write) {
       std::cerr << "error: automatic read-write mounting of a removable disk "
-                   "requires --allow-removable-disk-write.\n";
+                   "requires --allow-removable-disk-write when using "
+                   "--rw-experimental.\n";
       return 3;
     }
     if (location.device_class != DeviceClass::kRemovableDisk &&
@@ -3689,11 +3909,17 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
                    "this device class.\n";
       return 3;
     }
-    if (location.serial_number.empty() || location.stable_id.empty() ||
-        location.disk_size_bytes == 0) {
+    // Windows does not expose a serial number for its own virtual disks
+    // (VHD/VHDX).  Their stable id (the volume DeviceGuid) and size are the
+    // identity; every physical device class must report a serial.
+    const bool serial_required =
+        location.device_class != DeviceClass::kVirtualDisk;
+    if (location.stable_id.empty() || location.disk_size_bytes == 0 ||
+        (serial_required && location.serial_number.empty())) {
       std::cerr << "error: the device did not report a complete DEV-1 identity "
                    "(serial, stable id and size); read-write enrollment "
-                   "requires all three pins.\n";
+                   "requires the stable id and size, and a serial for every "
+                   "physical device class.\n";
       return 3;
     }
     entry.device_qualification = true;
@@ -3703,6 +3929,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
     entry.expected_serial = location.serial_number;
     entry.expected_stable_id = location.stable_id;
     entry.expected_size_bytes = location.disk_size_bytes;
+    entry.expected_device_class = location.device_class;
   }
 
   Status valid = ValidateAutomountEntry(entry);
@@ -4038,12 +4265,18 @@ int Run(const std::vector<std::string>& args) {
     }
   }
 
-  // --rw is the eventual stable alias. The qualified writer is still opt-in
-  // as --rw-experimental; a real device additionally needs
-  // --device-write-qualification and a device-class opt-in.
+  // --rw is the ordinary automount enrollment spelling.  It is not a manual
+  // writer switch: manual raw writes still require --rw-experimental plus the
+  // DEV-1 qualification flags, so any other command keeps the old refusal.
   if (explicit_rw) {
-    std::cerr << "error: --rw is not enabled yet as a stable alias. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
-    return 3;
+    const bool automount_enable =
+        positional.size() >= 2 && positional[0] == "automount" &&
+        positional[1] == "enable";
+    if (!automount_enable) {
+      std::cerr << "error: --rw is only valid for `xfswin automount enable`. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
+      return 3;
+    }
+    options.automount_rw = true;
   }
 
   if (options.perf_stats) xfs::PerfStats::Get().SetEnabled(true);

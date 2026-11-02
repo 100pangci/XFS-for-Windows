@@ -65,6 +65,35 @@ bool ParseU64Decimal(std::string_view text, uint64_t* out) {
   return true;
 }
 
+bool ParseDeviceClass(std::string_view text, DeviceClass* out) {
+  const std::string value = Lower(Trim(text));
+  if (value.empty() || value == "unknown" || value == "any") {
+    *out = DeviceClass::kUnknown;
+    return true;
+  }
+  if (value == "removable-disk" || value == "removable" || value == "usb") {
+    *out = DeviceClass::kRemovableDisk;
+    return true;
+  }
+  if (value == "virtual-disk" || value == "virtual" || value == "vhd") {
+    *out = DeviceClass::kVirtualDisk;
+    return true;
+  }
+  if (value == "fixed-disk" || value == "fixed") {
+    *out = DeviceClass::kFixedDisk;
+    return true;
+  }
+  if (value == "image-file" || value == "image") {
+    *out = DeviceClass::kImageFile;
+    return true;
+  }
+  if (value == "volume") {
+    *out = DeviceClass::kVolume;
+    return true;
+  }
+  return false;
+}
+
 std::string LineError(size_t line, const std::string& message) {
   return "line " + std::to_string(line) + ": " + message;
 }
@@ -148,11 +177,19 @@ Status ValidateAutomountEntry(const AutomountEntry& entry) {
                    "qualification (--device-write-qualification)")
         .Metadata("automount");
   }
-  if (entry.expected_serial.empty() || entry.expected_stable_id.empty() ||
-      entry.expected_size_bytes == 0) {
+  // Windows exposes no serial number for its own virtual disks (VHD/VHDX
+  // report an empty STORAGE_DEVICE_DESCRIPTOR serial).  The stable device id
+  // (the volume DeviceGuid) and the size are the identity there.  Every
+  // physical device class still has to pin its serial.
+  const bool serial_required =
+      entry.expected_device_class != DeviceClass::kVirtualDisk;
+  if (entry.expected_stable_id.empty() || entry.expected_size_bytes == 0 ||
+      (serial_required && entry.expected_serial.empty())) {
     return XFS_ERR(XfsError::kPermissionDenied,
                    "automount read-write requires the DEV-1 identity pins: "
-                   "expected serial, stable device id and size")
+                   "expected serial, stable device id and size (virtual disks "
+                   "have no serial and are pinned by stable id, size and "
+                   "class)")
         .Metadata("automount");
   }
   if (entry.allow_fixed_disk) {
@@ -160,6 +197,19 @@ Status ValidateAutomountEntry(const AutomountEntry& entry) {
                    "fixed physical disks are not qualified for automount "
                    "read-write; only the tested removable/virtual profile may "
                    "be enrolled")
+        .Metadata("automount");
+  }
+  if (entry.expected_device_class == DeviceClass::kFixedDisk) {
+    return XFS_ERR(XfsError::kPermissionDenied,
+                   "fixed physical disks are not qualified for automount "
+                   "read-write")
+        .Metadata("automount");
+  }
+  if (entry.expected_device_class == DeviceClass::kRemovableDisk &&
+      !entry.allow_removable_disk) {
+    return XFS_ERR(XfsError::kPermissionDenied,
+                   "a removable-disk pin requires the explicit removable-disk "
+                   "qualification opt-in")
         .Metadata("automount");
   }
   // A virtual disk is writable under the DEV-1 policy without a class opt-in.
@@ -319,6 +369,15 @@ Result<AutomountConfigLoad> ParseAutomountConfig(std::string_view text) {
                                  "expected-size must be a byte count"))
             .Metadata("automount");
       }
+    } else if (key == "expected-device-class") {
+      if (!ParseDeviceClass(value, &current.expected_device_class)) {
+        return XFS_ERR(XfsError::kInvalidArgument,
+                       LineError(line_number,
+                                 "expected-device-class must be one of "
+                                 "unknown, removable-disk, virtual-disk, "
+                                 "fixed-disk, image-file or volume"))
+            .Metadata("automount");
+      }
     } else if (key == "device-qualification") {
       if (!ParseBool(value, &current.device_qualification)) {
         return XFS_ERR(XfsError::kInvalidArgument,
@@ -415,6 +474,8 @@ std::string SerializeAutomountConfig(const AutomountConfig& config) {
     out << "expected-serial = " << entry->expected_serial << "\n";
     out << "expected-stable-id = " << entry->expected_stable_id << "\n";
     out << "expected-size = " << entry->expected_size_bytes << "\n";
+    out << "expected-device-class = "
+        << ToString(entry->expected_device_class) << "\n";
     out << "device-qualification = "
         << (entry->device_qualification ? "true" : "false") << "\n";
     out << "allow-removable-disk = "

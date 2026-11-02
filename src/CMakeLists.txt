@@ -39,6 +39,7 @@ add_library(xfs_core STATIC
   block/device_policy.cpp
   block/partition_device.cpp
   block/drive_letter.cpp
+  block/drive_letter_takeover.cpp
   block/windows_volume.cpp
   block/device_discovery.cpp
   block/windows_device_discovery.cpp
@@ -126,6 +127,13 @@ if(WIN32)
     target_compile_options(xfswin PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
     target_compile_definitions(xfswin PRIVATE
       _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+  if(XFSWIN_TEST_HOOKS)
+    # UX-1 integration tests: one-shot sentinel files under
+    # %ProgramData%\xfswin\test-hooks inject a failure at a precise point.  The
+    # service runs as LocalSystem and does not inherit environment variables,
+    # so a sentinel file is the transport.  Off in product builds.
+    target_compile_definitions(xfswin PRIVATE XFSWIN_TEST_HOOKS=1)
   endif()
 endif()
 

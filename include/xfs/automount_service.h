@@ -12,8 +12,10 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "xfs/error.h"
+#include "xfs/uuid.h"
 
 namespace xfs {
 
@@ -55,6 +57,46 @@ struct AutomountServiceStatusInfo {
 
 // Read-only SCM query.  Never starts or changes the service.
 AutomountServiceStatusInfo QueryAutomountServiceStatus();
+
+// ---------------------------------------------------------------------------
+// Live automount session state.
+//
+// The service is the only process that knows which drive letter was taken over
+// from a RAW Windows volume and whether an enrolled read-write entry fell back
+// to read-only.  It publishes that small snapshot so `xfswin status` can show
+// the effective state even though the engine lives in the service process.
+// The snapshot is not configuration and never authorizes anything.
+// ---------------------------------------------------------------------------
+struct AutomountRuntimeMount {
+  Uuid fs_uuid{};
+  std::string label;
+  std::string drive;
+  // Effective mode as reported by the engine: "read-only" or
+  // "experimental-rw".
+  std::string mode;
+  std::string configured_mode;
+  bool drive_taken_over = false;
+  std::string original_windows_drive;
+  std::string detail;
+};
+
+struct AutomountRuntimeStatus {
+  bool loaded = false;
+  std::vector<AutomountRuntimeMount> mounts;
+};
+
+// %ProgramData%\xfswin\sessions.ini
+std::filesystem::path DefaultAutomountRuntimeStatusPath();
+
+// Atomically replaces the snapshot.  An empty list marks the service as no
+// longer owning any mount; the CLI ignores a snapshot when the service is not
+// running.
+Status SaveAutomountRuntimeStatus(
+    const std::filesystem::path& path,
+    const std::vector<AutomountRuntimeMount>& mounts);
+
+Result<AutomountRuntimeStatus> LoadAutomountRuntimeStatus(
+    const std::filesystem::path& path);
 
 Status InstallAutomountService(std::string* message);
 Status UninstallAutomountService(std::string* message);
