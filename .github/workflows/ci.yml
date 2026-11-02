@@ -1127,8 +1127,9 @@ jobs:
           root = Path('ux-images')
           manifest = json.loads((root / 'ux-fixtures.json').read_text())
           fixtures = {item['name']: item for item in manifest['fixtures']}
-          expected = {'single', 'no-xfs', 'multi-partition', 'whole-disk',
-                      'corrupt', 'unsupported', 'dirty', 'same-a', 'same-b'}
+          expected = {'single', 'single-basic', 'no-xfs', 'multi-partition',
+                      'whole-disk', 'corrupt', 'unsupported', 'dirty',
+                      'same-a', 'same-b'}
           assert set(fixtures) == expected, sorted(fixtures)
           assert {item['format'] for item in fixtures.values()} == {
               'vhd', 'vhdx'}, {item['format'] for item in fixtures.values()}

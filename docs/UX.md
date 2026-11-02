@@ -343,8 +343,10 @@ Remove-Item "$env:ProgramData\xfswin\automount.ini"
 ```
 
 Setting `enabled = false` in the configuration has the same effect as
-`disable` for that UUID. Stopping the service unmounts the sessions it owns;
-manually mounted drives (`xfswin mount`) are left alone.
+`disable` for that UUID. Disabling an entry that is currently mounted unmounts
+its session and, because the device is still present, restores the original
+Windows mount point of the RAW volume. Stopping the service unmounts the
+sessions it owns; manually mounted drives (`xfswin mount`) are left alone.
 
 ## Troubleshooting
 
