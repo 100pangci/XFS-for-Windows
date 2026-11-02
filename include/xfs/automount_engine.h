@@ -317,6 +317,13 @@ class AutomountEngine {
   // Last refusal text per entry, so an unchanged refusal is logged once
   // instead of every reconciliation pass.
   std::map<std::string, std::string> logged_refusals_;
+  // The drive letter each filesystem used before its device was removed.
+  // A takeover deletes the Windows mount point, and Windows does not recreate
+  // it on reinsertion; this session-scoped memory lets the device come back
+  // at the same letter instead of racing an unrelated allocation.  It is
+  // never persisted and never overrides an explicit preference or a letter
+  // Windows did assign.
+  std::map<std::string, std::string> remembered_drives_;
   std::string last_config_fingerprint_;
   std::string last_config_error_;
 

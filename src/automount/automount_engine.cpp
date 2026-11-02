@@ -868,8 +868,13 @@ bool AutomountEngine::ChooseDrive(const DiscoveredFilesystem& filesystem,
       TakeoverEligible(filesystem)
           ? SingleDriveLetterMountPoint(filesystem.mount_points)
           : std::string();
+  std::string remembered;
+  const auto remembered_it = remembered_drives_.find(UuidKey(entry.fs_uuid));
+  if (remembered_it != remembered_drives_.end()) {
+    remembered = remembered_it->second;
+  }
   auto selected = ChooseDriveLetter(entry.preferred_drive, usage,
-                                    existing_same_volume);
+                                    existing_same_volume, remembered);
   if (!selected.ok()) {
     if (error) {
       *error = selected.error().code == XfsError::kNoSpace
@@ -1089,6 +1094,12 @@ void AutomountEngine::RestoreTakeover(DriveLetterTakeover* takeover,
   const std::string original = takeover->original_drive;
   Status restored = platform_.RestoreDriveLetterTakeover(takeover);
   if (restored.ok()) {
+    if (!takeover->volume_present && !takeover->drive.empty()) {
+      // The volume disappeared while the session owned the letter.  Windows
+      // will not recreate the deleted mount point, so remember the letter for
+      // this filesystem and reuse it when the device is inserted again.
+      remembered_drives_[uuid] = takeover->drive;
+    }
     std::string detail;
     if (takeover->volume_present) {
       detail = "restored the original Windows mount point " +

@@ -64,10 +64,16 @@ Result<DriveLetterChoice> ChooseDriveLetter(std::string_view preferred,
 //      (a same-letter takeover);
 //   3. the existing same-volume letter when the preferred one is occupied;
 //   4. the first free letter from D: through Z:.
-// A:, B: and C: are never taken over.  The caller must have verified that
-// `existing_same_volume` really belongs to the same volume.
+// When `remembered_letter` is set (a letter this service used for the same
+// filesystem before the device was removed) and none of the rules above chose
+// a letter, it is used if it is still free.  Windows does not restore a mount
+// point that a takeover deleted, so reinsertion would otherwise land on an
+// unrelated letter.  A:, B: and C: are never taken over.  The caller must
+// have verified that `existing_same_volume` really belongs to the same
+// volume.
 Result<DriveLetterChoice> ChooseDriveLetter(
     std::string_view preferred, const DriveLetterUsage& usage,
-    std::string_view existing_same_volume);
+    std::string_view existing_same_volume,
+    std::string_view remembered_letter = {});
 
 }  // namespace xfs

@@ -350,6 +350,44 @@ TEST(ux_drive_letter_takeover_priority) {
   }
 }
 
+TEST(ux_drive_letter_reinsertion_remembers_the_letter) {
+  DriveLetterUsage usage;
+
+  // A takeover deletes the volume's Windows mount point, and Windows does not
+  // recreate it on reinsertion.  The remembered letter wins over the first
+  // free one so the device comes back where it was.
+  auto choice = xfs::ChooseDriveLetter("", usage, "", "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK(choice.value().release_drive.empty());
+  CHECK(!choice.value().preferred_unavailable);
+
+  // An explicitly configured free preference still wins.
+  choice = xfs::ChooseDriveLetter("G:", usage, "", "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "G:");
+
+  // If Windows did assign the volume a letter again, that letter is taken
+  // over before the remembered one: no RAW drive may stay visible next to the
+  // XFS mount.
+  usage.used['F' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("", usage, "F:", "D:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK_STR_EQ(choice.value().release_drive, "F:");
+
+  // An occupied remembered letter falls back to the ordinary D:..Z: order.
+  usage.used['D' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("", usage, "", "D:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "E:");
+
+  // A:, B: and C: are never reused.
+  choice = xfs::ChooseDriveLetter("", usage, "", "C:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "E:");
+}
+
 TEST(ux_drive_letter_single_mount_point) {
   CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"E:\\"}), "E:");
   CHECK_STR_EQ(xfs::SingleDriveLetterMountPoint({"e:\\", "D:\\dir"}), "E:");
@@ -1845,6 +1883,53 @@ TEST(ux_automount_removal_does_not_restore_to_a_dead_volume) {
   CHECK(platform.sessions.empty());
   CHECK_EQ(platform.restore_calls, 1);
   CHECK(platform.CountLogs("drive-letter-restore", "skipped-removed") == 1);
+}
+
+TEST(ux_automount_reinsertion_reuses_the_remembered_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x45);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  xfs::DriveLetterInfo raw_letter;
+  raw_letter.letter = 'F';
+  raw_letter.kind = xfs::DriveLetterKind::kRemovable;
+  platform.occupied_letters.push_back(raw_letter);
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "F:");
+  CHECK(engine.status().mounts.front().drive_taken_over);
+
+  // Remove the device while the takeover owns F:.  The letter is released and
+  // no mount point is restored; the takeover deleted the only Windows one, so
+  // a discovery after reinsertion sees no letter at all.
+  platform.devices.front().present = false;
+  platform.volume_present = false;
+  platform.occupied_letters.clear();
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK(platform.CountLogs("drive-letter-restore", "skipped-removed") == 1);
+
+  // The same filesystem comes back without a Windows letter.  The ordinary
+  // allocator would pick D:; the remembered F: must win so the device returns
+  // to where it was.
+  xfs::DiscoveredFilesystem reinserted = MountedTakeoverFilesystem(uuid);
+  reinserted.mount_points.clear();
+  platform.devices.front().filesystem = reinserted;
+  platform.devices.front().present = true;
+  platform.volume_present = true;
+  engine.NotifyDeviceChanged(At(2000));
+  engine.Tick(At(2000));
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "F:");
+  CHECK_STR_EQ(platform.takeover_choices.back().drive, "F:");
+  CHECK(platform.takeover_choices.back().release_drive.empty());
+  CHECK(!engine.status().mounts.front().drive_taken_over);
 }
 
 TEST(ux_automount_service_stop_restores_the_windows_letter) {

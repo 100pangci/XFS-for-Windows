@@ -447,19 +447,32 @@ try {
     $drive = Wait-MountedDrive $uuid 90
     Assert (-not [string]::IsNullOrEmpty($drive)) `
         "the service did not mount the reinserted device"
-    # Windows may hand a RAW volume a different letter after the takeover
-    # removed its mount point; reusing the original letter is recorded, and the
-    # rest of the run follows the letter Windows (or the service) settled on.
-    $results.reinsertion_reused_original_letter = ($drive -eq $rawLetter)
-    if ($drive -ne $rawLetter) {
+    # The takeover deleted the RAW mount point; Windows does not recreate it
+    # for a reinserted RAW volume.  The service remembers the letter and mounts
+    # there again.  If Windows did assign a letter first, the service takes
+    # that letter over instead, which is the stronger rule; the rest of the
+    # run follows the letter that won.
+    $status = Wait-StatusContains 'Drive letter:' 30
+    Assert ($null -ne $status) `
+        "status does not report the reinsertion mount: $(Get-Status | Select-Object -ExpandProperty output)"
+    if ($status.output.Contains('taken over from the Windows volume')) {
         $results.reinsertion_drive = $drive
         $rawLetter = $drive
+    } else {
+        Assert ($drive -eq $rawLetter) `
+            "the reinserted device mounted at $drive, expected the remembered letter $rawLetter"
     }
-    Assert-XfsAt $drive 'reinsertion takeover'
+    Assert-XfsAt $drive 'reinsertion'
     Assert-Marker $drive
-    $status = Wait-StatusContains 'taken over from the Windows volume' 30
-    Assert ($null -ne $status) `
-        "the reinserted volume was not mounted as a takeover: $(Get-Status | Select-Object -ExpandProperty output)"
+    # A late Windows letter assignment must not leave a RAW drive next to the
+    # XFS mount; the volume may have no drive-letter mount point at all.
+    Start-Sleep -Seconds 2
+    $partition = Get-Partition -DiskNumber $single.number `
+        -PartitionNumber $partitionNumber -ErrorAction SilentlyContinue
+    $rawPaths = @($partition.AccessPaths | Where-Object { $_ -match '^[A-Za-z]:\\?$' })
+    Assert ($rawPaths.Count -eq 0) `
+        "the reinserted volume still has Windows mount point(s) $($rawPaths -join ',') next to the XFS mount at $drive"
+    $results.reinsertion_reused_original_letter = ($drive -eq $results.raw_letter)
     $results.steps['removal-reinsertion'] = 'passed'
 
     # -----------------------------------------------------------------------
@@ -469,6 +482,14 @@ try {
     # -----------------------------------------------------------------------
     "== read-write enrollment and automatic RW =="
     Assert-TakeoverOk (Invoke-Takeover -Arguments @('automount', 'stop') -LogName 'stop-rw-enroll') 'automount stop'
+    # The reinsertion pass mounted at the remembered letter without a Windows
+    # mount point to restore.  Give the RAW volume its letter again so the RW
+    # enrollment exercises the takeover path (CI disks are never assigned one
+    # by Windows on their own).
+    if (-not (Test-UxLetterInUse $rawLetter)) {
+        Set-UxRawVolumeLetter -DiskNumber $single.number `
+            -PartitionNumber $partitionNumber -Drive $rawLetter
+    }
     Assert-RawAt $rawLetter 'restore before RW enrollment'
     Enroll-ReadWrite $uuid
     $configText = Get-Content -Raw -Path $configPath

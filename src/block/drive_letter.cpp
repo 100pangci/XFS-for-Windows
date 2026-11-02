@@ -101,7 +101,8 @@ Result<DriveLetterChoice> ChooseDriveLetter(std::string_view preferred,
 
 Result<DriveLetterChoice> ChooseDriveLetter(
     std::string_view preferred, const DriveLetterUsage& usage,
-    std::string_view existing_same_volume) {
+    std::string_view existing_same_volume,
+    std::string_view remembered_letter) {
   std::string requested;
   if (!preferred.empty()) {
     auto result = NormalizeDriveLetter(preferred);
@@ -162,6 +163,26 @@ Result<DriveLetterChoice> ChooseDriveLetter(
     DriveLetterChoice choice;
     choice.drive = existing;
     choice.release_drive = existing;
+    return choice;
+  }
+
+  // Reinsertion: a takeover deletes the volume's Windows mount point, and
+  // Windows does not recreate it when the same device is plugged back in.
+  // Reuse the letter this service used for the filesystem before removal, so
+  // the device comes back at the same place and no later RAW letter can
+  // appear next to an unrelated allocation.  An explicit preference and an
+  // existing same-volume letter above still take priority.
+  std::string remembered;
+  if (!remembered_letter.empty()) {
+    auto result = NormalizeDriveLetter(remembered_letter);
+    if (result.ok() && IsTakeoverLetter(result.value()) &&
+        letter_is_free(result.value()[0])) {
+      remembered = result.value();
+    }
+  }
+  if (!remembered.empty()) {
+    DriveLetterChoice choice;
+    choice.drive = remembered;
     return choice;
   }
 

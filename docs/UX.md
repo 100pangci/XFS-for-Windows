@@ -116,6 +116,12 @@ The rest of the rules:
 * when the preferred letter is free but different from the volume's RAW
   letter, the mount uses the preferred letter and releases the RAW letter, so
   the volume never shows up twice (a RAW `F:` next to an XFS `G:`);
+* a takeover deletes the volume's Windows mount point, and Windows does not
+  recreate it when the same device is inserted again. The service remembers
+  the letter its session used and mounts a reinserted device at that letter
+  again, instead of racing a new allocation that could leave a late RAW letter
+  next to the XFS drive. An explicitly configured preference still wins, and a
+  letter Windows did assign is taken over as usual;
 * `A:` and `B:` are refused;
 * a failed mount leaves no drive letter behind, and a clean unmount releases
   the letter;
