@@ -304,12 +304,12 @@ uint32_t XfsVolumeSerial(const XfsSuperblock& sb) {
                                (static_cast<uint32_t>(sb.uuid[3]) << 24));
 }
 
-// One-shot failure injection for the Windows integration tests.  The service
-// runs as LocalSystem, so a sentinel file in the administrator-only
-// configuration directory is used instead of an environment variable that an
-// SCM-started process would never inherit.
-bool ConsumeTestHook(const wchar_t* name) {
+// Failure injection for the Windows integration tests.  The service runs as
+// LocalSystem, so a sentinel file in the administrator-only configuration
+// directory is used instead of an environment variable that an SCM-started
+// process would never inherit.
 #ifdef XFSWIN_TEST_HOOKS
+std::filesystem::path TestHookSentinel(const wchar_t* name) {
   wchar_t program_data[MAX_PATH + 1] = {};
   const DWORD length =
       GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH + 1);
@@ -320,11 +320,31 @@ bool ConsumeTestHook(const wchar_t* name) {
     directory = std::filesystem::path(L"C:\\ProgramData") / L"xfswin" /
                 L"test-hooks";
   }
+  return directory / name;
+}
+#endif
+
+// One-shot variant: consumes the sentinel when it fires.
+bool ConsumeTestHook(const wchar_t* name) {
+#ifdef XFSWIN_TEST_HOOKS
   std::error_code ec;
-  const std::filesystem::path sentinel = directory / name;
+  const std::filesystem::path sentinel = TestHookSentinel(name);
   if (!std::filesystem::exists(sentinel, ec)) return false;
   std::filesystem::remove(sentinel, ec);
   return true;
+#else
+  (void)name;
+  return false;
+#endif
+}
+
+// Persistent variant: every attempt fires while the sentinel exists.  The
+// rollback test uses this so a device or reconciliation event cannot turn a
+// failed-mount assertion into a successful mount behind the test's back.
+bool TestHookPresent(const wchar_t* name) {
+#ifdef XFSWIN_TEST_HOOKS
+  std::error_code ec;
+  return std::filesystem::exists(TestHookSentinel(name), ec);
 #else
   (void)name;
   return false;
@@ -658,9 +678,12 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     config.perf_stats = false;
 
     // The RAW mount point was detached before this call by the takeover
-    // transaction.  A CI-only one-shot sentinel exercises the rollback path
-    // after the detachment and before WinFsp owns the letter.
-    if (ConsumeTestHook(L"fail-next-winfsp-start")) {
+    // transaction.  A CI-only sentinel exercises the rollback path after the
+    // detachment and before WinFsp owns the letter.  The persistent variant
+    // keeps failing until the test removes it, so a later device event cannot
+    // mask the rollback by mounting successfully.
+    if (ConsumeTestHook(L"fail-next-winfsp-start") ||
+        TestHookPresent(L"fail-winfsp-start-until-cleared")) {
       result.status = XFS_ERR(XfsError::kInternal,
                               "injected WinFsp mount failure (test hook)");
       return result;

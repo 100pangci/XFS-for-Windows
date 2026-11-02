@@ -387,8 +387,10 @@ The UX-1 CI jobs are:
   `DeleteVolumeMountPointW` (rollback restores the RAW mount point), service
   stop/restart, removal without restoring a dead volume, RW enrollment,
   Win32/Explorer file operations and the identity-mismatch read-only fallback.
-  The WinFsp build used by this job sets `-DXFSWIN_TEST_HOOKS=ON`; the hook is
-  a one-shot sentinel file under `%ProgramData%\xfswin\test-hooks\`;
+  The WinFsp build used by this job sets `-DXFSWIN_TEST_HOOKS=ON`; the hooks are
+  sentinel files under `%ProgramData%\xfswin\test-hooks\` (one-shot for the
+  event tests, and a persistent `fail-winfsp-start-until-cleared` sentinel that
+  holds the rollback state until the test removes it);
 * `linux-verify-ux-rw-image` — the independent Linux XFS oracle on the image
   the WinFsp read-write mount produced: `qemu-img check`, conversion, GPT
   partition mapping, `xfs_repair -n`, a read-only kernel mount with semantic

@@ -389,8 +389,12 @@ try {
     Assert-RawAt $rawLetter 'restore before the rollback test'
     Enroll-ReadOnly $uuid 'auto'
     New-Item -ItemType Directory -Force $hooksDir | Out-Null
-    Set-Content -Path (Join-Path $hooksDir 'fail-next-winfsp-start') `
-        -Value 'injected' -NoNewline
+    # The persistent hook keeps every WinFsp start failing until this test
+    # removes it.  A one-shot hook is not enough: restoring the RAW mount
+    # point can trigger another discovery pass, and that pass would mount
+    # successfully before the rollback assertions run.
+    $hookPath = Join-Path $hooksDir 'fail-winfsp-start-until-cleared'
+    Set-Content -Path $hookPath -Value 'injected' -NoNewline
     Assert-TakeoverOk (Invoke-Takeover -Arguments @('automount', 'start') -LogName 'start-rollback') 'automount start'
     $failureSeen = Wait-EventLogContains 'injected WinFsp mount failure' 60
     Assert $failureSeen "the injected WinFsp failure was not reported in the event log"
@@ -399,7 +403,7 @@ try {
     Assert-RawAt $rawLetter 'rollback to the original Windows mount point'
     Assert (-not (Test-UxLetterInUse $preferred) -or $preferred -eq $rawLetter) `
         "the failed mount left the unrelated preferred letter $preferred in use"
-    Remove-Item (Join-Path $hooksDir 'fail-next-winfsp-start') -Force -ErrorAction SilentlyContinue
+    Remove-Item $hookPath -Force -ErrorAction SilentlyContinue
     $results.steps['rollback-after-winfsp-failure'] = 'passed'
 
     Assert-TakeoverOk (Invoke-Takeover -Arguments @('automount', 'stop') -LogName 'stop-post-rollback') 'automount stop'
@@ -545,6 +549,7 @@ try {
         } catch {}
     }
     Remove-Item (Join-Path $hooksDir 'fail-next-winfsp-start') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $hooksDir 'fail-winfsp-start-until-cleared') -Force -ErrorAction SilentlyContinue
     try { Invoke-Takeover -Arguments @('automount', 'stop') -LogName 'cleanup-stop' -TimeoutSeconds 30 | Out-Null } catch {}
     Detach-All-UxFixtures
     try { Invoke-Takeover -Arguments @('automount', 'uninstall') -LogName 'cleanup-uninstall' | Out-Null } catch {}

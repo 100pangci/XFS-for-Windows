@@ -807,7 +807,9 @@ artifact instead):
   Microsoft basic-data partition, the only partition type Windows gives a RAW
   volume and a drive letter): same-letter takeover, preferred/RAW release
   ordering, an occupied preferred letter, an injected WinFsp failure after
-  `DeleteVolumeMountPointW` (rollback restores the RAW mount point), service
+  `DeleteVolumeMountPointW` (a persistent sentinel keeps every WinFsp start
+  failing until the test clears it, so rollback restores the RAW mount point
+  and no later device event can mask it), service
   stop/restart, physical removal without restoring a dead volume,
   `automount enable --rw` enrollment, Win32 file operations, the
   identity-mismatch read-only fallback, and a final RW pass whose VHDX is
