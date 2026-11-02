@@ -131,6 +131,32 @@ Two volume states need explicit handling:
   when the pre-dismount query also reported no mounted filesystem.  Every other
   combination refuses ownership.
 
+### Volume letters and the automount takeover
+
+The automount service detaches the drive-letter mount point Windows assigned to
+the RAW volume **before** it asks the backend for a read-write open.  This is
+intentional: a writable open locks and dismounts every volume on the disk, so
+leaving `F:` attached until the open happens would either fail the lock or
+briefly leave `F:` showing a RAW volume while WinFsp mounts it.
+
+The takeover is a MOUNT MANAGER operation on the normal drive-letter mount
+point (`DeleteVolumeMountPointW` / `SetVolumeMountPointW`), not a change to the
+Mount Manager policy and not `IOCTL_MOUNTMGR_DELETE_POINTS`.  It is authorized
+only by an exact volume identity match (volume GUID, disk number,
+partition/extent offset and length) against the verified XFS candidate, only
+for an `ERROR_UNRECOGNIZED_VOLUME` volume, and only when the volume has exactly
+one drive-letter mount point.  Directory mount points are preserved.  The
+original letter, GUID and mount point are recorded for the session; a failed
+WinFsp mount restores them, a removed device is never re-bound to the dead
+volume, and a pending restore blocks a new mount for that filesystem.
+
+For a read-write automount entry the service also refuses a disk that carries
+another recognized Windows filesystem, because the ownership step above would
+dismount it.  Virtual disks are the only CI-verifiable class and report no
+storage serial; their automount identity pins are the volume `DeviceGuid`
+stable id, the disk size and the device class.  Physical classes must pin a
+serial.
+
 ## Sector geometry, alignment and I/O
 
 XFS blocks are not necessarily Windows sectors.  The backend therefore accepts

@@ -112,6 +112,12 @@ Artifacts: `dev1-vhd-device`, `dev1-vhd-winfsp`, `dev1-linux-oracle`
 | Cache mode | `buffered` |
 | Filesystem | XFS v5, block size 4096, inode size 512, 4 AGs x 32768 blocks, internal log at block 65540 |
 
+Because Windows reports no serial for its virtual disks, the UX-1 automount
+read-write enrollment pins the stable id, the disk size and the device class
+for `virtual-disk` entries. Physical classes (removable/fixed) still require a
+serial pin, and every insertion re-reads all pins from the live device before a
+read-write mount; a mismatch falls back to read-only.
+
 No physical fixed disk or 4Kn device was tested. The separate DEV-1R
 removable-media run passed on one physical USB device; see the linked ledger in
 the status summary.

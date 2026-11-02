@@ -35,9 +35,36 @@ qualification boundary.
    PS> xfswin automount start
    ```
 
-   From then on, inserting the device mounts it read-only at the first free
-   drive letter. `xfswin status` shows the service state, the configured
-   filesystems and the live mounts.
+   From then on, inserting the device mounts it read-only. If Windows already
+   assigned the underlying RAW volume a letter (for example `F:`), the service
+   **takes that letter over** and mounts the XFS filesystem at `F:` instead of
+   adding a second letter; if the volume has no Windows letter it allocates the
+   first free letter from `D:` through `Z:`. `xfswin status` shows the service
+   state, the configured filesystems and the live mounts, including whether
+   the letter was taken over or allocated.
+
+4. To let an enrolled device mount read-write automatically, run the enable
+   command once and choose the read-write mode:
+
+   ```powershell
+   PS> xfswin automount enable 11111111-1111-4111-8111-111111111111
+   Mount this filesystem automatically when it is inserted? [Y/n] y
+   Mount mode: 1) read-only  2) experimental read-write
+   Choose 1-2 [1]: 2
+   Read-write identity to pin:
+     filesystem UUID : 11111111-1111-4111-8111-111111111111
+     ...
+   Pin this device identity and enable automatic read-write? [y/N] y
+   ```
+
+   `xfswin automount enable <uuid> --rw` is the direct spelling for the same
+   enrollment: it skips the mode question and goes straight to the identity
+   confirmation. The identity shown is what gets pinned. Later insertions mount
+   read-write only when the XFS UUID and every pin still match; otherwise the
+   service falls back to read-only and says why in `xfswin status`. In an
+   unattended script the explicit confirmation is
+   `--yes-i-really-mean-it`; without a terminal and without that flag `--rw`
+   is refused.
 
 ## Discovery: `xfswin devices`
 
@@ -67,21 +94,28 @@ logic is separated from console input/output and is unit tested.
 ## Drive letters
 
 Everything except the legacy `xfswin mount <device> X:` form goes through one
-allocator:
+allocator. It considers, in this order:
 
-* a preferred letter — an explicit `--drive E:` answer or the letter stored for
-  an automount entry — is used when it is free;
-* otherwise, including `--drive auto` and an empty interactive answer, the
-  allocator checks `D:` through `Z:` in order and chooses the first free
-  letter; `A:`, `B:` and `C:` are never chosen automatically;
+1. the preferred letter, when it is free;
+2. the drive letter Windows assigned to the **same RAW volume**, when that
+   volume is the discovered XFS candidate (a takeover, not an eviction);
+3. the first free letter from `D:` through `Z:`.
+
+The rest of the rules:
+
+* `A:`, `B:` and `C:` are never chosen automatically and never taken over;
 * a preferred letter is a preference, not an override: if it is used by a
   volume, a network mapping, SUBST, a DOS device or another mounted
-  filesystem, `xfswin` never evicts it. It mounts at the first free letter from
-  `D:` through `Z:` — even when that letter is lower than the preferred one —
-  and prints
+  filesystem, `xfswin` never evicts it. An occupied preferred letter falls
+  back to the volume's own RAW letter when one exists, otherwise to the first
+  free letter from `D:` through `Z:` — even when that letter is lower than the
+  preferred one — and prints
 
   `The configured drive letter G: is already in use. Mounted as D: instead.`
 
+* when the preferred letter is free but different from the volume's RAW
+  letter, the mount uses the preferred letter and releases the RAW letter, so
+  the volume never shows up twice (a RAW `F:` next to an XFS `G:`);
 * `A:` and `B:` are refused;
 * a failed mount leaves no drive letter behind, and a clean unmount releases
   the letter;
@@ -95,6 +129,44 @@ devices and xfswin's own mounts are all respected.
 
 The legacy form keeps working: `xfswin mount \\.\PhysicalDriveN X:`. It also
 refuses an existing drive letter rather than overwriting it.
+
+## Drive-letter takeover
+
+When Windows shows an XFS partition as RAW, it may assign that volume a drive
+letter (`F:`) and Explorer shows "You need to format the disk in drive F:".
+Mounting the filesystem at another letter (`G:`) would leave the misleading RAW
+`F:` visible next to the real data. UX-1 instead detaches that Windows mount
+point and serves the filesystem at the same letter:
+
+1. discovery correlates the XFS candidate with the Windows volume by volume
+   GUID, disk number, partition/extent offset and extent length; an
+   approximate match is display-only and never authorizes a takeover;
+2. the volume must be RAW (`ERROR_UNRECOGNIZED_VOLUME`) and the XFS superblock
+   must verify (`ReadSuperblock` with CRC verification) and be mountable;
+3. the volume must have exactly one drive-letter mount point, and it must be
+   the letter being taken over — directory mount points are preserved and
+   multiple letters are left alone (the mount falls back to an allocation);
+4. `DeleteVolumeMountPointW` removes the RAW mount point, the service verifies
+   it is gone, and only then does WinFsp mount at that letter;
+5. on a failed mount, the original mount point is restored with
+   `SetVolumeMountPointW` before the service reports the failure.
+
+The transaction is a small state machine: `observed → prepared →
+original-removed → mounting → owned`, with a rollback path from every
+pre-mount state. The record is kept for the session only (original letter,
+volume GUID, mount point, disk/extent identity and XFS UUID). If the restore
+fails, the service logs a high-severity error and keeps retrying it during
+reconciliation; it never pretends the restore succeeded, and it does not start
+another mount for that filesystem while a restore is pending. `F:` is never
+left defined while WinFsp is being asked to mount `F:`.
+
+Removal is handled without touching Mount Manager policy: the service stops
+the WinFsp session, confirms the letter is free, and restores the original
+mount point only when the volume is still present. If the device was removed,
+the letter is left free instead of being bound to a dead volume; reinserting
+the device lets Windows reassign its letter, and the next takeover reuses it.
+Stopping the service with the device still inserted restores the Windows mount
+point, so the volume returns to its pre-service state.
 
 ## What Explorer shows
 
@@ -164,6 +236,7 @@ drive = auto
 expected-serial =
 expected-stable-id =
 expected-size = 0
+expected-device-class = unknown
 device-qualification = false
 allow-removable-disk = false
 allow-fixed-disk = false
@@ -174,31 +247,60 @@ SCM-started service does not inherit that variable and always uses
 `%ProgramData%`. Writes go through a temporary file, flush and rename, so an
 interrupted save cannot leave a half-valid configuration.
 
-The XFS UUID is the identity. The optional serial, stable id and size are
-DEV-1 identity pins. For read-write entries they are mandatory and must match
-on every insertion; a different device with the same UUID is refused rather
-than mounted.
+The XFS UUID is the identity. The optional serial, stable id, size and device
+class are DEV-1 identity pins. For read-write entries they are mandatory and
+must match on every insertion; a different device with the same UUID is
+refused rather than mounted. Windows reports no serial number for its own
+virtual disks (VHD/VHDX), so a virtual-disk entry pins the stable id (the
+volume `DeviceGuid`), the size and the class; every physical device class must
+pin its serial. The service still re-reads all of them from the live device on
+every insertion.
 
 ### Read-only default and the read-write boundary
 
 Every entry is read-only unless it was explicitly enrolled for experimental
-read-write:
+read-write. The ordinary one-time spelling is:
+
+```powershell
+xfswin automount enable <uuid> --rw
+```
+
+In a terminal it asks whether to mount automatically, then asks for the mode
+(1 = read-only, 2 = experimental read-write), then shows the detected
+filesystem and physical identity and asks for a separate confirmation before
+recording the pins. `--yes-i-really-mean-it` is the explicit confirmation for
+unattended scripts; without a terminal and without that flag, `--rw` is
+refused. The older engineering spelling remains:
 
 ```powershell
 xfswin automount enable <uuid> --rw-experimental `
     --device-write-qualification --drive auto
 ```
 
-That command is refused unless the filesystem is attached, all three DEV-1
-identity pins can be recorded, and the device class policy allows it:
+Read-write enrollment is refused unless the filesystem is attached and the
+DEV-1 identity pins can be recorded, and the device class policy allows it:
 
 * fixed physical disks are refused for automount read-write;
 * removable disks additionally require `--allow-removable-disk-write`;
 * virtual disks are allowed in CI;
-* the service rechecks qualification, identity pins and the writable feature
-  profile on every insertion, and refuses without bypassing the check;
+* the Windows system disk and a disk holding the page file are absolute
+  refusals: there is no flag that bypasses them;
+* a disk with another recognized Windows filesystem is refused, because a
+  DEV-1 read-write open locks and dismounts every volume on that physical
+  disk;
+* the service rechecks qualification, identity pins, the device class and the
+  writable feature profile on every insertion;
 * a failure is logged and the device stays unmounted; it is never retried as
   if it were a not-ready device.
+
+A read-write entry whose identity pins no longer match is **not** refused
+outright: the filesystem is still useful, so it mounts read-only with a note
+(`The configured read-write identity does not match this device (...); mounted
+read-only.`). Policy refusals (journal, system/pagefile disk, fixed disk,
+unsupported writable profile) remain absolute. `xfswin status` prints the
+effective mode and the configured mode separately. This is how a cloned or
+spoofed device with the same XFS UUID but a different serial/stable id/size
+never gets write access.
 
 The only removable hardware with DEV-1R evidence remains the Samsung Flash
 Drive (serial `AA00000000000489`, 64,160,400,896 bytes, USB BOT, 512/512-byte
@@ -254,6 +356,8 @@ manually mounted drives (`xfswin mount`) are left alone.
 | `the XFS journal is not clean` | Repair/recover the filesystem, or pass `--force-unsafe-ro` for a manual read-only mount. Automount never overrides this. |
 | Service status is `stopped` | No automatic mounts happen. Start it with `xfswin automount start`. |
 | Device inserted but nothing mounted | Check `xfswin status`; if the UUID is not configured, enroll it. If it is configured, read the event log entry for the mount attempt and its result. |
+| Explorer says "You need to format the disk in drive F:" | The RAW volume's letter was not (or not yet) taken over. Check `xfswin status` for `Drive letter: taken over ...` versus `allocated`; a non-exact volume match or multiple drive letters deliberately fall back and leave the RAW letter alone. |
+| RAW `F:` and XFS `G:` both visible | The takeover was refused (multiple letters, non-RAW volume, or an identity mismatch). Run `xfswin status --debug` and the event log; do not assign the RAW letter manually while the service owns the mount. |
 | `A:`/`B:` rejected | Windows conventions reserve them; choose another letter. |
 
 ## Automated coverage
@@ -273,6 +377,18 @@ The UX-1 CI jobs are:
 * `windows-automount-vhd` — the installed service with real VHD
   insertion/removal, service restart, preferred-letter fallback and two
   same-label/different-UUID devices;
+* `windows-automount-takeover` — a real Windows RAW letter assigned to the XFS
+  partition, then same-letter takeover, preferred/RAW release ordering, an
+  occupied preferred letter, an injected WinFsp failure after
+  `DeleteVolumeMountPointW` (rollback restores the RAW mount point), service
+  stop/restart, removal without restoring a dead volume, RW enrollment,
+  Win32/Explorer file operations and the identity-mismatch read-only fallback.
+  The WinFsp build used by this job sets `-DXFSWIN_TEST_HOOKS=ON`; the hook is
+  a one-shot sentinel file under `%ProgramData%\xfswin\test-hooks\`;
+* `linux-verify-ux-rw-image` — the independent Linux XFS oracle on the image
+  the WinFsp read-write mount produced: `qemu-img check`, conversion, GPT
+  partition mapping, `xfs_repair -n`, a read-only kernel mount with semantic
+  file checks, and `xfs_scrub -n` when available;
 * `windows-explorer-volume-info` — the Win32 volume information Explorer uses.
 
 Real USB insertion/removal and the DEV-1R removable write profile remain

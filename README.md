@@ -182,10 +182,17 @@ Optionally let a resident service do it whenever the media is inserted:
 ```
 
 Insert the device and it appears in Explorer as a normal drive; `$exe status`
-shows the service state, configured filesystems and live mounts. Automount is
-**read-only by default**. Read-write enrollment still requires explicit
-`--rw-experimental --device-write-qualification` plus the DEV-1 device-class
-opt-ins; fixed physical disks are refused, and removable disks need
+shows the service state, configured filesystems and live mounts. When Windows
+assigned the RAW volume a letter (`F:` with the "You need to format" prompt),
+the service takes that letter over and mounts the filesystem there instead of
+adding a second drive; a failed mount restores the original Windows mount
+point. Automount is **read-only by default**. For automatic read-write, enroll
+the device once with `$exe automount enable <uuid> --rw` and confirm the
+identity pins it prints (in a script, `--yes-i-really-mean-it`); subsequent
+insertions mount read-write only when the UUID, serial/stable id, size and
+device class all still match, otherwise they fall back to read-only. The older
+`--rw-experimental --device-write-qualification` spelling still works; fixed
+physical disks are refused, and removable disks need
 `--allow-removable-disk-write`. The only removable hardware with DEV-1R
 evidence is the Samsung Flash Drive (serial `AA00000000000489`, USB BOT,
 512/512-byte sectors); other removable devices and all fixed physical-disk
