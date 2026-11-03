@@ -204,10 +204,11 @@ Result<DriveLetterChoice> ChooseDriveLetter(
     if (!letter_is_free(letter)) continue;
     const std::string chosen = make(letter);
     if (requested.empty()) {
-      return DriveLetterChoice{chosen, {}, false, {}};
+      return DriveLetterChoice{chosen, {}, {}, false, {}};
     }
     return DriveLetterChoice{
         chosen,
+        {},
         {},
         true,
         "drive " + requested + " is already in use; choosing " + chosen +

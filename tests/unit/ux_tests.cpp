@@ -707,6 +707,9 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
 
   std::vector<Device> devices;
   std::vector<xfs::DriveLetterInfo> occupied_letters;
+  // Drive roots that currently resolve to a Windows volume GUID, keyed by
+  // "F:".  Used by the restored-letter hint.
+  std::map<std::string, std::string> drive_volumes;
   bool discovery_fails = false;
   bool discovery_incomplete = false;
   uint64_t retryable_failures = 0;
@@ -762,6 +765,13 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
       letters.push_back(info);
     }
     return letters;
+  }
+
+  bool DriveLetterResolvesToVolume(
+      std::string_view drive, std::string_view volume_device_path) override {
+    const auto it = drive_volumes.find(std::string(drive));
+    return it != drive_volumes.end() &&
+           it->second == volume_device_path;
   }
 
   xfs::TakeoverResult TakeOverDriveLetter(
@@ -1561,12 +1571,16 @@ class FakeTakeoverOps final : public xfs::TakeoverOps {
   int capture_calls = 0;
   int remove_calls = 0;
   int restore_calls = 0;
+  std::string last_release_volume_device_path;
 
   xfs::Status VerifyAndCapture(const xfs::DiscoveredFilesystem& filesystem,
                                std::string_view,
                                std::string_view release_drive,
+                               std::string_view release_volume_device_path,
                                xfs::DriveLetterTakeover* takeover) override {
     ++capture_calls;
+    last_release_volume_device_path =
+        std::string(release_volume_device_path);
     if (fail_capture) {
       return xfs::XFS_ERR(xfs::XfsError::kIoError, "injected capture failure");
     }
@@ -1708,6 +1722,33 @@ TEST(ux_takeover_refuses_unsafe_candidates) {
   result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
   CHECK(!result.status.ok());
   CHECK_EQ(ops.remove_calls, 0);
+}
+
+TEST(ux_takeover_accepts_a_live_verified_release_letter_after_a_restore) {
+  FakeTakeoverOps ops;
+  xfs::DiscoveredFilesystem filesystem = TakeoverCandidate(TestUuid(0x4d));
+  const std::string volume_path = filesystem.volume_device_path;
+  // The pass that follows a restore can run before the Mount Manager lists
+  // the restored letter again; the caller verified it live.
+  filesystem.windows_volume_found = false;
+  filesystem.volume_identity_exact = false;
+  filesystem.volume_unrecognized_raw = false;
+  filesystem.mount_points.clear();
+
+  // Without that live check the stale snapshot is refused before anything is
+  // detached.
+  auto result =
+      xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:");
+  CHECK(!result.status.ok());
+  CHECK_EQ(ops.remove_calls, 0);
+  CHECK_EQ(ops.capture_calls, 0);
+
+  result = xfs::PrepareDriveLetterTakeover(ops, filesystem, "F:", "F:",
+                                           volume_path);
+  CHECK(result.status.ok());
+  CHECK(result.takeover.state == xfs::TakeoverState::kOriginalRemoved);
+  CHECK_EQ(ops.capture_calls, 1);
+  CHECK_STR_EQ(ops.last_release_volume_device_path, volume_path);
 }
 
 TEST(ux_takeover_capture_failure_has_no_side_effects) {
@@ -1880,6 +1921,96 @@ TEST(ux_automount_winfsp_failure_restores_the_windows_letter) {
   CHECK(platform.CountLogs("drive-letter-restore", "restored") == 1);
   CHECK(engine.status().entries.front().state ==
         xfs::AutomountEntryState::kFailed);
+}
+
+TEST(ux_automount_retry_after_a_failed_mount_returns_to_the_restored_letter) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x4b);
+  const xfs::DiscoveredFilesystem filesystem =
+      MountedTakeoverFilesystem(uuid);
+  platform.devices.push_back({filesystem, true});
+  xfs::DriveLetterInfo raw_letter;
+  raw_letter.letter = 'F';
+  raw_letter.kind = xfs::DriveLetterKind::kRemovable;
+  platform.occupied_letters.push_back(raw_letter);
+  platform.drive_volumes["F:"] = filesystem.volume_device_path;
+  platform.mount_failures = 1;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+
+  // The failed mount restored the RAW letter; no other letter was allocated.
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.takeover_calls, 1);
+  CHECK_EQ(platform.restore_calls, 1);
+  CHECK(platform.CountLogs("drive-letter-restore", "restored") == 1);
+
+  // A notification runs the next pass before the Mount Manager has refreshed
+  // the volume's drive-letter list, so discovery no longer correlates the RAW
+  // letter with the XFS candidate.  The restored hint is validated live and
+  // the takeover releases F: again instead of allocating D: next to it.
+  xfs::DiscoveredFilesystem stale = filesystem;
+  stale.windows_volume_found = false;
+  stale.volume_identity_exact = false;
+  stale.volume_unrecognized_raw = false;
+  stale.mount_points.clear();
+  platform.devices.front().filesystem = stale;
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "F:");
+  CHECK_EQ(platform.takeover_calls, 2);
+  CHECK_EQ(platform.takeover_choices.size(), 2u);
+  CHECK_STR_EQ(platform.takeover_choices.back().release_drive, "F:");
+  CHECK_STR_EQ(platform.takeover_choices.back().release_volume_device_path,
+               filesystem.volume_device_path);
+  CHECK(engine.status().mounts.front().drive_taken_over);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kMounted);
+}
+
+TEST(ux_automount_restored_letter_hint_is_ignored_when_the_letter_moved) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x4c);
+  const xfs::DiscoveredFilesystem filesystem =
+      MountedTakeoverFilesystem(uuid);
+  platform.devices.push_back({filesystem, true});
+  xfs::DriveLetterInfo raw_letter;
+  raw_letter.letter = 'F';
+  raw_letter.kind = xfs::DriveLetterKind::kRemovable;
+  platform.occupied_letters.push_back(raw_letter);
+  platform.drive_volumes["F:"] = filesystem.volume_device_path;
+  platform.mount_failures = 1;
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.takeover_calls, 1);
+
+  // The letter was reassigned to a different volume between the restore and
+  // the next pass.  The hint must not authorize a takeover; F: belongs to
+  // someone else, so a normal free-letter allocation is correct.
+  xfs::DiscoveredFilesystem stale = filesystem;
+  stale.windows_volume_found = false;
+  stale.volume_identity_exact = false;
+  stale.volume_unrecognized_raw = false;
+  stale.mount_points.clear();
+  platform.devices.front().filesystem = stale;
+  platform.drive_volumes["F:"] = "\\\\?\\Volume{other-volume}";
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_STR_EQ(platform.sessions.begin()->second.drive, "D:");
+  // The second pass still calls the platform, but as a plain allocation: no
+  // letter of the other volume may be released.
+  CHECK_EQ(platform.takeover_calls, 2);
+  CHECK(platform.takeover_choices.back().release_drive.empty());
+  CHECK(!engine.status().mounts.front().drive_taken_over);
 }
 
 TEST(ux_automount_removal_does_not_restore_to_a_dead_volume) {

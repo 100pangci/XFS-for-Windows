@@ -150,4 +150,13 @@ bool QueryDriveVolumeInformation(std::string_view drive,
 // before a captured mount point may be removed or restored.
 Result<std::string> QueryVolumeNameForMountPoint(std::string_view mount_point);
 
+// True when the drive root ("F:" or "F:\\") currently resolves to exactly
+// `volume_device_path` ("\\?\Volume{...}").  This is the live counterpart of
+// the discovery snapshot's same-volume correlation: the Mount Manager updates
+// its per-volume path list asynchronously, so a pass that runs right after a
+// restore can miss the letter even though the letter already resolves back to
+// the recorded volume GUID.
+bool DriveLetterResolvesToVolume(std::string_view drive,
+                                 std::string_view volume_device_path);
+
 }  // namespace xfs

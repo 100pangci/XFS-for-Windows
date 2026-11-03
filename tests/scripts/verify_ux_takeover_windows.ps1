@@ -510,6 +510,8 @@ try {
     $status = Get-Status
     Assert ($status.output.Contains('experimental-rw')) `
         "status does not report read-write mode: $($status.output)"
+    Assert ($status.output.Contains("taken over from the Windows volume $($rawLetter.TrimEnd(':'))")) `
+        "the RW mount did not take over the RAW letter: $($status.output)"
     Assert-RwFileOperations $drive
     $results.steps['rw-enrollment-and-file-operations'] = 'passed'
 

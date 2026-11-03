@@ -25,6 +25,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "xfs/automount_config.h"
@@ -79,6 +80,13 @@ class AutomountPlatform {
   virtual Result<DiscoveryReport> Discover(
       const DiscoveryOptions& options) = 0;
   virtual std::vector<DriveLetterInfo> ListDriveLetters(std::string* error) = 0;
+  // True when the drive root ("F:" or "F:\\") currently resolves to exactly
+  // `volume_device_path` ("\\?\Volume{...}").  Discovery correlates a volume
+  // with its drive letter through the Mount Manager's path list, which is
+  // updated asynchronously; this live check lets the engine keep a
+  // same-volume letter that a pass running right after a restore did not see.
+  virtual bool DriveLetterResolvesToVolume(
+      std::string_view drive, std::string_view volume_device_path) = 0;
   // Takes over the Windows drive letter of the RAW volume, if the selection
   // asked for one (choice.release_drive non-empty).  Returns a kNone record
   // when there is nothing to take over.  On failure the record still describes
@@ -262,6 +270,19 @@ class AutomountEngine {
     AutomountTimePoint next_at{};
   };
 
+  // A Windows drive letter that was restored after a failed mount, together
+  // with the volume GUID verified for it.  Discovery normally correlates the
+  // letter with the XFS candidate by itself, but a pass triggered right after
+  // the restore can run before the Mount Manager refreshes the volume's path
+  // list.  Without this hint that pass would allocate an unrelated free letter
+  // and leave the RAW volume's letter next to the WinFsp mount.  The hint is
+  // only used when the letter is still in use and live-resolves to the same
+  // volume; the takeover then re-verifies everything before removing it.
+  struct RestoredDriveHint {
+    std::string drive;                // "F:"
+    std::string volume_device_path;   // "\\?\Volume{...}"
+  };
+
   void Reconcile(AutomountTimePoint now, bool reload_config);
   void ReloadConfig(AutomountTimePoint now);
   void ScheduleReconcile(AutomountTimePoint at);
@@ -324,6 +345,9 @@ class AutomountEngine {
   // never persisted and never overrides an explicit preference or a letter
   // Windows did assign.
   std::map<std::string, std::string> remembered_drives_;
+  // The restored Windows letter per filesystem, used while the volume is still
+  // attached (see RestoredDriveHint).
+  std::map<std::string, RestoredDriveHint> restored_drives_;
   std::string last_config_fingerprint_;
   std::string last_config_error_;
 

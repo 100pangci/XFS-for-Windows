@@ -568,6 +568,15 @@ Result<std::string> QueryVolumeNameForMountPoint(std::string_view mount_point) {
   return WideToUtf8(buffer.data());
 }
 
+bool DriveLetterResolvesToVolume(std::string_view drive,
+                                 std::string_view volume_device_path) {
+  if (volume_device_path.empty()) return false;
+  auto current = QueryVolumeNameForMountPoint(drive);
+  if (!current.ok()) return false;
+  return SamePathIgnoreCase(NormalizedVolumePath(current.value()),
+                            NormalizedVolumePath(volume_device_path));
+}
+
 }  // namespace xfs
 
 #else  // !_WIN32
@@ -643,6 +652,13 @@ Result<std::string> QueryVolumeNameForMountPoint(
   (void)mount_point;
   return XFS_ERR(XfsError::kUnsupportedFeature,
                  "volume queries are only supported on Windows");
+}
+
+bool DriveLetterResolvesToVolume(std::string_view drive,
+                                 std::string_view volume_device_path) {
+  (void)drive;
+  (void)volume_device_path;
+  return false;
 }
 
 }  // namespace xfs

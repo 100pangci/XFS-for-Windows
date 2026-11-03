@@ -29,6 +29,12 @@ struct DriveLetterChoice {
   // the Windows letter is released because the filesystem is mounted
   // elsewhere.  Directory mount points are never released.
   std::string release_drive;
+  // Set only when the caller verified, against live Windows state, that
+  // `release_drive` currently resolves to this exact volume GUID while the
+  // discovery snapshot for the pass did not report the same-volume letter.
+  // The takeover still re-verifies the volume before removing the mount point;
+  // this value only replaces the stale snapshot correlation.
+  std::string release_volume_device_path;
   bool preferred_unavailable = false;  // requested letter was occupied
   std::string note;           // human-readable fallback explanation
 };

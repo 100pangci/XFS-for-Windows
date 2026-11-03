@@ -258,11 +258,16 @@ struct ServiceRuntime;
 
 bool OpenErrorMayBeTransient(const std::string& error) {
   // The raw-device open reports the Win32 code in its message.  Only a device
-  // that is not ready yet is retryable; a filesystem or policy error never is.
-  // ERROR_NOT_READY (21), ERROR_DEVICE_NOT_CONNECTED (1167) and the two
-  // missing-path codes occur while a just-inserted USB device is still being
-  // enumerated.
+  // that is not ready yet or briefly busy is retryable; a filesystem or policy
+  // error never is.  ERROR_NOT_READY (21), ERROR_DEVICE_NOT_CONNECTED (1167)
+  // and the two missing-path codes occur while a just-inserted USB device is
+  // still being enumerated.  ERROR_SHARING_VIOLATION (32) occurs when a handle
+  // that is closing (the service's own previous session, Explorer, or an
+  // antivirus scan) still holds the disk exclusively; the next attempt is
+  // usually accepted, and treating it as fatal would leave the Windows RAW
+  // letter in place next to an unrelated allocation.
   return error.find("error 21:") != std::string::npos ||
+         error.find("error 32:") != std::string::npos ||
          error.find("error 1167:") != std::string::npos ||
          error.find("error 2:") != std::string::npos ||
          error.find("error 3:") != std::string::npos;
@@ -360,6 +365,7 @@ class WindowsTakeoverOps final : public TakeoverOps {
   Status VerifyAndCapture(const DiscoveredFilesystem& filesystem,
                           std::string_view drive,
                           std::string_view release_drive,
+                          std::string_view release_volume_device_path,
                           DriveLetterTakeover* takeover) override {
     if (!takeover) {
       return XFS_ERR(XfsError::kInvalidArgument, "missing takeover record");
@@ -367,7 +373,17 @@ class WindowsTakeoverOps final : public TakeoverOps {
     auto normalized = NormalizeDriveLetter(release_drive);
     if (!normalized.ok()) return normalized.error();
     const std::string release = normalized.value();
-    if (!filesystem.volume_identity_exact) {
+    // The engine may pass the volume GUID it has just verified live for
+    // `release_drive`.  A discovery pass that runs right after a restore can
+    // see the Mount Manager's path list before it lists the letter again; the
+    // snapshot correlation is then stale, but the volume itself is verified
+    // below against live state either way.
+    const std::string volume_path =
+        release_volume_device_path.empty()
+            ? filesystem.volume_device_path
+            : std::string(release_volume_device_path);
+    if (release_volume_device_path.empty() &&
+        !filesystem.volume_identity_exact) {
       return XFS_ERR(XfsError::kInvalidArgument,
                      "the Windows volume is not an exact extent match")
           .Metadata("drive-letter takeover");
@@ -380,7 +396,7 @@ class WindowsTakeoverOps final : public TakeoverOps {
     }
 
     std::string error;
-    auto state = QueryVolumePathState(filesystem.volume_device_path, &error);
+    auto state = QueryVolumePathState(volume_path, &error);
     if (!state.ok()) {
       return XFS_ERR(state.error().code,
                      "the Windows volume disappeared before the takeover: " +
@@ -573,12 +589,19 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     return EnumerateDriveLetters(error);
   }
 
+  bool DriveLetterResolvesToVolume(
+      std::string_view drive,
+      std::string_view volume_device_path) override {
+    return xfs::DriveLetterResolvesToVolume(drive, volume_device_path);
+  }
+
   TakeoverResult TakeOverDriveLetter(
       const DiscoveredFilesystem& filesystem,
       const DriveLetterChoice& choice) override {
     WindowsTakeoverOps ops;
     return PrepareDriveLetterTakeover(ops, filesystem, choice.drive,
-                                      choice.release_drive);
+                                      choice.release_drive,
+                                      choice.release_volume_device_path);
   }
 
   Status RestoreDriveLetterTakeover(DriveLetterTakeover* takeover) override {

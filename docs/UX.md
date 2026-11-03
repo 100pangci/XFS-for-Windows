@@ -166,6 +166,27 @@ reconciliation; it never pretends the restore succeeded, and it does not start
 another mount for that filesystem while a restore is pending. `F:` is never
 left defined while WinFsp is being asked to mount `F:`.
 
+A failed mount therefore returns the volume to its Windows letter before the
+next attempt. That attempt is usually triggered by the mount-point change
+itself, and it can run before the Mount Manager has refreshed the volume's
+drive-letter list, so discovery may not correlate `F:` with the XFS candidate
+even though the letter is already back. The service remembers the restored
+letter together with the verified volume GUID for that filesystem (session
+memory, never persisted) and, for that pass only, confirms with
+`GetVolumeNameForVolumeMountPointW` that the letter still resolves to the same
+volume before offering it as the same-volume letter again. The takeover then
+repeats the full live identity check — RAW volume, single extent matching the
+XFS candidate, exactly one drive-letter mount point — before removing
+anything. A letter that was released or now belongs to another volume is
+forgotten, and the ordinary allocator takes over. This prevents the RAW letter
+from being left next to an unrelated free-letter mount after a transient
+failure.
+
+A raw-disk open that fails with a sharing violation (`ERROR_SHARING_VIOLATION`,
+for example while the previous session's handle is still closing) is treated as
+a transient "device busy" failure and retried with the same bounded backoff as
+"not ready"; it is never reported as a policy refusal.
+
 Removal is handled without touching Mount Manager policy: the service stops
 the WinFsp session, confirms the letter is free, and restores the original
 mount point only when the volume is still present. If the device was removed,

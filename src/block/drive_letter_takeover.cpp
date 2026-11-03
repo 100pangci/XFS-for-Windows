@@ -104,10 +104,10 @@ bool TakeoverNeedsRestore(const DriveLetterTakeover& takeover) {
   }
 }
 
-TakeoverResult PrepareDriveLetterTakeover(TakeoverOps& ops,
-                                          const DiscoveredFilesystem& filesystem,
-                                          std::string_view drive_view,
-                                          std::string_view release_drive_view) {
+TakeoverResult PrepareDriveLetterTakeover(
+    TakeoverOps& ops, const DiscoveredFilesystem& filesystem,
+    std::string_view drive_view, std::string_view release_drive_view,
+    std::string_view release_volume_device_path) {
   TakeoverResult result;
   const std::string drive = NormalizeOrEmpty(drive_view);
   if (drive.empty()) {
@@ -140,44 +140,59 @@ TakeoverResult PrepareDriveLetterTakeover(TakeoverOps& ops,
   // Re-check the discovery facts locally before touching Windows.  The
   // platform verifies them again against live state; neither check is allowed
   // to trust a drive letter or a disk number on its own.
+  //
+  // The caller can supply a volume GUID it has just verified live as the owner
+  // of `release_drive`.  A pass that runs right after a restore may see the
+  // Mount Manager's per-volume path list before it lists that letter again,
+  // so the snapshot checks below would reject a correlation that is already
+  // true.  Skipping them is safe because every identity check that matters is
+  // repeated against live state in VerifyAndCapture before the mount point is
+  // removed.
+  const bool release_live_verified = !release_volume_device_path.empty();
   if (filesystem.probe.state != XfsProbeState::kValid) {
     return Failed(std::move(result), XfsError::kUnsupportedFeature,
                   "the XFS superblock did not verify; no drive letter may be "
                   "taken over");
   }
-  if (!filesystem.windows_volume_found || !filesystem.volume_identity_exact) {
-    return Failed(std::move(result), XfsError::kNotMounted,
-                  "the Windows volume does not match the XFS candidate's disk "
-                  "extents exactly");
-  }
-  if (!filesystem.volume_unrecognized_raw) {
-    return Failed(std::move(result), XfsError::kInvalidArgument,
-                  "the Windows volume has a recognized filesystem; its drive "
-                  "letter is never taken over");
-  }
-  if (filesystem.volume_device_path.empty()) {
-    return Failed(std::move(result), XfsError::kInvalidArgument,
-                  "the Windows volume identity is missing");
+  if (!release_live_verified) {
+    if (!filesystem.windows_volume_found ||
+        !filesystem.volume_identity_exact) {
+      return Failed(std::move(result), XfsError::kNotMounted,
+                    "the Windows volume does not match the XFS candidate's "
+                    "disk extents exactly");
+    }
+    if (!filesystem.volume_unrecognized_raw) {
+      return Failed(std::move(result), XfsError::kInvalidArgument,
+                    "the Windows volume has a recognized filesystem; its "
+                    "drive letter is never taken over");
+    }
+    if (filesystem.volume_device_path.empty()) {
+      return Failed(std::move(result), XfsError::kInvalidArgument,
+                    "the Windows volume identity is missing");
+    }
   }
   if (IsNullUuid(filesystem.probe.superblock.uuid)) {
     return Failed(std::move(result), XfsError::kBadUuid,
                   "the verified XFS filesystem has no UUID");
   }
-  const std::string only_drive =
-      SingleDriveLetterMountPoint(filesystem.mount_points);
-  if (only_drive.empty()) {
-    return Failed(std::move(result), XfsError::kAlreadyExists,
-                  "the Windows volume does not have exactly one drive-letter "
-                  "mount point; multiple letters are never taken over");
-  }
-  if (only_drive != release_drive) {
-    return Failed(std::move(result), XfsError::kInvalidArgument,
-                  "drive " + release_drive +
-                      " is not the Windows volume's drive letter");
+  if (!release_live_verified) {
+    const std::string only_drive =
+        SingleDriveLetterMountPoint(filesystem.mount_points);
+    if (only_drive.empty()) {
+      return Failed(std::move(result), XfsError::kAlreadyExists,
+                    "the Windows volume does not have exactly one drive-letter "
+                    "mount point; multiple letters are never taken over");
+    }
+    if (only_drive != release_drive) {
+      return Failed(std::move(result), XfsError::kInvalidArgument,
+                    "drive " + release_drive +
+                        " is not the Windows volume's drive letter");
+    }
   }
 
-  Status verified =
-      ops.VerifyAndCapture(filesystem, drive, release_drive, &result.takeover);
+  Status verified = ops.VerifyAndCapture(filesystem, drive, release_drive,
+                                         release_volume_device_path,
+                                         &result.takeover);
   if (!verified.ok()) {
     result.status = verified;
     result.takeover.state = TakeoverState::kFailed;

@@ -101,9 +101,17 @@ class TakeoverOps {
   //     and the only one (multiple letters must never be taken over silently);
   // then fills volume_name, mount_point, other_mount_points and the identity
   // fields of the record.
+  //
+  // `release_volume_device_path`, when not empty, is the volume GUID the caller
+  // verified live as the current owner of `release_drive` (see
+  // DriveLetterResolvesToVolume).  It is used instead of the discovery
+  // snapshot's volume path so a pass that runs before the Mount Manager has
+  // refreshed its path list can still verify the same volume live.  The live
+  // checks above still decide; this value is not trusted on its own.
   virtual Status VerifyAndCapture(const DiscoveredFilesystem& filesystem,
                                   std::string_view drive,
                                   std::string_view release_drive,
+                                  std::string_view release_volume_device_path,
                                   DriveLetterTakeover* takeover) = 0;
 
   // Detaches the recorded mount point.  Must not touch directory mount points.
@@ -132,10 +140,16 @@ struct TakeoverResult {
 // Runs Observed → Prepared → OriginalRemoved.  A no-op (kNone, Ok) when
 // `release_drive` is empty.  If removal succeeds but verification fails, the
 // original mount point is restored before returning the error.
-TakeoverResult PrepareDriveLetterTakeover(TakeoverOps& ops,
-                                          const DiscoveredFilesystem& filesystem,
-                                          std::string_view drive,
-                                          std::string_view release_drive);
+//
+// `release_volume_device_path` has the same meaning as in
+// TakeoverOps::VerifyAndCapture: pass the volume GUID the caller verified live
+// for `release_drive` when the discovery snapshot for this pass did not
+// correlate it.  It relaxes only the snapshot-based pre-checks; every live
+// identity check still runs before the mount point is removed.
+TakeoverResult PrepareDriveLetterTakeover(
+    TakeoverOps& ops, const DiscoveredFilesystem& filesystem,
+    std::string_view drive, std::string_view release_drive,
+    std::string_view release_volume_device_path = {});
 
 // Records the transition before the WinFsp mount is attempted.  Kept separate
 // so a crash between removal and mount leaves an accurate record.

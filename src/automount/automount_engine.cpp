@@ -307,6 +307,18 @@ void AutomountEngine::PruneRetries() {
       ++it;
     }
   }
+  // The restored-letter hint is session-scoped memory for an entry that is
+  // still enabled.  A removed or disabled entry must forget it, exactly like
+  // its retry state.
+  for (auto it = restored_drives_.begin(); it != restored_drives_.end();) {
+    Uuid uuid{};
+    if (!ParseUuid(it->first, &uuid) || !config_.Find(uuid) ||
+        !config_.Find(uuid)->enabled) {
+      it = restored_drives_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
@@ -782,6 +794,9 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
       mounts_.push_back(session);
       retries_.erase(key);
       exhausted_.erase(key);
+      // The session owns the letter now; the restore path records a fresh
+      // hint when it ends.
+      restored_drives_.erase(key);
       logged_refusals_.erase(key);
 
       es.state = AutomountEntryState::kMounted;
@@ -886,10 +901,39 @@ bool AutomountEngine::ChooseDrive(const DiscoveredFilesystem& filesystem,
     if (error) *error = "drive letters could not be enumerated";
     return false;
   }
-  const std::string existing_same_volume =
+  std::string existing_same_volume =
       TakeoverEligible(filesystem)
           ? SingleDriveLetterMountPoint(filesystem.mount_points)
           : std::string();
+  // A pass that runs right after a failed mount restored the volume's Windows
+  // mount point can see the Mount Manager's path list before it lists that
+  // letter again.  The restored hint re-establishes the same-volume letter,
+  // but only after checking live that the letter still resolves to the exact
+  // volume GUID that was verified for it.  The takeover repeats every identity
+  // check against live state before removing anything.
+  std::string existing_live_volume;
+  std::string restored_drive;
+  const auto restored_it = restored_drives_.find(UuidKey(entry.fs_uuid));
+  if (restored_it != restored_drives_.end()) {
+    const RestoredDriveHint hint = restored_it->second;
+    const bool letter_in_use =
+        hint.drive.size() == 2 && usage.IsUsed(hint.drive[0]);
+    if (!letter_in_use ||
+        !platform_.DriveLetterResolvesToVolume(hint.drive,
+                                               hint.volume_device_path)) {
+      // The letter was released, or it now belongs to a different volume.
+      // The hint is stale and must not influence the allocation.
+      restored_drives_.erase(restored_it);
+    } else if (existing_same_volume.empty()) {
+      existing_same_volume = hint.drive;
+      existing_live_volume = hint.volume_device_path;
+      restored_drive = hint.drive;
+    } else if (existing_same_volume != hint.drive) {
+      // The volume now has two letters.  Never guess which one to detach: drop
+      // the hint and let the live verification refuse the multiple letters.
+      restored_drives_.erase(restored_it);
+    }
+  }
   std::string remembered;
   const auto remembered_it = remembered_drives_.find(UuidKey(entry.fs_uuid));
   if (remembered_it != remembered_drives_.end()) {
@@ -906,6 +950,13 @@ bool AutomountEngine::ChooseDrive(const DiscoveredFilesystem& filesystem,
     return false;
   }
   if (choice) *choice = std::move(selected.value());
+  if (choice && !restored_drive.empty() &&
+      choice->release_drive == restored_drive) {
+    // The chosen release letter comes from the hint, not from this pass's
+    // discovery snapshot; tell the platform which volume it was verified
+    // against so it can repeat the identity check live.
+    choice->release_volume_device_path = existing_live_volume;
+  }
   if (choice && choice->drive.size() == 2) {
     usage.used[static_cast<size_t>(choice->drive[0] - 'A')] = true;
   }
@@ -1122,6 +1173,15 @@ void AutomountEngine::RestoreTakeover(DriveLetterTakeover* takeover,
       // this filesystem and reuse it when the device is inserted again.
       remembered_drives_[uuid] = takeover->drive;
     }
+    if (takeover->volume_present && !takeover->original_drive.empty() &&
+        !takeover->volume_device_path.empty()) {
+      // The volume has its Windows letter back.  A discovery pass triggered by
+      // this restore can run before the Mount Manager refreshes the volume's
+      // path list; remember the verified letter so that pass still takes it
+      // over instead of allocating an unrelated free letter.
+      restored_drives_[uuid] = RestoredDriveHint{takeover->original_drive,
+                                                 takeover->volume_device_path};
+    }
     std::string detail;
     if (takeover->volume_present) {
       detail = "restored the original Windows mount point " +
@@ -1171,6 +1231,12 @@ void AutomountEngine::RetryPendingRestores(AutomountTimePoint now) {
         // letter exactly as the immediate restore path does; otherwise the
         // reinserted device would land on an unrelated free letter.
         remembered_drives_[it->uuid] = it->takeover.drive;
+      }
+      if (it->takeover.volume_present && !it->takeover.original_drive.empty() &&
+          !it->takeover.volume_device_path.empty()) {
+        restored_drives_[it->uuid] =
+            RestoredDriveHint{it->takeover.original_drive,
+                              it->takeover.volume_device_path};
       }
       Log(AutomountLogLevel::kInfo, "drive-letter-restore", it->uuid,
           it->takeover.original_drive, "",
