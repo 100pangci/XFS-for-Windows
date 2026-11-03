@@ -3546,6 +3546,7 @@ int CommandStatus(const Options& options) {
 
   std::cout << "Mounted XFS filesystems:\n";
   bool any_mounted = false;
+  std::vector<std::string> printed_uuids;
   if (!discovered.ok()) {
     std::cout << "  unavailable: " << DiscoveryErrorText(discovered.error())
               << "\n";
@@ -3559,6 +3560,7 @@ int CommandStatus(const Options& options) {
       const Uuid& uuid = filesystem.probe.superblock.uuid;
       const AutomountEntry* entry = config ? config->Find(uuid) : nullptr;
       const AutomountRuntimeMount* runtime_mount = runtime_mount_for(uuid);
+      printed_uuids.push_back(FormatUuid(uuid));
       std::cout << "  " << filesystem.xfswin_drive << "  "
                 << (filesystem.probe.label.empty() ? "(no label)"
                                                    : filesystem.probe.label)
@@ -3613,9 +3615,64 @@ int CommandStatus(const Options& options) {
         }
       }
     }
-    if (!any_mounted) std::cout << "  none\n";
     PrintDiscoveryWarnings(discovered.value(), options);
   }
+  // A read-write session holds its raw disk exclusively, so discovery cannot
+  // read that filesystem even though the mount is live.  The service's session
+  // snapshot is then the only source for the drive, UUID, mode and takeover
+  // state; print those mounts so `status` still describes them.  UUIDs that
+  // discovery already printed are skipped.
+  for (const auto& mount : runtime_status.mounts) {
+    if (mount.drive.empty()) continue;
+    const std::string uuid_text = FormatUuid(mount.fs_uuid);
+    if (std::find(printed_uuids.begin(), printed_uuids.end(), uuid_text) !=
+        printed_uuids.end()) {
+      continue;
+    }
+    any_mounted = true;
+    const AutomountEntry* entry =
+        config ? config->Find(mount.fs_uuid) : nullptr;
+    std::cout << "  " << mount.drive << "  "
+              << (mount.label.empty() ? "(no label)" : mount.label) << "  "
+              << uuid_text << "  " << mount.mode << "\n";
+    std::cout << "    Device      : ";
+    if (entry && (!entry->expected_serial.empty() ||
+                  !entry->expected_stable_id.empty() ||
+                  entry->expected_device_class != DeviceClass::kUnknown ||
+                  entry->expected_size_bytes != 0)) {
+      std::cout << "identity pinned at enrollment: serial="
+                << (entry->expected_serial.empty() ? "(none)"
+                                                   : entry->expected_serial)
+                << " stable id="
+                << (entry->expected_stable_id.empty()
+                        ? "(none)"
+                        : entry->expected_stable_id)
+                << " class=" << ToString(entry->expected_device_class)
+                << " size=" << entry->expected_size_bytes;
+    } else {
+      std::cout << "(the read-write mount holds the raw disk exclusively; "
+                   "live device identity is not readable)";
+    }
+    std::cout << "\n";
+    std::cout << "    Mode        : " << mount.mode;
+    if (mount.configured_mode != mount.mode) {
+      std::cout << " (configured " << mount.configured_mode << ")";
+    }
+    std::cout << "\n";
+    if (!mount.detail.empty()) {
+      std::cout << "    Note        : " << mount.detail << "\n";
+    }
+    std::cout << "    Drive letter: "
+              << (mount.drive_taken_over
+                      ? "taken over from the Windows volume " +
+                            mount.original_windows_drive
+                      : std::string("allocated (no Windows drive letter "
+                                    "was taken over)"))
+              << "\n";
+    std::cout << "    Automount   : "
+              << (entry && entry->enabled ? "enabled" : "disabled") << "\n";
+  }
+  if (!any_mounted) std::cout << "  none\n";
   return 0;
 }
 

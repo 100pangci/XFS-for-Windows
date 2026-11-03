@@ -336,6 +336,12 @@ is not marked globally incomplete for this reason, so unrelated entries are not
 pushed into a false "not ready" retry. A disk whose number has no device
 behind it is still treated as removed.
 
+`xfswin status` still lists such a live mount - drive letter, filesystem UUID,
+mode and takeover state - from the service's session snapshot, because its raw
+disk cannot be probed. The device identity shown in that case is the identity
+pinned at enrollment; the live device fields are only readable when the disk is
+not held exclusively.
+
 Each mounted filesystem has its own session. Removing one device stops only
 that session, releases its drive letter and destroys the session; a failure
 on one filesystem does not unmount another. A reinserted device goes through a
