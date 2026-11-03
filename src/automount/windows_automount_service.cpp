@@ -647,9 +647,15 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     policy.allow_fixed_disk = false;
     policy.qualification_override =
         read_write && entry.device_qualification;
-    policy.expected_serial = entry.expected_serial;
-    policy.expected_stable_id = entry.expected_stable_id;
-    policy.expected_size_bytes = entry.expected_size_bytes;
+    // The identity pins are the DEV-1 read-write authorization: they bind the
+    // enrolled device to the exclusive writable open.  A read-only mount is
+    // the safe fallback when those pins no longer match, so it must not be
+    // refused by them; it still goes through the read-only safety policy.
+    if (read_write) {
+      policy.expected_serial = entry.expected_serial;
+      policy.expected_stable_id = entry.expected_stable_id;
+      policy.expected_size_bytes = entry.expected_size_bytes;
+    }
     policy.cache_mode = read_write ? DeviceCacheMode::kNoBuffering
                                    : DeviceCacheMode::kBuffered;
 
