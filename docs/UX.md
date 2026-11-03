@@ -375,7 +375,7 @@ sessions it owns; manually mounted drives (`xfswin mount`) are left alone.
 |---|---|
 | `device discovery requires administrator privileges` | Run from an elevated PowerShell. Discovery opens raw disks read-only. |
 | `This build was compiled without WinFsp support` | Reconfigure with `-DXFSWIN_BUILD_WINFSP=ON` and the WinFsp SDK, and make `winfsp-x64.dll` available. |
-| `The configured drive letter G: is already in use` | Informational: the mount used the first free letter from `D:` through `Z:` instead. |
+| `The configured drive letter G: is already in use` | Informational: the mount used another letter instead - the volume's own RAW letter, the letter this filesystem used before reinsertion, or the first free one from `D:` through `Z:`. |
 | `the XFS journal is not clean` | Repair/recover the filesystem, or pass `--force-unsafe-ro` for a manual read-only mount. Automount never overrides this. |
 | Service status is `stopped` | No automatic mounts happen. Start it with `xfswin automount start`. |
 | Device inserted but nothing mounted | Check `xfswin status`; if the UUID is not configured, enroll it. If it is configured, read the event log entry for the mount attempt and its result. |
