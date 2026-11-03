@@ -386,6 +386,23 @@ TEST(ux_drive_letter_reinsertion_remembers_the_letter) {
   choice = xfs::ChooseDriveLetter("", usage, "", "C:");
   CHECK(choice.ok());
   CHECK_STR_EQ(choice.value().drive, "E:");
+
+  // Reusing the remembered letter because the configured preference is
+  // occupied is still a fallback: status must say the preference was not
+  // honored, not silently treat the remembered letter as the choice.
+  DriveLetterUsage occupied;
+  occupied.used['G' - 'A'] = true;
+  choice = xfs::ChooseDriveLetter("G:", occupied, "", "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK(choice.value().preferred_unavailable);
+
+  // With no configured preference, the remembered letter is the primary
+  // choice and is not reported as a fallback.
+  choice = xfs::ChooseDriveLetter("", occupied, "", "F:");
+  CHECK(choice.ok());
+  CHECK_STR_EQ(choice.value().drive, "F:");
+  CHECK(!choice.value().preferred_unavailable);
 }
 
 TEST(ux_drive_letter_single_mount_point) {

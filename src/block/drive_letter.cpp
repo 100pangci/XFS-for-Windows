@@ -183,6 +183,15 @@ Result<DriveLetterChoice> ChooseDriveLetter(
   if (!remembered.empty()) {
     DriveLetterChoice choice;
     choice.drive = remembered;
+    // The remembered letter is a fallback below an explicit preference.  If
+    // the preference is occupied, say so: the caller reports "mounted as X
+    // instead" instead of pretending the configured letter was honored.
+    choice.preferred_unavailable = !requested.empty();
+    if (!requested.empty()) {
+      choice.note = "drive " + requested +
+                    " is already in use; reusing the previous drive letter " +
+                    remembered + " instead";
+    }
     return choice;
   }
 

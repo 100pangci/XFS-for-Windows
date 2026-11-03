@@ -1165,11 +1165,24 @@ void AutomountEngine::RetryPendingRestores(AutomountTimePoint now) {
     }
     Status restored = platform_.RestoreDriveLetterTakeover(&it->takeover);
     if (restored.ok()) {
+      if (!it->takeover.volume_present && !it->takeover.drive.empty()) {
+        // The device disappeared before the deferred restore succeeded, so
+        // the deleted Windows mount point cannot be re-created.  Remember the
+        // letter exactly as the immediate restore path does; otherwise the
+        // reinserted device would land on an unrelated free letter.
+        remembered_drives_[it->uuid] = it->takeover.drive;
+      }
       Log(AutomountLogLevel::kInfo, "drive-letter-restore", it->uuid,
-          it->takeover.original_drive, "", "restored",
-          "the original Windows mount point " + it->takeover.mount_point +
-              " was restored after " + std::to_string(it->attempts) +
-              " attempt(s)");
+          it->takeover.original_drive, "",
+          it->takeover.volume_present ? "restored" : "skipped-removed",
+          it->takeover.volume_present
+              ? "the original Windows mount point " +
+                    it->takeover.mount_point + " was restored after " +
+                    std::to_string(it->attempts) + " attempt(s)"
+              : "the volume was removed; the original Windows mount point " +
+                    it->takeover.mount_point +
+                    " was not re-created after " +
+                    std::to_string(it->attempts) + " attempt(s)");
       it = pending_restores_.erase(it);
       continue;
     }
