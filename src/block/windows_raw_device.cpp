@@ -1602,7 +1602,8 @@ std::string WindowsRawBlockDevice::Describe() const {
 // ---------------------------------------------------------------------------
 // Enumeration
 // ---------------------------------------------------------------------------
-std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
+std::vector<RawDiskInfo> EnumeratePhysicalDrives(
+    std::string* error, std::vector<uint32_t>* locked_disk_numbers) {
   std::vector<RawDiskInfo> disks;
   const uint32_t system_disk = SystemDiskNumber();
   const std::set<uint32_t> pagefile_disks = PagefileDiskNumbers();
@@ -1614,15 +1615,15 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
+      const DWORD open_error = GetLastError();
       if (number == 0) {
         if (error) {
-          DWORD ec = GetLastError();
-          if (ec == ERROR_ACCESS_DENIED) {
+          if (open_error == ERROR_ACCESS_DENIED) {
             *error =
                 "access to physical drives requires Administrator "
                 "privileges; run xfswin from an elevated prompt";
           } else {
-            *error = "cannot open PhysicalDrive0" + FormatWinError(ec);
+            *error = "cannot open PhysicalDrive0" + FormatWinError(open_error);
           }
         }
         return disks;
@@ -1632,6 +1633,16 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
       // cannot be opened would hide every disk after the hole, so a healthy
       // mount on one of them would look removed.  Keep scanning; disk 0 is the
       // only number whose absence means the whole enumeration is unusable.
+      //
+      // A sharing violation is different from a hole: the device exists but
+      // an exclusive handle (this service's own read-write session, or another
+      // program) owns it.  Report the number so discovery can keep the live
+      // session it belongs to instead of treating the unreadable filesystem
+      // as a removed device.  A missing device fails with FILE_NOT_FOUND, so
+      // ordinary holes stay unreported.
+      if (locked_disk_numbers && open_error == ERROR_SHARING_VIOLATION) {
+        locked_disk_numbers->push_back(number);
+      }
       continue;
     }
 
@@ -1763,7 +1774,8 @@ std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
 
 namespace xfs {
 
-std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error) {
+std::vector<RawDiskInfo> EnumeratePhysicalDrives(
+    std::string* error, std::vector<uint32_t>*) {
   if (error) *error = "raw devices are only supported on Windows";
   return {};
 }

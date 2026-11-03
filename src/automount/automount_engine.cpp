@@ -471,7 +471,11 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
           // cannot open that disk and reports an incomplete pass instead of
           // its filesystem.  That is not evidence that the device was
           // removed: dropping the session here would unmount and remount it
-          // in a loop (and the remount can race the closing handle).
+          // in a loop (and the remount can race the closing handle).  A
+          // different device that reused the old disk number while also held
+          // exclusively cannot be told apart without opening the disk; keeping
+          // the session until the disk becomes readable is the safer failure
+          // mode (a stale session with failed I/O, not a dropped live mount).
           const auto& unreadable_disks = discovered.value().incomplete_disks;
           if (std::find(unreadable_disks.begin(), unreadable_disks.end(),
                         session.location.disk_number) !=

@@ -328,10 +328,13 @@ with backoff). Filesystem errors, unsupported features, dirty journals and
 policy refusals are never retried.
 
 A read-write session holds its raw disk exclusively, so a discovery pass in
-the same service cannot open that disk. Such a pass reports the disk as
-incomplete instead of its filesystem; that is not treated as a removal, and
-the live session stays mounted. A disk that disappears from enumeration
-entirely is still treated as removed.
+the same service cannot open that disk. Physical-drive enumeration reports a
+disk that still exists but is held exclusively (a sharing violation on open),
+and the pass records that disk number as unreadable instead of its filesystem;
+that is not treated as a removal, and the live session stays mounted. The pass
+is not marked globally incomplete for this reason, so unrelated entries are not
+pushed into a false "not ready" retry. A disk whose number has no device
+behind it is still treated as removed.
 
 Each mounted filesystem has its own session. Removing one device stops only
 that session, releases its drive letter and destroys the session; a failure

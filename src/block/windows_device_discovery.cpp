@@ -227,15 +227,26 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
     }
   };
   std::string enumerate_error;
+  std::vector<uint32_t> locked_disks;
   XFS_DEBUG("discovery: enumerating physical drives");
-  auto disks = EnumeratePhysicalDrives(&enumerate_error);
-  XFS_DEBUG("discovery: physical drives=" << disks.size());
+  auto disks = EnumeratePhysicalDrives(&enumerate_error, &locked_disks);
+  XFS_DEBUG("discovery: physical drives=" << disks.size()
+                                          << " locked=" << locked_disks.size());
   if (disks.empty() && !enumerate_error.empty()) {
     if (error) *error = enumerate_error;
     return XFS_ERR(XfsError::kPermissionDenied, enumerate_error)
         .Metadata("device discovery");
   }
   if (!enumerate_error.empty()) report.warnings.push_back(enumerate_error);
+  // An exclusive handle hides the whole disk from enumeration, not only its
+  // volumes.  Record it before the per-disk loop so a read-write session that
+  // owns the disk is not mistaken for a removed device.  This is deliberately
+  // not `report.incomplete`: an exclusive handle is the normal state of this
+  // service's own read-write mount, and marking the whole pass "not ready"
+  // would make unrelated, absent entries look like they are still retrying.
+  for (uint32_t number : locked_disks) {
+    mark_incomplete_disk(number);
+  }
 
   std::string volume_error;
   XFS_DEBUG("discovery: enumerating volumes");
