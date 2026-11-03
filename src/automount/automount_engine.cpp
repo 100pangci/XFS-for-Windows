@@ -467,6 +467,24 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
           }
         }
         if (!still_present) {
+          // A read-write session holds its raw disk exclusively, so discovery
+          // cannot open that disk and reports an incomplete pass instead of
+          // its filesystem.  That is not evidence that the device was
+          // removed: dropping the session here would unmount and remount it
+          // in a loop (and the remount can race the closing handle).
+          const auto& unreadable_disks = discovered.value().incomplete_disks;
+          if (std::find(unreadable_disks.begin(), unreadable_disks.end(),
+                        session.location.disk_number) !=
+              unreadable_disks.end()) {
+            still_present = true;
+            AddWarning(&status_.warnings,
+                       "disk " +
+                           std::to_string(session.location.disk_number) +
+                           " could not be read while a mount is active; "
+                           "keeping the live session");
+          }
+        }
+        if (!still_present) {
           drop = true;
           reason = "the device was removed or re-enumerated";
         }

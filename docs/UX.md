@@ -327,6 +327,12 @@ A mount attempt only retries when the device is not ready (bounded attempts
 with backoff). Filesystem errors, unsupported features, dirty journals and
 policy refusals are never retried.
 
+A read-write session holds its raw disk exclusively, so a discovery pass in
+the same service cannot open that disk. Such a pass reports the disk as
+incomplete instead of its filesystem; that is not treated as a removal, and
+the live session stays mounted. A disk that disappears from enumeration
+entirely is still treated as removed.
+
 Each mounted filesystem has its own session. Removing one device stops only
 that session, releases its drive letter and destroys the session; a failure
 on one filesystem does not unmount another. A reinserted device goes through a

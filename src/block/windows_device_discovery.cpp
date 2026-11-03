@@ -219,6 +219,13 @@ std::string DiskLabel(const RawDiskInfo& disk) {
 Result<DiscoveryReport> EnumerateXfsFilesystems(
     const DiscoveryOptions& options, std::string* error) {
   DiscoveryReport report;
+  auto mark_incomplete_disk = [&report](uint32_t disk_number) {
+    if (std::find(report.incomplete_disks.begin(),
+                  report.incomplete_disks.end(),
+                  disk_number) == report.incomplete_disks.end()) {
+      report.incomplete_disks.push_back(disk_number);
+    }
+  };
   std::string enumerate_error;
   XFS_DEBUG("discovery: enumerating physical drives");
   auto disks = EnumeratePhysicalDrives(&enumerate_error);
@@ -252,6 +259,7 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
     if (!device) {
       report.incomplete = true;
       ++report.retryable_failures;
+      mark_incomplete_disk(disk.disk_number);
       report.warnings.push_back(
           "cannot read disk " + std::to_string(disk.disk_number) + " (" +
           DiskLabel(disk) + "): " + open_error);
@@ -293,6 +301,7 @@ Result<DiscoveryReport> EnumerateXfsFilesystems(
       if (probe.state == XfsProbeState::kUnreadable) {
         report.incomplete = true;
         ++report.retryable_failures;
+        mark_incomplete_disk(disk.disk_number);
       }
       if (probe.state == XfsProbeState::kNoXfs) continue;
 

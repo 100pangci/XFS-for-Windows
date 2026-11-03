@@ -143,6 +143,12 @@ struct DiscoveryReport {
   // not be opened; an automount retry may succeed later.
   bool incomplete = false;
   uint64_t retryable_failures = 0;
+  // Physical disk numbers that were enumerated but could not be read in this
+  // pass (the handle could not be opened or a candidate probe was unreadable).
+  // A live read-write automount session holds its raw disk exclusively, which
+  // prevents discovery from opening the same disk; such a session must not be
+  // mistaken for a removed device.
+  std::vector<uint32_t> incomplete_disks;
 };
 
 // Read-only probe of one candidate region.  `available_bytes` is the

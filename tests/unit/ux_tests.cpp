@@ -693,6 +693,7 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
   bool discovery_fails = false;
   bool discovery_incomplete = false;
   uint64_t retryable_failures = 0;
+  std::vector<uint32_t> incomplete_disks;
   bool letters_fail = false;
   std::string letters_error = "drive-letter enumeration failed";
   int discover_calls = 0;
@@ -722,8 +723,9 @@ class FakeAutomountPlatform final : public xfs::AutomountPlatform {
     for (const auto& device : devices) {
       if (device.present) report.filesystems.push_back(device.filesystem);
     }
-    report.incomplete = discovery_incomplete;
+    report.incomplete = discovery_incomplete || !incomplete_disks.empty();
     report.retryable_failures = retryable_failures;
+    report.incomplete_disks = incomplete_disks;
     return report;
   }
 
@@ -1930,6 +1932,45 @@ TEST(ux_automount_reinsertion_reuses_the_remembered_letter) {
   CHECK_STR_EQ(platform.takeover_choices.back().drive, "F:");
   CHECK(platform.takeover_choices.back().release_drive.empty());
   CHECK(!engine.status().mounts.front().drive_taken_over);
+}
+
+TEST(ux_automount_unreadable_disk_does_not_drop_a_live_session) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x47);
+  platform.devices.push_back({TestFilesystem(uuid, "LIVE", 2, "SN-LIVE"), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  const uint32_t disk =
+      platform.devices.front().filesystem.location.disk_number;
+
+  // A read-write session holds the raw disk exclusively: discovery cannot open
+  // it, so the UUID is missing from the report while the disk is reported as
+  // incomplete.  That must not be treated as a removal.
+  platform.devices.front().present = false;
+  platform.incomplete_disks.push_back(disk);
+  engine.NotifyDeviceChanged(At(1000));
+  engine.Tick(At(1000));
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(engine.status().mounts.size(), 1u);
+  bool warned = false;
+  for (const auto& warning : engine.status().warnings) {
+    if (warning.find("could not be read while a mount is active") !=
+        std::string::npos) {
+      warned = true;
+    }
+  }
+  CHECK(warned);
+
+  // The disk is genuinely gone (not merely unreadable): the session stops.
+  platform.incomplete_disks.clear();
+  engine.NotifyDeviceChanged(At(2000));
+  engine.Tick(At(2000));
+  CHECK(platform.sessions.empty());
+  CHECK(engine.status().mounts.empty());
 }
 
 TEST(ux_automount_service_stop_restores_the_windows_letter) {

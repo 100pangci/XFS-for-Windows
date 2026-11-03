@@ -811,7 +811,8 @@ artifact instead):
   failing until the test clears it, so rollback restores the RAW mount point
   and no later device event can mask it), service
   stop/restart, physical removal without restoring a dead volume, reinsertion
-  at the remembered letter with no late RAW mount point,
+  at the remembered letter with no late RAW mount point, an RW session that
+  survives discovery passes unable to open its exclusively-held disk,
   `automount enable --rw` enrollment, Win32 file operations, the
   identity-mismatch read-only fallback, and a final RW pass whose VHDX is
   handed to the Linux oracle.  CI-only; it replaces the machine-wide
