@@ -335,6 +335,59 @@ TEST(conc_info_cache_never_publishes_stale_snapshot) {
   CHECK_EQ(info.value().size, 0u);
 }
 
+// MarkDeferredTimes publishes a timestamp that is not yet in the on-disk
+// inode.  A GetFileInfo that started before that publication must not cache
+// its old mtime/ctime after the deferred timestamp is visible; otherwise the
+// stale entry survives until an unrelated metadata generation bump.
+TEST(conc_deferred_timestamp_survives_stale_info_cache_insert) {
+  FixtureImage::Instance().Reset();
+  auto mounted = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(mounted.ok());
+  auto& fs = *mounted.value();
+  const uint64_t ino = FixtureImage::Instance().info().file_ino;
+  auto before = fs.OpenInode(ino);
+  CHECK(before.ok());
+  const xfs::XfsTimestamp old_time = before.value().mtime;
+
+  ScenarioGuard scenario;
+  xfs::XfsFileInfo observed;
+  bool reader_ok = false;
+  uint64_t reader = C().Spawn("reader", [&] {
+    auto info = fs.GetFileInfo(ino);
+    reader_ok = info.ok();
+    if (info.ok()) observed = info.value();
+  });
+  uint64_t writer = C().Spawn("writer", [&] {
+    const uint8_t byte = 0x5a;
+    auto status = fs.WriteFileData(ino, 0, &byte, 1, /*append=*/false,
+                                   /*defer_timestamps=*/true);
+    CHECK(status.ok());
+  });
+
+  C().Start(reader);
+  // The reader has read the on-disk inode and is about to publish it, but has
+  // not taken the cache lock yet.
+  RunUntil(reader, "info.cache.insert.before");
+  C().Start(writer);
+  FinishOp(writer);
+  ResumeAndFinish(reader);
+  scenario.Finish();
+
+  CHECK(reader_ok);
+  auto after_open = fs.OpenInode(ino);
+  CHECK(after_open.ok());
+  CHECK(after_open.value().mtime.sec != old_time.sec ||
+        after_open.value().mtime.nsec != old_time.nsec);
+  auto info = fs.GetFileInfo(ino);
+  CHECK(info.ok());
+  if (info.ok()) {
+    CHECK_EQ(info.value().mtime.sec, after_open.value().mtime.sec);
+    CHECK_EQ(info.value().mtime.nsec, after_open.value().mtime.nsec);
+    CHECK_EQ(info.value().ctime.sec, after_open.value().ctime.sec);
+    CHECK_EQ(info.value().ctime.nsec, after_open.value().ctime.nsec);
+  }
+}
+
 TEST(conc_directory_cache_never_publishes_stale_listing) {
   FixtureImage::Instance().Reset();
   auto mounted = FixtureImage::Instance().Mount(/*read_write=*/true);

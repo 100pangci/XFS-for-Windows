@@ -659,6 +659,18 @@ Result<XfsFileInfo> XfsFilesystem::GetFileInfoLocked(uint64_t ino) const {
   XFS_CONC_SYNC("info.cache.insert.before", "ino=" + std::to_string(ino));
   {
     std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+    // A deferred timestamp may have been published after OpenInode read the
+    // on-disk inode but before this insertion.  Overlay it here (under the
+    // same cache -> deferred order used by MarkDeferredTimes) so this cache
+    // entry cannot outlive that update with old mtime/ctime.
+    {
+      std::lock_guard<xfs::conc::Mutex> deferred_lock(deferred_mutex_);
+      auto deferred = deferred_times_.find(ino);
+      if (deferred != deferred_times_.end()) {
+        info.mtime = deferred->second;
+        info.ctime = deferred->second;
+      }
+    }
     if (metadata_generation_[ino] == info_generation) {
       constexpr size_t kMaxCachedInfos = 32768;
       if (info_cache_.size() >= kMaxCachedInfos) info_cache_.clear();
