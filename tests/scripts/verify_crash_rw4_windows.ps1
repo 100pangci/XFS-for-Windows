@@ -56,43 +56,43 @@ function New-Base([string]$name, [scriptblock]$setup) {
 # Base images: the state each scenario starts from.
 $baseRenamesame = New-Base 'base-renamesame' {
     param($img)
-    Invoke-Ok 'create /a.bin' @('create', $img, '/a.bin', '--rw-experimental')
+    Invoke-Ok 'create /a.bin' @('create', $img, '/a.bin', '--rw')
     Invoke-Ok 'write /a.bin' @('pwrite', $img, '/a.bin', '0',
-        '--rw-experimental', "--from=$payload8k")
+        '--rw', "--from=$payload8k")
 }
 $baseRenamecross = New-Base 'base-renamecross' {
     param($img)
-    Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw-experimental')
-    Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw-experimental')
-    Invoke-Ok 'create /A/f' @('create', $img, '/A/f', '--rw-experimental')
-    Invoke-Ok 'write /A/f' @('pwrite', $img, '/A/f', '0', '--rw-experimental',
+    Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw')
+    Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw')
+    Invoke-Ok 'create /A/f' @('create', $img, '/A/f', '--rw')
+    Invoke-Ok 'write /A/f' @('pwrite', $img, '/A/f', '0', '--rw',
         "--from=$payload4k")
 }
 $baseRenamereplace = New-Base 'base-renamereplace' {
     param($img)
-    Invoke-Ok 'create /src' @('create', $img, '/src', '--rw-experimental')
-    Invoke-Ok 'write /src' @('pwrite', $img, '/src', '0', '--rw-experimental',
+    Invoke-Ok 'create /src' @('create', $img, '/src', '--rw')
+    Invoke-Ok 'write /src' @('pwrite', $img, '/src', '0', '--rw',
         "--from=$payload4k")
-    Invoke-Ok 'create /dst' @('create', $img, '/dst', '--rw-experimental')
-    Invoke-Ok 'write /dst' @('pwrite', $img, '/dst', '0', '--rw-experimental',
+    Invoke-Ok 'create /dst' @('create', $img, '/dst', '--rw')
+    Invoke-Ok 'write /dst' @('pwrite', $img, '/dst', '0', '--rw',
         "--from=$payload8k")
 }
 $baseDirmove = New-Base 'base-dirmove' {
     param($img)
-    Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw-experimental')
-    Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw-experimental')
-    Invoke-Ok 'mkdir /A/child' @('mkdir', $img, '/A/child', '--rw-experimental')
+    Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw')
+    Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw')
+    Invoke-Ok 'mkdir /A/child' @('mkdir', $img, '/A/child', '--rw')
 }
 $baseDirreplace = New-Base 'base-dirreplace' {
     param($img)
-    Invoke-Ok 'mkdir /s' @('mkdir', $img, '/s', '--rw-experimental')
-    Invoke-Ok 'mkdir /t' @('mkdir', $img, '/t', '--rw-experimental')
+    Invoke-Ok 'mkdir /s' @('mkdir', $img, '/s', '--rw')
+    Invoke-Ok 'mkdir /t' @('mkdir', $img, '/t', '--rw')
 }
 $baseLink = New-Base 'base-link' {
     param($img)
-    Invoke-Ok 'create /file' @('create', $img, '/file', '--rw-experimental')
+    Invoke-Ok 'create /file' @('create', $img, '/file', '--rw')
     Invoke-Ok 'write /file' @('pwrite', $img, '/file', '0',
-        '--rw-experimental', "--from=$payload4k")
+        '--rw', "--from=$payload4k")
 }
 $baseSymlink = Join-Path $WorkDir 'base-symlink.img'
 Copy-Item $fixture $baseSymlink -Force
@@ -118,47 +118,47 @@ $points = @(
 $scenarios = @(
     [pscustomobject]@{
         mode = 'renamesame'; base = $baseRenamesame; transactions = 1
-        args = @('rename', '@IMAGE@', '/a.bin', '/b.bin', '--rw-experimental')
+        args = @('rename', '@IMAGE@', '/a.bin', '/b.bin', '--rw')
         params = @{ size = 8192 }
     },
     [pscustomobject]@{
         mode = 'renamecross'; base = $baseRenamecross; transactions = 1
-        args = @('rename', '@IMAGE@', '/A/f', '/B/f', '--rw-experimental')
+        args = @('rename', '@IMAGE@', '/A/f', '/B/f', '--rw')
         params = @{ size = 4096 }
     },
     [pscustomobject]@{
         mode = 'renamereplace'; base = $baseRenamereplace; transactions = 3
-        args = @('rename', '@IMAGE@', '/src', '/dst', '--rw-experimental',
+        args = @('rename', '@IMAGE@', '/src', '/dst', '--rw',
             '--replace')
         params = @{ src_size = 4096; dst_size = 8192 }
     },
     [pscustomobject]@{
         mode = 'dirmove'; base = $baseDirmove; transactions = 1
         args = @('rename', '@IMAGE@', '/A/child', '/B/child',
-            '--rw-experimental')
+            '--rw')
         params = @{}
     },
     [pscustomobject]@{
         mode = 'dirreplace'; base = $baseDirreplace; transactions = 2
-        args = @('rename', '@IMAGE@', '/s', '/t', '--rw-experimental',
+        args = @('rename', '@IMAGE@', '/s', '/t', '--rw',
             '--replace')
         params = @{}
     },
     [pscustomobject]@{
         mode = 'link'; base = $baseLink; transactions = 1
-        args = @('link', '@IMAGE@', '/file', '/linked', '--rw-experimental')
+        args = @('link', '@IMAGE@', '/file', '/linked', '--rw')
         params = @{}
     },
     [pscustomobject]@{
         mode = 'symlink'; base = $baseSymlink; transactions = 1
         args = @('symlink', '@IMAGE@', '../hello.bin', '/sl',
-            '--rw-experimental')
+            '--rw')
         params = @{ target = '../hello.bin' }
     },
     [pscustomobject]@{
         mode = 'symlinkremote'; base = $baseSymlinkremote; transactions = 1
         args = @('symlink', '@IMAGE@', $remoteTarget, '/slr',
-            '--rw-experimental')
+            '--rw')
         params = @{ target = $remoteTarget }
     }
 )

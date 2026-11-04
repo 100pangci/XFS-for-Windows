@@ -29,7 +29,7 @@ def main():
     def cli(command, *operands, write=False):
         argv = [args.exe, command, str(image), *map(str, operands)]
         if write:
-            argv += ["--rw-experimental", "--verbose"]
+            argv += ["--rw", "--verbose"]
         proc = subprocess.run(argv, capture_output=True, text=True)
         assert proc.returncode == 0, " ".join(argv) + "\n" + proc.stdout + proc.stderr
         for line in (proc.stdout + proc.stderr).splitlines():

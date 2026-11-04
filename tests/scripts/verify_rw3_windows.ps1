@@ -82,20 +82,20 @@ $specs = @{}
 $img = Join-Path $WorkDir 'create.img'
 Copy-Item $fixture $img -Force
 Invoke-Ok 'create /r3.bin' @('create', $img, '/r3.bin',
-    '--rw-experimental', '--mode=0640')
+    '--rw', '--mode=0640')
 Invoke-Ok 'write /r3.bin' @('pwrite', $img, '/r3.bin', '0',
-    '--rw-experimental', "--from=$payload8k")
-Invoke-Ok 'mkdir /r3dir' @('mkdir', $img, '/r3dir', '--rw-experimental')
+    '--rw', "--from=$payload8k")
+Invoke-Ok 'mkdir /r3dir' @('mkdir', $img, '/r3dir', '--rw')
 Invoke-Ok 'create /r3dir/child.bin' @('create', $img, '/r3dir/child.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /r3dir/child.bin' @('pwrite', $img, '/r3dir/child.bin', '0',
-    '--rw-experimental', "--from=$payload4k")
+    '--rw', "--from=$payload4k")
 Invoke-Ok 'create /r3dir/empty.bin' @('create', $img, '/r3dir/empty.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Fail 'duplicate create' @('create', $img, '/r3.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Fail 'rmdir of a non-empty directory' @('rmdir', $img, '/r3dir',
-    '--rw-experimental')
+    '--rw')
 $dir_ino = Get-Inode $img '/r3dir'
 $root_ino = Get-Inode $img '/'
 Test-Consistent $img
@@ -128,25 +128,25 @@ $images['create.img'] = [ordered]@{
 $img = Join-Path $WorkDir 'rm.img'
 Copy-Item $fixture $img -Force
 Invoke-Ok 'create /doomed.bin' @('create', $img, '/doomed.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /doomed.bin' @('pwrite', $img, '/doomed.bin', '0',
-    '--rw-experimental', "--from=$payload8k")
+    '--rw', "--from=$payload8k")
 Invoke-Ok 'mkdir /doomeddir' @('mkdir', $img, '/doomeddir',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'create /doomeddir/x.bin' @('create', $img, '/doomeddir/x.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Fail 'rmdir of a non-empty directory' @('rmdir', $img, '/doomeddir',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'unlink /doomed.bin' @('unlink', $img, '/doomed.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'unlink /doomeddir/x.bin' @('unlink', $img, '/doomeddir/x.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'rmdir /doomeddir' @('rmdir', $img, '/doomeddir',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'create /kept.bin' @('create', $img, '/kept.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /kept.bin' @('pwrite', $img, '/kept.bin', '0',
-    '--rw-experimental', "--from=$payload16k")
+    '--rw', "--from=$payload16k")
 Test-Consistent $img
 $specs['rm.img.root'] = [ordered]@{
     dir_ino = (Get-Inode $img '/')
@@ -167,20 +167,20 @@ $images['rm.img'] = [ordered]@{
 # ---------------------------------------------------------------------------
 $img = Join-Path $WorkDir 'leafchurn.img'
 Copy-Item $fixture $img -Force
-Invoke-Ok 'mkdir /churn' @('mkdir', $img, '/churn', '--rw-experimental')
+Invoke-Ok 'mkdir /churn' @('mkdir', $img, '/churn', '--rw')
 $kept = @()
 $dropped = @()
 for ($i = 0; $i -lt 260; $i++) {
     $name = 'f{0:d4}.bin' -f $i
     Invoke-Ok "create /churn/$name" @('create', $img, "/churn/$name",
-        '--rw-experimental')
+        '--rw')
     if (($i % 2) -eq 1) { $kept += $name } else { $dropped += $name }
 }
 Invoke-Ok 'write /churn/f0001.bin' @('pwrite', $img, '/churn/f0001.bin', '0',
-    '--rw-experimental', "--from=$payload4k")
+    '--rw', "--from=$payload4k")
 foreach ($name in $dropped) {
     Invoke-Ok "unlink /churn/$name" @('unlink', $img, "/churn/$name",
-        '--rw-experimental')
+        '--rw')
 }
 Test-Consistent $img
 $churn_entries = @()
@@ -206,12 +206,12 @@ $images['leafchurn.img'] = [ordered]@{
 # ---------------------------------------------------------------------------
 $img = Join-Path $WorkDir 'nodedir.img'
 Copy-Item $fixture $img -Force
-Invoke-Ok 'mkdir /big' @('mkdir', $img, '/big', '--rw-experimental')
+Invoke-Ok 'mkdir /big' @('mkdir', $img, '/big', '--rw')
 $big_names = @()
 for ($i = 0; $i -lt 520; $i++) {
     $name = 'g{0:d4}.bin' -f $i
     Invoke-Ok "create /big/$name" @('create', $img, "/big/$name",
-        '--rw-experimental')
+        '--rw')
     $big_names += $name
 }
 Test-Consistent $img
@@ -235,20 +235,20 @@ $images['nodedir.img'] = [ordered]@{
 # ---------------------------------------------------------------------------
 $img = Join-Path $WorkDir 'blockdir.img'
 Copy-Item $fixture $img -Force
-Invoke-Ok 'mkdir /blocky' @('mkdir', $img, '/blocky', '--rw-experimental')
+Invoke-Ok 'mkdir /blocky' @('mkdir', $img, '/blocky', '--rw')
 $block_kept = @()
 $block_dropped = @()
 for ($i = 0; $i -lt 120; $i++) {
     $name = 'b{0:d3}.bin' -f $i
     Invoke-Ok "create /blocky/$name" @('create', $img, "/blocky/$name",
-        '--rw-experimental')
+        '--rw')
     if (($i % 4) -eq 0) { $block_dropped += $name } else { $block_kept += $name }
 }
 Invoke-Ok 'write /blocky/b001.bin' @('pwrite', $img, '/blocky/b001.bin',
-    '0', '--rw-experimental', "--from=$payload4k")
+    '0', '--rw', "--from=$payload4k")
 foreach ($name in $block_dropped) {
     Invoke-Ok "unlink /blocky/$name" @('unlink', $img, "/blocky/$name",
-        '--rw-experimental')
+        '--rw')
 }
 Test-Consistent $img
 $block_entries = @()

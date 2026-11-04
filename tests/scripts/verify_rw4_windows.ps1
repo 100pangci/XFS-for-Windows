@@ -88,49 +88,49 @@ $models = @{}
 # ---------------------------------------------------------------------------
 $img = Join-Path $WorkDir 'rename.img'
 Copy-Item $fixture $img -Force
-Invoke-Ok 'create /a.bin' @('create', $img, '/a.bin', '--rw-experimental')
-Invoke-Ok 'write /a.bin' @('pwrite', $img, '/a.bin', '0', '--rw-experimental',
+Invoke-Ok 'create /a.bin' @('create', $img, '/a.bin', '--rw')
+Invoke-Ok 'write /a.bin' @('pwrite', $img, '/a.bin', '0', '--rw',
     "--from=$payload8k")
 Invoke-Ok 'rename /a.bin -> /b.bin' @('rename', $img, '/a.bin', '/b.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'rename /b.bin -> /renamed.bin' @('rename', $img, '/b.bin',
-    '/renamed.bin', '--rw-experimental')
+    '/renamed.bin', '--rw')
 $renamed_ino = Get-Inode $img '/renamed.bin'
-Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw-experimental')
-Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw-experimental')
+Invoke-Ok 'mkdir /A' @('mkdir', $img, '/A', '--rw')
+Invoke-Ok 'mkdir /B' @('mkdir', $img, '/B', '--rw')
 Invoke-Ok 'create /A/file.bin' @('create', $img, '/A/file.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /A/file.bin' @('pwrite', $img, '/A/file.bin', '0',
-    '--rw-experimental', "--from=$payload4k")
+    '--rw', "--from=$payload4k")
 Invoke-Ok 'rename /A/file.bin -> /B/file.bin' @('rename', $img,
-    '/A/file.bin', '/B/file.bin', '--rw-experimental')
-Invoke-Ok 'mkdir /A/child' @('mkdir', $img, '/A/child', '--rw-experimental')
+    '/A/file.bin', '/B/file.bin', '--rw')
+Invoke-Ok 'mkdir /A/child' @('mkdir', $img, '/A/child', '--rw')
 Invoke-Ok 'create /A/child/inner.bin' @('create', $img, '/A/child/inner.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'rename /A/child -> /A/child2' @('rename', $img, '/A/child',
-    '/A/child2', '--rw-experimental')
+    '/A/child2', '--rw')
 $child2_ino = Get-Inode $img '/A/child2'
 Invoke-Ok 'rename /A -> /B/A' @('rename', $img, '/A', '/B/A',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'link /renamed.bin -> /hard.bin' @('link', $img, '/renamed.bin',
-    '/hard.bin', '--rw-experimental')
+    '/hard.bin', '--rw')
 Invoke-Ok 'symlink /link1' @('symlink', $img, '../renamed.bin', '/link1',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'rename /link1 -> /link2' @('rename', $img, '/link1', '/link2',
-    '--rw-experimental')
+    '--rw')
 # Refusals: none of these may change the namespace.
 Invoke-Fail 'rename of a missing source' @('rename', $img, '/nosuch.bin',
-    '/x.bin', '--rw-experimental')
+    '/x.bin', '--rw')
 Invoke-Fail 'rename onto an occupied name' @('rename', $img, '/renamed.bin',
-    '/hard.bin', '--rw-experimental')
+    '/hard.bin', '--rw')
 # Renaming between two names of the same inode is a POSIX/XFS no-op; both
 # names (and nlink) must survive.
 Invoke-Ok 'rename a hard link onto its sibling is a no-op' @('rename', $img,
-    '/renamed.bin', '/hard.bin', '--rw-experimental', '--replace')
+    '/renamed.bin', '/hard.bin', '--rw', '--replace')
 Invoke-Fail 'rename a directory into itself' @('rename', $img, '/B',
-    '/B/A/x', '--rw-experimental')
+    '/B/A/x', '--rw')
 Invoke-Fail 'rename onto a non-empty directory' @('rename', $img, '/B/A',
-    '/B', '--rw-experimental', '--replace')
+    '/B', '--rw', '--replace')
 Test-Consistent $img
 $hard_ino = Get-Inode $img '/hard.bin'
 if ($hard_ino -ne $renamed_ino) { throw "/hard.bin must share the inode" }
@@ -184,43 +184,43 @@ $images['rename.img'] = [ordered]@{
 $img = Join-Path $WorkDir 'replace.img'
 Copy-Item $fixture $img -Force
 Invoke-Ok 'create /victim.bin' @('create', $img, '/victim.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /victim.bin' @('pwrite', $img, '/victim.bin', '0',
-    '--rw-experimental', "--from=$payload16k")
+    '--rw', "--from=$payload16k")
 $victim_ino = Get-Inode $img '/victim.bin'
 Invoke-Ok 'create /winner.bin' @('create', $img, '/winner.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /winner.bin' @('pwrite', $img, '/winner.bin', '0',
-    '--rw-experimental', "--from=$payload8k")
+    '--rw', "--from=$payload8k")
 $winner_ino = Get-Inode $img '/winner.bin'
 Invoke-Ok 'rename /winner.bin -> /victim.bin (replace)' @('rename', $img,
-    '/winner.bin', '/victim.bin', '--rw-experimental', '--replace')
+    '/winner.bin', '/victim.bin', '--rw', '--replace')
 if ((Get-Inode $img '/victim.bin') -ne $winner_ino) {
     throw "/victim.bin must point at the winning inode"
 }
-Invoke-Ok 'mkdir /s' @('mkdir', $img, '/s', '--rw-experimental')
+Invoke-Ok 'mkdir /s' @('mkdir', $img, '/s', '--rw')
 $s_ino = Get-Inode $img '/s'
-Invoke-Ok 'mkdir /t' @('mkdir', $img, '/t', '--rw-experimental')
+Invoke-Ok 'mkdir /t' @('mkdir', $img, '/t', '--rw')
 Invoke-Ok 'rename /s -> /t (replace dir)' @('rename', $img, '/s', '/t',
-    '--rw-experimental', '--replace')
+    '--rw', '--replace')
 if ((Get-Inode $img '/t') -ne $s_ino) {
     throw "/t must point at the moved directory inode"
 }
-Invoke-Ok 'mkdir /hold' @('mkdir', $img, '/hold', '--rw-experimental')
-Invoke-Ok 'create /hold/f' @('create', $img, '/hold/f', '--rw-experimental')
+Invoke-Ok 'mkdir /hold' @('mkdir', $img, '/hold', '--rw')
+Invoke-Ok 'create /hold/f' @('create', $img, '/hold/f', '--rw')
 Invoke-Ok 'link /hold/f -> /hold/g' @('link', $img, '/hold/f', '/hold/g',
-    '--rw-experimental')
+    '--rw')
 $hold_ino = Get-Inode $img '/hold/f'
-Invoke-Ok 'create /src.bin' @('create', $img, '/src.bin', '--rw-experimental')
+Invoke-Ok 'create /src.bin' @('create', $img, '/src.bin', '--rw')
 $src_ino = Get-Inode $img '/src.bin'
 Invoke-Ok 'rename /src.bin -> /hold/f (replace linked)' @('rename', $img,
-    '/src.bin', '/hold/f', '--rw-experimental', '--replace')
-Invoke-Ok 'mkdir /full' @('mkdir', $img, '/full', '--rw-experimental')
-Invoke-Ok 'create /full/c' @('create', $img, '/full/c', '--rw-experimental')
+    '/src.bin', '/hold/f', '--rw', '--replace')
+Invoke-Ok 'mkdir /full' @('mkdir', $img, '/full', '--rw')
+Invoke-Ok 'create /full/c' @('create', $img, '/full/c', '--rw')
 Invoke-Fail 'replace a non-empty directory' @('rename', $img, '/t', '/full',
-    '--rw-experimental', '--replace')
+    '--rw', '--replace')
 Invoke-Fail 'replace a directory with a file' @('rename', $img, '/hold/g',
-    '/t', '--rw-experimental', '--replace')
+    '/t', '--rw', '--replace')
 Test-Consistent $img
 $models['replace'] = [ordered]@{
     entries = @(
@@ -262,25 +262,25 @@ $near_limit = 'a' * 300
 $remote = 'r' + ('b' * 399)
 $long_remote = 'dir/' + ('c' * 996)
 Invoke-Ok 'symlink /l1' @('symlink', $img, '../hello.bin', '/l1',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'symlink /l2' @('symlink', $img, '/nonexistent/target', '/l2',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'symlink /l3' @('symlink', $img, 'dangling/path', '/l3',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'symlink /l4' @('symlink', $img, '资料/../文件.txt', '/l4',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'symlink /l5' @('symlink', $img, $near_limit, '/l5',
-    '--rw-experimental')
-Invoke-Ok 'symlink /l6' @('symlink', $img, $remote, '/l6', '--rw-experimental')
+    '--rw')
+Invoke-Ok 'symlink /l6' @('symlink', $img, $remote, '/l6', '--rw')
 Invoke-Ok 'symlink /l7' @('symlink', $img, $long_remote, '/l7',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'rename /l1 -> /l1r' @('rename', $img, '/l1', '/l1r',
-    '--rw-experimental')
-Invoke-Ok 'unlink /l7' @('unlink', $img, '/l7', '--rw-experimental')
+    '--rw')
+Invoke-Ok 'unlink /l7' @('unlink', $img, '/l7', '--rw')
 Invoke-Fail 'symlink over an existing name' @('symlink', $img, 'x', '/l2',
-    '--rw-experimental')
+    '--rw')
 Invoke-Fail 'symlink with an empty target' @('symlink', $img, '', '/empty',
-    '--rw-experimental')
+    '--rw')
 Test-Consistent $img
 $models['symlink'] = [ordered]@{
     entries = @(
@@ -322,21 +322,21 @@ $images['symlink.img'] = [ordered]@{
 # ---------------------------------------------------------------------------
 $img = Join-Path $WorkDir 'nodedir.img'
 Copy-Item $fixture $img -Force
-Invoke-Ok 'mkdir /big' @('mkdir', $img, '/big', '--rw-experimental')
+Invoke-Ok 'mkdir /big' @('mkdir', $img, '/big', '--rw')
 $big_names = @()
 for ($i = 0; $i -lt 520; $i++) {
     $name = 'g{0:d4}.bin' -f $i
     Invoke-Ok "create /big/$name" @('create', $img, "/big/$name",
-        '--rw-experimental')
+        '--rw')
     $big_names += $name
 }
 $g0_ino = Get-Inode $img '/big/g0000.bin'
 Invoke-Ok 'rename-replace /big/g0001.bin -> g0002.bin' @('rename', $img,
-    '/big/g0001.bin', '/big/g0002.bin', '--rw-experimental', '--replace')
+    '/big/g0001.bin', '/big/g0002.bin', '--rw', '--replace')
 Invoke-Ok 'link /big/g0000.bin -> /big/glink.bin' @('link', $img,
-    '/big/g0000.bin', '/big/glink.bin', '--rw-experimental')
+    '/big/g0000.bin', '/big/glink.bin', '--rw')
 Invoke-Ok 'rename /big/g0005.bin -> /BIG-MOVED.bin' @('rename', $img,
-    '/big/g0005.bin', '/BIG-MOVED.bin', '--rw-experimental')
+    '/big/g0005.bin', '/BIG-MOVED.bin', '--rw')
 Test-Consistent $img
 $big_expected = @()
 foreach ($name in $big_names) {

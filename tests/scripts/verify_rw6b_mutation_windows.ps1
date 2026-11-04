@@ -10,7 +10,7 @@
 #   * the independent forward-derived ownership oracle
 #   * the user-visible namespace/content/size/nlink/symlink state
 #
-# This matrix now uses the ordinary --rw-experimental gate: rmapbt=1 with
+# This matrix now uses the ordinary --rw gate: rmapbt=1 with
 # reflink=0 is a supported writable profile.  The final image and expected.json
 # are verified by Linux (xfs_repair -n, mount, xfs_db, oracle).
 #
@@ -79,7 +79,7 @@ function Invoke-Q([string]$what, [string[]]$arguments) {
 }
 
 # Exercise the same explicit opt-in as every ordinary write command.
-$q = @('--rw-experimental')
+$q = @('--rw')
 
 Write-Host "copying Linux-created rmapbt image: $SourceImage"
 Copy-Item $SourceImage $image -Force

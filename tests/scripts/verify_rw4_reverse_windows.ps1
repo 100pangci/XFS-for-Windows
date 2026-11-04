@@ -95,15 +95,15 @@ if (($x -join "`n") -notmatch 'child2') {
 
 # 3. Windows mutates the Linux-created tree again.
 Invoke-Ok 'rename /linuxdir/A2 -> /linuxdir/A3' @('rename', $image,
-    '/linuxdir/A2', '/linuxdir/A3', '--rw-experimental')
+    '/linuxdir/A2', '/linuxdir/A3', '--rw')
 Invoke-Ok 'link /hard.bin -> /win-after-linux.bin' @('link', $image,
-    '/hard.bin', '/win-after-linux.bin', '--rw-experimental')
+    '/hard.bin', '/win-after-linux.bin', '--rw')
 Invoke-Ok 'symlink /win-symlink' @('symlink', $image, 'win/target',
-    '/win-symlink', '--rw-experimental')
+    '/win-symlink', '--rw')
 Invoke-Ok 'unlink /linux-symlink' @('unlink', $image, '/linux-symlink',
-    '--rw-experimental')
+    '--rw')
 Invoke-Fail 'rename /linuxdir into itself' @('rename', $image, '/linuxdir',
-    '/linuxdir/A3/x', '--rw-experimental')
+    '/linuxdir/A3/x', '--rw')
 
 & $Exe check $image | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "xfswin check failed after the mutations" }

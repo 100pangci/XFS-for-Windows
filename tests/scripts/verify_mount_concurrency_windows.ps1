@@ -81,7 +81,7 @@ Assert-DriveFree $Drive
 $outLog = Join-Path $tempDir 'xfswin-conc.out'
 $errLog = Join-Path $tempDir 'xfswin-conc.err'
 $proc = Start-Process -FilePath $script:exe `
-    -ArgumentList @('mount', $modified, $Drive, '--rw-experimental', '--verbose') `
+    -ArgumentList @('mount', $modified, $Drive, '--rw', '--verbose') `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
     -NoNewWindow -PassThru
 $mounted = $false

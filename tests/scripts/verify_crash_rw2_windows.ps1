@@ -67,9 +67,9 @@ function Run-CrashCase([string]$mode, [string]$point, [int]$hit) {
     Copy-Item $pristine $image -Force
     $env:XFSWIN_CRASH_AT = if ($hit -gt 1) { "$point`:$hit" } else { $point }
     if ($mode -eq 'extend') {
-        $out = & $Exe extend $image /hello.bin "$extend_size" --rw-experimental 2>&1
+        $out = & $Exe extend $image /hello.bin "$extend_size" --rw 2>&1
     } else {
-        $out = & $Exe truncate $image /hello.bin "$truncate_size" --rw-experimental 2>&1
+        $out = & $Exe truncate $image /hello.bin "$truncate_size" --rw 2>&1
     }
     $code = $LASTEXITCODE
     Remove-Item Env:XFSWIN_CRASH_AT

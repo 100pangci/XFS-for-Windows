@@ -34,17 +34,17 @@ Invoke-Ok 'mkimage' @('mkimage', $base, '400M')
 Invoke-Ok 'format' @('format', $base, '--yes-i-really-mean-it',
     '--modern-inode-profile')
 Invoke-Ok 'create /base.bin' @('create', $base, '/base.bin',
-    '--rw-experimental')
+    '--rw')
 $payload = 'A' * 8192
 Invoke-Ok 'write /base.bin' @('pwrite', $base, '/base.bin', '0',
-    '--rw-experimental', "--text=$payload")
+    '--rw', "--text=$payload")
 # The formatter's initial chunk has 61 free inodes; /base.bin uses one, so
 # these fillers consume the other 60. The crash cases below then have to
 # allocate a new inode chunk (ICREATE, finobt insertion and inobtcount
 # accounting) rather than always reusing the formatter chunk.
 for ($i = 0; $i -lt 60; $i++) {
     Invoke-Ok ("fill {0}" -f $i) @('create', $base,
-        ("/fill{0:D2}.bin" -f $i), '--rw-experimental')
+        ("/fill{0:D2}.bin" -f $i), '--rw')
 }
 Copy-Item $base $pristine -Force
 
@@ -77,12 +77,12 @@ function Run-CrashCase([string]$mode, [string]$point, [int]$hit) {
     Copy-Item $pristine $image -Force
     $env:XFSWIN_CRASH_AT = if ($hit -gt 1) { "$point`:$hit" } else { $point }
     switch ($mode) {
-        'create' { $out = & $Exe create $image /new.bin --rw-experimental 2>&1 }
-        'mkdir' { $out = & $Exe mkdir $image /newdir --rw-experimental 2>&1 }
-        'unlink' { $out = & $Exe unlink $image /base.bin --rw-experimental 2>&1 }
-        'rename' { $out = & $Exe rename $image /base.bin /moved.bin --rw-experimental 2>&1 }
-        'write' { $out = & $Exe pwrite $image /base.bin 0 --rw-experimental --text=Z 2>&1 }
-        'allocwrite' { $out = & $Exe pwrite $image /base.bin 16384 --rw-experimental --text=B 2>&1 }
+        'create' { $out = & $Exe create $image /new.bin --rw 2>&1 }
+        'mkdir' { $out = & $Exe mkdir $image /newdir --rw 2>&1 }
+        'unlink' { $out = & $Exe unlink $image /base.bin --rw 2>&1 }
+        'rename' { $out = & $Exe rename $image /base.bin /moved.bin --rw 2>&1 }
+        'write' { $out = & $Exe pwrite $image /base.bin 0 --rw --text=Z 2>&1 }
+        'allocwrite' { $out = & $Exe pwrite $image /base.bin 16384 --rw --text=B 2>&1 }
     }
     $code = $LASTEXITCODE
     Remove-Item Env:XFSWIN_CRASH_AT

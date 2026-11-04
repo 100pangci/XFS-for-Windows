@@ -60,27 +60,27 @@ class Runner:
             raise SystemExit("%s is still readable" % path)
 
     def create(self, path):
-        self.run(["create", self.image, path, "--rw-experimental"])
+        self.run(["create", self.image, path, "--rw"])
 
     def mkdir(self, path):
-        self.run(["mkdir", self.image, path, "--rw-experimental"])
+        self.run(["mkdir", self.image, path, "--rw"])
 
     def put(self, path, data, work):
         temp = os.path.join(work, "input.bin")
         with open(temp, "wb") as f:
             f.write(data)
-        self.run(["pwrite", self.image, path, "0", "--rw-experimental", "--from=" + temp])
+        self.run(["pwrite", self.image, path, "0", "--rw", "--from=" + temp])
 
     def clone(self, src, dst, length=0):
         self.run(["reflink", self.image, src, dst, "0", "0", str(length),
-                  "--rw-experimental"])
+                  "--rw"])
 
     def truncate(self, path, size):
         self.run(["truncate", self.image, path, str(size),
-                  "--rw-experimental"])
+                  "--rw"])
 
     def unlink(self, path):
-        self.run(["unlink", self.image, path, "--rw-experimental"])
+        self.run(["unlink", self.image, path, "--rw"])
 
 
 def require(actual, expected, what):

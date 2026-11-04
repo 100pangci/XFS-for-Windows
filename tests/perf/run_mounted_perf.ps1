@@ -99,7 +99,7 @@ function Invoke-Mount([string]$xfswin, [string]$image, [string]$drive,
                       [string]$outDir) {
   $stdout = Join-Path $outDir 'mount-stdout.log'
   $stderr = Join-Path $outDir 'mount-stderr.log'
-  $mountArgs = @('mount', $image, ($drive + ':'), '--rw-experimental',
+  $mountArgs = @('mount', $image, ($drive + ':'), '--rw',
                  '--perf-stats')
   $quotedArgs = ($mountArgs | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
   $proc = Start-Process -FilePath $xfswin -ArgumentList $quotedArgs `

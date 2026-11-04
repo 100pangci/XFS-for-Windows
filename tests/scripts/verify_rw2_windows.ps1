@@ -41,20 +41,20 @@ function Invoke-Ok([string]$what, [string[]]$arguments) {
 # 1. extend: write past EOF (allocation + extent map + size).
 Copy-Item $fixture (Join-Path $WorkDir 'extend.img') -Force
 Invoke-Ok 'extend' @('extend', (Join-Path $WorkDir 'extend.img'), '/hello.bin',
-    "$extend_size", '--rw-experimental')
+    "$extend_size", '--rw')
 
 # 2. truncate: shrink to 20000 bytes (frees blocks, keeps a partial block).
 Copy-Item $fixture (Join-Path $WorkDir 'truncate.img') -Force
 Invoke-Ok 'truncate' @('truncate', (Join-Path $WorkDir 'truncate.img'),
-    '/hello.bin', "$truncate_size", '--rw-experimental')
+    '/hello.bin', "$truncate_size", '--rw')
 
 # 3. reuse: truncate to zero, then extend again with a constant fill; the new
 #    blocks must come from the run the truncate freed.
 Copy-Item $fixture (Join-Path $WorkDir 'reuse.img') -Force
 Invoke-Ok 'reuse truncate' @('truncate', (Join-Path $WorkDir 'reuse.img'),
-    '/hello.bin', '0', '--rw-experimental')
+    '/hello.bin', '0', '--rw')
 Invoke-Ok 'reuse extend' @('extend', (Join-Path $WorkDir 'reuse.img'),
-    '/hello.bin', "$reuse_size", '--rw-experimental', '--fill=0x5A')
+    '/hello.bin', "$reuse_size", '--rw', '--fill=0x5A')
 
 # 4. btree: 30 sparse one-block writes, so the data fork needs a bmap btree.
 $overlay = Join-Path $WorkDir 'overlay.bin'
@@ -64,7 +64,7 @@ Copy-Item $fixture (Join-Path $WorkDir 'btree.img') -Force
 for ($i = 0; $i -lt $btree_extents; $i++) {
     $offset = $old_size + $i * 2 * 4096
     Invoke-Ok "btree write $i" @('pwrite', (Join-Path $WorkDir 'btree.img'),
-        '/hello.bin', "$offset", '--rw-experimental', "--from=$overlay")
+        '/hello.bin', "$offset", '--rw', "--from=$overlay")
 }
 
 # The Windows side verifies every image structurally before upload, with the
