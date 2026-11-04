@@ -37,7 +37,16 @@ add_library(xfs_core STATIC
   core/concurrency_hooks.cpp
   block/image_device.cpp
   block/device_policy.cpp
+  block/partition_device.cpp
+  block/drive_letter.cpp
+  block/drive_letter_takeover.cpp
+  block/windows_volume.cpp
+  block/device_discovery.cpp
+  block/windows_device_discovery.cpp
+  block/device_selection.cpp
   block/windows_raw_device.cpp
+  automount/automount_config.cpp
+  automount/automount_engine.cpp
   mkfs/geometry.cpp
   mkfs/ag_builder.cpp
   mkfs/inode_builder.cpp
@@ -119,6 +128,13 @@ if(WIN32)
     target_compile_definitions(xfswin PRIVATE
       _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   endif()
+  if(XFSWIN_TEST_HOOKS)
+    # UX-1 integration tests: one-shot sentinel files under
+    # %ProgramData%\xfswin\test-hooks inject a failure at a precise point.  The
+    # service runs as LocalSystem and does not inherit environment variables,
+    # so a sentinel file is the transport.  Off in product builds.
+    target_compile_definitions(xfswin PRIVATE XFSWIN_TEST_HOOKS=1)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -130,14 +146,17 @@ if(XFSWIN_BUILD_WINFSP)
   )
   target_sources(xfswin PRIVATE
     winfsp/mount_host.cpp
+    automount/windows_automount_service.cpp
   )
   target_include_directories(xfs_core PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_include_directories(xfswin PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_link_libraries(xfs_core PRIVATE ${XFSWIN_WINFSP_LIBRARY})
   target_link_libraries(xfswin PRIVATE ${XFSWIN_WINFSP_LIBRARY})
-  # SDDL security descriptors
+  # SDDL security descriptors and Service Control Manager access
   target_link_libraries(xfs_core PRIVATE advapi32)
   target_link_libraries(xfswin PRIVATE advapi32)
+  # Configuration Manager device arrival/removal notifications
+  target_link_libraries(xfswin PRIVATE cfgmgr32)
   # Delay-load the WinFsp runtime so all other commands work without it.
   if(MSVC)
     target_link_options(xfswin PRIVATE "/DELAYLOAD:winfsp-x64.dll")

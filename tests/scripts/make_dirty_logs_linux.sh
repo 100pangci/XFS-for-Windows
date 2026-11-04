@@ -40,8 +40,8 @@ SIZE_MB=${SIZE_MB:-512}
 # Default: the RW-0..RW-5 minimal profile. RW-6 jobs override this with the
 # modern inode profile (finobt/inobtcount/sparse/bigtime/nrext64).
 MKFS_OPTS=${MKFS_OPTS:--m crc=1,finobt=0,rmapbt=0,reflink=0,inobtcount=0,bigtime=0 -i sparse=0}
-SCENARIOS="timestamp extend truncate create unlink mkdir rmdir rename-same
-rename-cross rename-replace hardlink symlink-inline symlink-remote"
+SCENARIOS=${SCENARIOS:-"timestamp extend truncate create unlink mkdir rmdir rename-same
+rename-cross rename-replace hardlink symlink-inline symlink-remote"}
 
 mkdir -p "$OUT"
 WORK=$(mktemp -d)

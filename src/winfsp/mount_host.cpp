@@ -14,6 +14,7 @@
 #include "winfsp/winfsp_adapter.h"
 #include "xfs/filesystem.h"
 #include "xfs/image_device.h"
+#include "xfs/partition_device.h"
 #include "xfs/windows_raw_device.h"
 
 namespace xfs::winfsp {
@@ -58,7 +59,7 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
 
 }  // namespace
 
-int RunMountHost(const std::string& target, const std::string& drive,
+int RunMountHost(const MountTarget& target, const std::string& drive,
                  bool force_unsafe_ro, bool verbose, bool read_write,
                  bool perf_stats, bool allow_rmapbt_qualification,
                  bool allow_reflink_qualification,
@@ -77,11 +78,28 @@ int RunMountHost(const std::string& target, const std::string& drive,
   FreeLibrary(winfsp_dll);
 
   std::string error;
-  auto device = OpenTarget(target, /*writable=*/read_write, device_policy,
+  auto device = OpenTarget(target.path, /*writable=*/read_write, device_policy,
                            &error);
   if (!device) {
     std::cerr << "error: " << error << "\n";
     return 1;
+  }
+  if (target.offset_bytes != 0 || target.length_bytes != 0) {
+    uint64_t length = target.length_bytes;
+    if (length == 0) {
+      if (target.offset_bytes >= device->Size()) {
+        std::cerr << "error: the partition starts outside the device\n";
+        return 1;
+      }
+      length = device->Size() - target.offset_bytes;
+    }
+    auto view = OffsetBlockDevice::Create(std::move(device),
+                                          target.offset_bytes, length);
+    if (!view.ok()) {
+      std::cerr << "error: " << view.error().Format() << "\n";
+      return 1;
+    }
+    device = std::move(view.value());
   }
   MountOptions options;
   options.force_unsafe_ro = force_unsafe_ro;
@@ -109,6 +127,18 @@ int RunMountHost(const std::string& target, const std::string& drive,
   return 0;
 }
 
+int RunMountHost(const std::string& target, const std::string& drive,
+                 bool force_unsafe_ro, bool verbose, bool read_write,
+                 bool perf_stats, bool allow_rmapbt_qualification,
+                 bool allow_reflink_qualification,
+                 const DeviceOpenPolicy* device_policy) {
+  MountTarget whole;
+  whole.path = target;
+  return RunMountHost(whole, drive, force_unsafe_ro, verbose, read_write,
+                      perf_stats, allow_rmapbt_qualification,
+                      allow_reflink_qualification, device_policy);
+}
+
 int StopMountHost(const std::string& drive) {
   Status status = RequestUnmount(Utf8ToWide(drive));
   if (!status.ok()) {
@@ -124,6 +154,10 @@ int StopMountHost(const std::string& drive) {
 #else
 
 namespace xfs::winfsp {
+int RunMountHost(const MountTarget&, const std::string&, bool, bool, bool,
+                 bool, bool, bool, const DeviceOpenPolicy*) {
+  return 1;
+}
 int RunMountHost(const std::string&, const std::string&, bool, bool, bool,
                  bool, bool, bool, const DeviceOpenPolicy*) {
   return 1;

@@ -24,7 +24,11 @@
 #include <thread>
 
 #include "xfs/block_device.h"
+#include "xfs/automount_config.h"
+#include "xfs/device_discovery.h"
+#include "xfs/device_selection.h"
 #include "xfs/directory.h"
+#include "xfs/drive_letter.h"
 #include "xfs/endian.h"
 #include "xfs/error.h"
 #include "xfs/filesystem.h"
@@ -38,12 +42,14 @@
 #include "xfs/rmap.h"
 #include "xfs/superblock.h"
 #include "xfs/win_name_map.h"
+#include "xfs/windows_volume.h"
 #include "xfs/perf_stats.h"
 #include "xfs/windows_raw_device.h"
 
 #ifdef XFSWIN_HAS_WINFSP
 #include "winfsp/mount_host.h"
 #include "winfsp/winfsp_adapter.h"
+#include "xfs/automount_service.h"
 #endif
 
 namespace xfs::cli {
@@ -130,6 +136,22 @@ void PrintUsage() {
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
       "      --rw-experimental         writable mount (images, or a real device\n"
       "                                together with --device-write-qualification)\n"
+      "  mount                         choose an attached XFS filesystem and a\n"
+      "                                drive letter interactively\n"
+      "  mount <device|image>          mount to the first free letter (D:..Z:)\n"
+      "      --drive <X:|auto>         preferred drive letter (default auto)\n"
+      "  devices                       list attached XFS filesystems\n"
+      "  status                        automount service state and mounted XFS\n"
+      "  automount install|uninstall   install/remove the resident service\n"
+      "  automount start|stop          start/stop the resident service\n"
+      "  automount status              same view as `xfswin status`\n"
+      "  automount enable [<fs>]       mount a configured XFS automatically\n"
+      "      --drive <X:|auto>         preferred letter; auto scans D:..Z:\n"
+      "      --rw-experimental --device-write-qualification\n"
+      "      [--allow-removable-disk-write]\n"
+      "                                enroll for qualified read-write access\n"
+      "  automount disable <fs>        stop mounting a configured XFS\n"
+      "  automount run                 run in console mode (diagnostics/tests)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
       "global options:\n"
@@ -152,6 +174,8 @@ void PrintUsage() {
       "  xfswin info test.img\n"
       "  xfswin check test.img\n"
       "  xfswin ls test.img /\n"
+      "  xfswin devices\n"
+      "  xfswin mount\n"
       "  xfswin cat \\\\.\\PhysicalDrive2 /etc/hostname\n"
       "  xfswin mount test.img X:\n"
       "  xfswin mount test.img X: --rw-experimental\n";
@@ -1980,6 +2004,273 @@ int CommandFormat(const std::string& target, const Options& options) {
   return 0;
 }
 
+std::string DiscoveryErrorText(const ErrorContext& error) {
+  if (error.code == XfsError::kPermissionDenied) {
+    return "XFS device discovery requires administrator privileges. Run the "
+           "command from an elevated prompt.";
+  }
+  return "Device discovery failed: " + error.message;
+}
+
+void PrintDiscoveryWarnings(const DiscoveryReport& report,
+                            const Options& options) {
+  for (const auto& warning : report.warnings) {
+    std::cerr << "warning: " << warning << "\n";
+  }
+  if (report.incomplete) {
+    std::cerr << "warning: some devices could not be read; if a device was "
+                 "just inserted, wait for it to become ready and try again.\n";
+  }
+  if (options.debug && report.retryable_failures != 0) {
+    std::cerr << "debug: retryable discovery failures: "
+              << report.retryable_failures << "\n";
+  }
+}
+
+int CommandDevices(const Options& options) {
+  std::string error;
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &error);
+  if (!discovered.ok()) {
+    std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+    if (options.verbose) PrintError(discovered.error());
+    return 1;
+  }
+  const DiscoveryReport& report = discovered.value();
+  const auto lines = FormatDeviceMenu(report);
+  if (lines.empty()) {
+    std::cout << "No XFS filesystems are attached.\n";
+  } else {
+    std::cout << "XFS filesystems attached to this computer:\n";
+    for (const auto& line : lines) std::cout << line << "\n";
+  }
+  const auto rejected = FormatRejectedDevices(report);
+  if (!rejected.empty()) {
+    std::cout << "\nXFS candidates that cannot be mounted:\n";
+    for (const auto& line : rejected) std::cout << line << "\n";
+  }
+  PrintDiscoveryWarnings(report, options);
+  return 0;
+}
+
+#ifdef XFSWIN_HAS_WINFSP
+
+bool AllocateMountDrive(const std::string& preferred, std::string* drive,
+                        bool* fell_back, std::string* error) {
+  std::string letter_error;
+  const auto letters = EnumerateDriveLetters(&letter_error);
+  if (!letter_error.empty()) {
+    if (error) {
+      *error = "drive letters could not be enumerated: " + letter_error;
+    }
+    return false;
+  }
+  DriveLetterUsage usage;
+  for (const auto& letter : letters) {
+    if (letter.letter >= 'A' && letter.letter <= 'Z') {
+      const size_t index = static_cast<size_t>(letter.letter - 'A');
+      usage.used[index] = true;
+      usage.kinds[index] = letter.kind;
+      usage.targets[index] = letter.target;
+    }
+  }
+  auto choice = ChooseDriveLetter(preferred, usage);
+  if (!choice.ok()) {
+    if (error) {
+      *error = choice.error().code == XfsError::kNoSpace
+                   ? "no free drive letter is available"
+                   : choice.error().message;
+    }
+    return false;
+  }
+  if (drive) *drive = choice.value().drive;
+  if (fell_back) *fell_back = choice.value().preferred_unavailable;
+  return true;
+}
+
+int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
+                              const std::string& preferred,
+                              const Options& options) {
+  if (filesystem.xfswin_mounted) {
+    std::cerr << "error: this XFS filesystem is already mounted at "
+              << filesystem.xfswin_drive << " by xfswin.\n";
+    return 1;
+  }
+  if (filesystem.probe.log_state == LogState::kDirty ||
+      filesystem.probe.log_state == LogState::kUnknown) {
+    if (!options.force_unsafe_ro) {
+      std::cerr
+          << "error: the XFS journal is not clean, so a read-only mount is "
+             "unsafe.\n"
+             "       Recover the filesystem first, or pass --force-unsafe-ro "
+             "if you accept the risk.\n";
+      return 1;
+    }
+  }
+  const bool read_write = options.rw_experimental;
+  if (read_write && !options.device_write_qualification) {
+    std::cerr
+        << "error: writable mounting of a real device requires both "
+           "--rw-experimental and --device-write-qualification.\n"
+           "       The class policy still applies: fixed disks need "
+           "--allow-fixed-disk-write and removable disks need "
+           "--allow-removable-disk-write.\n";
+    return 3;
+  }
+
+  std::string drive;
+  bool fell_back = false;
+  std::string drive_error;
+  if (!AllocateMountDrive(preferred, &drive, &fell_back, &drive_error)) {
+    std::cerr << "error: " << drive_error << "\n";
+    return 1;
+  }
+  if (fell_back && !preferred.empty()) {
+    std::cout << "The configured drive letter " << preferred
+              << " is already in use. Mounted as " << drive << " instead.\n";
+  }
+
+  winfsp::MountTarget target;
+  target.path = filesystem.location.disk_path;
+  target.offset_bytes = filesystem.location.offset_bytes;
+  target.length_bytes =
+      filesystem.location.whole_disk ? 0 : filesystem.location.length_bytes;
+  const std::string label =
+      filesystem.probe.label.empty() ? "XFS filesystem"
+                                     : filesystem.probe.label;
+  std::cout << "Mounting " << label << " at " << drive << " ("
+            << (read_write ? "experimental read-write" : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
+  DeviceOpenPolicy raw_policy =
+      BuildRawDevicePolicy(options, read_write);
+  return winfsp::RunMountHost(
+      target, drive, options.force_unsafe_ro, options.verbose || options.debug,
+      read_write, options.perf_stats, options.rmapbt_qualification,
+      options.reflink_qualification, &raw_policy);
+}
+
+int CommandMountInteractive(const Options& options, bool drive_specified,
+                            const std::string& preferred) {
+  std::string error;
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &error);
+  if (!discovered.ok()) {
+    std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+    if (options.verbose) PrintError(discovered.error());
+    return 1;
+  }
+  const DiscoveryReport& report = discovered.value();
+  if (report.filesystems.empty()) {
+    const auto rejected = FormatRejectedDevices(report);
+    for (const auto& line : rejected) std::cout << line << "\n";
+    std::cout << "No mountable XFS filesystems are attached.\n";
+    PrintDiscoveryWarnings(report, options);
+    return 1;
+  }
+
+  std::cout << "XFS filesystems attached to this computer:\n";
+  for (const auto& line : FormatDeviceMenu(report)) std::cout << line << "\n";
+  const auto rejected = FormatRejectedDevices(report);
+  if (!rejected.empty()) {
+    std::cout << "\nXFS candidates that cannot be mounted:\n";
+    for (const auto& line : rejected) std::cout << line << "\n";
+  }
+  PrintDiscoveryWarnings(report, options);
+
+  std::cout << "\nSelect a filesystem by number, UUID, or label: ";
+  std::cout.flush();
+  std::string selection;
+  if (!std::getline(std::cin, selection)) {
+    std::cerr << "\nerror: no selection was entered\n";
+    return 1;
+  }
+  auto index = SelectDiscoveredFilesystem(selection, report.filesystems);
+  if (!index.ok()) {
+    std::cerr << "error: " << index.error().message << "\n";
+    return 1;
+  }
+  const DiscoveredFilesystem& filesystem = report.filesystems[index.value()];
+  if (filesystem.xfswin_mounted) {
+    std::cerr << "error: this XFS filesystem is already mounted at "
+              << filesystem.xfswin_drive << " by xfswin.\n";
+    return 1;
+  }
+
+  std::string chosen = preferred;
+  if (!drive_specified) {
+    std::cout << "Drive letter [auto]: ";
+    std::cout.flush();
+    std::string answer;
+    if (!std::getline(std::cin, answer)) answer.clear();
+    auto parsed = ParseDriveSelection(answer);
+    if (!parsed.ok()) {
+      std::cerr << "error: " << parsed.error().message << "\n";
+      return 1;
+    }
+    chosen = parsed.value().drive;
+  }
+  return MountDiscoveredFilesystem(filesystem, chosen, options);
+}
+
+int CommandMountAutoDrive(const std::string& target,
+                          const std::string& preferred,
+                          const Options& options) {
+  const bool raw = IsRawDevicePath(target);
+  if (raw && options.rw_experimental &&
+      !options.device_write_qualification) {
+    std::cerr
+        << "error: writable mounting of a real device requires both "
+           "--rw-experimental and --device-write-qualification.\n"
+           "       The class policy still applies: fixed disks need "
+           "--allow-fixed-disk-write and removable disks need "
+           "--allow-removable-disk-write.\n";
+    return 3;
+  }
+  std::string drive;
+  bool fell_back = false;
+  std::string drive_error;
+  if (!AllocateMountDrive(preferred, &drive, &fell_back, &drive_error)) {
+    std::cerr << "error: " << drive_error << "\n";
+    return 1;
+  }
+  if (fell_back && !preferred.empty()) {
+    std::cout << "The configured drive letter " << preferred
+              << " is already in use. Mounted as " << drive << " instead.\n";
+  }
+  std::cout << "Mounting " << target << " at " << drive << " ("
+            << (options.rw_experimental ? "experimental read-write"
+                                        : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
+  DeviceOpenPolicy raw_policy =
+      BuildRawDevicePolicy(options, options.rw_experimental);
+  winfsp::MountTarget whole;
+  whole.path = target;
+  return winfsp::RunMountHost(
+      whole, drive, options.force_unsafe_ro, options.verbose || options.debug,
+      options.rw_experimental, options.perf_stats,
+      options.rmapbt_qualification, options.reflink_qualification,
+      raw ? &raw_policy : nullptr);
+}
+
+#else  // !XFSWIN_HAS_WINFSP
+
+int CommandMountInteractive(const Options&, bool, const std::string&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+int CommandMountAutoDrive(const std::string&, const std::string&,
+                          const Options&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+#endif  // XFSWIN_HAS_WINFSP
+
 int CommandMount(const std::string& target, const std::string& drive,
                  const Options& options) {
   // DEV-1: a raw device is never writable merely because its path looks like
@@ -1999,6 +2290,15 @@ int CommandMount(const std::string& target, const std::string& drive,
     return 3;
   }
 #ifdef XFSWIN_HAS_WINFSP
+  // Announce the mount like the interactive and --drive forms do. A user who
+  // runs the legacy form from a script still sees which mode and letter apply.
+  std::cout << "Mounting " << target << " at " << drive << " ("
+            << (options.rw_experimental ? "experimental read-write"
+                                        : "read-only")
+            << ").\n";
+  std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
+  std::cout.flush();
+
   DeviceOpenPolicy raw_policy =
       BuildRawDevicePolicy(options, options.rw_experimental);
   return winfsp::RunMountHost(
@@ -3117,6 +3417,737 @@ int CommandXattrRemove(const std::string& target, const std::string& path,
   return 0;
 }
 
+#ifdef XFSWIN_HAS_WINFSP
+
+void PrintAutomountWarnings(const std::vector<std::string>& warnings) {
+  for (const auto& warning : warnings) {
+    std::cout << "warning: " << warning << "\n";
+  }
+}
+
+int PrintAutomountServiceResult(const Status& status,
+                                const std::string& message) {
+  if (!status.ok()) {
+    PrintError(status.error());
+    return 1;
+  }
+  if (!message.empty()) std::cout << message << "\n";
+  return 0;
+}
+
+std::optional<bool> DriveReportsReadOnly(const std::string& drive) {
+  if (drive.size() != 2 || drive[1] != ':') return std::nullopt;
+  wchar_t root[4] = {static_cast<wchar_t>(drive[0]), L':', L'\\', L'\0'};
+  DWORD flags = 0;
+  if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, &flags,
+                             nullptr, 0)) {
+    return std::nullopt;
+  }
+  return (flags & FILE_READ_ONLY_VOLUME) != 0;
+}
+
+int CommandStatus(const Options& options) {
+  // A status query may have to wait on a device or a volume that does not
+  // answer. Keep every completed section visible in redirected logs so a
+  // timeout can be attributed to the step that blocked.
+  std::cout << std::unitbuf;
+  std::cout << "XFS for Windows status\n";
+  const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
+  std::cout << "Automount service : " << ToString(service.state);
+  if (!service.detail.empty()) std::cout << " (" << service.detail << ")";
+  std::cout << "\n";
+  const AutomountServicePaths paths = DefaultAutomountServicePaths();
+  std::cout << "Configuration     : " << paths.config_file.string() << "\n";
+  if (!service.installed()) {
+    std::cout << "  Install the service with `xfswin automount install`, then "
+                 "start it with `xfswin automount start`.\n";
+  } else if (service.state == AutomountServiceState::kStopped) {
+    std::cout << "  The service is not running; inserted devices are not "
+                 "mounted automatically.\n";
+  }
+
+  auto loaded = LoadAutomountConfig(paths.config_file);
+  const AutomountConfig* config = nullptr;
+  if (!loaded.ok()) {
+    std::cout << "Configuration error: " << loaded.error().Format() << "\n";
+  } else {
+    config = &loaded.value().config;
+    PrintAutomountWarnings(loaded.value().warnings);
+  }
+
+  // The engine lives in the service process.  Its small session snapshot is
+  // the only way to distinguish a taken-over drive letter from an allocated
+  // one and an effective read-only fallback from the configured mode.
+  AutomountRuntimeStatus runtime_status;
+  if (service.state == AutomountServiceState::kRunning) {
+    const std::filesystem::path sessions =
+        DefaultAutomountRuntimeStatusPath();
+    auto runtime = LoadAutomountRuntimeStatus(sessions);
+    if (runtime.ok()) {
+      runtime_status = std::move(runtime.value());
+    } else if (options.verbose) {
+      std::cerr << "[status] runtime sessions unavailable: "
+                << runtime.error().Format() << "\n";
+    }
+  }
+  auto runtime_mount_for = [&runtime_status](const Uuid& uuid)
+      -> const AutomountRuntimeMount* {
+    for (const auto& mount : runtime_status.mounts) {
+      if (UuidEqual(mount.fs_uuid, uuid)) return &mount;
+    }
+    return nullptr;
+  };
+
+  std::string discovery_error;
+  if (options.verbose) {
+    std::cerr << "[status] discovering attached filesystems\n";
+  }
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &discovery_error);
+  if (options.verbose) {
+    std::cerr << "[status] device discovery finished\n";
+  }
+
+  std::cout << "Configured automatic mounts:\n";
+  bool any_configured = false;
+  if (config) {
+    for (const auto& entry : config->entries) {
+      any_configured = true;
+      std::string label;
+      if (discovered.ok()) {
+        for (const auto& filesystem : discovered.value().filesystems) {
+          if (UuidEqual(filesystem.probe.superblock.uuid, entry.fs_uuid)) {
+            label = filesystem.probe.label;
+            break;
+          }
+        }
+      }
+      std::cout << "  " << FormatUuid(entry.fs_uuid);
+      if (!label.empty()) std::cout << "  " << label;
+      std::cout << "  "
+                << (entry.preferred_drive.empty() ? "auto"
+                                                 : entry.preferred_drive)
+                << "  " << ToString(entry.mode) << "  "
+                << (entry.enabled ? "enabled" : "disabled") << "\n";
+      if (!entry.expected_serial.empty() ||
+          !entry.expected_stable_id.empty() ||
+          entry.expected_device_class != DeviceClass::kUnknown ||
+          entry.expected_size_bytes != 0) {
+        std::cout << "    identity pinned: serial="
+                  << (entry.expected_serial.empty() ? "(none)"
+                                                    : entry.expected_serial)
+                  << " class=" << ToString(entry.expected_device_class)
+                  << " size=" << entry.expected_size_bytes
+                  << " qualification="
+                  << (entry.device_qualification ? "yes" : "no") << "\n";
+      }
+    }
+  }
+  if (!any_configured) std::cout << "  none\n";
+
+  std::cout << "Mounted XFS filesystems:\n";
+  bool any_mounted = false;
+  std::vector<std::string> printed_uuids;
+  if (!discovered.ok()) {
+    std::cout << "  unavailable: " << DiscoveryErrorText(discovered.error())
+              << "\n";
+    if (options.verbose) PrintError(discovered.error());
+  } else {
+    for (const auto& filesystem : discovered.value().filesystems) {
+      if (!filesystem.xfswin_mounted || filesystem.xfswin_drive.empty()) {
+        continue;
+      }
+      any_mounted = true;
+      const Uuid& uuid = filesystem.probe.superblock.uuid;
+      const AutomountEntry* entry = config ? config->Find(uuid) : nullptr;
+      const AutomountRuntimeMount* runtime_mount = runtime_mount_for(uuid);
+      printed_uuids.push_back(FormatUuid(uuid));
+      std::cout << "  " << filesystem.xfswin_drive << "  "
+                << (filesystem.probe.label.empty() ? "(no label)"
+                                                   : filesystem.probe.label)
+                << "  " << FormatUuid(uuid);
+      if (runtime_mount) {
+        std::cout << "  " << runtime_mount->mode;
+      } else if (entry) {
+        std::cout << "  " << ToString(entry->mode);
+      } else {
+        const auto read_only = DriveReportsReadOnly(filesystem.xfswin_drive);
+        if (read_only) {
+          std::cout << "  " << (*read_only ? "read-only" : "read-write");
+        }
+      }
+      std::cout << "\n";
+      std::cout << "    Device      : " << filesystem.location.disk_path
+                << "  serial "
+                << (filesystem.location.serial_number.empty()
+                        ? "(none)"
+                        : filesystem.location.serial_number)
+                << "  stable id "
+                << (filesystem.location.stable_id.empty()
+                        ? "(none)"
+                        : filesystem.location.stable_id)
+                << "\n";
+      if (runtime_mount) {
+        std::cout << "    Mode        : " << runtime_mount->mode;
+        if (runtime_mount->configured_mode != runtime_mount->mode) {
+          std::cout << " (configured " << runtime_mount->configured_mode
+                    << ")";
+        }
+        std::cout << "\n";
+        if (!runtime_mount->detail.empty()) {
+          std::cout << "    Note        : " << runtime_mount->detail << "\n";
+        }
+        std::cout << "    Drive letter: "
+                  << (runtime_mount->drive_taken_over
+                          ? "taken over from the Windows volume " +
+                                runtime_mount->original_windows_drive
+                          : std::string("allocated (no Windows drive letter "
+                                        "was taken over)"))
+                  << "\n";
+        std::cout << "    Automount   : "
+                  << (entry && entry->enabled ? "enabled" : "disabled")
+                  << "\n";
+      } else {
+        std::cout << "    Drive letter: allocated or managed outside the "
+                     "running service\n";
+        if (entry) {
+          std::cout << "    Automount   : "
+                    << (entry->enabled ? "enabled" : "disabled") << "\n";
+        }
+      }
+    }
+    PrintDiscoveryWarnings(discovered.value(), options);
+  }
+  // A read-write session holds its raw disk exclusively, so discovery cannot
+  // read that filesystem even though the mount is live.  The service's session
+  // snapshot is then the only source for the drive, UUID, mode and takeover
+  // state; print those mounts so `status` still describes them.  UUIDs that
+  // discovery already printed are skipped.
+  for (const auto& mount : runtime_status.mounts) {
+    if (mount.drive.empty()) continue;
+    const std::string uuid_text = FormatUuid(mount.fs_uuid);
+    if (std::find(printed_uuids.begin(), printed_uuids.end(), uuid_text) !=
+        printed_uuids.end()) {
+      continue;
+    }
+    any_mounted = true;
+    const AutomountEntry* entry =
+        config ? config->Find(mount.fs_uuid) : nullptr;
+    std::cout << "  " << mount.drive << "  "
+              << (mount.label.empty() ? "(no label)" : mount.label) << "  "
+              << uuid_text << "  " << mount.mode << "\n";
+    std::cout << "    Device      : ";
+    if (entry && (!entry->expected_serial.empty() ||
+                  !entry->expected_stable_id.empty() ||
+                  entry->expected_device_class != DeviceClass::kUnknown ||
+                  entry->expected_size_bytes != 0)) {
+      std::cout << "identity pinned at enrollment: serial="
+                << (entry->expected_serial.empty() ? "(none)"
+                                                   : entry->expected_serial)
+                << " stable id="
+                << (entry->expected_stable_id.empty()
+                        ? "(none)"
+                        : entry->expected_stable_id)
+                << " class=" << ToString(entry->expected_device_class)
+                << " size=" << entry->expected_size_bytes;
+    } else {
+      std::cout << "(the read-write mount holds the raw disk exclusively; "
+                   "live device identity is not readable)";
+    }
+    std::cout << "\n";
+    std::cout << "    Mode        : " << mount.mode;
+    if (mount.configured_mode != mount.mode) {
+      std::cout << " (configured " << mount.configured_mode << ")";
+    }
+    std::cout << "\n";
+    if (!mount.detail.empty()) {
+      std::cout << "    Note        : " << mount.detail << "\n";
+    }
+    std::cout << "    Drive letter: "
+              << (mount.drive_taken_over
+                      ? "taken over from the Windows volume " +
+                            mount.original_windows_drive
+                      : std::string("allocated (no Windows drive letter "
+                                    "was taken over)"))
+              << "\n";
+    std::cout << "    Automount   : "
+              << (entry && entry->enabled ? "enabled" : "disabled") << "\n";
+  }
+  if (!any_mounted) std::cout << "  none\n";
+  return 0;
+}
+
+std::string TrimAscii(std::string text) {
+  auto not_space = [](unsigned char c) { return !std::isspace(c); };
+  text.erase(text.begin(),
+             std::find_if(text.begin(), text.end(), not_space));
+  text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(),
+             text.end());
+  return text;
+}
+
+bool PromptYesNo(const std::string& prompt, bool default_value) {
+  std::cout << prompt;
+  std::cout.flush();
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    std::cout << "\n";
+    return default_value;
+  }
+  std::string answer = TrimAscii(line);
+  for (char& c : answer) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (answer.empty()) return default_value;
+  if (answer == "y" || answer == "yes") return true;
+  if (answer == "n" || answer == "no") return false;
+  std::cout << "Please answer yes or no; using the default.\n";
+  return default_value;
+}
+
+int PromptMountMode() {
+  std::cout << "Mode [1=read-only, 2=read-write] [1]: ";
+  std::cout.flush();
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    std::cout << "\n";
+    return 1;
+  }
+  const std::string answer = TrimAscii(line);
+  if (answer.empty() || answer == "1" || answer == "ro" ||
+      answer == "read-only") {
+    return 1;
+  }
+  if (answer == "2" || answer == "rw" || answer == "read-write") {
+    return 2;
+  }
+  std::cout << "Unrecognized mode; using read-only.\n";
+  return 1;
+}
+
+// Shows exactly which physical device the read-write authorization would be
+// bound to and asks for a separate confirmation.  The default is No; EOF and
+// unrecognized input never authorize a writable enrollment.
+bool ConfirmRwEnrollment(const DiscoveredFilesystem& filesystem,
+                         bool terminal, bool assume_yes) {
+  const PartitionLocation& location = filesystem.location;
+  std::cout << "Read-write identity to pin:\n"
+            << "  filesystem UUID : "
+            << FormatUuid(filesystem.probe.superblock.uuid) << "\n"
+            << "  label           : "
+            << (filesystem.probe.label.empty() ? "(none)"
+                                               : filesystem.probe.label)
+            << "\n"
+            << "  device          : " << location.disk_path << "\n"
+            << "  model           : "
+            << (location.model.empty() ? "(none)" : location.model) << "\n"
+            << "  serial          : "
+            << (location.serial_number.empty() ? "(none)"
+                                               : location.serial_number)
+            << "\n"
+            << "  stable id       : "
+            << (location.stable_id.empty() ? "(none)" : location.stable_id)
+            << "\n"
+            << "  whole disk size : " << location.disk_size_bytes << " bytes ("
+            << HumanBytes(location.disk_size_bytes) << ")\n"
+            << "  device class    : " << ToString(location.device_class)
+            << "\n";
+  if (location.serial_number.empty() &&
+      location.device_class == DeviceClass::kVirtualDisk) {
+    std::cout << "  identity note   : this virtual disk exposes no serial "
+                 "number; the stable id, size and class are the pins\n";
+  }
+  if (assume_yes) {
+    std::cout << "Read-write enrollment confirmed by --yes-i-really-mean-it.\n";
+    return true;
+  }
+  if (!terminal) return false;
+  return PromptYesNo(
+      "Pin this device identity and enable automatic read-write? [y/N] ",
+      false);
+}
+
+int CommandAutomountEnable(const std::vector<std::string>& args,
+                           const Options& options, bool drive_specified,
+                           const std::string& drive_option) {
+  if (args.size() > 3) {
+    std::cerr << "usage: xfswin automount enable [<uuid|label|number>] "
+                 "[--drive <letter|auto>] [--rw [--yes-i-really-mean-it]]\n"
+                 "       xfswin automount enable [<uuid|label|number>] "
+                 "[--drive <letter|auto>] [--rw-experimental "
+                 "--device-write-qualification]\n";
+    return 1;
+  }
+  const bool terminal = _isatty(_fileno(stdin)) != 0;
+  // The legacy engineering spelling keeps its explicit qualification
+  // requirements.  The ordinary `--rw` spelling asks for the identity
+  // confirmation instead (or requires --yes-i-really-mean-it in a script).
+  if (options.rw_experimental && !options.device_write_qualification) {
+    std::cerr << "error: enrolling a filesystem for automatic read-write "
+                 "mounting with --rw-experimental requires "
+                 "--device-write-qualification and the DEV-1 identity pins "
+                 "(recorded automatically from the device).\n";
+    return 3;
+  }
+  if (options.automount_rw && !terminal && !options.yes_i_really_mean_it) {
+    std::cerr << "error: --rw needs an explicit identity confirmation. Run it "
+                 "in a terminal, or pass --yes-i-really-mean-it for unattended "
+                 "enrollment.\n";
+    return 3;
+  }
+  const bool interactive_enrollment =
+      args.size() == 2 && terminal && !options.rw_experimental &&
+      !options.automount_rw;
+  bool read_write = options.rw_experimental || options.automount_rw;
+
+  const AutomountServicePaths paths = DefaultAutomountServicePaths();
+  Status directory = EnsureAutomountServicePaths(paths);
+  if (!directory.ok()) {
+    PrintError(directory.error());
+    return 1;
+  }
+  auto loaded = LoadAutomountConfig(paths.config_file);
+  if (!loaded.ok()) {
+    PrintError(loaded.error());
+    return 1;
+  }
+  PrintAutomountWarnings(loaded.value().warnings);
+  AutomountConfig config = loaded.value().config;
+
+  const std::string selector = args.size() == 3 ? args[2] : std::string();
+  std::string discovery_error;
+  auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &discovery_error);
+  const DiscoveryReport* report = discovered.ok() ? &discovered.value() : nullptr;
+
+  Uuid uuid{};
+  const DiscoveredFilesystem* selected = nullptr;
+  if (selector.empty()) {
+    if (!report) {
+      std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+      return 1;
+    }
+    if (report->filesystems.empty()) {
+      for (const auto& line : FormatRejectedDevices(*report)) {
+        std::cout << line << "\n";
+      }
+      std::cout << "No mountable XFS filesystems are attached.\n";
+      PrintDiscoveryWarnings(*report, options);
+      return 1;
+    }
+    std::cout << "XFS filesystems attached to this computer:\n";
+    for (const auto& line : FormatDeviceMenu(*report)) std::cout << line << "\n";
+    const auto rejected = FormatRejectedDevices(*report);
+    if (!rejected.empty()) {
+      std::cout << "\nXFS candidates that cannot be mounted:\n";
+      for (const auto& line : rejected) std::cout << line << "\n";
+    }
+    PrintDiscoveryWarnings(*report, options);
+    std::cout << "\nSelect a filesystem by number, UUID, or label: ";
+    std::cout.flush();
+    std::string selection;
+    if (!std::getline(std::cin, selection)) {
+      std::cerr << "\nerror: no selection was entered\n";
+      return 1;
+    }
+    auto index = SelectDiscoveredFilesystem(selection, report->filesystems);
+    if (!index.ok()) {
+      std::cerr << "error: " << index.error().message << "\n";
+      return 1;
+    }
+    selected = &report->filesystems[index.value()];
+    uuid = selected->probe.superblock.uuid;
+  } else if (ParseUuid(selector, &uuid)) {
+    if (report) {
+      for (const auto& filesystem : report->filesystems) {
+        if (UuidEqual(filesystem.probe.superblock.uuid, uuid)) {
+          selected = &filesystem;
+          break;
+        }
+      }
+    }
+    if (!selected && read_write) {
+      std::cerr << "error: the filesystem is not currently attached; attach "
+                   "the device so its DEV-1 identity pins can be recorded "
+                   "before enrolling it for read-write access.\n";
+      return 1;
+    }
+    if (!selected && !report) {
+      PrintAutomountWarnings({DiscoveryErrorText(discovered.error())});
+    }
+  } else {
+    if (!report) {
+      std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+      return 1;
+    }
+    auto index = SelectDiscoveredFilesystem(selector, report->filesystems);
+    if (!index.ok()) {
+      std::cerr << "error: " << index.error().message << "\n";
+      return 1;
+    }
+    selected = &report->filesystems[index.value()];
+    uuid = selected->probe.superblock.uuid;
+  }
+
+  if (interactive_enrollment) {
+    std::cout << "\n";
+    if (!PromptYesNo(
+            "Mount this filesystem automatically when it is inserted? [Y/n] ",
+            true)) {
+      std::cout << "No change was made.\n";
+      return 0;
+    }
+    if (PromptMountMode() == 2) read_write = true;
+  }
+  if (read_write && !options.rw_experimental) {
+    if (!selected) {
+      std::cerr << "error: the filesystem must be attached before read-write "
+                   "access can be enrolled.\n";
+      return 1;
+    }
+    if (!ConfirmRwEnrollment(*selected, terminal,
+                             options.yes_i_really_mean_it)) {
+      std::cout << "Read-write enrollment was not confirmed; no change was "
+                   "made.\n";
+      return 1;
+    }
+  }
+
+  const AutomountEntry* existing = config.Find(uuid);
+  AutomountEntry entry = existing ? *existing : AutomountEntry{};
+  entry.fs_uuid = uuid;
+  entry.enabled = true;
+  entry.mode = read_write ? AutomountMode::kExperimentalReadWrite
+                          : AutomountMode::kReadOnly;
+  if (drive_specified) {
+    auto parsed = ParseDriveSelection(drive_option);
+    if (!parsed.ok()) {
+      std::cerr << "error: " << parsed.error().message << "\n";
+      return 1;
+    }
+    entry.preferred_drive = parsed.value().drive;
+  } else if (!existing) {
+    entry.preferred_drive.clear();
+  }
+
+  if (read_write) {
+    if (!selected) {
+      std::cerr << "error: the filesystem must be attached before it can be "
+                   "enrolled for read-write access.\n";
+      return 1;
+    }
+    const PartitionLocation& location = selected->location;
+    // Absolute refusals: there is no flag or confirmation that can authorize
+    // writing to the Windows system or page-file disk.
+    if (location.system_disk) {
+      std::cerr << "error: the Windows system disk is never eligible for "
+                   "automatic read-write mounting.\n";
+      return 3;
+    }
+    if (location.pagefile_disk) {
+      std::cerr << "error: a disk holding the Windows page file is never "
+                   "eligible for automatic read-write mounting.\n";
+      return 3;
+    }
+    if (location.device_class == DeviceClass::kFixedDisk) {
+      std::cerr << "error: fixed physical disks are not qualified for "
+                   "automatic read-write mounting.\n";
+      return 3;
+    }
+    if (options.rw_experimental &&
+        location.device_class == DeviceClass::kRemovableDisk &&
+        !options.allow_removable_disk_write) {
+      std::cerr << "error: automatic read-write mounting of a removable disk "
+                   "requires --allow-removable-disk-write when using "
+                   "--rw-experimental.\n";
+      return 3;
+    }
+    if (location.device_class != DeviceClass::kRemovableDisk &&
+        location.device_class != DeviceClass::kVirtualDisk) {
+      std::cerr << "error: automatic read-write mounting is not qualified for "
+                   "this device class.\n";
+      return 3;
+    }
+    // Windows does not expose a serial number for its own virtual disks
+    // (VHD/VHDX).  Their stable id (the volume DeviceGuid) and size are the
+    // identity; every physical device class must report a serial.
+    const bool serial_required =
+        location.device_class != DeviceClass::kVirtualDisk;
+    if (location.stable_id.empty() || location.disk_size_bytes == 0 ||
+        (serial_required && location.serial_number.empty())) {
+      std::cerr << "error: the device did not report a complete DEV-1 identity "
+                   "(serial, stable id and size); read-write enrollment "
+                   "requires the stable id and size, and a serial for every "
+                   "physical device class.\n";
+      return 3;
+    }
+    entry.device_qualification = true;
+    entry.allow_fixed_disk = false;
+    entry.allow_removable_disk =
+        location.device_class == DeviceClass::kRemovableDisk;
+    entry.expected_serial = location.serial_number;
+    entry.expected_stable_id = location.stable_id;
+    entry.expected_size_bytes = location.disk_size_bytes;
+    entry.expected_device_class = location.device_class;
+  }
+
+  Status valid = ValidateAutomountEntry(entry);
+  if (!valid.ok()) {
+    PrintError(valid.error());
+    return 1;
+  }
+  config.Upsert(entry);
+  Status saved = SaveAutomountConfig(paths.config_file, config);
+  if (!saved.ok()) {
+    PrintError(saved.error());
+    return 1;
+  }
+
+  std::string label = selected ? selected->probe.label : std::string();
+  std::cout << "Automatic mounting enabled for ";
+  if (label.empty()) {
+    std::cout << FormatUuid(uuid);
+  } else {
+    std::cout << label << " (" << FormatUuid(uuid) << ")";
+  }
+  std::cout << " at "
+            << (entry.preferred_drive.empty() ? "the first free drive letter"
+                                              : entry.preferred_drive)
+            << " (" << ToString(entry.mode) << ").\n";
+  if (read_write) {
+    std::cout << "warning: experimental read-write access is enabled; the "
+                 "DEV-1 identity pins and the removable-disk/virtual-disk "
+                 "policy still apply on every insertion.\n";
+  }
+  const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
+  if (service.state == AutomountServiceState::kRunning) {
+    std::cout << "The running automount service will apply this change "
+                 "shortly.\n";
+  } else {
+    std::cout << "The automount service is not running; start it with "
+                 "`xfswin automount start`.\n";
+  }
+  return 0;
+}
+
+int CommandAutomountDisable(const std::vector<std::string>& args,
+                            const Options& options) {
+  (void)options;
+  if (args.size() != 3) {
+    std::cerr << "usage: xfswin automount disable <uuid|label|number>\n";
+    return 1;
+  }
+  const AutomountServicePaths paths = DefaultAutomountServicePaths();
+  auto loaded = LoadAutomountConfig(paths.config_file);
+  if (!loaded.ok()) {
+    PrintError(loaded.error());
+    return 1;
+  }
+  PrintAutomountWarnings(loaded.value().warnings);
+  AutomountConfig config = loaded.value().config;
+
+  Uuid uuid{};
+  if (!ParseUuid(args[2], &uuid)) {
+    std::string discovery_error;
+    auto discovered =
+        EnumerateXfsFilesystems(DiscoveryOptions{}, &discovery_error);
+    if (!discovered.ok()) {
+      std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+      return 1;
+    }
+    auto index =
+        SelectDiscoveredFilesystem(args[2], discovered.value().filesystems);
+    if (!index.ok()) {
+      std::cerr << "error: " << index.error().message << "\n";
+      return 1;
+    }
+    uuid = discovered.value()
+               .filesystems[index.value()]
+               .probe.superblock.uuid;
+  }
+  AutomountEntry* entry = config.Find(uuid);
+  if (!entry) {
+    std::cerr << "error: " << FormatUuid(uuid)
+              << " is not configured for automatic mounting.\n";
+    return 1;
+  }
+  entry->enabled = false;
+  Status saved = SaveAutomountConfig(paths.config_file, config);
+  if (!saved.ok()) {
+    PrintError(saved.error());
+    return 1;
+  }
+  std::cout << "Automatic mounting disabled for " << FormatUuid(uuid) << ".\n";
+  const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
+  if (service.state == AutomountServiceState::kRunning) {
+    std::cout << "The running automount service will apply this change "
+                 "shortly.\n";
+  }
+  return 0;
+}
+
+int CommandAutomount(const std::vector<std::string>& args,
+                     const Options& options, bool drive_specified,
+                     const std::string& drive_option) {
+  if (args.size() < 2) {
+    std::cerr
+        << "usage: xfswin automount <install|uninstall|start|stop|status|"
+           "enable|disable|run>\n";
+    return 1;
+  }
+  const std::string& action = args[1];
+  std::string message;
+  if (action == "install" || action == "uninstall" || action == "start" ||
+      action == "stop" || action == "status" || action == "run") {
+    if (args.size() != 2) {
+      std::cerr << "usage: xfswin automount " << action << "\n";
+      return 1;
+    }
+    if (action == "install") {
+      return PrintAutomountServiceResult(InstallAutomountService(&message),
+                                         message);
+    }
+    if (action == "uninstall") {
+      return PrintAutomountServiceResult(UninstallAutomountService(&message),
+                                         message);
+    }
+    if (action == "start") {
+      return PrintAutomountServiceResult(StartAutomountService(&message),
+                                         message);
+    }
+    if (action == "stop") {
+      return PrintAutomountServiceResult(StopAutomountService(&message),
+                                         message);
+    }
+    if (action == "run") {
+      return RunAutomountService();
+    }
+    return CommandStatus(options);
+  }
+  if (action == "enable") {
+    return CommandAutomountEnable(args, options, drive_specified,
+                                  drive_option);
+  }
+  if (action == "disable") {
+    return CommandAutomountDisable(args, options);
+  }
+  std::cerr << "error: unknown automount action '" << action << "'\n";
+  return 1;
+}
+
+#else  // !XFSWIN_HAS_WINFSP
+
+int CommandStatus(const Options&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+int CommandAutomount(const std::vector<std::string>&, const Options&, bool,
+                     const std::string&) {
+  std::cerr << "error: this build was compiled without WinFsp support.\n";
+  return 1;
+}
+
+#endif  // XFSWIN_HAS_WINFSP
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
@@ -3131,7 +4162,10 @@ int Run(const std::vector<std::string>& args) {
   int rmap_ag = -1;
   bool explicit_rw = false;
   bool replace_existing = false;
-  for (const auto& arg : args) {
+  std::string drive_option;
+  bool drive_option_given = false;
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string& arg = args[i];
     if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
     } else if (arg == "--perf-stats") {
@@ -3238,6 +4272,19 @@ int Run(const std::vector<std::string>& args) {
       options.nrext64 = true;
     } else if (arg == "--rw") {
       explicit_rw = true;
+    } else if (StartsWith(arg, "--drive=")) {
+      drive_option = arg.substr(8);
+      drive_option_given = true;
+    } else if (arg == "--drive") {
+      // `--drive E:` has always been the documented spelling; accept it
+      // alongside `--drive=E:`. The value is never a flag, so a following
+      // option means the value is missing.
+      if (i + 1 >= args.size() || StartsWith(args[i + 1], "--")) {
+        std::cerr << "error: --drive requires a drive letter or 'auto'\n";
+        return 1;
+      }
+      drive_option = args[++i];
+      drive_option_given = true;
     } else if (StartsWith(arg, "--text=")) {
       pwrite_text = arg.substr(7);
     } else if (StartsWith(arg, "--from=")) {
@@ -3275,12 +4322,18 @@ int Run(const std::vector<std::string>& args) {
     }
   }
 
-  // --rw is the eventual stable alias. The qualified writer is still opt-in
-  // as --rw-experimental; a real device additionally needs
-  // --device-write-qualification and a device-class opt-in.
+  // --rw is the ordinary automount enrollment spelling.  It is not a manual
+  // writer switch: manual raw writes still require --rw-experimental plus the
+  // DEV-1 qualification flags, so any other command keeps the old refusal.
   if (explicit_rw) {
-    std::cerr << "error: --rw is not enabled yet as a stable alias. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
-    return 3;
+    const bool automount_enable =
+        positional.size() >= 2 && positional[0] == "automount" &&
+        positional[1] == "enable";
+    if (!automount_enable) {
+      std::cerr << "error: --rw is only valid for `xfswin automount enable`. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
+      return 3;
+    }
+    options.automount_rw = true;
   }
 
   if (options.perf_stats) xfs::PerfStats::Get().SetEnabled(true);
@@ -3311,6 +4364,24 @@ int Run(const std::vector<std::string>& args) {
   const std::string& command = positional[0];
 
   if (command == "list") return CommandList();
+  if (command == "devices") {
+    if (positional.size() != 1) {
+      std::cerr << "usage: xfswin devices\n";
+      return 1;
+    }
+    return CommandDevices(options);
+  }
+  if (command == "status") {
+    if (positional.size() != 1) {
+      std::cerr << "usage: xfswin status\n";
+      return 1;
+    }
+    return CommandStatus(options);
+  }
+  if (command == "automount") {
+    return CommandAutomount(positional, options, drive_option_given,
+                            drive_option);
+  }
   if (command == "info") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin info <device|image>\n";
@@ -3591,11 +4662,32 @@ int Run(const std::vector<std::string>& args) {
     return CommandFormat(positional[1], options);
   }
   if (command == "mount") {
-    if (positional.size() != 3) {
-      std::cerr << "usage: xfswin mount <device|image> <drive-letter|directory>\n";
-      return 1;
+    std::string preferred;
+    if (drive_option_given) {
+      auto parsed = ParseDriveSelection(drive_option);
+      if (!parsed.ok()) {
+        std::cerr << "error: " << parsed.error().message << "\n";
+        return 1;
+      }
+      preferred = parsed.value().drive;
     }
-    return CommandMount(positional[1], positional[2], options);
+    if (positional.size() == 1) {
+      return CommandMountInteractive(options, drive_option_given, preferred);
+    }
+    if (positional.size() == 2) {
+      return CommandMountAutoDrive(positional[1], preferred, options);
+    }
+    if (positional.size() == 3) {
+      if (drive_option_given) {
+        std::cerr << "error: use either the positional drive letter or "
+                     "--drive, not both\n";
+        return 1;
+      }
+      return CommandMount(positional[1], positional[2], options);
+    }
+    std::cerr << "usage: xfswin mount [<device|image> [<drive-letter>]] "
+                 "[--drive <letter|auto>]\n";
+    return 1;
   }
   if (command == "unmount") {
     if (positional.size() != 2) {

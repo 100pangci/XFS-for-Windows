@@ -64,7 +64,13 @@ struct RawDiskInfo {
 };
 
 // Enumerates \\.\PhysicalDrive0..N with geometry, identity and safety flags.
-std::vector<RawDiskInfo> EnumeratePhysicalDrives(std::string* error);
+// When `locked_disk_numbers` is not null it receives every disk number that
+// exists but could not be opened because another handle holds the disk
+// exclusively (ERROR_SHARING_VIOLATION), for example this service's own
+// read-write mount.  A number with no device behind it is not reported: the
+// disk-number space is sparse and those holes are normal.
+std::vector<RawDiskInfo> EnumeratePhysicalDrives(
+    std::string* error, std::vector<uint32_t>* locked_disk_numbers = nullptr);
 
 // Opens a raw device path (\\.\PhysicalDriveN, \\.\HarddiskVolumeX, ...) under
 // an explicit policy.  A writable open probes the device first, validates its

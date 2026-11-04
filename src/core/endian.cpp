@@ -41,23 +41,27 @@ int HexDigit(char c) {
 bool ParseUuid(const std::string& text, Uuid* out) {
   // Accept "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (36 chars).
   if (text.size() != 36) return false;
-  size_t positions[16];
-  size_t out_idx = 0;
-  for (size_t i = 0; i < 36 && out_idx < 16; ++i) {
-    if (i == 8 || i == 13 || i == 18 || i == 23) {
+  for (size_t i = 0; i < 36; ++i) {
+    const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+    if (dash) {
       if (text[i] != '-') return false;
+    } else if (HexDigit(text[i]) < 0) {
+      return false;
+    }
+  }
+  Uuid uuid{};
+  size_t byte_index = 0;
+  for (size_t i = 0; i < 36 && byte_index < 16;) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      ++i;
       continue;
     }
-    positions[out_idx++] = i;
+    const int hi = HexDigit(text[i]);
+    const int lo = HexDigit(text[i + 1]);
+    uuid[byte_index++] = static_cast<uint8_t>((hi << 4) | lo);
+    i += 2;
   }
-  if (out_idx != 16) return false;
-  Uuid uuid{};
-  for (size_t i = 0; i < 16; ++i) {
-    int hi = HexDigit(text[positions[i]]);
-    int lo = HexDigit(text[positions[i] + 1]);
-    if (hi < 0 || lo < 0) return false;
-    uuid[i] = static_cast<uint8_t>((hi << 4) | lo);
-  }
+  if (byte_index != 16) return false;
   *out = uuid;
   return true;
 }

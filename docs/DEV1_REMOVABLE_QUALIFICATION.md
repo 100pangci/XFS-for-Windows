@@ -480,4 +480,21 @@ device path in final HEAD.
 `AA00000000000489`, 64,160,400,896 bytes, USB BOT, 512-byte sectors,
 2026-11-01).**
 
+## 7. Automount enrollment on this profile
+
+`xfswin automount enable <uuid> --rw` records the same DEV-1 identity pins
+(serial `AA00000000000489`, the stable id, 64,160,400,896 bytes, class
+`removable-disk`) and the removable-disk opt-in. Every later insertion
+re-reads them before a read-write mount; a different device with the same XFS
+UUID falls back to read-only. Drive-letter takeover uses the letter Windows
+assigned to the RAW volume only after an exact volume/disk/extent match, and a
+failed WinFsp mount restores that Windows mount point.
+
+The automated takeover and read-write automount coverage in CI runs on virtual
+disks (VHDX), not on this USB device: `windows-automount-takeover` and
+`linux-verify-ux-rw-image`. This manual DEV-1R run did not exercise the
+automount service or a RAW-letter takeover on the Samsung device, so that path
+remains covered by the VHD CI evidence and the unit transaction tests rather
+than by a second physical run.
+
 **FIXED PHYSICAL DISK: NOT READY.**

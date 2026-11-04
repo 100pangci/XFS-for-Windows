@@ -32,6 +32,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -80,6 +81,9 @@ struct AdapterState {
   // changed, invalid handle).  Every later device-touching callback fails
   // fast instead of retrying, and the mount host is asked to unmount.
   std::atomic<bool> device_failed{false};
+  // Stop event of this mount session.  Set once during session setup before
+  // the dispatcher can report a device failure; never shared between mounts.
+  HANDLE stop_event = nullptr;
 
   // WinFsp's default FileContext model is a "file node": opening the same file
   // must return the same node value for as long as it is open anywhere, and
@@ -185,47 +189,28 @@ void CountCallback(std::atomic<uint64_t>& counter) {
   if (perf.enabled()) counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-// A process mounts at most one filesystem (the stop event below already
-// assumes this), so the active mount state is reachable from the error
-// translation helpers that do not receive FSP_FILE_SYSTEM*.
-std::atomic<AdapterState*> g_mount_state{nullptr};
-HANDLE g_stop_event = nullptr;
-
 // The raw-device backend latches a terminal failure (device removed, media
 // changed, invalid handle) into DeviceState::kInvalid.  A mount must not keep
 // serving a dead device: latch the failure once, make every later
-// device-touching callback fail, and signal the mount host so it runs the
-// unmount path instead of leaving a dead drive letter attached.  The unmount
-// itself will report the failed durable close, which is the correct outcome.
-void NoteDeviceFailure() {
-  AdapterState* state = g_mount_state.load(std::memory_order_acquire);
-  if (!state || !state->fs) return;
-  if (state->fs->device().State() != DeviceState::kInvalid) return;
-  if (state->device_failed.exchange(true, std::memory_order_relaxed)) return;
+// device-touching callback fail, and signal that mount's stop event so the
+// mount host runs the unmount path instead of leaving a dead drive letter
+// attached.  Each session owns its own state and event; one failed device
+// never signals another mount.  The unmount itself will report the failed
+// durable close, which is the correct outcome.
+void NoteDeviceFailure(AdapterState& state) {
+  if (!state.fs) return;
+  if (state.fs->device().State() != DeviceState::kInvalid) return;
+  if (state.device_failed.exchange(true, std::memory_order_relaxed)) return;
   XFS_ERROR("block device failed terminally ("
-            << ToString(state->fs->device().LastErrorKind())
+            << ToString(state.fs->device().LastErrorKind())
             << "); stopping the mount");
-  if (g_stop_event) SetEvent(g_stop_event);
+  if (state.stop_event) SetEvent(state.stop_event);
 }
 
-// Publishes the active mount to NoteDeviceFailure() for exactly as long as
-// callbacks can run against it.
-class MountStateScope {
- public:
-  explicit MountStateScope(AdapterState* state) {
-    g_mount_state.store(state, std::memory_order_release);
-  }
-  ~MountStateScope() {
-    g_mount_state.store(nullptr, std::memory_order_release);
-  }
-  MountStateScope(const MountStateScope&) = delete;
-  MountStateScope& operator=(const MountStateScope&) = delete;
-};
-
-NTSTATUS NtFromError(XfsError code) {
+NTSTATUS NtFromError(AdapterState& state, XfsError code) {
   // Device I/O errors are the only ones that can mean the device went away.
   if (code == XfsError::kIoError || code == XfsError::kShortRead) {
-    NoteDeviceFailure();
+    NoteDeviceFailure(state);
   }
   switch (code) {
     case XfsError::kOk: return STATUS_SUCCESS;
@@ -269,8 +254,8 @@ NTSTATUS NtFromError(XfsError code) {
   }
 }
 
-NTSTATUS NtFromStatus(const Status& status) {
-  return NtFromError(status.error().code);
+NTSTATUS NtFromStatus(AdapterState& state, const Status& status) {
+  return NtFromError(state, status.error().code);
 }
 
 std::wstring JoinName(const std::wstring& parent, const std::wstring& child) {
@@ -788,7 +773,7 @@ NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
     XFS_DEBUG("GetSecurityByName('" << WideToUtf8(file_name)
                                      << "') failed: "
                                      << inode.error().Format());
-    return NtFromError(inode.error().code);
+    return NtFromError(state, inode.error().code);
   }
   uint32_t attributes = FileAttributesFor(state, inode.value().mode);
   if (NeedsSecurityOverflow(state, security_descriptor_size)) {
@@ -812,7 +797,7 @@ NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   // always, FILE_OPEN_IF / FILE_OVERWRITE_IF after Open reported
   // OBJECT_NAME_NOT_FOUND. Existence is therefore an error here.
   auto target = ResolveParentAndName(state, file_name);
-  if (!target.ok()) return NtFromError(target.error().code);
+  if (!target.ok()) return NtFromError(state, target.error().code);
   const uint64_t parent_ino = target.value().first;
   const std::string& name = target.value().second;
   const bool directory = (create_options & FILE_DIRECTORY_FILE) != 0;
@@ -820,13 +805,13 @@ NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   uint64_t ino = 0;
   if (directory) {
     Status status = state.fs->Mkdir(parent_ino, name, 0755, 0, 0);
-    if (!status.ok()) return NtFromStatus(status);
+    if (!status.ok()) return NtFromStatus(state, status);
     auto entry = state.fs->LookupName(parent_ino, name);
-    if (!entry.ok()) return NtFromError(entry.error().code);
+    if (!entry.ok()) return NtFromError(state, entry.error().code);
     ino = entry.value().ino;
   } else {
     auto created = state.fs->CreateRegularFile(parent_ino, name, 0644, 0, 0);
-    if (!created.ok()) return NtFromError(created.error().code);
+    if (!created.ok()) return NtFromError(state, created.error().code);
     ino = created.value();
     // AllocationSize is a real hint from the Windows copy path. Preallocate
     // unwritten extents without moving EOF; a later write converts only the
@@ -842,12 +827,12 @@ NTSTATUS Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
     }
   }
   auto inode = state.fs->OpenInode(ino);
-  if (!inode.ok()) return NtFromError(inode.error().code);
+  if (!inode.ok()) return NtFromError(state, inode.error().code);
   auto context = TakeNode(state, std::move(inode.value()), parent_ino, name);
-  if (!context.ok()) return NtFromError(context.error().code);
+  if (!context.ok()) return NtFromError(state, context.error().code);
   *file_context = context.value();
   auto info = state.fs->GetFileInfo(ino);
-  if (!info.ok()) return NtFromError(info.error().code);
+  if (!info.ok()) return NtFromError(state, info.error().code);
   FillFileInfo(state, info.value(), file_info);
   DropNamespaceCaches(state, parent_ino);
   DropPathCache(state, file_name ? std::wstring(file_name) : std::wstring(),
@@ -866,13 +851,13 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
       return STATUS_FILE_IS_A_DIRECTORY;
     }
     auto inode = state.fs->OpenInode(state.fs->RootInode());
-    if (!inode.ok()) return NtFromError(inode.error().code);
+    if (!inode.ok()) return NtFromError(state, inode.error().code);
     auto context = TakeNode(state, std::move(inode.value()),
                             state.fs->RootInode(), std::string());
-    if (!context.ok()) return NtFromError(context.error().code);
+    if (!context.ok()) return NtFromError(state, context.error().code);
     *file_context = context.value();
     auto info = state.fs->GetFileInfo(state.fs->RootInode());
-    if (!info.ok()) return NtFromError(info.error().code);
+    if (!info.ok()) return NtFromError(state, info.error().code);
     FillFileInfo(state, info.value(), file_info);
     return STATUS_SUCCESS;
   }
@@ -880,14 +865,14 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
   if (!target.ok()) {
     XFS_DEBUG("Open('" << WideToUtf8(file_name)
                        << "') failed: " << target.error().Format());
-    return NtFromError(target.error().code);
+    return NtFromError(state, target.error().code);
   }
   const uint64_t parent_ino = target.value().first;
   const std::string& name = target.value().second;
   auto entry = state.fs->LookupName(parent_ino, name);
-  if (!entry.ok()) return NtFromError(entry.error().code);
+  if (!entry.ok()) return NtFromError(state, entry.error().code);
   auto inode = state.fs->OpenInode(entry.value().ino);
-  if (!inode.ok()) return NtFromError(inode.error().code);
+  if (!inode.ok()) return NtFromError(state, inode.error().code);
   if ((create_options & FILE_DIRECTORY_FILE) && !inode.value().IsDir()) {
     return STATUS_NOT_A_DIRECTORY;
   }
@@ -905,18 +890,18 @@ NTSTATUS Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name,
       XFS_DEBUG("Open(overwrite, ino=" << inode.value().ino
                                        << ") refused: "
                                        << info.error().Format());
-      return NtFromError(info.error().code);
+      return NtFromError(state, info.error().code);
     }
     auto fresh = state.fs->OpenInode(inode.value().ino);
-    if (!fresh.ok()) return NtFromError(fresh.error().code);
+    if (!fresh.ok()) return NtFromError(state, fresh.error().code);
     inode = std::move(fresh);
   }
   auto context =
       TakeNode(state, std::move(inode.value()), parent_ino, name);
-  if (!context.ok()) return NtFromError(context.error().code);
+  if (!context.ok()) return NtFromError(state, context.error().code);
   *file_context = context.value();
   auto info = state.fs->GetFileInfo(entry.value().ino);
-  if (!info.ok()) return NtFromError(info.error().code);
+  if (!info.ok()) return NtFromError(state, info.error().code);
   FillFileInfo(state, info.value(), file_info);
   return STATUS_SUCCESS;
 }
@@ -931,7 +916,7 @@ NTSTATUS Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32,
   if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
   if (!node->inode->IsRegular()) return STATUS_NOT_SUPPORTED;
   auto info = state.fs->SetFileSize(node->inode->ino, 0);
-  if (!info.ok()) return NtFromError(info.error().code);
+  if (!info.ok()) return NtFromError(state, info.error().code);
   if (allocation_size > 0) {
     Status pre = PreallocateHint(*state.fs, node->inode->ino, allocation_size);
     if (!pre.ok()) {
@@ -1067,7 +1052,7 @@ NTSTATUS Read(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (node->inode->IsDir()) return STATUS_INVALID_DEVICE_REQUEST;
   auto read =
       ReadInode(state, *node->inode, node->extents.get(), offset, buffer, length);
-  if (!read.ok()) return NtFromError(read.error().code);
+  if (!read.ok()) return NtFromError(state, read.error().code);
   *bytes_transferred = static_cast<ULONG>(read.value());
   return STATUS_SUCCESS;
 }
@@ -1107,7 +1092,7 @@ NTSTATUS Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer,
     XFS_DEBUG("Write(ino=" << node->inode->ino << ", offset=" << offset
                            << ", length=" << length
                            << ") refused: " << written.error().Format());
-    return NtFromError(written.error().code);
+    return NtFromError(state, written.error().code);
   }
   if (bytes_transferred) {
     *bytes_transferred = static_cast<ULONG>(written.value());
@@ -1128,7 +1113,7 @@ NTSTATUS Flush(FSP_FILE_SYSTEM* file_system, PVOID, FSP_FSCTL_FILE_INFO*) {
   if (!status.ok()) {
     XFS_ERROR("flush failed: " << status.error().Format());
     // A flush failure is how a removed device usually surfaces first.
-    NoteDeviceFailure();
+    NoteDeviceFailure(state);
     return STATUS_IO_DEVICE_ERROR;
   }
   return STATUS_SUCCESS;
@@ -1157,7 +1142,7 @@ NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
 
   auto current = state.fs->GetFileInfo(node->inode->ino);
-  if (!current.ok()) return NtFromError(current.error().code);
+  if (!current.ok()) return NtFromError(state, current.error().code);
 
   if (file_attributes != INVALID_FILE_ATTRIBUTES) {
     // POSIX mode is the authority on this volume. Windows' read-only bit maps
@@ -1175,7 +1160,7 @@ NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
         mode = static_cast<uint16_t>(mode | 0200);
       }
       auto changed_mode = state.fs->SetFileMode(node->inode->ino, mode);
-      if (!changed_mode.ok()) return NtFromError(changed_mode.error().code);
+      if (!changed_mode.ok()) return NtFromError(state, changed_mode.error().code);
       current = changed_mode;
     }
   }
@@ -1206,7 +1191,7 @@ NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (changed) {
     auto updated = state.fs->SetFileTimes(node->inode->ino, atime, mtime,
                                           ctime);
-    if (!updated.ok()) return NtFromError(updated.error().code);
+    if (!updated.ok()) return NtFromError(state, updated.error().code);
   }
   RefreshNode(state, NodeId(file_context));
   auto refreshed = LookupNode(state, file_context);
@@ -1228,7 +1213,7 @@ NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
     // one extends allocation without moving EOF (unwritten extents).
     if (new_size < node->inode->size) {
       auto truncated = state.fs->SetFileSize(node->inode->ino, new_size);
-      if (!truncated.ok()) return NtFromError(truncated.error().code);
+      if (!truncated.ok()) return NtFromError(state, truncated.error().code);
     } else {
       const uint64_t block_size = state.fs->geometry().block_size;
       const uint64_t allocated =
@@ -1252,7 +1237,7 @@ NTSTATUS SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   if (!info.ok()) {
     XFS_DEBUG("SetFileSize(ino=" << node->inode->ino << ", size=" << new_size
                                  << ") refused: " << info.error().Format());
-    return NtFromError(info.error().code);
+    return NtFromError(state, info.error().code);
   }
   RefreshNode(state, NodeId(file_context));
   auto refreshed = LookupNode(state, file_context);
@@ -1269,7 +1254,7 @@ NTSTATUS SetDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR,
   if (!delete_file) return STATUS_SUCCESS;  // clearing the disposition
   // The actual deletion happens in Cleanup; this is the read-only test that
   // Windows performs first (like xfs_remove's checks, before any mutation).
-  return NtFromStatus(CheckDeletable(state, *node->inode));
+  return NtFromStatus(state, CheckDeletable(state, *node->inode));
 }
 
 NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR) {
@@ -1278,7 +1263,7 @@ NTSTATUS CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR) {
   if (!state.read_write) return STATUS_MEDIA_WRITE_PROTECTED;
   auto node = LookupNode(state, file_context);
   if (!node) return STATUS_INVALID_HANDLE;
-  return NtFromStatus(CheckDeletable(state, *node->inode));
+  return NtFromStatus(state, CheckDeletable(state, *node->inode));
 }
 
 NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
@@ -1289,9 +1274,9 @@ NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_nam
   // The FSD hands over both names; the core owns the whole atomic operation
   // (never DirRemove + DirInsert from here).
   auto src = ResolveParentAndName(state, file_name);
-  if (!src.ok()) return NtFromError(src.error().code);
+  if (!src.ok()) return NtFromError(state, src.error().code);
   auto dst = ResolveParentAndName(state, new_file_name);
-  if (!dst.ok()) return NtFromError(dst.error().code);
+  if (!dst.ok()) return NtFromError(state, dst.error().code);
 
   // The replaced target may still have open handles: keep its inode alive
   // (AGI unlinked list) and let the last Close free it.
@@ -1303,7 +1288,7 @@ NTSTATUS Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_nam
     XFS_DEBUG("Rename('" << WideToUtf8(file_name) << "' -> '"
                          << WideToUtf8(new_file_name)
                          << "') failed: " << outcome.error().Format());
-    return NtFromError(outcome.error().code);
+    return NtFromError(state, outcome.error().code);
   }
 
   uint64_t free_ino = 0;
@@ -1420,7 +1405,7 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   }
   if (!children) {
     auto entries = state.fs->ListDirectory(context->inode->ino);
-    if (!entries.ok()) return NtFromError(entries.error().code);
+    if (!entries.ok()) return NtFromError(state, entries.error().code);
     auto built = std::make_shared<std::vector<DirChild>>();
     built->reserve(entries.value().size());
     for (const auto& entry : entries.value()) {
@@ -1482,12 +1467,12 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
   auto add_entry = [&](uint64_t ino, const std::u16string& name) -> bool {
     auto file_info = state.fs->GetFileInfo(ino);
     if (!file_info.ok()) {
-      NoteDeviceFailure();
+      NoteDeviceFailure(state);
       if (state.device_failed.load(std::memory_order_relaxed)) {
         XFS_ERROR("cannot enumerate inode " << ino
                                             << " after device failure: "
                                             << file_info.error().Format());
-        stop_status = NtFromError(file_info.error().code);
+        stop_status = NtFromError(state, file_info.error().code);
         return false;
       }
       XFS_WARN("cannot open inode " << ino << ": "
@@ -1518,9 +1503,9 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
         if (!have_parent) {
           auto parent = state.fs->LookupName(context->inode->ino, "..");
           if (!parent.ok()) {
-            NoteDeviceFailure();
+            NoteDeviceFailure(state);
             if (state.device_failed.load(std::memory_order_relaxed)) {
-              return NtFromError(parent.error().code);
+              return NtFromError(state, parent.error().code);
             }
             continue;
           }
@@ -1558,8 +1543,15 @@ NTSTATUS ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 // Mount lifetime
 // ---------------------------------------------------------------------------
 
+// The console mount host runs at most one session per process. Ctrl+C must
+// only signal it: the session's waiter thread performs the clean unmount.
+std::atomic<MountSession*> g_console_session{nullptr};
+
 BOOL WINAPI ConsoleCtrlHandler(DWORD) {
-  if (g_stop_event) SetEvent(g_stop_event);
+  if (MountSession* session =
+          g_console_session.load(std::memory_order_acquire)) {
+    session->RequestStop();
+  }
   return TRUE;
 }
 
@@ -2252,8 +2244,123 @@ int RunAdapterSelfTest(std::unique_ptr<XfsFilesystem> filesystem) {
   return failures ? 1 : 0;
 }
 
-Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
-                            const MountConfig& config) {
+namespace {
+
+// Session IDs only need to be unique within this process: they identify one
+// live WinFsp mount to the automount service.
+std::atomic<uint64_t> g_session_sequence{0};
+
+// WinFsp does not copy the interface table: FspFileSystemCreate stores the
+// pointer for the lifetime of the file system object.  A stack-local table is
+// only safe while the creating stack frame survives; the automount service
+// creates mounts on its worker thread, whose stack is reused immediately
+// afterwards.  The callbacks are stateless (the per-mount state lives in
+// FileSystem->UserContext), so one immutable table with static storage serves
+// every session.
+const FSP_FILE_SYSTEM_INTERFACE* FileSystemInterface() {
+  static const FSP_FILE_SYSTEM_INTERFACE interface = [] {
+    FSP_FILE_SYSTEM_INTERFACE table{};
+    table.GetVolumeInfo = GetVolumeInfo;
+    table.SetVolumeLabel = SetVolumeLabel;
+    table.GetSecurityByName = GetSecurityByName;
+    table.Create = Create;
+    table.Open = Open;
+    table.Overwrite = Overwrite;
+    table.Cleanup = Cleanup;
+    table.Close = Close;
+    table.Read = Read;
+    table.Write = Write;
+    table.Flush = Flush;
+    table.GetFileInfo = GetFileInfo;
+    table.SetBasicInfo = SetBasicInfo;
+    table.SetFileSize = SetFileSize;
+    table.CanDelete = CanDelete;
+    table.SetDelete = SetDelete;
+    table.Rename = Rename;
+    table.GetSecurity = GetSecurity;
+    table.SetSecurity = SetSecurity;
+    table.ReadDirectory = ReadDirectory;
+    return table;
+  }();
+  return &interface;
+}
+
+}  // namespace
+
+struct MountSession::Impl {
+  MountConfig config;
+  std::unique_ptr<AdapterState> state;
+  FSP_FILE_SYSTEM* winfsp = nullptr;
+  HANDLE stop_event = nullptr;
+  std::string id;
+  std::atomic<bool> finished{false};
+  Status unmount_status;
+  std::mutex join_mutex;
+  bool joined = false;
+  std::thread waiter;
+
+  ~Impl() {
+    // A session destroyed without Stop() still has to release the drive.
+    if (stop_event) SetEvent(stop_event);
+    if (waiter.joinable()) waiter.join();
+    if (stop_event) CloseHandle(stop_event);
+    if (state && state->security_descriptor) {
+      LocalFree(state->security_descriptor);
+      state->security_descriptor = nullptr;
+    }
+  }
+
+  void WaitLoop() {
+    WaitForSingleObject(stop_event, INFINITE);
+    Cleanup();
+  }
+
+  void Cleanup() {
+    FspFileSystemStopDispatcher(winfsp);
+    // Clean unmount: close the journal with an unmount record and push
+    // everything this process wrote to stable storage before the mount point
+    // disappears. A failure is reported as a failed unmount: the filesystem
+    // may still be structurally consistent, but the caller must not be told
+    // that the durable close succeeded when it did not.
+    Status status = OkStatus();
+    if (config.read_write) {
+      // Publish deferred timestamps before the unmount record: a clean log
+      // must not be followed by new transactions.
+      Status published = state->fs->CommitAllDeferredMetadata();
+      if (!published.ok()) {
+        XFS_ERROR("unmount deferred metadata commit failed: "
+                  << published.error().Format());
+        status = published;
+      }
+      Status closed = state->fs->WriteCleanUnmountRecord();
+      if (!closed.ok()) {
+        XFS_ERROR("unmount journal close failed: " << closed.error().Format());
+        if (status.ok()) status = closed;
+      }
+      Status flushed = state->fs->Flush();
+      if (!flushed.ok()) {
+        XFS_ERROR("unmount flush failed: " << flushed.error().Format());
+        if (status.ok()) status = flushed;
+      }
+    }
+    FspFileSystemRemoveMountPoint(winfsp);
+    FspFileSystemDelete(winfsp);
+    winfsp = nullptr;
+    if (state->security_descriptor) {
+      LocalFree(state->security_descriptor);
+      state->security_descriptor = nullptr;
+    }
+    if (PerfStats::Get().enabled()) {
+      std::fputs(PerfStats::Get().Text().c_str(), stderr);
+    }
+    XFS_INFO("unmounted");
+    unmount_status = status;
+    finished.store(true, std::memory_order_release);
+  }
+};
+
+Result<std::unique_ptr<MountSession>> MountSession::Start(
+    std::unique_ptr<XfsFilesystem> filesystem, const MountConfig& config) {
   if (!filesystem) {
     return XFS_ERR(XfsError::kInvalidArgument, "no filesystem to mount");
   }
@@ -2299,41 +2406,73 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   }
 
   if (config.perf_stats) PerfStats::Get().SetEnabled(true);
-  auto state = std::make_unique<AdapterState>();
-  state->fs = std::move(filesystem);
-  // Callbacks may run from the moment the dispatcher starts; publish the
-  // mount now so a terminal device failure is noticed on any callback path.
-  MountStateScope mount_state_scope(state.get());
-  state->read_write = config.read_write;
-  const XfsGeometry& geo = state->fs->geometry();
-  const XfsSuperblock& sb = state->fs->superblock();
-  if (state->read_write && !state->fs->writable()) {
+
+  auto impl = std::make_unique<Impl>();
+  impl->config = config;
+  impl->id = "xfswin." + std::to_string(++g_session_sequence);
+  impl->state = std::make_unique<AdapterState>();
+  AdapterState& state = *impl->state;
+  state.fs = std::move(filesystem);
+  state.read_write = config.read_write;
+  if (state.read_write && !state.fs->writable()) {
     return XFS_ERR(XfsError::kInternal,
                    "read-write mount requested for a read-only filesystem");
   }
 
-  state->sector_size = 512;
-  state->sectors_per_allocation_unit =
+  // Free everything a failed Start() prepared. The waiter thread is only
+  // started after every fallible step, so this never races with cleanup.
+  bool dispatcher_started = false;
+  auto teardown = [&]() {
+    if (impl->winfsp) {
+      if (dispatcher_started) {
+        FspFileSystemStopDispatcher(impl->winfsp);
+        dispatcher_started = false;
+      }
+      FspFileSystemRemoveMountPoint(impl->winfsp);
+      FspFileSystemDelete(impl->winfsp);
+      impl->winfsp = nullptr;
+    }
+    if (impl->stop_event) {
+      CloseHandle(impl->stop_event);
+      impl->stop_event = nullptr;
+      state.stop_event = nullptr;
+    }
+    if (state.security_descriptor) {
+      LocalFree(state.security_descriptor);
+      state.security_descriptor = nullptr;
+    }
+  };
+  auto fail = [&](ErrorContext error)
+      -> Result<std::unique_ptr<MountSession>> {
+    teardown();
+    return error;
+  };
+
+  const XfsGeometry& geo = state.fs->geometry();
+  const XfsSuperblock& sb = state.fs->superblock();
+
+  state.sector_size = 512;
+  state.sectors_per_allocation_unit =
       static_cast<uint16_t>(std::max<uint32_t>(1, geo.block_size / 512));
-  state->label = Utf8ToUtf16(sb.label.data());
+  state.label = Utf8ToUtf16(sb.label.data());
 
   // Read-only: read access for everyone (POSIX ACLs are preserved internally
   // but not translated into Windows ACLs in this version). Read-write: full
   // access for everyone, so applications can actually write; the POSIX mode
   // bits still decide per file (a 0444 file is reported read-only).
   const wchar_t* sddl =
-      state->read_write ? L"O:BAG:BAD:(A;;FA;;;WD)" : L"O:BAG:BAD:(A;;FR;;;WD)";
+      state.read_write ? L"O:BAG:BAD:(A;;FA;;;WD)" : L"O:BAG:BAD:(A;;FR;;;WD)";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-          sddl, SDDL_REVISION_1, &state->security_descriptor,
-          &state->security_descriptor_size)) {
-    return XFS_ERR(XfsError::kInternal,
-                   "failed to build the volume security descriptor");
+          sddl, SDDL_REVISION_1, &state.security_descriptor,
+          &state.security_descriptor_size)) {
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "failed to build the volume security descriptor"));
   }
 
   FSP_FSCTL_VOLUME_PARAMS params{};
   params.Version = sizeof(params);
-  params.SectorSize = state->sector_size;
-  params.SectorsPerAllocationUnit = state->sectors_per_allocation_unit;
+  params.SectorSize = state.sector_size;
+  params.SectorsPerAllocationUnit = state.sectors_per_allocation_unit;
   FILETIME now{};
   GetSystemTimeAsFileTime(&now);
   params.VolumeCreationTime =
@@ -2346,7 +2485,7 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   // Windows' cache after our own writes, so the default stays 0. The timeout
   // is overridable for A/B measurement (docs/PERFORMANCE.md); it is not a
   // durability knob.
-  uint32_t file_info_timeout = state->read_write ? 0 : 1000;
+  uint32_t file_info_timeout = state.read_write ? 0 : 1000;
   if (const char* env = std::getenv("XFSWIN_FILE_INFO_TIMEOUT_MS")) {
     char* end = nullptr;
     const unsigned long parsed = std::strtoul(env, &end, 10);
@@ -2358,7 +2497,7 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   params.CaseSensitiveSearch = 1;
   params.CasePreservedNames = 1;
   params.UnicodeOnDisk = 1;
-  params.ReadOnlyVolume = state->read_write ? 0 : 1;
+  params.ReadOnlyVolume = state.read_write ? 0 : 1;
   params.PersistentAcls = 0;
   params.PostCleanupWhenModifiedOnly = 1;
   // The adapter supports open-but-unlinked files and open-handle rename
@@ -2384,77 +2523,83 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
   wcscpy_s(params.FileSystemName,
            sizeof(params.FileSystemName) / sizeof(WCHAR), L"XFS");
 
-  FSP_FILE_SYSTEM_INTERFACE interface{};
-  interface.GetVolumeInfo = GetVolumeInfo;
-  interface.SetVolumeLabel = SetVolumeLabel;
-  interface.GetSecurityByName = GetSecurityByName;
-  interface.Create = Create;
-  interface.Open = Open;
-  interface.Overwrite = Overwrite;
-  interface.Cleanup = Cleanup;
-  interface.Close = Close;
-  interface.Read = Read;
-  interface.Write = Write;
-  interface.Flush = Flush;
-  interface.GetFileInfo = GetFileInfo;
-  interface.SetBasicInfo = SetBasicInfo;
-  interface.SetFileSize = SetFileSize;
-  interface.CanDelete = CanDelete;
-  interface.SetDelete = SetDelete;
-  interface.Rename = Rename;
-  interface.GetSecurity = GetSecurity;
-  interface.SetSecurity = SetSecurity;
-  interface.ReadDirectory = ReadDirectory;
-
-  FSP_FILE_SYSTEM* winfsp = nullptr;
   // The device path must be the WinFsp control device (FSP_FSCTL_DISK_DEVICE_NAME
   // is a narrow literal; the L"" prefix makes the concatenation wide). The FSD
   // derives a unique volume device from the mount point.
   static const wchar_t kDiskDeviceName[] = L"" FSP_FSCTL_DISK_DEVICE_NAME;
   NTSTATUS status = FspFileSystemCreate(
-      const_cast<PWSTR>(kDiskDeviceName), &params, &interface, &winfsp);
+      const_cast<PWSTR>(kDiskDeviceName), &params, FileSystemInterface(),
+      &impl->winfsp);
   if (status != STATUS_SUCCESS) {
-    LocalFree(state->security_descriptor);
-    return XFS_ERR(XfsError::kInternal,
-                   "FspFileSystemCreate failed (NTSTATUS 0x" +
-                       std::to_string(static_cast<uint32_t>(status)) + ")");
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "FspFileSystemCreate failed (NTSTATUS 0x" +
+                            std::to_string(static_cast<uint32_t>(status)) +
+                            ")"));
   }
-  winfsp->UserContext = state.get();
+  impl->winfsp->UserContext = &state;
   // WinFsp's fine-grained guard: namespace operations take an exclusive lock,
   // while reads/writes/getinfo for different files run in parallel. The core
   // uses a write barrier plus per-inode stripes, and the image device now
   // allows concurrent positioned I/O, so this actually reaches the storage.
-  FspFileSystemSetOperationGuard(winfsp, FspFileSystemOpEnter,
+  FspFileSystemSetOperationGuard(impl->winfsp, FspFileSystemOpEnter,
                                  FspFileSystemOpLeave);
   FspFileSystemSetOperationGuardStrategy(
-      winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
+      impl->winfsp, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
 
-  status = FspFileSystemSetMountPoint(winfsp,
-                                      const_cast<PWSTR>(config.mount_point.c_str()));
-  if (status == STATUS_SUCCESS) {
-    status = FspFileSystemStartDispatcher(winfsp, 0);
+  // Create the stop event before the dispatcher can run any callback, and
+  // keep its handle open until the session is destroyed: RequestStop() and
+  // another process's `xfswin unmount` may race with cleanup.
+  const std::wstring event_name = StopEventName(config.mount_point);
+  impl->stop_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
+  if (!impl->stop_event) {
+    return fail(XFS_ERR(
+        XfsError::kInternal,
+        "failed to create the mount stop event; the mount cannot be stopped"));
   }
+  // A crashed previous mount may have left the named event signalled.
+  ResetEvent(impl->stop_event);
+  state.stop_event = impl->stop_event;
+  if (state.device_failed.load(std::memory_order_relaxed)) {
+    return fail(XFS_ERR(
+        XfsError::kIoError,
+        "the XFS device failed before the WinFsp mount became visible"));
+  }
+
+  // Start serving before the drive letter exists. Once the mount point is
+  // created, Windows and other processes may issue requests immediately;
+  // WinFsp documents that this race has caused failed or blocked access right
+  // after mounting. A running dispatcher handles those requests instead of
+  // queueing them behind mount-point creation.
+  status = FspFileSystemStartDispatcher(impl->winfsp, 0);
   if (status != STATUS_SUCCESS) {
-    FspFileSystemRemoveMountPoint(winfsp);
-    FspFileSystemDelete(winfsp);
-    LocalFree(state->security_descriptor);
-    return XFS_ERR(XfsError::kInternal,
-                   "failed to mount XFS at " +
-                       WideToUtf8(config.mount_point) +
-                       " (NTSTATUS 0x" +
-                       std::to_string(static_cast<uint32_t>(status)) +
-                       "); is WinFsp installed and is the drive letter free?");
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "failed to start the WinFsp dispatcher (NTSTATUS 0x" +
+                            std::to_string(static_cast<uint32_t>(status)) +
+                            ")"));
+  }
+  dispatcher_started = true;
+
+  status = FspFileSystemSetMountPoint(
+      impl->winfsp, const_cast<PWSTR>(config.mount_point.c_str()));
+  if (status != STATUS_SUCCESS) {
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "failed to mount XFS at " +
+                            WideToUtf8(config.mount_point) +
+                            " (NTSTATUS 0x" +
+                            std::to_string(static_cast<uint32_t>(status)) +
+                            "); is WinFsp installed and is the drive letter "
+                            "free?"));
   }
 
-  std::wstring event_name = StopEventName(config.mount_point);
-  HANDLE stop_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-  g_stop_event = stop_event;
-  // A device failure during mount setup latched the flag before the event
-  // existed; honor it now instead of waiting forever.
-  if (state->device_failed.load(std::memory_order_relaxed)) {
-    SetEvent(stop_event);
+  // The waiter owns the clean unmount for the whole session lifetime.
+  try {
+    Impl* raw = impl.get();
+    raw->waiter = std::thread([raw] { raw->WaitLoop(); });
+  } catch (...) {
+    FspFileSystemStopDispatcher(impl->winfsp);
+    return fail(XFS_ERR(XfsError::kInternal,
+                        "failed to start the mount cleanup thread"));
   }
-  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
   XFS_INFO("mounted XFS " << (config.read_write ? "read-write" : "read-only")
                           << " at " << WideToUtf8(config.mount_point)
@@ -2465,51 +2610,62 @@ Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
              "and reflinks are enabled (real disks require "
              "--device-write-qualification)");
   }
-  if (stop_event) {
-    WaitForSingleObject(stop_event, INFINITE);
-  } else {
-    XFS_WARN("failed to create stop event; use Ctrl+C to unmount");
-    for (;;) Sleep(1000);
-  }
+  return std::unique_ptr<MountSession>(new MountSession(std::move(impl)));
+}
 
+MountSession::MountSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+MountSession::~MountSession() = default;
+
+const std::string& MountSession::id() const { return impl_->id; }
+
+const std::wstring& MountSession::mount_point() const {
+  return impl_->config.mount_point;
+}
+
+bool MountSession::alive() const {
+  return !impl_->finished.load(std::memory_order_acquire);
+}
+
+void MountSession::RequestStop() {
+  if (impl_->stop_event) SetEvent(impl_->stop_event);
+}
+
+Status MountSession::Stop() {
+  RequestStop();
+  std::lock_guard<std::mutex> lock(impl_->join_mutex);
+  if (!impl_->joined) {
+    if (impl_->waiter.joinable()) impl_->waiter.join();
+    impl_->joined = true;
+  }
+  return impl_->unmount_status;
+}
+
+Status MountSession::Wait() {
+  std::lock_guard<std::mutex> lock(impl_->join_mutex);
+  if (!impl_->joined) {
+    if (impl_->waiter.joinable()) impl_->waiter.join();
+    impl_->joined = true;
+  }
+  return impl_->unmount_status;
+}
+
+bool MountSession::read_write() const { return impl_->config.read_write; }
+
+Status RunMountedFilesystem(std::unique_ptr<XfsFilesystem> filesystem,
+                            const MountConfig& config) {
+  auto started = MountSession::Start(std::move(filesystem), config);
+  if (!started.ok()) return started.error();
+  MountSession& session = *started.value();
+  g_console_session.store(&session, std::memory_order_release);
+  if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
+    XFS_WARN("failed to install the console control handler; use "
+             "`xfswin unmount` to stop this mount");
+  }
+  Status status = session.Wait();
   SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
-  g_stop_event = nullptr;
-  FspFileSystemStopDispatcher(winfsp);
-  // Clean unmount: close the journal with an unmount record and push
-  // everything this process wrote to stable storage before the mount point
-  // disappears. A failure is reported as a failed unmount: the filesystem may
-  // still be structurally consistent, but the caller must not be told that the
-  // durable close succeeded when it did not.
-  Status unmount_status = OkStatus();
-  if (config.read_write) {
-    // Publish deferred timestamps before the unmount record: a clean log must
-    // not be followed by new transactions.
-    Status published = state->fs->CommitAllDeferredMetadata();
-    if (!published.ok()) {
-      XFS_ERROR("unmount deferred metadata commit failed: "
-                << published.error().Format());
-      unmount_status = published;
-    }
-    Status closed = state->fs->WriteCleanUnmountRecord();
-    if (!closed.ok()) {
-      XFS_ERROR("unmount journal close failed: " << closed.error().Format());
-      if (unmount_status.ok()) unmount_status = closed;
-    }
-    Status flushed = state->fs->Flush();
-    if (!flushed.ok()) {
-      XFS_ERROR("unmount flush failed: " << flushed.error().Format());
-      if (unmount_status.ok()) unmount_status = flushed;
-    }
-  }
-  FspFileSystemRemoveMountPoint(winfsp);
-  FspFileSystemDelete(winfsp);
-  if (stop_event) CloseHandle(stop_event);
-  LocalFree(state->security_descriptor);
-  if (PerfStats::Get().enabled()) {
-    std::fputs(PerfStats::Get().Text().c_str(), stderr);
-  }
-  XFS_INFO("unmounted");
-  return unmount_status;
+  g_console_session.store(nullptr, std::memory_order_release);
+  return status;
 }
 
 Status RequestUnmount(const std::wstring& mount_point) {

@@ -23,6 +23,10 @@ struct Options {
   // a real device additionally needs device_write_qualification and the class
   // opt-in, and the backend's device policy still applies.
   bool rw_experimental = false;
+  // UX-1: `automount enable --rw` is the ordinary one-time enrollment spelling.
+  // It never authorizes a manual raw write; it records the identity pins after
+  // an explicit confirmation and applies only to automatic mounting.
+  bool automount_rw = false;
   // Formatter-only modern inode feature switches (RW-6A).
   bool finobt = false;
   bool inobtcount = false;

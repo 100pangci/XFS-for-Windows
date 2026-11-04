@@ -111,15 +111,28 @@ const char* ToString(LogState state) {
 
 Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
                                      const XfsGeometry& geo,
-                                     const XfsSuperblock& sb) {
+                                     const XfsSuperblock& sb,
+                                     uint64_t device_offset) {
   if (sb.logstart == 0 || sb.logblocks == 0) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "no internal log to check")
         .Metadata("log");
   }
-  uint64_t log_start = geo.FsbToByte(sb.logstart);
+  const uint64_t fs_log_start = geo.FsbToByte(sb.logstart);
   uint64_t log_bytes = static_cast<uint64_t>(sb.logblocks) << geo.block_log;
-  if (log_start + log_bytes > dev.Size()) {
+  const uint64_t device_size = dev.Size();
+  // The filesystem may live at a partition offset inside a whole-disk device.
+  // Apply that offset exactly like ReadSuperblock does; all geometry values,
+  // including logstart, are filesystem-relative.
+  if (device_offset > device_size ||
+      fs_log_start > device_size - device_offset) {
+    return XFS_ERR(XfsError::kCorruptSuperblock,
+                   "log extends past the end of the device")
+        .Metadata("log")
+        .Offset(device_offset + fs_log_start);
+  }
+  const uint64_t log_start = device_offset + fs_log_start;
+  if (log_bytes > device_size - log_start) {
     return XFS_ERR(XfsError::kCorruptSuperblock,
                    "log extends past the end of the device")
         .Metadata("log")
