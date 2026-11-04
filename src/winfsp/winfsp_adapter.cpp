@@ -2615,7 +2615,7 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
                           << " at " << WideToUtf8(config.mount_point)
                           << " (uuid " << FormatUuid(sb.uuid) << ")");
   if (config.read_write) {
-    XFS_WARN("read-write mount: experimental writer; create, overwrite, "
+    XFS_WARN("read-write mount: supported profile; create, overwrite, "
              "extend, truncate, delete, rename, hard links, symlinks, xattrs "
              "and reflinks are enabled (real disks require "
              "--device-write-qualification)");
