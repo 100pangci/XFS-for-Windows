@@ -44,11 +44,18 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   if (!mountable.ok()) return mountable.error();
 
   XfsGeometry geo = MakeGeometry(sb);
-  if (geo.dblocks * geo.block_size > device->Size()) {
+  // dblocks * block_size can overflow uint64 for a structurally valid but
+  // enormous geometry (for example 2^52 blocks of 4 KiB = 2^64 bytes).
+  // Divide instead of multiplying so the check itself cannot wrap to zero and
+  // let an image smaller than its declared filesystem through.
+  const uint64_t device_size = device->Size();
+  if (geo.block_size == 0 ||
+      geo.dblocks > device_size / geo.block_size) {
     return XFS_ERR(XfsError::kCorruptSuperblock,
-                   "filesystem larger than the device")
-        .Expected(device->Size())
-        .Actual(geo.dblocks * geo.block_size);
+                   "filesystem larger than the device (or its byte size "
+                   "overflows)")
+        .Expected(device_size)
+        .Actual(geo.dblocks);
   }
 
   auto fs = std::unique_ptr<XfsFilesystem>(new XfsFilesystem());

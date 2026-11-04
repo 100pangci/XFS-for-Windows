@@ -85,6 +85,22 @@ void SetUnknownRoCompat(xfstest::FixtureImage& fixture) {
   CHECK(fixture.storage().Write(0, super.data(), super.size()));
 }
 
+// A structurally valid geometry whose byte size is exactly 2^64: 2^24 AGs of
+// 2^28 4 KiB blocks.  dblocks * block_size wraps to zero in uint64.
+void SetOverflowingGeometry(xfstest::FixtureImage& fixture) {
+  auto sb = ReadSuperblock(fixture.storage(), 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  std::vector<uint8_t> super(sb.value().sectsize, 0);
+  CHECK(fixture.storage().Read(0, super.data(), super.size()));
+  PutBE32(super.data(), ondisk::sb::kAgblocks, 1u << 28);
+  PutBE32(super.data(), ondisk::sb::kAgcount, 1u << 24);
+  PutBE64(super.data(), ondisk::sb::kDblocks, 1ull << 52);
+  super[ondisk::sb::kAgblklog] = 28;
+  UpdateXfsChecksum(super.data(), super.size(), ondisk::sb::kCrc);
+  CHECK(fixture.storage().Write(0, super.data(), super.size()));
+}
+
 }  // namespace
 
 // Once a transaction's log record has been written and flushed, a later
@@ -263,5 +279,32 @@ TEST(rw_stable_recover_journal_checks_profile_before_replay) {
   CHECK(memory->bytes() == before);
   fs.value().reset();
 
+  fixture.Reset();
+}
+
+TEST(rw_stable_mount_rejects_overflowing_geometry) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  SetOverflowingGeometry(fixture);
+  const std::vector<uint8_t> before = memory->bytes();
+
+  MountOptions options;
+  options.read_write = true;
+  auto mounted = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(!mounted.ok());
+  if (!mounted.ok()) {
+    CHECK_EQ(mounted.error().code, XfsError::kCorruptSuperblock);
+    CHECK(mounted.error().message.find("larger than the device") !=
+          std::string::npos);
+  }
+  CHECK(memory->bytes() == before);
   fixture.Reset();
 }
