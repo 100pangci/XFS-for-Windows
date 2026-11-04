@@ -92,7 +92,11 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
         .Expected(512)
         .Actual(sb.sectsize == 512 ? log_sector_size : sb.sectsize);
   }
-  if (sb.logsunit != 0) {
+  // Linux mkfs writes sb_logsunit = 1 for a v2 log that has no stripe unit
+  // (xfs_mkfs.c); 0 is the legacy encoding for the same state.  The kernel
+  // only treats values above 1 as a real log stripe unit (xfs_log_rlimit.c,
+  // xfs_log.c), so both 0 and 1 mean "no stripe unit" and stay writable.
+  if (sb.logsunit > 1) {
     return XFS_ERR(XfsError::kUnsupportedGeometry,
                    "log stripe units are not supported for read-write")
         .Metadata("superblock")

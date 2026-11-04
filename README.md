@@ -101,8 +101,8 @@ reflink on/off (refcountbt + CoW)
 parent pointers (XFS_SB_FEAT_INCOMPAT_PARENT)
 exchange-range as a feature bit (operation not implemented)
 XFS_SB_FEAT_INCOMPAT_LOG_XATTRS
-one internal log (512-byte log sector, no stripe unit), one data device,
-no realtime device
+one internal log (512-byte log sector, no stripe unit: superblock value 0 or
+1), one data device, no realtime device
 512-byte filesystem sectors
 ftype=1, at most 64 inodes per block
 dirblklog == 0

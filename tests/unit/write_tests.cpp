@@ -302,6 +302,18 @@ TEST(writable_profile_allow_list) {
   quota_inode.uquotino = 70;
   CHECK(!CheckWritableProfile(quota_inode, MakeGeometry(quota_inode)).ok());
 
+  // sb_logsunit is "no log stripe unit" when it is 0 or 1: legacy images use
+  // 0, Linux mkfs writes 1 for a v2 log without a stripe unit, and the kernel
+  // only treats values above 1 as a real stripe unit.  Both must be writable;
+  // a real stripe unit is refused below.
+  XfsSuperblock no_log_stripe = sb;
+  no_log_stripe.logsunit = 0;
+  CHECK(CheckWritableProfile(no_log_stripe,
+                             MakeGeometry(no_log_stripe)).ok());
+  no_log_stripe.logsunit = 1;
+  CHECK(CheckWritableProfile(no_log_stripe,
+                             MakeGeometry(no_log_stripe)).ok());
+
   // Geometry-level refusals.
   struct Case {
     const char* what;

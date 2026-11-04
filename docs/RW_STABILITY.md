@@ -48,7 +48,8 @@ A writable mount requires every one of these:
 XFS v5, CRC verified, ftype=1, attr2
 one internal log, one data device, no realtime device
 512-byte filesystem sectors and 512-byte log sectors
-log stripe unit 0
+log stripe unit 0 or 1 (both encode "no stripe unit"; Linux mkfs writes 1 for
+a v2 log)
 dirblklog == 0 (one filesystem block per directory block)
 at most 64 inodes per filesystem block
 allocation groups smaller than 2^31 blocks when reflink is enabled
@@ -71,9 +72,9 @@ meta-uuid
 
 Refused before the first write, with the blocking feature named: metadir,
 zoned, zone gaps, needs-repair, quotas, realtime devices, external logs,
-asciici, multi-block directory blocks, 4Kn/alternate sector geometry, log
-stripe units, unsupported inode geometry, unknown feature bits, and
-exchange-range operations in the log.
+asciici, multi-block directory blocks, 4Kn/alternate sector geometry, real log
+stripe units (values above 1), unsupported inode geometry, unknown feature
+bits, and exchange-range operations in the log.
 
 Read-only access is more permissive and is not changed by this contract.
 
@@ -275,7 +276,7 @@ realtime device
 asciici version bit
 ftype=0
 4K filesystem sector
-log stripe unit
+real log stripe unit (value above 1)
 dirblklog != 0
 external log
 inconsistent inodes-per-block
@@ -349,7 +350,8 @@ A future stable build:
 * Exchange-range operations (XMI/XMD) are not implemented; the feature bit is
   accepted.
 * `asciici` directories, multi-block directory blocks, 4Kn/alternate sector
-  geometry and log stripe units are refused for writing.
+  geometry and real log stripe units (values above 1) are refused for writing.
+  The superblock values 0 and 1 both mean "no stripe unit" and are accepted.
 * No ACL/security-descriptor translation; ACLs and security xattrs are
   preserved as opaque bytes.
 * No NTFS alternate data streams.
@@ -370,7 +372,7 @@ The RW-STABLE-1 audit fixed these correctness findings, one commit each:
 | A commit failure after log durability could leave a mount reporting further writes as successful | disable writes after the failure |
 | Clean-log recovery wrote AGI unlinked work before checking the writable profile | profile check before recovery writes |
 | `RecoverJournal` could replay before the profile gate | gate recovery first |
-| The writer accepted ftype=0, alternate sector geometry and log stripe units | enforce the documented geometry |
+| The writer accepted ftype=0, alternate sector geometry and real log stripe units | enforce the documented geometry |
 | `dblocks * block_size` could overflow and let an undersized image through | reject overflowing geometry |
 | Read-write could proceed without a verified superblock CRC | require CRC verification |
 | An unreadable AGI silently fell back to a mount-time LSN | fail the recovery |

@@ -1377,11 +1377,12 @@ back the graduation claims:
 * `tests/tools/rw_stable_refusal_matrix.py` patches one superblock field at a
   time into an unsupported profile/geometry, recomputes the superblock CRC,
   runs a mutation with `--rw`, and requires a non-zero exit plus an unchanged
-  whole-image SHA-256. The same run proves an unpatched control copy accepts
-  the mutation. It covers metadir, zoned, zone-gaps, needs-repair, unknown
+  whole-image SHA-256. The same run proves an unpatched control copy and
+  copies patched to `sb_logsunit` 0 and 1 accept the mutation. It covers metadir, zoned, zone-gaps, needs-repair, unknown
   incompatible/read-only/log bits, quota flags and inode, realtime, asciici,
-  ftype=0, 4K sectors, log stripe units, `dirblklog != 0`, external log and
-  inconsistent inode geometry.
+  ftype=0, 4K sectors, a real log stripe unit (4096; 0 and 1 mean "none" and
+  are accepted), `dirblklog != 0`, external log and inconsistent inode
+  geometry.
 * `tests/scripts/verify_rw_alias_windows.ps1` starts from two byte-identical
   images and runs the same namespace/data/xattr/reflink/CoW/fallocate/truncate
   workload through `--rw` and the deprecated `--rw-experimental` alias. It

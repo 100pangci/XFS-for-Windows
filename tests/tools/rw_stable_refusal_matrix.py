@@ -145,6 +145,21 @@ def main():
     results.append({"case": "control", "exit": rc, "changed": False})
     os.unlink(work)
 
+    # sb_logsunit 0 and 1 both encode "no log stripe unit": Linux mkfs writes 1
+    # for a v2 log, 0 is the legacy encoding, and the kernel only treats values
+    # above 1 as a real stripe unit.  Both encodings must stay writable; a real
+    # stripe unit (4096) is refused below.
+    for value in (0, 1):
+        shutil.copyfile(source, work)
+        patch(work, lambda sb, v=value: be32(sb, 196, v))
+        rc, text = run(exe, ["create", work, "/no-stripe.bin", "--rw"])
+        if rc != 0:
+            failures.append("logsunit=%d unexpectedly refused:\n%s" %
+                            (value, text))
+        results.append({"case": "logsunit-none-%d" % value, "exit": rc,
+                        "changed": True})
+        os.unlink(work)
+
     for name, needle, mutate in CASES:
         shutil.copyfile(source, work)
         patch(work, mutate)
@@ -182,7 +197,8 @@ def main():
             print("rw-stable refusal: FAIL: %s" % failure, file=sys.stderr)
         return 1
     print("rw-stable refusal matrix: ok (%d unsupported profiles refused "
-          "without a write; control mutation accepted)" % len(CASES))
+          "without a write; control mutation and both no-stripe-unit "
+          "encodings accepted)" % len(CASES))
     return 0
 
 
