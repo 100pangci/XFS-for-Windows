@@ -2095,8 +2095,12 @@ int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
               << filesystem.xfswin_drive << " by xfswin.\n";
     return 1;
   }
-  if (filesystem.probe.log_state == LogState::kDirty ||
-      filesystem.probe.log_state == LogState::kUnknown) {
+  const bool read_write = options.rw_experimental;
+  // A read-only mount cannot repair a non-clean log.  A read-write mount can:
+  // Mount() replays a recoverable dirty log before exposing the filesystem,
+  // and refuses unknown/unrecoverable content itself.
+  if (!read_write && (filesystem.probe.log_state == LogState::kDirty ||
+                      filesystem.probe.log_state == LogState::kUnknown)) {
     if (!options.force_unsafe_ro) {
       std::cerr
           << "error: the XFS journal is not clean, so a read-only mount is "
@@ -2106,7 +2110,6 @@ int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
       return 1;
     }
   }
-  const bool read_write = options.rw_experimental;
   if (read_write && !options.device_write_qualification) {
     std::cerr
         << "error: writable mounting of a real device requires both "
