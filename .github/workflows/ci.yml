@@ -1109,15 +1109,21 @@ jobs:
             out/rw6e-windows.oracle.json
           if-no-files-found: error
 
+      - name: Stage the RW-STABLE alias-equivalence artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force out\rw-stable-alias | Out-Null
+          Copy-Item out\rw-alias\canonical.img out\rw-stable-alias\
+          Copy-Item out\rw-alias\alias.img out\rw-stable-alias\
+          Copy-Item out\rw-alias\manifest.json out\rw-stable-alias\
+          Copy-Item out\rw-stable-refusal.json out\rw-stable-alias\
+
       - name: Upload the RW-STABLE alias-equivalence images
         uses: actions/upload-artifact@v4
         with:
           name: rw-stable-alias
-          path: |
-            out/rw-alias/canonical.img
-            out/rw-alias/alias.img
-            out/rw-alias/manifest.json
-            out/rw-stable-refusal.json
+          path: out/rw-stable-alias/*
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
