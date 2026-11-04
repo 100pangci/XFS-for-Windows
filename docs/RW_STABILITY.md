@@ -370,6 +370,7 @@ The RW-STABLE-1 audit fixed these correctness findings, one commit each:
 | Finding | Fix |
 |---|---|
 | A commit failure after log durability could leave a mount reporting further writes as successful | disable writes after the failure |
+| Removing the last xattr released the attr fork with `aformat = 0`, which `xfs_repair -n` would reset | write the empty fork as EXTENTS |
 | Clean-log recovery wrote AGI unlinked work before checking the writable profile | profile check before recovery writes |
 | `RecoverJournal` could replay before the profile gate | gate recovery first |
 | The writer accepted ftype=0, alternate sector geometry and real log stripe units | enforce the documented geometry |
