@@ -48,6 +48,7 @@
 #include "xfs/rmap_intent.h"
 #include "xfs/parent.h"
 #include "xfs/transaction.h"
+#include "xfs/write.h"
 #include "xfs/xattr_intent.h"
 #include "write/xattr_write_internal.h"
 
@@ -114,6 +115,19 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverJournal(
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "journal recovery needs a writable device")
         .Metadata("log");
+  }
+  // Recovery writes metadata and completion transactions, so it is subject to
+  // the same writable-profile allow-list as a read-write mount.  A caller that
+  // mounted with check_log=false could otherwise replay an unsupported image.
+  Status profile = CheckWritableProfile(
+      superblock_, geometry_, options_.recovery_only,
+      options_.allow_rmapbt_qualification, options_.recovery_only,
+      options_.allow_reflink_qualification,
+      options_.allow_parent_qualification);
+  if (!profile.ok()) {
+    auto error = profile.error();
+    error.message += " (journal recovery is a read-write operation)";
+    return error;
   }
   auto scan = ScanLog(*device_, superblock_, geometry_);
   if (!scan.ok()) return scan.error();

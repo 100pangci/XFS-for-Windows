@@ -71,6 +71,20 @@ std::vector<uint8_t> ReadLog(xfstest::FixtureImage& fixture, uint64_t start,
   return bytes;
 }
 
+// Sets an unknown read-only-compatible bit and keeps the superblock CRC valid,
+// so the only reason to refuse is the writable-profile allow-list.
+void SetUnknownRoCompat(xfstest::FixtureImage& fixture) {
+  auto sb = ReadSuperblock(fixture.storage(), 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  std::vector<uint8_t> super(sb.value().sectsize, 0);
+  CHECK(fixture.storage().Read(0, super.data(), super.size()));
+  PutBE32(super.data(), ondisk::sb::kFeaturesRoCompat,
+          GetBE32(super.data(), ondisk::sb::kFeaturesRoCompat) | (1u << 4));
+  UpdateXfsChecksum(super.data(), super.size(), ondisk::sb::kCrc);
+  CHECK(fixture.storage().Write(0, super.data(), super.size()));
+}
+
 }  // namespace
 
 // Once a transaction's log record has been written and flushed, a later
@@ -175,21 +189,7 @@ TEST(rw_stable_clean_log_recover_checks_profile_before_first_write) {
 
   // Make CheckWritableProfile refuse the image while keeping every other
   // structure valid: set an unknown read-only-compatible feature bit.
-  auto sb = xfs::ReadSuperblock(*memory, 0, true);
-  CHECK(sb.ok());
-  if (!sb.ok()) {
-    fixture.Reset();
-    return;
-  }
-  std::vector<uint8_t> super(sb.value().sectsize, 0);
-  CHECK(memory->Read(0, super.data(), super.size()));
-  PutBE32(super.data(), xfs::ondisk::sb::kFeaturesRoCompat,
-          GetBE32(super.data(), xfs::ondisk::sb::kFeaturesRoCompat) |
-              (1u << 4));
-  UpdateXfsChecksum(super.data(), super.size(),
-                    xfs::ondisk::sb::kCrc);
-  CHECK(memory->Write(0, super.data(), super.size()));
-
+  SetUnknownRoCompat(fixture);
   const std::vector<uint8_t> before = memory->bytes();
 
   xfs::MountOptions options;
@@ -211,6 +211,57 @@ TEST(rw_stable_clean_log_recover_checks_profile_before_first_write) {
     CHECK(agi.ok());
     if (agi.ok()) CHECK(agi.value().unlinked[bucket] != 0xffffffffu);
   }
+
+  fixture.Reset();
+}
+
+// The public RecoverJournal API can be called on a mount created with
+// check_log=false.  It must refuse an unsupported writable profile before the
+// first replay write, just like a read-write mount and `xfswin recover`.
+TEST(rw_stable_recover_journal_checks_profile_before_replay) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    const XfsTimestamp stamp{1700031000, 3};
+    CHECK(fs.value()
+              ->SetFileTimes(fixture.info().file_ino, stamp, stamp, stamp)
+              .ok());
+    // Dropped without a clean-unmount record: the log is dirty.
+  }
+  SetUnknownRoCompat(fixture);
+  const std::vector<uint8_t> before = memory->bytes();
+
+  MountOptions options;
+  options.check_log = false;  // the standalone recovery shape
+  auto fs = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(fs.ok());
+  if (!fs.ok()) {
+    fixture.Reset();
+    return;
+  }
+  auto report =
+      fs.value()->RecoverJournal(XfsFilesystem::RecoveryFinish::kMount);
+  CHECK(!report.ok());
+  if (!report.ok()) {
+    CHECK_EQ(report.error().code, XfsError::kUnsupportedFeature);
+  }
+  CHECK(memory->bytes() == before);
+  fs.value().reset();
 
   fixture.Reset();
 }
