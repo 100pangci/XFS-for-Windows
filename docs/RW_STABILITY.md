@@ -393,14 +393,14 @@ does not run filesystem code itself.
 | build, unit, sanitizers | `linux-build-test`, `linux-sanitizer`, `windows-build-test` |
 | concurrency | `linux-concurrency`, `linux-concurrency-sanitizer`, `linux-concurrency-tsan`, `windows-concurrency-core`, `linux-verify-conc-windows`, `linux-verify-conc-winfsp` |
 | stateful/model/fuzz | `linux-stateful-fuzz`, `linux-stateful-fuzz-sanitizer`, `linux-verify-stateful-windows` |
-| Windows writer → Linux oracle | `linux-verify-windows`, `linux-verify-rw`, `linux-verify-rw6`, `linux-verify-rw6c`, `linux-verify-rw6d` |
+| Windows writer → Linux oracle | `linux-verify-windows`, `linux-verify-rw`, `linux-verify-rw6-modern`, `linux-verify-rw6c`, `linux-verify-rw6d` |
 | Linux writer → Windows | `windows-read-linux-image` |
 | WinFsp read-write | `windows-mount` |
 | ENOSPC | `windows-rw6b-enospc`, `windows-rw6c-enospc`, `windows-rw6d-enospc` |
 | crash/recovery | `windows-rw6b-crash`, `windows-rw6c-crash`, `windows-rw6d-crash`, `windows-recover-linux-logs` |
 | parent pointers | `linux-verify-rw6e-mutation` |
-| DEV-1 / VHD | `windows-rawdevice-vhd`, `windows-vhd-device` |
-| automount and UX takeover | `windows-automount-takeover`, `windows-automount-vhd`, `linux-verify-ux-rw-image` |
+| DEV-1 / VHD | `windows-rawdevice-vhd`, `windows-vhd-device`, `windows-vhd-winfsp`, `linux-verify-windows-vhd` |
+| automount and UX takeover | `windows-automount-events`, `windows-automount-takeover`, `windows-automount-vhd`, `linux-verify-ux-rw-image` |
 
 Additional jobs outside the aggregate (buffer cancellation, cross-recovery,
 reverse mutation, scrub, perf) remain part of the full CI signal and are

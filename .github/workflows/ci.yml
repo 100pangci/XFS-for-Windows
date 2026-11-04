@@ -5814,7 +5814,7 @@ jobs:
       - windows-mount
       - linux-verify-conc-winfsp
       - linux-verify-rw
-      - linux-verify-rw6
+      - linux-verify-rw6-modern
       - linux-verify-rw6c
       - linux-verify-rw6d
       - linux-verify-rw6e-mutation
@@ -5827,6 +5827,9 @@ jobs:
       - windows-recover-linux-logs
       - windows-rawdevice-vhd
       - windows-vhd-device
+      - windows-vhd-winfsp
+      - linux-verify-windows-vhd
+      - windows-automount-events
       - windows-automount-takeover
       - windows-automount-vhd
       - linux-verify-ux-rw-image
