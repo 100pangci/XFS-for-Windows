@@ -678,6 +678,25 @@ jobs:
         shell: pwsh
         run: python tests/tools/xfs_probe.py out/windows.img
 
+      - name: RW-STABLE fail-closed refusal matrix (digest before/after)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          python tests/tools/rw_stable_refusal_matrix.py `
+            --exe $exe --image out\windows.img `
+            --json out\rw-stable-refusal.json
+          if ($LASTEXITCODE -ne 0) { throw "the RW-STABLE refusal matrix failed" }
+
+      - name: RW-STABLE canonical/legacy CLI equivalence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "build\src\$env:BUILD_CONFIG\xfswin.exe"
+          pwsh -NoProfile -File tests/scripts/verify_rw_alias_windows.ps1 `
+            -Xfswin $exe -WorkDir out\rw-alias -SizeMB 300
+          if ($LASTEXITCODE -ne 0) { throw "the RW-STABLE alias equivalence test failed" }
+
       - name: RW-6A modern inode profile (formatter + oracle)
         shell: pwsh
         run: |
@@ -687,9 +706,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
           & $exe format out\modern.img --yes-i-really-mean-it --modern-inode-profile
           if ($LASTEXITCODE -ne 0) { throw "modern format failed" }
-          & $exe create out\modern.img /modern.bin --rw-experimental
+          & $exe create out\modern.img /modern.bin --rw
           if ($LASTEXITCODE -ne 0) { throw "modern create failed" }
-          & $exe pwrite out\modern.img /modern.bin 0 --rw-experimental --text=modern
+          & $exe pwrite out\modern.img /modern.bin 0 --rw --text=modern
           if ($LASTEXITCODE -ne 0) { throw "modern write failed" }
           & $exe check out\modern.img --verbose
           if ($LASTEXITCODE -ne 0) { throw "modern check failed" }
@@ -773,30 +792,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "mkimage failed" }
           & $exe format out\rw6e-parent.img --yes-i-really-mean-it --modern-default-profile
           if ($LASTEXITCODE -ne 0) { throw "modern parent format failed" }
-          & $exe create out\rw6e-parent.img /f --rw-experimental
+          & $exe create out\rw6e-parent.img /f --rw
           if ($LASTEXITCODE -ne 0) { throw "create on parent fs failed" }
-          & $exe mkdir out\rw6e-parent.img /a --rw-experimental
+          & $exe mkdir out\rw6e-parent.img /a --rw
           if ($LASTEXITCODE -ne 0) { throw "mkdir a failed" }
-          & $exe mkdir out\rw6e-parent.img /b --rw-experimental
+          & $exe mkdir out\rw6e-parent.img /b --rw
           if ($LASTEXITCODE -ne 0) { throw "mkdir b failed" }
-          & $exe mkdir out\rw6e-parent.img /a/d --rw-experimental
+          & $exe mkdir out\rw6e-parent.img /a/d --rw
           if ($LASTEXITCODE -ne 0) { throw "mkdir a/d failed" }
-          & $exe link out\rw6e-parent.img /f /a/same --rw-experimental
+          & $exe link out\rw6e-parent.img /f /a/same --rw
           if ($LASTEXITCODE -ne 0) { throw "link a/same failed" }
-          & $exe link out\rw6e-parent.img /f /b/same --rw-experimental
+          & $exe link out\rw6e-parent.img /f /b/same --rw
           if ($LASTEXITCODE -ne 0) { throw "link b/same failed" }
-          & $exe rename out\rw6e-parent.img /a/same /b/moved --rw-experimental
+          & $exe rename out\rw6e-parent.img /a/same /b/moved --rw
           if ($LASTEXITCODE -ne 0) { throw "cross-dir rename failed" }
-          & $exe rename out\rw6e-parent.img /a/d /b/d2 --rw-experimental
+          & $exe rename out\rw6e-parent.img /a/d /b/d2 --rw
           if ($LASTEXITCODE -ne 0) { throw "directory move failed" }
-          & $exe xattr set out\rw6e-parent.img /f user.alpha hello --rw-experimental
+          & $exe xattr set out\rw6e-parent.img /f user.alpha hello --rw
           if ($LASTEXITCODE -ne 0) { throw "ordinary xattr on parent fs failed" }
           # Private namespace mutation must be refused even with the parent
           # profile writable.
-          & $exe xattr remove out\rw6e-parent.img /f parent.f --rw-experimental 2>$null
+          & $exe xattr remove out\rw6e-parent.img /f parent.f --rw 2>$null
           if ($LASTEXITCODE -eq 0) { throw "parent xattr removal was not refused" }
           $global:LASTEXITCODE = 0
-          & $exe unlink out\rw6e-parent.img /b/moved --rw-experimental
+          & $exe unlink out\rw6e-parent.img /b/moved --rw
           if ($LASTEXITCODE -ne 0) { throw "unlink failed" }
           & $exe check out\rw6e-parent.img --parents --verbose
           if ($LASTEXITCODE -ne 0) { throw "parent check failed" }
@@ -872,9 +891,9 @@ jobs:
           }
 
           # In-place overwrite inside the fixture file's allocated extent.
-          & $exe pwrite out\fixture-write.img /hello.bin 100 --rw-experimental --text=OVERWRITTEN
+          & $exe pwrite out\fixture-write.img /hello.bin 100 --rw --text=OVERWRITTEN
           if ($LASTEXITCODE -ne 0) { throw "pwrite failed" }
-          & $exe pwrite out\fixture-write.img /hello.bin 0 --rw-experimental --text=x
+          & $exe pwrite out\fixture-write.img /hello.bin 0 --rw --text=x
           if ($LASTEXITCODE -ne 0) { throw "pwrite in place failed" }
           & $exe check out\fixture-write.img
           if ($LASTEXITCODE -ne 0) { throw "check failed after pwrite" }
@@ -883,9 +902,9 @@ jobs:
 
           # RW-2: writing past EOF grows the file through a real allocation
           # transaction, and truncate sets the size back.
-          & $exe pwrite out\fixture-write.img /hello.bin 32768 --rw-experimental --text=GROWN
+          & $exe pwrite out\fixture-write.img /hello.bin 32768 --rw --text=GROWN
           if ($LASTEXITCODE -ne 0) { throw "growing write failed" }
-          & $exe truncate out\fixture-write.img /hello.bin 32000 --rw-experimental
+          & $exe truncate out\fixture-write.img /hello.bin 32000 --rw
           if ($LASTEXITCODE -ne 0) { throw "truncate failed" }
           & $exe check out\fixture-write.img
           if ($LASTEXITCODE -ne 0) { throw "check failed after growth/truncate" }
@@ -894,11 +913,11 @@ jobs:
 
           # Writes without the confirmation flag and read-write mounts of real
           # devices are refused; the refusal must not change the image.
-          Assert-Refused 3 "write without --rw-experimental" {
+          Assert-Refused 3 "write without --rw" {
             & $exe pwrite out\fixture-write.img /hello.bin 0 --text=x
           }
           Assert-Refused 3 "read-write mount of a raw device" {
-            & $exe mount \\.\PhysicalDrive0 Y: --rw-experimental
+            & $exe mount \\.\PhysicalDrive0 Y: --rw
           }
           & $exe check out\fixture-write.img
           if ($LASTEXITCODE -ne 0) { throw "check failed after refused writes" }
@@ -1088,6 +1107,17 @@ jobs:
             out/rw6e-windows.img
             out/rw6e-windows.img.manifest.json
             out/rw6e-windows.oracle.json
+          if-no-files-found: error
+
+      - name: Upload the RW-STABLE alias-equivalence images
+        uses: actions/upload-artifact@v4
+        with:
+          name: rw-stable-alias
+          path: |
+            out/rw-alias/canonical.img
+            out/rw-alias/alias.img
+            out/rw-alias/manifest.json
+            out/rw-stable-refusal.json
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -2789,6 +2819,19 @@ jobs:
           ls -l fixture/fixture.img
           sudo bash tests/scripts/verify_fixture_linux.sh fixture/fixture.img
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: rw-stable-alias
+          path: rw-stable-alias
+
+      - name: Verify canonical and legacy --rw output with Linux
+        run: |
+          ls -l rw-stable-alias
+          sudo bash tests/scripts/verify_rw_alias_linux.sh \
+            rw-stable-alias/canonical.img \
+            rw-stable-alias/alias.img \
+            rw-stable-alias/manifest.json
+
       - name: Populate the read-write interoperability image
         run: |
           sudo bash tests/scripts/make_rw_image.sh images/windows.img rw
@@ -2944,7 +2987,7 @@ jobs:
           # Read-write self-test: overwrites bytes inside an existing file
           # through the real Write/Flush callbacks.
           Copy-Item "rw\rw.img" "rw\rw-selftest.img"
-          & $exe selftest "rw\rw-selftest.img" --rw-experimental
+          & $exe selftest "rw\rw-selftest.img" --rw
           if ($LASTEXITCODE -ne 0) { throw "read-write adapter selftest failed" }
 
       - name: Mount and verify read-only semantics
@@ -5469,36 +5512,36 @@ jobs:
           }
 
           Run @('check', $img, '--parents', '--verbose')
-          Run @('create', $img, '/windows.bin', '--rw-experimental')
-          Run @('pwrite', $img, '/windows.bin', '0', '--rw-experimental',
+          Run @('create', $img, '/windows.bin', '--rw')
+          Run @('pwrite', $img, '/windows.bin', '0', '--rw',
             '--text=WINDOWS-RW6E')
-          Run @('mkdir', $img, '/win-dir', '--rw-experimental')
-          Run @('create', $img, '/win-dir/child', '--rw-experimental')
-          Run @('pwrite', $img, '/win-dir/child', '0', '--rw-experimental',
+          Run @('mkdir', $img, '/win-dir', '--rw')
+          Run @('create', $img, '/win-dir/child', '--rw')
+          Run @('pwrite', $img, '/win-dir/child', '0', '--rw',
             '--text=CHILD')
           Run @('link', $img, '/win-dir/child', '/win-dir/renamed',
-            '--rw-experimental')
-          Run @('mkdir', $img, '/win-move', '--rw-experimental')
+            '--rw')
+          Run @('mkdir', $img, '/win-move', '--rw')
           Run @('rename', $img, '/win-dir', '/win-move/dir',
-            '--rw-experimental')
+            '--rw')
           Run @('xattr', 'set', $img, '/win-move/dir/child', 'user.ci',
-            'hello', '--rw-experimental')
-          Run @('create', $img, '/win-move/dir/after', '--rw-experimental')
-          Run @('unlink', $img, '/win-move/dir/after', '--rw-experimental')
+            'hello', '--rw')
+          Run @('create', $img, '/win-move/dir/after', '--rw')
+          Run @('unlink', $img, '/win-move/dir/after', '--rw')
           Run @('symlink', $img, 'target', '/win-move/link',
-            '--rw-experimental')
-          Run @('create', $img, '/win-delete', '--rw-experimental')
-          Run @('unlink', $img, '/win-delete', '--rw-experimental')
-          Run @('mkdir', $img, '/win-empty', '--rw-experimental')
-          Run @('rmdir', $img, '/win-empty', '--rw-experimental')
-          Run @('create', $img, '/win-victim', '--rw-experimental')
-          Run @('pwrite', $img, '/win-victim', '0', '--rw-experimental',
+            '--rw')
+          Run @('create', $img, '/win-delete', '--rw')
+          Run @('unlink', $img, '/win-delete', '--rw')
+          Run @('mkdir', $img, '/win-empty', '--rw')
+          Run @('rmdir', $img, '/win-empty', '--rw')
+          Run @('create', $img, '/win-victim', '--rw')
+          Run @('pwrite', $img, '/win-victim', '0', '--rw',
             '--text=VICTIM')
-          Run @('create', $img, '/win-source', '--rw-experimental')
-          Run @('pwrite', $img, '/win-source', '0', '--rw-experimental',
+          Run @('create', $img, '/win-source', '--rw')
+          Run @('pwrite', $img, '/win-source', '0', '--rw',
             '--text=REPLACED')
           Run @('rename', $img, '/win-source', '/win-victim', '--replace',
-            '--rw-experimental')
+            '--rw')
           Run @('check', $img, '--parents', '--verbose')
 
           & $exe parents $img /windows.bin --json |
@@ -5744,3 +5787,70 @@ jobs:
           name: windows-perf-ab
           path: out/perf-ab
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # RW-STABLE-1 qualification gate.
+  #
+  # This job runs no filesystem code itself.  It is the single required check
+  # that turns the scattered writer, oracle, crash, recovery, concurrency,
+  # ENOSPC, WinFsp, automount and DEV-1 jobs into one supported-read-write
+  # decision.  docs/RW_STABILITY.md maps each contract promise to the jobs
+  # below; the hardware DEV-1R run is manual and is recorded separately.
+  # ---------------------------------------------------------------------------
+  rw-stable-qualification:
+    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    needs:
+      - linux-build-test
+      - linux-sanitizer
+      - linux-concurrency
+      - linux-concurrency-sanitizer
+      - linux-concurrency-tsan
+      - linux-stateful-fuzz
+      - linux-stateful-fuzz-sanitizer
+      - linux-verify-stateful-windows
+      - windows-build-test
+      - linux-verify-windows
+      - windows-read-linux-image
+      - windows-mount
+      - linux-verify-conc-winfsp
+      - linux-verify-rw
+      - linux-verify-rw6
+      - linux-verify-rw6c
+      - linux-verify-rw6d
+      - linux-verify-rw6e-mutation
+      - windows-rw6b-enospc
+      - windows-rw6c-enospc
+      - windows-rw6d-enospc
+      - windows-rw6b-crash
+      - windows-rw6c-crash
+      - windows-rw6d-crash
+      - windows-recover-linux-logs
+      - windows-rawdevice-vhd
+      - windows-vhd-device
+      - windows-automount-takeover
+      - windows-automount-vhd
+      - linux-verify-ux-rw-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification job to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          bad = {name: job.get("result", "missing")
+                 for name, job in needs.items()
+                 if job.get("result") != "success"}
+          if bad:
+              print("RW-STABLE-1 qualification is NOT READY:", file=sys.stderr)
+              for name, result in sorted(bad.items()):
+                  print(f"  {name}: {result}", file=sys.stderr)
+              sys.exit(1)
+          print(f"RW-STABLE-1 qualification: READY "
+                f"({len(needs)} evidence jobs passed)")
+          PY
