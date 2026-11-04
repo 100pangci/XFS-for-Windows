@@ -183,16 +183,16 @@ CI against the Linux-populated and golden images.
 ### 2. CLI write path
 
 ```powershell
-xfswin pwrite test.img /hello.bin 4096 --rw-experimental --from=overlay.bin
-xfswin extend test.img /hello.bin 45000 --rw-experimental
-xfswin truncate test.img /hello.bin 20000 --rw-experimental
-xfswin create test.img /new.bin --rw-experimental --mode=0644
-xfswin mkdir test.img /newdir --rw-experimental
-xfswin rename test.img /new.bin /renamed.bin --rw-experimental
-xfswin link test.img /renamed.bin /second --rw-experimental
-xfswin symlink test.img ../target /link --rw-experimental
-xfswin unlink test.img /new.bin --rw-experimental
-xfswin rmdir test.img /newdir --rw-experimental
+xfswin pwrite test.img /hello.bin 4096 --rw --from=overlay.bin
+xfswin extend test.img /hello.bin 45000 --rw
+xfswin truncate test.img /hello.bin 20000 --rw
+xfswin create test.img /new.bin --rw --mode=0644
+xfswin mkdir test.img /newdir --rw
+xfswin rename test.img /new.bin /renamed.bin --rw
+xfswin link test.img /renamed.bin /second --rw
+xfswin symlink test.img ../target /link --rw
+xfswin unlink test.img /new.bin --rw
+xfswin rmdir test.img /newdir --rw
 xfswin check test.img
 python tests\tools\rw2_probe.py test.img --inode 67
 python tests\tools\rw3_probe.py test.img
@@ -200,7 +200,7 @@ python tests\tools\rw4_probe.py test.img --model model.json
 ```
 
 `pwrite`, `extend` and `truncate` perform the same core mutations the WinFsp
-callbacks do (image files need `--rw-experimental`; a real device additionally
+callbacks do (image files need `--rw`; a real device additionally
 needs `--device-write-qualification` and the device-class opt-in, then the
 raw-device policy applies), so CI can verify writes against Linux oracles
 without the WinFsp driver. `pwrite` supports growth now;
@@ -230,7 +230,7 @@ and directory formats (shortform/block/leaf/node).
 
 ### 3. WinFsp read-write mount
 
-Without a driver, `xfswin selftest <image> --rw-experimental` drives the real
+Without a driver, `xfswin selftest <image> --rw` drives the real
 callbacks (open, write, flush, re-open, read back), then writes past EOF,
 shrinks the file, grows it sparsely and shrinks it again, verifying the size and
 the data through a fresh node; RW-3 extends it with create + write + re-open,
@@ -255,7 +255,7 @@ existing file, then writes a second overlay through `xfswin pwrite` and runs
 ```text
 Windows  format an image (read-write safe profile)
 Linux    populate it with deterministic files (tests/tools/rw_content.py)
-Windows  mount --rw-experimental, overwrite bytes in two files
+Windows  mount --rw, overwrite bytes in two files
 Linux    sudo tests/scripts/verify_rw_linux.sh modified.img rw.img recipe overlay
 ```
 
@@ -269,7 +269,7 @@ this is.
 
 ```powershell
 $env:XFSWIN_CRASH_AT = 'before_data_write'
-xfswin pwrite image.img /hello.bin 0 --rw-experimental --text=x
+xfswin pwrite image.img /hello.bin 0 --rw --text=x
 # process terminates with exit code 0x58435348, no clean unmount
 ```
 
@@ -638,7 +638,7 @@ Then the product-specific matrix runs:
    rename/replace-with-open-handle/hard-link/symlink), mounts the
    Linux image at `X:`, verifies reads/hashes/Unicode names, asserts that every
    write-path callback is rejected as write-protected, then mounts the
-   read-write image with `--rw-experimental`, overwrites bytes through the
+   read-write image with `--rw`, overwrites bytes through the
    WinFsp `Write` callback, exercises growth, append handles and `SetEndOfFile`
    on an existing file, exercises create/mkdir/delete/rmdir/rename (with
    symlink creation and writes to 0444 files still refused), writes a second
@@ -1368,3 +1368,31 @@ truncate, rename, hardlink and xattr evidence, and carries the expected device
 identity. Archive it with the run record and the Linux artifacts. The hardware
 run and Linux VM phase both passed on 2026-11-01 for the one tested device; see
 [DEV1_REMOVABLE_QUALIFICATION.md](DEV1_REMOVABLE_QUALIFICATION.md).
+
+## RW-STABLE-1: supported read-write qualification
+
+The contract itself is [RW_STABILITY.md](RW_STABILITY.md). Two focused tools
+back the graduation claims:
+
+* `tests/tools/rw_stable_refusal_matrix.py` patches one superblock field at a
+  time into an unsupported profile/geometry, recomputes the superblock CRC,
+  runs a mutation with `--rw`, and requires a non-zero exit plus an unchanged
+  whole-image SHA-256. The same run proves an unpatched control copy accepts
+  the mutation. It covers metadir, zoned, zone-gaps, needs-repair, unknown
+  incompatible/read-only/log bits, quota flags and inode, realtime, asciici,
+  ftype=0, 4K sectors, log stripe units, `dirblklog != 0`, external log and
+  inconsistent inode geometry.
+* `tests/scripts/verify_rw_alias_windows.ps1` starts from two byte-identical
+  images and runs the same namespace/data/xattr/reflink/CoW/fallocate/truncate
+  workload through `--rw` and the deprecated `--rw-experimental` alias. It
+  compares names, modes, link counts, sizes, extent counts, symlink targets,
+  xattr values and content hashes, and asserts the deprecation warning appears
+  only for the alias. `tests/scripts/verify_rw_alias_linux.sh` then runs
+  `xfs_repair -n`, a read-only kernel mount and the recorded content hashes on
+  both images.
+
+The `rw-stable-qualification` job is the aggregate gate. It runs no filesystem
+code; it requires the writer, sanitizer, concurrency, stateful, crash,
+recovery, ENOSPC, WinFsp, automount, VHD and Linux-oracle jobs listed in
+[RW_STABILITY.md](RW_STABILITY.md#11-evidence-ledger) to succeed. A red
+aggregate is a `NOT READY` decision, not a flaky retry.

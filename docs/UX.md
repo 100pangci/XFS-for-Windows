@@ -49,7 +49,7 @@ qualification boundary.
    ```powershell
    PS> xfswin automount enable 11111111-1111-4111-8111-111111111111
    Mount this filesystem automatically when it is inserted? [Y/n] y
-   Mount mode: 1) read-only  2) experimental read-write
+   Mount mode: 1) read-only  2) read-write
    Choose 1-2 [1]: 2
    Read-write identity to pin:
      filesystem UUID : 11111111-1111-4111-8111-111111111111
@@ -285,24 +285,29 @@ every insertion.
 
 ### Read-only default and the read-write boundary
 
-Every entry is read-only unless it was explicitly enrolled for experimental
-read-write. The ordinary one-time spelling is:
+Every entry is read-only unless it was explicitly enrolled for read-write.
+The ordinary one-time spelling is:
 
 ```powershell
 xfswin automount enable <uuid> --rw
 ```
 
 In a terminal it asks whether to mount automatically, then asks for the mode
-(1 = read-only, 2 = experimental read-write), then shows the detected
+(1 = read-only, 2 = read-write), then shows the detected
 filesystem and physical identity and asks for a separate confirmation before
 recording the pins. `--yes-i-really-mean-it` is the explicit confirmation for
 unattended scripts; without a terminal and without that flag, `--rw` is
-refused. The older engineering spelling remains:
+refused. The deprecated pre-graduation spelling still works and keeps its
+legacy explicit-qualification requirement:
 
 ```powershell
 xfswin automount enable <uuid> --rw-experimental `
     --device-write-qualification --drive auto
 ```
+
+Prefer `--rw` for new configurations. Both spellings record the same
+`mode = read-write` entry; a pre-graduation `mode = experimental-rw` line is
+accepted and rewritten on the next save without changing the pins.
 
 Read-write enrollment is refused unless the filesystem is attached and the
 DEV-1 identity pins can be recorded, and the device class policy allows it:

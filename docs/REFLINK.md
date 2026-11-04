@@ -3,7 +3,7 @@
 Status: **ordinary writable profile, opened 2026-10-25** after every gate in
 the qualification ledger below passed on
 [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954).
-Ordinary `--rw-experimental` now accepts `reflink=1` filesystems with
+Ordinary `--rw` now accepts `reflink=1` filesystems with
 `rmapbt=0` or `rmapbt=1`. The former hidden switch
 (`--rw-reflink-qualification`, `MountOptions::allow_reflink_qualification`)
 and the recovery-only path remain accepted for compatibility, but reflink no
@@ -20,7 +20,7 @@ This milestone implements:
 * CUI/CUD log intent parsing, preflight, lifetime matching and completion;
 * mount-time orphan CoW staging cleanup;
 * formatter support for `reflink=1,rmapbt=0` and `reflink=1,rmapbt=1`;
-* ordinary `--rw-experimental` CLI access (the legacy qualification flag is a
+* ordinary `--rw` CLI access (the legacy qualification flag is a
   no-op) and an independent Python oracle.
 
 It deliberately does **not** support realtime refcount, external logs, quotas,
@@ -290,9 +290,9 @@ free-space-only release accounting for shared blocks.
 `CheckWritableProfile` accepts `reflink=1` and `reflink=1,rmapbt=1` through the
 ordinary allow-list:
 
-* `--rw-experimental` alone: the public opt-in, including reflink, refcountbt,
+* `--rw` alone: the public opt-in, including reflink, refcountbt,
   shared truncate/unlink and CoW;
-* `--rw-experimental --rw-reflink-qualification`: the legacy flag is accepted
+* `--rw --rw-reflink-qualification`: the legacy flag is accepted
   as a no-op for compatibility with older scripts;
 * `xfswin recover --yes-i-really-mean-it`: still the explicit recovery path,
   including CUI/CUD completion and orphan CoW staging cleanup;
@@ -324,7 +324,7 @@ ctest --test-dir build -C RelWithDebInfo --output-on-failure
 * clone/holes/unwritten/partial EOF/all-hole/local-fork behavior;
 * CoW write, destination isolation, source preservation and cache reads;
 * three-way clones, truncate, unlink and last-reference release;
-* ordinary `--rw-experimental` writable acceptance;
+* ordinary `--rw` writable acceptance;
 * orphan CoW staging cleanup on the next writable mount;
 * CUI/CUD structural matrices and lifetime/ID reuse;
 * overlapping written-data rmap records with one private CoW block.
@@ -400,7 +400,7 @@ passed; local tests and Windows self-consistency are not Linux evidence.
 All twelve rows are verified by [run 40165123954](https://github.com/100pangci/XFS-for-Windows/actions/runs/40165123954).
 The ordinary reflink write gate was opened on 2026-10-25 on that basis. The
 gate-opening rerun [40168219743](https://github.com/100pangci/XFS-for-Windows/actions/runs/40168219743)
-then repeated the RW-6C matrix with plain `--rw-experimental`; every RW-6C job
+then repeated the RW-6C matrix with plain `--rw`; every RW-6C job
 passed, including the Linux round trip, reverse/final mounts, crash matrices,
 ENOSPC, genuine CUI recovery and the refusal matrix.
 

@@ -375,7 +375,7 @@ Two oracles are kept; neither side proves itself:
   unsupported items=...)`; it never writes.
 * `xfswin mount <image> X:` (read-only): a dirty log still refuses; use
   `--force-unsafe-ro` to get the pre-recovery view (clearly warned).
-* `xfswin mount <image> X: --rw-experimental`: a dirty log is recovered
+* `xfswin mount <image> X: --rw`: a dirty log is recovered
   automatically before the volume becomes visible; any recovery error fails the
   mount.
 * `xfswin journal <image> [--json]`: structural dump of the log (records,

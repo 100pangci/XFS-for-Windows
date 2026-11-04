@@ -135,11 +135,11 @@ Further preparation findings, all fixed before the hardware result is claimed:
   fallback could not run on the device.  They now accept a qualified real
   device through the shared raw-device gate: each requires
   `--device-write-qualification`; the file-mutating commands also require
-  `--rw-experimental`, while `recover` keeps its `--yes-i-really-mean-it`
+  `--rw`, while `recover` keeps its `--yes-i-really-mean-it`
   confirmation.  The device class policy, the expected-identity pins, the
   system/pagefile refusal and volume ownership then decide whether the disk
   may be written.  A raw target without the qualification opt-in is still
-  refused before any I/O.  `selftest --rw-experimental` remains image-only by
+  refused before any I/O.  `selftest --rw` remains image-only by
   design; raw-device destructive testing uses `device-selftest`.
 * The CoW `pwrite` step passed `'--from=' + $overlay` inside a PowerShell array
   literal.  The comma operator binds tighter than `+`, so the CLI received

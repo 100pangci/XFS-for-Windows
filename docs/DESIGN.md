@@ -72,7 +72,7 @@ CLI (xfswin.exe)                       WinFsp host
    intermediate state on disk - including after a crash between two
    transactions - is a legal XFS state this build and Linux both accept.
 9. A read-write mount of a raw device is refused in code unless
-   `--rw-experimental`, `--device-write-qualification`, the device-class
+   `--rw`, `--device-write-qualification`, the device-class
    opt-in and the backend policy (identity pins, system/pagefile refusal,
    volume ownership) all pass; an image target does not need the device
    opt-ins.
