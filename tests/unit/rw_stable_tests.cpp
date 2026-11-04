@@ -93,6 +93,35 @@ class FailAgiRead final : public xfs::BlockDevice {
   uint64_t agi_offset_;
 };
 
+// Fails primary-superblock reads after the mount has completed.
+class FailPrimarySuperblockReads final : public xfs::BlockDevice {
+ public:
+  explicit FailPrimarySuperblockReads(xfs::BlockDevice* backing)
+      : backing_(backing) {}
+
+  void Enable() { enabled_ = true; }
+
+  bool Read(uint64_t offset, void* buffer, size_t size) override {
+    if (enabled_ && offset == 0 && size >= 512) {
+      last_error_ = "injected primary superblock read failure";
+      return false;
+    }
+    return backing_->Read(offset, buffer, size);
+  }
+  bool Write(uint64_t offset, const void* buffer, size_t size) override {
+    return backing_->Write(offset, buffer, size);
+  }
+  bool Flush() override { return backing_->Flush(); }
+  uint64_t Size() const override { return backing_->Size(); }
+  uint32_t SectorSize() const override { return backing_->SectorSize(); }
+  const xfs::DeviceInfo& Info() const override { return backing_->Info(); }
+  void Close() override {}
+
+ private:
+  xfs::BlockDevice* backing_;
+  bool enabled_ = false;
+};
+
 std::vector<uint8_t> ReadLog(xfstest::FixtureImage& fixture, uint64_t start,
                              uint64_t length) {
   std::vector<uint8_t> bytes(length);
@@ -519,4 +548,44 @@ TEST(rw_stable_in_place_overwrite_refuses_reflink_shared_range) {
                                overlay.size())
               .ok());
   }
+}
+
+// `xfswin check` re-reads the primary superblock for live counters.  An
+// unreadable primary must be reported as corruption, not silently replaced by
+// the mount-time copy and reported OK.  Inode enumeration must fail too.
+TEST(rw_stable_check_reports_unreadable_primary_superblock) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto device =
+      std::make_unique<FailPrimarySuperblockReads>(&fixture.storage());
+  auto* faults = device.get();
+  MountOptions options;
+  options.read_write = true;
+  auto mounted = XfsFilesystem::Mount(std::move(device), options);
+  CHECK(mounted.ok());
+  if (!mounted.ok()) {
+    fixture.Reset();
+    return;
+  }
+  XfsFilesystem& fs = *mounted.value();
+  faults->Enable();
+
+  CheckReport report = fs.CheckConsistency(CheckOptions{});
+  bool saw_superblock = false;
+  for (const CheckItem& item : report.items) {
+    if (item.name != "superblock") continue;
+    saw_superblock = true;
+    CHECK(item.status == CheckStatus::kCorrupt);
+    CHECK(item.message.find("failed to read superblock") !=
+          std::string::npos);
+  }
+  CHECK(saw_superblock);
+  CHECK(report.Overall() != CheckStatus::kOk);
+
+  auto inodes = fs.ListAllocatedInodes();
+  CHECK(!inodes.ok());
+  if (!inodes.ok()) CHECK_EQ(inodes.error().code, XfsError::kIoError);
+
+  mounted.value().reset();
+  fixture.Reset();
 }
