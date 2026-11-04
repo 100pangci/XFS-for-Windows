@@ -80,7 +80,7 @@ void PrintUsage() {
       "  rmap <device|image> [--ag=N] human-readable reverse mappings\n"
       "  refcount <device|image> [--ag=N]  typed refcountbt records\n"
       "  reflink <image> <src> <dst> <off> <len>  shared-extent clone\n"
-      "      --rw-experimental         writable mount (images; real devices\n"
+      "      --rw         writable mount (images; real devices\n"
       "                                need --device-write-qualification)\n"
       "  journal <device|image>        dump the internal log structure\n"
       "      --json                    machine-readable (recovery differential)\n"
@@ -89,39 +89,39 @@ void PrintUsage() {
       "  cat <device|image> <path>     write a file (or symlink target) to stdout\n"
       "  stat <device|image> <path>    show inode information\n"
       "  pwrite <image> <path> <off>   write bytes at an offset (may extend the\n"
-      "      --rw-experimental [--text=<s> | --from=<file>]\n"
+      "      --rw [--text=<s> | --from=<file>]\n"
       "  fallocate <image> <path> <off> <len>  allocate unwritten extents\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  convert-unwritten <image> <path> <off> <len>  mark them written\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  bmap <image> <path>          dump the physical data extents [--json]\n"
       "  xattr list <image> <path>    list native extended attributes [--json]\n"
       "  xattr get <image> <path> <name>  raw value to stdout, or --hex/\n"
       "      --output=<file>          --include-private reads a parent.* value\n"
       "  xattr set <image> <path> <name> [value | --value-file=<f> |\n"
-      "      --value-hex=<hex>] --rw-experimental [--create|--replace]\n"
-      "  xattr remove <image> <path> <name>  --rw-experimental\n"
+      "      --value-hex=<hex>] --rw [--create|--replace]\n"
+      "  xattr remove <image> <path> <name>  --rw\n"
       "      --include-private         xattr list: show parent.* records\n"
       "  parents <image> <path>       list reverse parent pointers [--json]\n"
       "  extend <image> <path> <size>  grow a file to <size> bytes by writing a\n"
-      "      --rw-experimental [--fill=0xNN]\n"
+      "      --rw [--fill=0xNN]\n"
       "  truncate <image> <path> <size>  set the file size (allocate or free)\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  create <image> <path>         create a regular file\n"
-      "      --rw-experimental [--mode=0644]\n"
+      "      --rw [--mode=0644]\n"
       "  mkdir <image> <path>          create a directory\n"
-      "      --rw-experimental [--mode=0755]\n"
+      "      --rw [--mode=0755]\n"
       "  unlink <image> <path>         remove a regular file\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  rmdir <image> <path>          remove an empty directory\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  rename <image> <src> <dst>    atomically rename (file, symlink or dir)\n"
-      "      --rw-experimental [--replace]  --replace overwrites an existing\n"
+      "      --rw [--replace]  --replace overwrites an existing\n"
       "                                     file or empty directory target\n"
       "  link <image> <existing> <new> create a hard link\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  symlink <image> <target> <path>  create a symlink (target kept verbatim)\n"
-      "      --rw-experimental\n"
+      "      --rw\n"
       "  format <device|image>         create a new XFS v5 filesystem\n"
       "      [--modern-inode-profile]  enable finobt + inobtcount + sparse\n"
       "                                inodes + bigtime + NREXT64\n"
@@ -134,7 +134,7 @@ void PrintUsage() {
       "      [--parent]                parent pointers (implies exchange-range)\n"
       "      [--modern-default-profile] the xfsprogs 7.2 default feature set\n"
       "  mount <device|image> <X:>     mount via WinFsp (read-only by default)\n"
-      "      --rw-experimental         writable mount (images, or a real device\n"
+      "      --rw         writable mount (images, or a real device\n"
       "                                together with --device-write-qualification)\n"
       "  mount                         choose an attached XFS filesystem and a\n"
       "                                drive letter interactively\n"
@@ -147,9 +147,12 @@ void PrintUsage() {
       "  automount status              same view as `xfswin status`\n"
       "  automount enable [<fs>]       mount a configured XFS automatically\n"
       "      --drive <X:|auto>         preferred letter; auto scans D:..Z:\n"
+      "      --rw [--yes-i-really-mean-it]\n"
+      "                                enroll for read-write access (identity\n"
+      "                                pins are recorded after confirmation)\n"
       "      --rw-experimental --device-write-qualification\n"
       "      [--allow-removable-disk-write]\n"
-      "                                enroll for qualified read-write access\n"
+      "                                legacy enrollment spelling (deprecated)\n"
       "  automount disable <fs>        stop mounting a configured XFS\n"
       "  automount run                 run in console mode (diagnostics/tests)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
@@ -159,6 +162,8 @@ void PrintUsage() {
       "  --debug                       detailed parser traversal output\n"
       "  --perf-stats                  collect I/O, journal, cache and lock counters\n"
       "  --force-unsafe-ro             allow mounting a dirty/unknown log\n"
+      "  --rw                          allow read-write access (the device policy,\n"
+      "                                qualification and identity pins still apply)\n"
       "  --yes-i-really-mean-it        required for destructive format/selftest\n"
       "  --device-write-qualification  allow writable access to a real disk\n"
       "                                under the DEV-1 device policy\n"
@@ -178,7 +183,7 @@ void PrintUsage() {
       "  xfswin mount\n"
       "  xfswin cat \\\\.\\PhysicalDrive2 /etc/hostname\n"
       "  xfswin mount test.img X:\n"
-      "  xfswin mount test.img X: --rw-experimental\n";
+      "  xfswin mount test.img X: --rw\n";
 }
 
 std::string HumanBytes(uint64_t bytes) {
@@ -372,7 +377,7 @@ std::unique_ptr<BlockDevice> OpenTarget(const std::string& target,
 }
 
 // Shared gate for the commands that mutate their target.  Image files need
-// only --rw-experimental (recover uses its own confirmation instead).  A real
+// only --rw (recover uses its own confirmation instead).  A real
 // device needs --device-write-qualification; the class policy
 // (fixed/removable), the expected-identity pins, the system/pagefile refusal
 // and volume ownership are then enforced by the backend when the device is
@@ -2095,7 +2100,7 @@ int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
               << filesystem.xfswin_drive << " by xfswin.\n";
     return 1;
   }
-  const bool read_write = options.rw_experimental;
+  const bool read_write = options.read_write;
   // A read-only mount cannot repair a non-clean log.  A read-write mount can:
   // Mount() replays a recoverable dirty log before exposing the filesystem,
   // and refuses unknown/unrecoverable content itself.
@@ -2113,7 +2118,7 @@ int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
   if (read_write && !options.device_write_qualification) {
     std::cerr
         << "error: writable mounting of a real device requires both "
-           "--rw-experimental and --device-write-qualification.\n"
+           "--rw and --device-write-qualification.\n"
            "       The class policy still applies: fixed disks need "
            "--allow-fixed-disk-write and removable disks need "
            "--allow-removable-disk-write.\n";
@@ -2141,7 +2146,7 @@ int MountDiscoveredFilesystem(const DiscoveredFilesystem& filesystem,
       filesystem.probe.label.empty() ? "XFS filesystem"
                                      : filesystem.probe.label;
   std::cout << "Mounting " << label << " at " << drive << " ("
-            << (read_write ? "experimental read-write" : "read-only")
+            << (read_write ? "read-write" : "read-only")
             << ").\n";
   std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
   std::cout.flush();
@@ -2220,11 +2225,11 @@ int CommandMountAutoDrive(const std::string& target,
                           const std::string& preferred,
                           const Options& options) {
   const bool raw = IsRawDevicePath(target);
-  if (raw && options.rw_experimental &&
+  if (raw && options.read_write &&
       !options.device_write_qualification) {
     std::cerr
         << "error: writable mounting of a real device requires both "
-           "--rw-experimental and --device-write-qualification.\n"
+           "--rw and --device-write-qualification.\n"
            "       The class policy still applies: fixed disks need "
            "--allow-fixed-disk-write and removable disks need "
            "--allow-removable-disk-write.\n";
@@ -2242,19 +2247,19 @@ int CommandMountAutoDrive(const std::string& target,
               << " is already in use. Mounted as " << drive << " instead.\n";
   }
   std::cout << "Mounting " << target << " at " << drive << " ("
-            << (options.rw_experimental ? "experimental read-write"
+            << (options.read_write ? "read-write"
                                         : "read-only")
             << ").\n";
   std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
   std::cout.flush();
 
   DeviceOpenPolicy raw_policy =
-      BuildRawDevicePolicy(options, options.rw_experimental);
+      BuildRawDevicePolicy(options, options.read_write);
   winfsp::MountTarget whole;
   whole.path = target;
   return winfsp::RunMountHost(
       whole, drive, options.force_unsafe_ro, options.verbose || options.debug,
-      options.rw_experimental, options.perf_stats,
+      options.read_write, options.perf_stats,
       options.rmapbt_qualification, options.reflink_qualification,
       raw ? &raw_policy : nullptr);
 }
@@ -2282,11 +2287,11 @@ int CommandMount(const std::string& target, const std::string& drive,
   // that particular disk may be written (fixed and removable disks have their
   // own opt-in flags).
   const bool raw = IsRawDevicePath(target);
-  if (raw && options.rw_experimental &&
+  if (raw && options.read_write &&
       !options.device_write_qualification) {
     std::cerr
         << "error: writable mounting of a real device requires both "
-           "--rw-experimental and --device-write-qualification.\n"
+           "--rw and --device-write-qualification.\n"
            "       The class policy still applies: fixed disks need "
            "--allow-fixed-disk-write and removable disks need "
            "--allow-removable-disk-write.\n";
@@ -2296,17 +2301,17 @@ int CommandMount(const std::string& target, const std::string& drive,
   // Announce the mount like the interactive and --drive forms do. A user who
   // runs the legacy form from a script still sees which mode and letter apply.
   std::cout << "Mounting " << target << " at " << drive << " ("
-            << (options.rw_experimental ? "experimental read-write"
+            << (options.read_write ? "read-write"
                                         : "read-only")
             << ").\n";
   std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
   std::cout.flush();
 
   DeviceOpenPolicy raw_policy =
-      BuildRawDevicePolicy(options, options.rw_experimental);
+      BuildRawDevicePolicy(options, options.read_write);
   return winfsp::RunMountHost(
       target, drive, options.force_unsafe_ro, options.verbose || options.debug,
-      options.rw_experimental, options.perf_stats, options.rmapbt_qualification,
+      options.read_write, options.perf_stats, options.rmapbt_qualification,
       options.reflink_qualification, raw ? &raw_policy : nullptr);
 #else
   (void)target;
@@ -2350,7 +2355,7 @@ bool ParseU64(const std::string& text, uint64_t* out) {
 
 // Every ordinary mutation opens a writable mount through this helper.  The
 // legacy qualification flags are forwarded as accepted no-ops; the ordinary
-// --rw-experimental flag is the real opt-in for every writable feature.
+// --rw flag is the real opt-in for every writable feature.
 MountOptions WritableMountOptions(const Options& options) {
   MountOptions mount_options;
   mount_options.read_write = true;
@@ -2368,8 +2373,8 @@ MountOptions WritableMountOptions(const Options& options) {
 int CommandPwrite(const std::string& target, const std::string& path,
                   const std::string& offset_text, const std::string& text,
                   const std::string& from_file, const Options& options) {
-  if (!options.rw_experimental) {
-    std::cerr << "error: pwrite modifies the target; pass --rw-experimental to confirm\n";
+  if (!options.read_write) {
+    std::cerr << "error: pwrite modifies the target; pass --rw to confirm\n";
     return 3;
   }
   const int raw_gate = CheckRawWritableTarget(target, options);
@@ -2477,8 +2482,8 @@ int CommandPwrite(const std::string& target, const std::string& path,
 int CommandExtend(const std::string& target, const std::string& path,
                   const std::string& size_text, uint8_t fill,
                   bool have_fill, const Options& options) {
-  if (!options.rw_experimental) {
-    std::cerr << "error: extend modifies the image; pass --rw-experimental\n";
+  if (!options.read_write) {
+    std::cerr << "error: extend modifies the image; pass --rw\n";
     return 3;
   }
   const int raw_gate = CheckRawWritableTarget(target, options);
@@ -2546,8 +2551,8 @@ int CommandExtend(const std::string& target, const std::string& path,
 // truncate: SetFileSize, in both directions.
 int CommandTruncate(const std::string& target, const std::string& path,
                     const std::string& size_text, const Options& options) {
-  if (!options.rw_experimental) {
-    std::cerr << "error: truncate modifies the image; pass --rw-experimental\n";
+  if (!options.read_write) {
+    std::cerr << "error: truncate modifies the image; pass --rw\n";
     return 3;
   }
   const int raw_gate = CheckRawWritableTarget(target, options);
@@ -2603,9 +2608,9 @@ int ParseRangeArguments(const std::string& target, const std::string& path,
                         const std::string& offset_text,
                         const std::string& length_text, const Options& options,
                         uint64_t* offset, uint64_t* length) {
-  if (!options.rw_experimental) {
+  if (!options.read_write) {
     std::cerr << "error: this command modifies the image; pass "
-                 "--rw-experimental\n";
+                 "--rw\n";
     return 3;
   }
   const int raw_gate = CheckRawWritableTarget(target, options);
@@ -2820,9 +2825,9 @@ Result<std::pair<uint64_t, std::string>> ParentAndName(XfsFilesystem& fs,
 // gate; the class policy and identity pins are enforced by the backend.
 int OpenWritable(const std::string& target, const Options& options,
                  std::unique_ptr<XfsFilesystem>* fs_out) {
-  if (!options.rw_experimental) {
+  if (!options.read_write) {
     std::cerr << "error: this command modifies the image; pass "
-                 "--rw-experimental to confirm\n";
+                 "--rw to confirm\n";
     return 3;
   }
   const int raw_gate = CheckRawWritableTarget(target, options);
@@ -3784,7 +3789,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
   // The legacy engineering spelling keeps its explicit qualification
   // requirements.  The ordinary `--rw` spelling asks for the identity
   // confirmation instead (or requires --yes-i-really-mean-it in a script).
-  if (options.rw_experimental && !options.device_write_qualification) {
+  if (options.rw_experimental_alias && !options.device_write_qualification) {
     std::cerr << "error: enrolling a filesystem for automatic read-write "
                  "mounting with --rw-experimental requires "
                  "--device-write-qualification and the DEV-1 identity pins "
@@ -3798,9 +3803,9 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
     return 3;
   }
   const bool interactive_enrollment =
-      args.size() == 2 && terminal && !options.rw_experimental &&
+      args.size() == 2 && terminal && !options.read_write &&
       !options.automount_rw;
-  bool read_write = options.rw_experimental || options.automount_rw;
+  bool read_write = options.read_write || options.automount_rw;
 
   const AutomountServicePaths paths = DefaultAutomountServicePaths();
   Status directory = EnsureAutomountServicePaths(paths);
@@ -3900,7 +3905,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
     }
     if (PromptMountMode() == 2) read_write = true;
   }
-  if (read_write && !options.rw_experimental) {
+  if (read_write && !options.rw_experimental_alias) {
     if (!selected) {
       std::cerr << "error: the filesystem must be attached before read-write "
                    "access can be enrolled.\n";
@@ -3918,7 +3923,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
   AutomountEntry entry = existing ? *existing : AutomountEntry{};
   entry.fs_uuid = uuid;
   entry.enabled = true;
-  entry.mode = read_write ? AutomountMode::kExperimentalReadWrite
+  entry.mode = read_write ? AutomountMode::kReadWrite
                           : AutomountMode::kReadOnly;
   if (drive_specified) {
     auto parsed = ParseDriveSelection(drive_option);
@@ -3955,7 +3960,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
                    "automatic read-write mounting.\n";
       return 3;
     }
-    if (options.rw_experimental &&
+    if (options.rw_experimental_alias &&
         location.device_class == DeviceClass::kRemovableDisk &&
         !options.allow_removable_disk_write) {
       std::cerr << "error: automatic read-write mounting of a removable disk "
@@ -4016,7 +4021,7 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
                                               : entry.preferred_drive)
             << " (" << ToString(entry.mode) << ").\n";
   if (read_write) {
-    std::cout << "warning: experimental read-write access is enabled; the "
+    std::cout << "warning: read-write access is enabled; the "
                  "DEV-1 identity pins and the removable-disk/virtual-disk "
                  "policy still apply on every insertion.\n";
   }
@@ -4163,7 +4168,6 @@ int Run(const std::vector<std::string>& args) {
   uint32_t namespace_mode = 0;
   bool have_mode = false;
   int rmap_ag = -1;
-  bool explicit_rw = false;
   bool replace_existing = false;
   std::string drive_option;
   bool drive_option_given = false;
@@ -4180,8 +4184,13 @@ int Run(const std::vector<std::string>& args) {
       options.force_unsafe_ro = true;
     } else if (arg == "--yes-i-really-mean-it") {
       options.yes_i_really_mean_it = true;
+    } else if (arg == "--rw") {
+      options.read_write = true;
+      options.automount_rw = true;
     } else if (arg == "--rw-experimental") {
-      options.rw_experimental = true;
+      options.read_write = true;
+      options.rw_experimental_alias = true;
+      std::cerr << "warning: --rw-experimental is deprecated; use --rw\n";
     } else if (arg == "--device-write-qualification") {
       options.device_write_qualification = true;
     } else if (arg == "--allow-fixed-disk-write") {
@@ -4273,8 +4282,6 @@ int Run(const std::vector<std::string>& args) {
       options.sparse_inodes = true;
       options.bigtime = true;
       options.nrext64 = true;
-    } else if (arg == "--rw") {
-      explicit_rw = true;
     } else if (StartsWith(arg, "--drive=")) {
       drive_option = arg.substr(8);
       drive_option_given = true;
@@ -4325,19 +4332,10 @@ int Run(const std::vector<std::string>& args) {
     }
   }
 
-  // --rw is the ordinary automount enrollment spelling.  It is not a manual
-  // writer switch: manual raw writes still require --rw-experimental plus the
-  // DEV-1 qualification flags, so any other command keeps the old refusal.
-  if (explicit_rw) {
-    const bool automount_enable =
-        positional.size() >= 2 && positional[0] == "automount" &&
-        positional[1] == "enable";
-    if (!automount_enable) {
-      std::cerr << "error: --rw is only valid for `xfswin automount enable`. Use --rw-experimental for the qualified experimental writer\n" "       (create, overwrite, extend, truncate, delete, rename, hard links, symlinks, xattrs and reflinks).\n" "       Real devices additionally require --device-write-qualification and a device-class opt-in.\n";
-      return 3;
-    }
-    options.automount_rw = true;
-  }
+  // `--rw` is the documented writer switch: automount enrollment records the
+  // DEV-1 pins (after confirmation), while every other command passes it
+  // through to the ordinary read-write mount path.  Qualification, device
+  // class, identity and volume-ownership checks still apply there.
 
   if (options.perf_stats) xfs::PerfStats::Get().SetEnabled(true);
   if (!options.device_cache_mode.empty()) {
@@ -4439,7 +4437,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "reflink") {
     if (positional.size() != 7) {
       std::cerr << "usage: xfswin reflink <image> <src> <dst> <src-offset> "
-                   "<dst-offset> <length> --rw-experimental\n"
+                   "<dst-offset> <length> --rw\n"
                    "       length 0 clones to the source EOF\n";
       return 1;
     }
@@ -4493,7 +4491,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "pwrite") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin pwrite <image> <path> <offset> "
-                   "--rw-experimental [--text=<string> | --from=<file>]\n";
+                   "--rw [--text=<string> | --from=<file>]\n";
       return 1;
     }
     return CommandPwrite(positional[1], positional[2], positional[3],
@@ -4502,7 +4500,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "fallocate") {
     if (positional.size() != 5) {
       std::cerr << "usage: xfswin fallocate <image> <path> <offset> <length> "
-                   "--rw-experimental\n";
+                   "--rw\n";
       return 1;
     }
     return CommandFallocate(positional[1], positional[2], positional[3],
@@ -4511,7 +4509,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "convert-unwritten") {
     if (positional.size() != 5) {
       std::cerr << "usage: xfswin convert-unwritten <image> <path> <offset> "
-                   "<length> --rw-experimental\n";
+                   "<length> --rw\n";
       return 1;
     }
     return CommandConvertUnwritten(positional[1], positional[2],
@@ -4527,7 +4525,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "extend") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin extend <image> <path> <new-size> "
-                   "--rw-experimental [--fill=0xNN]\n";
+                   "--rw [--fill=0xNN]\n";
       return 1;
     }
     return CommandExtend(positional[1], positional[2], positional[3],
@@ -4536,7 +4534,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "truncate") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin truncate <image> <path> <new-size> "
-                   "--rw-experimental\n";
+                   "--rw\n";
       return 1;
     }
     return CommandTruncate(positional[1], positional[2], positional[3],
@@ -4552,7 +4550,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "xattr") {
     if (positional.size() < 4) {
       std::cerr << "usage: xfswin xattr <list|get|set|remove> <image> <path> "
-                   "[name] [value] [--rw-experimental]\n";
+                   "[name] [value] [--rw]\n";
       return 1;
     }
     const std::string& sub = positional[1];
@@ -4580,7 +4578,7 @@ int Run(const std::vector<std::string>& args) {
           (!has_inline && !has_external)) {
         std::cerr << "usage: xfswin xattr set <image> <path> <name> "
                      "[value | --value-file=<file> | --value-hex=<hex>] "
-                     "--rw-experimental [--create|--replace]\n";
+                     "--rw [--create|--replace]\n";
         return 1;
       }
       return CommandXattrSet(positional[2], positional[3], positional[4],
@@ -4590,7 +4588,7 @@ int Run(const std::vector<std::string>& args) {
     if (sub == "remove") {
       if (positional.size() != 5) {
         std::cerr << "usage: xfswin xattr remove <image> <path> <name> "
-                     "--rw-experimental\n";
+                     "--rw\n";
         return 1;
       }
       return CommandXattrRemove(positional[2], positional[3], positional[4],
@@ -4601,7 +4599,7 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "create") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin create <image> <path> --rw-experimental "
+      std::cerr << "usage: xfswin create <image> <path> --rw "
                    "[--mode=0644]\n";
       return 1;
     }
@@ -4610,7 +4608,7 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "mkdir") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin mkdir <image> <path> --rw-experimental "
+      std::cerr << "usage: xfswin mkdir <image> <path> --rw "
                    "[--mode=0755]\n";
       return 1;
     }
@@ -4619,14 +4617,14 @@ int Run(const std::vector<std::string>& args) {
   }
   if (command == "unlink") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin unlink <image> <path> --rw-experimental\n";
+      std::cerr << "usage: xfswin unlink <image> <path> --rw\n";
       return 1;
     }
     return CommandUnlink(positional[1], positional[2], options);
   }
   if (command == "rmdir") {
     if (positional.size() != 3) {
-      std::cerr << "usage: xfswin rmdir <image> <path> --rw-experimental\n";
+      std::cerr << "usage: xfswin rmdir <image> <path> --rw\n";
       return 1;
     }
     return CommandRmdir(positional[1], positional[2], options);
@@ -4634,7 +4632,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "rename") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin rename <image> <src> <dst> "
-                   "--rw-experimental [--replace]\n";
+                   "--rw [--replace]\n";
       return 1;
     }
     return CommandRename(positional[1], positional[2], positional[3],
@@ -4643,7 +4641,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "link") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin link <image> <existing> <new> "
-                   "--rw-experimental\n";
+                   "--rw\n";
       return 1;
     }
     return CommandLink(positional[1], positional[2], positional[3], options);
@@ -4651,7 +4649,7 @@ int Run(const std::vector<std::string>& args) {
   if (command == "symlink") {
     if (positional.size() != 4) {
       std::cerr << "usage: xfswin symlink <image> <target> <linkpath> "
-                   "--rw-experimental\n";
+                   "--rw\n";
       return 1;
     }
     return CommandSymlink(positional[1], positional[2], positional[3], options);
@@ -4702,27 +4700,27 @@ int Run(const std::vector<std::string>& args) {
   if (command == "selftest") {
     if (positional.size() != 2) {
       std::cerr << "usage: xfswin selftest <device|image> "
-                   "[--rw-experimental]\n"
+                   "[--rw]\n"
                    "       read-write selftest: image only; use device-selftest "
                    "for a raw device\n";
       return 1;
     }
 #ifdef XFSWIN_HAS_WINFSP
     {
-      if (options.rw_experimental && IsRawDevicePath(positional[1])) {
+      if (options.read_write && IsRawDevicePath(positional[1])) {
         std::cerr << "error: the read-write self-test is restricted to image "
                      "files; use device-selftest for a raw device\n";
         return 3;
       }
       std::string error;
-      auto dev = OpenTarget(positional[1], options.rw_experimental, false,
+      auto dev = OpenTarget(positional[1], options.read_write, false,
                             &error);
       if (!dev) {
         std::cerr << "error: " << error << "\n";
         return 1;
       }
       MountOptions mount_options;
-      mount_options.read_write = options.rw_experimental;
+      mount_options.read_write = options.read_write;
       mount_options.allow_rmapbt_qualification =
           options.rmapbt_qualification;
       mount_options.allow_reflink_qualification =
