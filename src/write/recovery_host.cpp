@@ -97,8 +97,12 @@ Result<XfsFilesystem::RecoverySummary> XfsFilesystem::AnalyzeJournal() const {
     // Unresolved intents the completion pass cannot finish are a refusal too:
     // the scan only proves the replay half can be done.
     for (const PendingIntent& intent : CollectPendingIntents(log)) {
+      // ATTRI is completed by the same deferred-intent pass as EFI/RUI/CUI/
+      // BUI; leaving it out made `xfswin check` report a recoverable log as
+      // unsupported even though mount/recover can finish it.
       if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
-          intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
+          intent.type == lf::kItemCui || intent.type == lf::kItemBui ||
+          intent.type == lf::kItemAttri) {
         continue;
       }
       summary.unsupported_items.push_back(
