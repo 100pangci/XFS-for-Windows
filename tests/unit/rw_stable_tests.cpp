@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - RW-STABLE-1 gate regressions.
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -13,6 +14,7 @@
 #include "xfs/crc32c.h"
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
+#include "xfs/formatter.h"
 #include "xfs/ondisk.h"
 #include "xfs/superblock.h"
 
@@ -402,4 +404,75 @@ TEST(rw_stable_unreadable_agi_fails_clean_mount_recovery) {
   CHECK(memory->bytes() == before);
 
   fixture.Reset();
+}
+
+// The in-place overwrite API writes mapped blocks directly and never performs
+// copy-on-write.  On a reflink image, a range still shared through refcountbt
+// must be refused before the first data byte is written: otherwise the write
+// would silently change the source file's bytes as well.
+TEST(rw_stable_in_place_overwrite_refuses_reflink_shared_range) {
+  auto device = std::make_unique<xfstest::MemoryBlockDevice>(300ull << 20);
+  mkfs::FormatOptions format_options;
+  format_options.block_size = 4096;
+  format_options.inode_size = 512;
+  format_options.quiet = true;
+  format_options.reflink = true;
+  auto formatted = mkfs::Format(*device, format_options);
+  CHECK(formatted.ok());
+  if (!formatted.ok()) return;
+
+  MountOptions options;
+  options.read_write = true;
+  auto mounted = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(device.get()), options);
+  CHECK(mounted.ok());
+  if (!mounted.ok()) return;
+  XfsFilesystem& fs = *mounted.value();
+
+  auto src = fs.CreateRegularFile(fs.RootInode(), "src", 0644, 0, 0);
+  auto dst = fs.CreateRegularFile(fs.RootInode(), "dst", 0644, 0, 0);
+  CHECK(src.ok());
+  CHECK(dst.ok());
+  if (!src.ok() || !dst.ok()) return;
+
+  std::vector<uint8_t> data(8192);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<uint8_t>((i * 29u) ^ 0x3du);
+  }
+  CHECK(fs.WriteFileData(src.value(), 0, data.data(), data.size()).ok());
+  auto cloned = fs.ReflinkRange(src.value(), 0, dst.value(), 0, 0);
+  CHECK(cloned.ok());
+  if (!cloned.ok()) return;
+
+  const std::vector<uint8_t> before = device->bytes();
+  const std::vector<uint8_t> overlay(4096, 0xee);
+  auto wrote =
+      fs.OverwriteFileData(dst.value(), 0, overlay.data(), overlay.size());
+  CHECK(!wrote.ok());
+  if (!wrote.ok()) {
+    CHECK_EQ(wrote.error().code, XfsError::kWriteNeedsCow);
+    CHECK(wrote.error().message.find("shared") != std::string::npos);
+  }
+  // Refused before the data write and before the timestamp transaction.
+  CHECK(device->bytes() == before);
+
+  std::vector<uint8_t> recheck(data.size(), 0);
+  auto read_src = fs.ReadFile(src.value(), 0, recheck.data(), recheck.size());
+  CHECK(read_src.ok());
+  CHECK(recheck == data);
+  std::fill(recheck.begin(), recheck.end(), static_cast<uint8_t>(0));
+  auto read_dst = fs.ReadFile(dst.value(), 0, recheck.data(), recheck.size());
+  CHECK(read_dst.ok());
+  CHECK(recheck == data);
+
+  // A private file on the same reflink filesystem must still take the
+  // in-place path; the check may not refuse every overwrite.
+  auto plain = fs.CreateRegularFile(fs.RootInode(), "plain", 0644, 0, 0);
+  CHECK(plain.ok());
+  if (plain.ok()) {
+    CHECK(fs.WriteFileData(plain.value(), 0, data.data(), data.size()).ok());
+    CHECK(fs.OverwriteFileData(plain.value(), 0, overlay.data(),
+                               overlay.size())
+              .ok());
+  }
 }

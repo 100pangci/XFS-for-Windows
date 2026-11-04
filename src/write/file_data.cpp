@@ -68,6 +68,26 @@ Result<size_t> XfsFilesystem::OverwriteFileData(uint64_t ino, uint64_t offset,
                              length, &mappings);
   if (!s.ok()) return s.error();
 
+  // This API writes mapped blocks directly, so it cannot isolate a reflink
+  // owner with copy-on-write.  Refuse a shared range before the first data
+  // byte is written; WriteFileData is the path that can stage and remap it.
+  if (geometry_.features.reflink) {
+    const uint64_t first_block = offset >> geometry_.block_log;
+    const uint64_t last_block = (offset + length - 1) >> geometry_.block_log;
+    auto shared = RangeHasSharedData(*device_, geometry_, *extents.value(),
+                                     first_block, last_block);
+    if (!shared.ok()) return shared.error();
+    if (shared.value()) {
+      return XFS_ERR(XfsError::kWriteNeedsCow,
+                     "write range is shared with another file; an in-place "
+                     "overwrite would modify both (use WriteFileData for "
+                     "copy-on-write)")
+          .Ino(ino)
+          .Offset(offset)
+          .Metadata("reflink");
+    }
+  }
+
   XFS_CONC_SYNC("data.write.before", "ino=" + std::to_string(ino));
   MaybeCrash(CrashPoint::kBeforeDataWrite, RangeText(ino, offset, length));
 

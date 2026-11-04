@@ -217,9 +217,12 @@ class XfsFilesystem {
   // ---- mutation API (read-write mounts only) ----
   // Overwrites bytes inside extents that are already allocated and written.
   // Never allocates, never converts an unwritten extent and never changes the
-  // inode size (see MapWrittenRange for the exact range rule). Returns the
-  // number of bytes written; on failure nothing is guaranteed to be intact
-  // beyond the reported error, but no metadata was touched either.
+  // inode size (see MapWrittenRange for the exact range rule). A range whose
+  // blocks are shared through refcountbt is refused with kWriteNeedsCow
+  // before any data is written, because an in-place write would change the
+  // other owner too; WriteFileData performs the copy-on-write instead.
+  // Returns the number of bytes written; on failure nothing is guaranteed to
+  // be intact beyond the reported error, but no metadata was touched either.
   //
   // A successful write also updates mtime/ctime through a metadata
   // transaction (RW-1), exactly like a Linux write: the data itself is not

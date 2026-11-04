@@ -234,7 +234,8 @@ NTSTATUS NtFromError(AdapterState& state, XfsError code) {
     // conversion transaction that this build does not implement yet.
     case XfsError::kWriteExtendsFile:
     case XfsError::kWriteNeedsAllocation:
-    case XfsError::kWriteNeedsConversion: return STATUS_NOT_SUPPORTED;
+    case XfsError::kWriteNeedsConversion:
+    case XfsError::kWriteNeedsCow: return STATUS_NOT_SUPPORTED;
     case XfsError::kNoSpace: return STATUS_DISK_FULL;
     case XfsError::kDirtyLog:
     case XfsError::kNeedsRepair: return STATUS_VOLUME_DIRTY;

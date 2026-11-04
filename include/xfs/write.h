@@ -33,6 +33,8 @@
 
 namespace xfs {
 
+class BlockDevice;
+
 // ---------------------------------------------------------------------------
 // Writable mount policy
 // ---------------------------------------------------------------------------
@@ -78,5 +80,14 @@ struct WriteMapping {
 Status MapWrittenRange(const XfsGeometry& geo, const XfsInode& inode,
                        const std::vector<XfsExtent>& extents, uint64_t offset,
                        uint64_t length, std::vector<WriteMapping>* out);
+
+// True when any written data extent overlapping the inclusive file-block range
+// [first_block, last_block] also has a shared refcountbt record.  An
+// unreadable refcount tree is an error, never "not shared": callers use this
+// to decide whether a direct (non-CoW) data write would modify blocks another
+// file still owns.
+Result<bool> RangeHasSharedData(BlockDevice& dev, const XfsGeometry& geo,
+                                const std::vector<XfsExtent>& extents,
+                                uint64_t first_block, uint64_t last_block);
 
 }  // namespace xfs
