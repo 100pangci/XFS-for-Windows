@@ -539,7 +539,7 @@ TEST(ux_automount_config_rw_requires_qualification_and_identity) {
       "version = 1\n"
       "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
       "enabled = true\n"
-      "mode = experimental-rw\n"
+      "mode = read-write\n"
       "drive = E:\n";
   auto parsed = xfs::ParseAutomountConfig(text);
   CHECK(!parsed.ok());
@@ -568,7 +568,7 @@ TEST(ux_automount_config_legacy_mode_migrates_on_save) {
       "version = 1\n"
       "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
       "enabled = true\n"
-      "mode = experimental-rw\n"
+      "mode = read-write\n"
       "drive = E:\n"
       "expected-serial = AA00000000000489\n"
       "expected-stable-id = {E3BDCF9A-D368-E874-81CB-EC5639EC18E6}\n"
@@ -2328,7 +2328,7 @@ TEST(ux_automount_config_device_class_roundtrip) {
       "version = 1\n"
       "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
       "enabled = true\n"
-      "mode = experimental-rw\n"
+      "mode = read-write\n"
       "drive = F:\n"
       "expected-serial = SN1\n"
       "expected-stable-id = stable-SN1\n"
@@ -2364,7 +2364,7 @@ TEST(ux_automount_config_refuses_unsafe_device_class_pins) {
         "version = 1\n"
         "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
         "enabled = true\n"
-        "mode = experimental-rw\n"
+        "mode = read-write\n"
         "expected-serial = SN1\n"
         "expected-stable-id = stable-SN1\n"
         "expected-size = 64160400896\n" +
@@ -2392,7 +2392,7 @@ TEST(ux_automount_config_virtual_disk_needs_no_serial) {
         "version = 1\n"
         "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
         "enabled = true\n"
-        "mode = experimental-rw\n" +
+        "mode = read-write\n" +
         serial_line + "expected-stable-id = stable-SN1\n"
         "expected-size = 64160400896\n" +
         class_line + "device-qualification = true\n"
