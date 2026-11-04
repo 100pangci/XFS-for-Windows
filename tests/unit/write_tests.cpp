@@ -198,6 +198,8 @@ TEST(writable_profile_allow_list) {
   sb.features2 = ondisk::kVersion2Crc | ondisk::kVersion2Ftype;
   sb.features_incompat = ondisk::kIncompatFtype;
   sb.features.ftype = true;
+  sb.sectsize = 512;
+  sb.logsectsize = 512;
   sb.logstart = 4;
   sb.logblocks = 512;
   XfsGeometry geo = MakeGeometry(sb);
@@ -316,6 +318,9 @@ TEST(writable_profile_allow_list) {
       {"log-incompat",
        [](XfsSuperblock& s) { s.features_log_incompat = 0x2; }},
       {"asciici", [](XfsSuperblock& s) { s.features.asciici = true; }},
+      {"ftype", [](XfsSuperblock& s) { s.features.ftype = false; }},
+      {"sector", [](XfsSuperblock& s) { s.sectsize = 4096; }},
+      {"log stripe", [](XfsSuperblock& s) { s.logsunit = 4096; }},
   };
   for (const auto& test : cases) {
     XfsSuperblock copy = sb;
