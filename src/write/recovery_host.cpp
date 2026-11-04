@@ -116,6 +116,11 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverJournal(
                    "journal recovery needs a writable device")
         .Metadata("log");
   }
+  if (!superblock_.crc_verified) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "journal recovery requires a verified superblock CRC")
+        .Metadata("superblock");
+  }
   // Recovery writes metadata and completion transactions, so it is subject to
   // the same writable-profile allow-list as a read-write mount.  A caller that
   // mounted with check_log=false could otherwise replay an unsupported image.

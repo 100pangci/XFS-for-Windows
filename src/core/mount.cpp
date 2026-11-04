@@ -36,6 +36,14 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   if (!device) {
     return XFS_ERR(XfsError::kInvalidArgument, "no block device supplied");
   }
+  // A writable mount must never trust an unverified superblock.  verify_crc is
+  // a read-only diagnostics option; allowing it for read-write would skip the
+  // checksum that protects every geometry and feature decision below.
+  if (options.read_write && !options.verify_crc) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "read-write mounts require superblock CRC verification")
+        .Metadata("superblock");
+  }
   auto sb_result = ReadSuperblock(*device, 0, options.verify_crc);
   if (!sb_result.ok()) return sb_result.error();
   XfsSuperblock sb = std::move(sb_result.value());

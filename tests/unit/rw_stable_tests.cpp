@@ -85,6 +85,16 @@ void SetUnknownRoCompat(xfstest::FixtureImage& fixture) {
   CHECK(fixture.storage().Write(0, super.data(), super.size()));
 }
 
+void CorruptSuperblockCrc(xfstest::FixtureImage& fixture) {
+  auto sb = ReadSuperblock(fixture.storage(), 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  std::vector<uint8_t> super(sb.value().sectsize, 0);
+  CHECK(fixture.storage().Read(0, super.data(), super.size()));
+  super[ondisk::sb::kCrc] ^= 0xff;
+  CHECK(fixture.storage().Write(0, super.data(), super.size()));
+}
+
 // A structurally valid geometry whose byte size is exactly 2^64: 2^24 AGs of
 // 2^28 4 KiB blocks.  dblocks * block_size wraps to zero in uint64.
 void SetOverflowingGeometry(xfstest::FixtureImage& fixture) {
@@ -304,6 +314,33 @@ TEST(rw_stable_mount_rejects_overflowing_geometry) {
     CHECK_EQ(mounted.error().code, XfsError::kCorruptSuperblock);
     CHECK(mounted.error().message.find("larger than the device") !=
           std::string::npos);
+  }
+  CHECK(memory->bytes() == before);
+  fixture.Reset();
+}
+
+TEST(rw_stable_read_write_mount_requires_verified_superblock_crc) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  CorruptSuperblockCrc(fixture);
+  const std::vector<uint8_t> before = memory->bytes();
+
+  MountOptions options;
+  options.read_write = true;
+  options.verify_crc = false;
+  auto mounted = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(!mounted.ok());
+  if (!mounted.ok()) {
+    CHECK_EQ(mounted.error().code, XfsError::kUnsupportedFeature);
+    CHECK(mounted.error().message.find("CRC") != std::string::npos);
   }
   CHECK(memory->bytes() == before);
   fixture.Reset();
