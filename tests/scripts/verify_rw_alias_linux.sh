@@ -34,7 +34,8 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
 for path, digest in data["sha256"].items():
-    print(path, digest)
+    # Get-FileHash prints uppercase hex; sha256sum prints lowercase.
+    print(path, digest.lower())
 PY
 if [ ! -s "$expected" ]; then
     echo "FAILED: the manifest contains no content hashes" >&2
@@ -63,7 +64,15 @@ verify_image() {
     mount -o loop,ro "$image" "$mnt"
     local failed=0
     while read -r path digest; do
-        actual="$(sha256sum "$mnt$path" | awk '{print $1}')"
+        if [ -L "$mnt$path" ]; then
+            # Do not hash through the link: the workload's relative target
+            # climbs above the mountpoint when the image is mounted at a
+            # subdirectory, which is valid only when the image is the root.
+            # The stored target is checked explicitly below, and the Windows
+            # equivalence test already compared the followed content.
+            continue
+        fi
+        actual="$(sha256sum "$mnt$path" | awk '{print tolower($1)}')"
         if [ "$actual" != "$digest" ]; then
             echo "FAILED: $label $path is $actual, expected $digest" >&2
             failed=1
