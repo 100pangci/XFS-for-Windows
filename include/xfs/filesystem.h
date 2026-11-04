@@ -515,6 +515,14 @@ class XfsFilesystem {
  private:
   XfsFilesystem() = default;
 
+  // A commit that fails after its log record may have reached stable storage
+  // must disable further writes: the log position was not advanced, so a new
+  // transaction would reuse the same blocks and overwrite the only durable
+  // copy of the failed transaction.  The mount stays readable and the caller
+  // must unmount and replay/repair before writing again.
+  Status WriteFailureStatus() const;
+  void PoisonWrites(const ErrorContext& error);
+
   // Names every core lock for the CONC-1 event log. The names are static
   // string literals; this runs once at mount.
   void InitConcurrencyLockNames() {
@@ -729,6 +737,10 @@ class XfsFilesystem {
   MountOptions options_;
   std::vector<std::string> warnings_;
   bool writable_ = false;
+  // Set when CommitTransaction fails after log I/O may have made the record
+  // durable.  All later transactions, flushes and clean-unmount writes fail.
+  bool write_failed_ = false;
+  std::optional<ErrorContext> write_failure_;
 
   // PERF-1 lock hierarchy (full description in docs/LOCKING.md):
   //   write_barrier_ -> per-inode locks (inode-number order) -> extent_map

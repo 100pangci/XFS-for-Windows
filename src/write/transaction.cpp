@@ -726,12 +726,32 @@ Status XfsTransaction::AddMetadataBuffer(uint64_t offset,
   return OkStatus();
 }
 
+Status XfsFilesystem::WriteFailureStatus() const {
+  if (!write_failed_) return OkStatus();
+  ErrorContext error = write_failure_.value_or(MakeError(
+      XfsError::kIoError,
+      "an earlier transaction failed after its log record may have become "
+      "durable"));
+  error.message +=
+      "; the read-write mount is disabled until it is unmounted and the "
+      "filesystem is recovered";
+  return Status(std::move(error));
+}
+
+void XfsFilesystem::PoisonWrites(const ErrorContext& error) {
+  if (write_failed_) return;
+  write_failed_ = true;
+  write_failure_ = error;
+}
+
 Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
   if (!writable_) {
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "filesystem is mounted read-only")
         .Metadata("transaction");
   }
+  Status failed = WriteFailureStatus();
+  if (!failed.ok()) return failed.error();
   if (!log_position_valid_) {
     auto position = ReadLogPosition(*device_, geometry_, superblock_);
     if (!position.ok()) return position.error();
@@ -810,6 +830,8 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     return XFS_ERR(XfsError::kReadOnlyVolume, "filesystem is mounted read-only")
         .Metadata("transaction");
   }
+  Status failed = WriteFailureStatus();
+  if (!failed.ok()) return failed;
   if (!txn.started_) {
     return XFS_ERR(XfsError::kInvalidArgument, "transaction was not started")
         .Metadata("transaction");
@@ -818,6 +840,14 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     return XFS_ERR(XfsError::kInternal, "log position lost before commit")
         .Metadata("transaction");
   }
+  // From the first log write onwards, a failure may leave a partially or
+  // fully durable record at this transaction's position.  The position is not
+  // advanced in that case, so continuing to write would overwrite the record
+  // and lose the only copy of metadata that may already be on disk.
+  auto fail_after_log_io = [this](ErrorContext error) -> Status {
+    PoisonWrites(error);
+    return Status(std::move(error));
+  };
 
   // Frame the item operations into one or more 32 KiB log records. The first
   // record carries START + the transaction header; the last one COMMIT. A
@@ -905,11 +935,11 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         static_cast<uint64_t>(record.params.block) * lf::kCycleBlockSize;
     if (!device_->Write(record_offset, record.bytes.data(),
                         lf::kRecordHeaderSize)) {
-      return XFS_ERR(XfsError::kIoError,
-                     "failed to write log record header: " +
-                         device_->LastError())
-          .Offset(record_offset)
-          .Metadata("log");
+      return fail_after_log_io(XFS_ERR(XfsError::kIoError,
+                                       "failed to write log record header: " +
+                                           device_->LastError())
+                                   .Offset(record_offset)
+                                   .Metadata("log"));
     }
     // A torn record (header without data, or a partial data area) fails the
     // record CRC and is trimmed by recovery. If an earlier piece was durable
@@ -925,11 +955,11 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
       if (!device_->Write(record_offset + lf::kRecordHeaderSize,
                           record.bytes.data() + lf::kRecordHeaderSize,
                           record.bytes.size() - lf::kRecordHeaderSize)) {
-        return XFS_ERR(XfsError::kIoError,
-                       "failed to write log record data: " +
-                           device_->LastError())
-            .Offset(record_offset + lf::kRecordHeaderSize)
-            .Metadata("log");
+        return fail_after_log_io(
+            XFS_ERR(XfsError::kIoError,
+                    "failed to write log record data: " + device_->LastError())
+                .Offset(record_offset + lf::kRecordHeaderSize)
+                .Metadata("log"));
       }
     }
   }
@@ -937,10 +967,11 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
       geometry_.FsbToByte(superblock_.logstart) +
       static_cast<uint64_t>(txn.block_) * lf::kCycleBlockSize;
   if (!device_->Flush()) {
-    return XFS_ERR(XfsError::kIoError,
-                   "failed to flush log record: " + device_->LastError())
-        .Offset(first_record_offset)
-        .Metadata("log");
+    return fail_after_log_io(
+        XFS_ERR(XfsError::kIoError,
+                "failed to flush log record: " + device_->LastError())
+            .Offset(first_record_offset)
+            .Metadata("log"));
   }
   MaybeCrash(CrashPoint::kAfterLogCommit, TxnText(txn, "committed"));
   XFS_CONC_SYNC("txn.commit.log_durable",
@@ -961,12 +992,13 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     if (write.suppressed) continue;  // a stale buffer is never dispatched
     ++metadata_writes;
     if (!device_->Write(write.offset, write.data.data(), write.data.size())) {
-      return XFS_ERR(XfsError::kIoError,
-                     std::string("failed to write ") + write.what + ": " +
-                         device_->LastError())
-          .Offset(write.offset)
-          .Ino(write.ino)
-          .Metadata(write.what);
+      return fail_after_log_io(
+          XFS_ERR(XfsError::kIoError,
+                  std::string("failed to write ") + write.what + ": " +
+                      device_->LastError())
+              .Offset(write.offset)
+              .Ino(write.ino)
+              .Metadata(write.what));
     }
   }
   if (metadata_writes != 0) {
@@ -1064,6 +1096,8 @@ Status XfsFilesystem::RunTransaction(
 
 Status XfsFilesystem::WriteCleanUnmountRecord() {
   if (!writable_) return OkStatus();
+  Status failed = WriteFailureStatus();
+  if (!failed.ok()) return failed;
   // A clean log must not be followed by pending timestamp transactions.
   std::unique_lock<xfs::conc::SharedMutex> barrier(write_barrier_);
   Status deferred = CommitAllDeferredTimesLocked();

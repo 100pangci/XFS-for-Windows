@@ -16,6 +16,7 @@ add_executable(xfs_tests
   unit/rw6c_tests.cpp
   unit/rw6d_tests.cpp
   unit/rw6e_tests.cpp
+  unit/rw_stable_tests.cpp
   unit/perf_tests.cpp
   unit/conc_tests.cpp
   unit/recovery_tests.cpp

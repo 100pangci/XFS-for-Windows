@@ -26,6 +26,8 @@
 namespace xfs {
 
 Status XfsFilesystem::Flush() {
+  Status failed = WriteFailureStatus();
+  if (!failed.ok()) return failed;
   PerfStats& perf = PerfStats::Get();
   if (perf.enabled()) {
     perf.flush_calls.fetch_add(1, std::memory_order_relaxed);
