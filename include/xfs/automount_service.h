@@ -72,7 +72,7 @@ struct AutomountRuntimeMount {
   std::string label;
   std::string drive;
   // Effective mode as reported by the engine: "read-only" or
-  // "experimental-rw".
+  // "read-write".
   std::string mode;
   std::string configured_mode;
   bool drive_taken_over = false;

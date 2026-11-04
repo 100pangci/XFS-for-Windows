@@ -103,7 +103,7 @@ std::string LineError(size_t line, const std::string& message) {
 const char* ToString(AutomountMode mode) {
   switch (mode) {
     case AutomountMode::kReadOnly: return "read-only";
-    case AutomountMode::kExperimentalReadWrite: return "experimental-rw";
+    case AutomountMode::kReadWrite: return "read-write";
   }
   return "read-only";
 }
@@ -114,9 +114,12 @@ bool ParseAutomountMode(std::string_view input, AutomountMode* out) {
     *out = AutomountMode::kReadOnly;
     return true;
   }
-  if (value == "experimental-rw" || value == "experimental" ||
-      value == "read-write" || value == "rw") {
-    *out = AutomountMode::kExperimentalReadWrite;
+  // read-write/rw are canonical; experimental-rw/experimental are accepted so
+  // configurations written before the profile graduated still load.  The next
+  // save rewrites them as `mode = read-write`.
+  if (value == "read-write" || value == "rw" || value == "experimental-rw" ||
+      value == "experimental") {
+    *out = AutomountMode::kReadWrite;
     return true;
   }
   return false;
@@ -169,7 +172,7 @@ Status ValidateAutomountEntry(const AutomountEntry& entry) {
           .Metadata("automount");
     }
   }
-  if (entry.mode != AutomountMode::kExperimentalReadWrite) return OkStatus();
+  if (entry.mode != AutomountMode::kReadWrite) return OkStatus();
 
   if (!entry.device_qualification) {
     return XFS_ERR(XfsError::kPermissionDenied,
@@ -343,7 +346,7 @@ Result<AutomountConfigLoad> ParseAutomountConfig(std::string_view text) {
       if (!ParseAutomountMode(value, &current.mode)) {
         return XFS_ERR(XfsError::kInvalidArgument,
                        LineError(line_number,
-                                 "mode must be read-only or experimental-rw"))
+                                 "mode must be read-only or read-write"))
             .Metadata("automount");
       }
     } else if (key == "drive") {

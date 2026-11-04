@@ -422,7 +422,7 @@ xfs::AutomountEntry WritableEntry() {
   xfs::AutomountEntry entry;
   CHECK(xfs::ParseUuid(kConfigUuid, &entry.fs_uuid));
   entry.enabled = true;
-  entry.mode = xfs::AutomountMode::kExperimentalReadWrite;
+  entry.mode = xfs::AutomountMode::kReadWrite;
   entry.preferred_drive = "E:";
   entry.expected_serial = "AA00000000000489";
   entry.expected_stable_id = "{E3BDCF9A-D368-E874-81CB-EC5639EC18E6}";
@@ -550,16 +550,74 @@ TEST(ux_automount_config_writable_entry_roundtrip) {
   xfs::AutomountConfig config;
   config.Upsert(WritableEntry());
   const std::string serialized = xfs::SerializeAutomountConfig(config);
-  CHECK(serialized.find("mode = experimental-rw") != std::string::npos);
+  CHECK(serialized.find("mode = read-write") != std::string::npos);
+  CHECK(serialized.find("experimental-rw") == std::string::npos);
   CHECK(serialized.find("device-qualification = true") != std::string::npos);
   auto parsed = xfs::ParseAutomountConfig(serialized);
   CHECK(parsed.ok());
   const auto* entry = parsed.value().config.Find(WritableEntry().fs_uuid);
   CHECK(entry != nullptr);
-  CHECK(entry->mode == xfs::AutomountMode::kExperimentalReadWrite);
+  CHECK(entry->mode == xfs::AutomountMode::kReadWrite);
   CHECK_STR_EQ(entry->expected_stable_id,
                "{E3BDCF9A-D368-E874-81CB-EC5639EC18E6}");
   CHECK_EQ(entry->expected_size_bytes, 64160400896ull);
+}
+
+TEST(ux_automount_config_legacy_mode_migrates_on_save) {
+  const std::string legacy =
+      "version = 1\n"
+      "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+      "enabled = true\n"
+      "mode = experimental-rw\n"
+      "drive = E:\n"
+      "expected-serial = AA00000000000489\n"
+      "expected-stable-id = {E3BDCF9A-D368-E874-81CB-EC5639EC18E6}\n"
+      "expected-size = 64160400896\n"
+      "expected-device-class = virtual-disk\n"
+      "device-qualification = true\n";
+  auto parsed = xfs::ParseAutomountConfig(legacy);
+  CHECK(parsed.ok());
+  const xfs::AutomountEntry* entry = parsed.value().config.Find(
+      WritableEntry().fs_uuid);
+  CHECK(entry != nullptr);
+  if (!entry) return;
+  CHECK(entry->mode == xfs::AutomountMode::kReadWrite);
+  CHECK_STR_EQ(entry->expected_serial, "AA00000000000489");
+  CHECK_STR_EQ(entry->expected_stable_id,
+               "{E3BDCF9A-D368-E874-81CB-EC5639EC18E6}");
+  CHECK_EQ(entry->expected_size_bytes, 64160400896ull);
+  CHECK(entry->expected_device_class == xfs::DeviceClass::kVirtualDisk);
+  CHECK(entry->device_qualification);
+
+  const std::string serialized =
+      xfs::SerializeAutomountConfig(parsed.value().config);
+  CHECK(serialized.find("mode = read-write") != std::string::npos);
+  CHECK(serialized.find("experimental-rw") == std::string::npos);
+  auto reloaded = xfs::ParseAutomountConfig(serialized);
+  CHECK(reloaded.ok());
+  const xfs::AutomountEntry* again =
+      reloaded.value().config.Find(WritableEntry().fs_uuid);
+  CHECK(again != nullptr);
+  if (!again) return;
+  CHECK(again->mode == xfs::AutomountMode::kReadWrite);
+  CHECK_STR_EQ(again->expected_serial, "AA00000000000489");
+  CHECK_STR_EQ(again->expected_stable_id,
+               "{E3BDCF9A-D368-E874-81CB-EC5639EC18E6}");
+  CHECK_EQ(again->expected_size_bytes, 64160400896ull);
+  CHECK(again->expected_device_class == xfs::DeviceClass::kVirtualDisk);
+}
+
+// Canonical and legacy mode spellings all resolve to the same internal mode.
+TEST(ux_automount_mode_spellings_are_equivalent) {
+  for (const char* spelling :
+       {"read-write", "rw", "experimental-rw", "experimental"}) {
+    xfs::AutomountMode mode = xfs::AutomountMode::kReadOnly;
+    CHECK(xfs::ParseAutomountMode(spelling, &mode));
+    CHECK(mode == xfs::AutomountMode::kReadWrite);
+  }
+  xfs::AutomountMode read_only = xfs::AutomountMode::kReadWrite;
+  CHECK(xfs::ParseAutomountMode("read-only", &read_only));
+  CHECK(read_only == xfs::AutomountMode::kReadOnly);
 }
 
 TEST(ux_automount_config_rejects_duplicates_and_newer_versions) {
@@ -610,7 +668,7 @@ TEST(ux_automount_config_atomic_save_and_load) {
   CHECK_EQ(loaded.value().config.debounce_ms, 1200u);
   const auto* entry = loaded.value().config.Find(WritableEntry().fs_uuid);
   CHECK(entry != nullptr);
-  CHECK(entry->mode == xfs::AutomountMode::kExperimentalReadWrite);
+  CHECK(entry->mode == xfs::AutomountMode::kReadWrite);
 
   // The temporary file must not be left behind.
   for (const auto& child : std::filesystem::directory_iterator(
@@ -1168,7 +1226,7 @@ TEST(ux_automount_read_write_policy_preserves_device_class_boundaries) {
   xfs::AutomountEngine engine(platform, FastRetrySettings());
   xfs::AutomountEntry fixed_entry =
       EngineEntry(fixed_uuid, "", true,
-                  xfs::AutomountMode::kExperimentalReadWrite);
+                  xfs::AutomountMode::kReadWrite);
   fixed_entry.device_qualification = true;
   fixed_entry.expected_serial = "SNF";
   fixed_entry.expected_stable_id = "stable-SNF";
@@ -1190,7 +1248,7 @@ TEST(ux_automount_read_write_policy_preserves_device_class_boundaries) {
                                         FastRetrySettings());
   xfs::AutomountEntry entry =
       EngineEntry(removable_uuid, "", true,
-                  xfs::AutomountMode::kExperimentalReadWrite);
+                  xfs::AutomountMode::kReadWrite);
   entry.device_qualification = true;
   entry.expected_serial = "SNR";
   entry.expected_stable_id = "stable-SNR";
@@ -1208,7 +1266,7 @@ TEST(ux_automount_read_write_policy_preserves_device_class_boundaries) {
   removable_engine.Tick(At(1000));
   CHECK_EQ(removable_platform.sessions.size(), 1u);
   CHECK(removable_platform.sessions.begin()->second.entry.mode ==
-        xfs::AutomountMode::kExperimentalReadWrite);
+        xfs::AutomountMode::kReadWrite);
 }
 
 TEST(ux_automount_identity_pin_mismatch_refuses_mount) {
@@ -1843,7 +1901,7 @@ xfs::DiscoveredFilesystem MountedTakeoverFilesystem(const xfs::Uuid& uuid) {
 xfs::AutomountEntry RwEngineEntry(const xfs::Uuid& uuid,
                                   uint64_t disk_size = 64ull << 30) {
   xfs::AutomountEntry entry =
-      EngineEntry(uuid, "", true, xfs::AutomountMode::kExperimentalReadWrite);
+      EngineEntry(uuid, "", true, xfs::AutomountMode::kReadWrite);
   entry.expected_serial = "SN-T";
   entry.expected_stable_id = "stable-SN-T";
   entry.expected_size_bytes = disk_size;
@@ -2159,7 +2217,7 @@ TEST(ux_automount_rw_identity_mismatch_falls_back_to_read_only) {
   const auto& mount = engine.status().mounts.front();
   CHECK(!mount.read_write);
   CHECK(mount.mode == xfs::AutomountMode::kReadOnly);
-  CHECK(mount.configured_mode == xfs::AutomountMode::kExperimentalReadWrite);
+  CHECK(mount.configured_mode == xfs::AutomountMode::kReadWrite);
   CHECK(mount.mode_note.find("read-only") != std::string::npos);
   CHECK(engine.status().entries.front().effective_mode ==
         xfs::AutomountMode::kReadOnly);
@@ -2204,7 +2262,7 @@ TEST(ux_automount_rw_matching_identity_mounts_read_write) {
 
   CHECK_EQ(platform.sessions.size(), 1u);
   CHECK(platform.sessions.begin()->second.mode ==
-        xfs::AutomountMode::kExperimentalReadWrite);
+        xfs::AutomountMode::kReadWrite);
   CHECK(engine.status().mounts.front().read_write);
   CHECK(engine.status().mounts.front().drive_taken_over);
 }

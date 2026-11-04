@@ -22,7 +22,7 @@ namespace xfs {
 
 enum class AutomountMode : uint8_t {
   kReadOnly = 0,
-  kExperimentalReadWrite = 1,
+  kReadWrite = 1,
 };
 
 const char* ToString(AutomountMode mode);

@@ -67,7 +67,7 @@ constexpr wchar_t kServiceDisplayName[] = L"XFS for Windows automount";
 constexpr wchar_t kServiceDescription[] =
     L"Discovers attached XFS filesystems and mounts configured filesystems "
     L"under a free drive letter. Read-only unless a filesystem was explicitly "
-    L"enrolled for qualified experimental read-write access.";
+    L"enrolled for qualified read-write access.";
 
 std::string WideToUtf8(const std::wstring& text) {
   if (text.empty()) return {};
@@ -619,7 +619,7 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
                               "the discovered filesystem has no raw device path");
       return result;
     }
-    const bool read_write = mode == AutomountMode::kExperimentalReadWrite;
+    const bool read_write = mode == AutomountMode::kReadWrite;
     if (read_write &&
         !UuidEqual(entry.fs_uuid, filesystem.probe.superblock.uuid)) {
       result.status = XFS_ERR(XfsError::kPermissionDenied,
