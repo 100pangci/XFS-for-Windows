@@ -2247,8 +2247,7 @@ int CommandMountAutoDrive(const std::string& target,
               << " is already in use. Mounted as " << drive << " instead.\n";
   }
   std::cout << "Mounting " << target << " at " << drive << " ("
-            << (options.read_write ? "read-write"
-                                        : "read-only")
+            << (options.read_write ? "read-write" : "read-only")
             << ").\n";
   std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
   std::cout.flush();
@@ -2301,8 +2300,7 @@ int CommandMount(const std::string& target, const std::string& drive,
   // Announce the mount like the interactive and --drive forms do. A user who
   // runs the legacy form from a script still sees which mode and letter apply.
   std::cout << "Mounting " << target << " at " << drive << " ("
-            << (options.read_write ? "read-write"
-                                        : "read-only")
+            << (options.read_write ? "read-write" : "read-only")
             << ").\n";
   std::cout << "Run `xfswin unmount " << drive << "` to stop.\n";
   std::cout.flush();
