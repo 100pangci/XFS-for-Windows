@@ -15,12 +15,19 @@
 #include "xfs/endian.h"
 #include "xfs/filesystem.h"
 #include "xfs/formatter.h"
+#include "xfs/log_format.h"
+#include "xfs/log_record.h"
 #include "xfs/ondisk.h"
+#include "xfs/recovery.h"
 #include "xfs/superblock.h"
 
 using namespace xfs;
 
 namespace {
+
+namespace bt = ondisk::btree;
+namespace di = ondisk::inode;
+namespace lf = logfmt;
 
 // Injects a non-terminal failure on the first metadata write after a
 // transaction's log record has been written and flushed.  The log range is
@@ -587,5 +594,73 @@ TEST(rw_stable_check_reports_unreadable_primary_superblock) {
   if (!inodes.ok()) CHECK_EQ(inodes.error().code, XfsError::kIoError);
 
   mounted.value().reset();
+  fixture.Reset();
+}
+
+// A logged inode btree root that does not fit the inode fork must fail the
+// replay.  Silently keeping the older on-disk root would apply the rest of
+// the logged inode update and leave a state the log never described.
+TEST(rw_stable_recovery_rejects_malformed_logged_btree_root) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto sb = ReadSuperblock(fixture.storage(), 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) return;
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  auto recovery_geo = MakeRecoveryGeometry(sb.value(), geo);
+  CHECK(recovery_geo.ok());
+  if (!recovery_geo.ok()) return;
+
+  const uint64_t ino = fixture.info().file_ino;
+  const uint64_t blkno = geo.FsbToByte(geo.InoToFsb(ino)) / 512;
+  const uint32_t len =
+      static_cast<uint32_t>(geo.block_size / 512);
+  const uint32_t boffset =
+      geo.InoOffset(ino) * static_cast<uint32_t>(geo.inode_size);
+
+  // Variant 0: more records than the fork can hold.
+  // Variant 1: a record count whose key/pointer arrays do not fit the region.
+  for (int variant = 0; variant < 2; ++variant) {
+    std::vector<uint8_t> format(lf::kInodeLogFormatSize, 0);
+    PutLE16(&format, lf::kIlfType, lf::kItemInode);
+    PutLE16(&format, lf::kIlfSize, 3);
+    PutLE32(&format, lf::kIlfFields, lf::kILogCore | lf::kILogDBRoot);
+    PutLE64(&format, lf::kIlfIno, ino);
+    PutLE64(&format, lf::kIlfBlkno, blkno);
+    PutLE32(&format, lf::kIlfLen, len);
+    PutLE32(&format, lf::kIlfBoffset, boffset);
+
+    std::vector<uint8_t> log_dinode(lf::kLogDinodeSize, 0);
+    log_dinode[0] = 0x4e;  // di_magic 0x494e, host order in the log dinode
+    log_dinode[1] = 0x49;
+    log_dinode[di::kVersion] = 3;
+
+    std::vector<uint8_t> root(bt::kLHeaderLenV5, 0);
+    PutBE16(root.data(), bt::kLevel, 1);
+    PutBE16(root.data(), bt::kNumrecs, variant == 0 ? 100 : 1);
+
+    RecoveredItem item;
+    item.type = lf::kItemInode;
+    item.tid = 1;
+    item.regions = {format, log_dinode, root};
+    RecoveredTransaction transaction;
+    transaction.tid = 1;
+    transaction.lsn = MakeLsn(0xffffffffu, 0xffffffffu);
+    transaction.items.push_back(std::move(item));
+
+    LogScan scan;
+    scan.state = LogState::kDirty;
+    scan.geometry = recovery_geo.value();
+    scan.transactions.push_back(std::move(transaction));
+
+    auto replay =
+        ReplayLog(fixture.storage(), sb.value(), geo, scan, nullptr);
+    CHECK(!replay.ok());
+    if (!replay.ok()) {
+      CHECK(replay.error().message.find("btree root") != std::string::npos);
+      CHECK(replay.error().ino.has_value());
+      if (replay.error().ino) CHECK_EQ(*replay.error().ino, ino);
+    }
+  }
   fixture.Reset();
 }
