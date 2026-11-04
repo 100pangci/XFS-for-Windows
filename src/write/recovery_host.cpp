@@ -785,10 +785,13 @@ Result<uint64_t> XfsFilesystem::ProcessAgiUnlinkedLists(
   for (uint32_t agno = 0; agno < geometry_.agcount; ++agno) {
     auto agi = ReadAgi(*device_, geometry_, agno);
     if (!agi.ok()) {
-      XFS_WARN("recovery: cannot read AGI " << agno << ": "
-                                            << agi.error().message
-                                            << "; skipping its unlinked lists");
-      continue;
+      // A mount must not become writable while an AG's unlinked list is
+      // unreadable: an I/O error here leaves zero-link inodes that the
+      // filesystem claims to have processed.  Fail recovery and keep the log
+      // authoritative instead of skipping the AG.
+      XFS_ERROR("recovery: cannot read AGI " << agno << ": "
+                                             << agi.error().Format());
+      return agi.error();
     }
     for (uint32_t bucket = 0; bucket < ondisk::kAgiUnlinkedBuckets; ++bucket) {
       for (uint32_t step = 0; step < kMaxWalk; ++step) {

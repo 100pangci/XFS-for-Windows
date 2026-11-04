@@ -64,6 +64,33 @@ class FailFirstMetadataWrite final : public xfs::BlockDevice {
   bool failed_ = false;
 };
 
+// Fails one exact AGI-sector read and nothing else.
+class FailAgiRead final : public xfs::BlockDevice {
+ public:
+  FailAgiRead(xfs::BlockDevice* backing, uint64_t agi_offset)
+      : backing_(backing), agi_offset_(agi_offset) {}
+
+  bool Read(uint64_t offset, void* buffer, size_t size) override {
+    if (offset == agi_offset_ && size <= 512) {
+      last_error_ = "injected AGI read failure";
+      return false;
+    }
+    return backing_->Read(offset, buffer, size);
+  }
+  bool Write(uint64_t offset, const void* buffer, size_t size) override {
+    return backing_->Write(offset, buffer, size);
+  }
+  bool Flush() override { return backing_->Flush(); }
+  uint64_t Size() const override { return backing_->Size(); }
+  uint32_t SectorSize() const override { return backing_->SectorSize(); }
+  const xfs::DeviceInfo& Info() const override { return backing_->Info(); }
+  void Close() override {}
+
+ private:
+  xfs::BlockDevice* backing_;
+  uint64_t agi_offset_;
+};
+
 std::vector<uint8_t> ReadLog(xfstest::FixtureImage& fixture, uint64_t start,
                              uint64_t length) {
   std::vector<uint8_t> bytes(length);
@@ -343,5 +370,36 @@ TEST(rw_stable_read_write_mount_requires_verified_superblock_crc) {
     CHECK(mounted.error().message.find("CRC") != std::string::npos);
   }
   CHECK(memory->bytes() == before);
+  fixture.Reset();
+}
+
+TEST(rw_stable_unreadable_agi_fails_clean_mount_recovery) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  auto sb = ReadSuperblock(*memory, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) {
+    fixture.Reset();
+    return;
+  }
+  const XfsGeometry geo = MakeGeometry(sb.value());
+  const uint64_t agi_offset =
+      geo.AgByteOffset(0) + 2ull * geo.sector_size;
+  const std::vector<uint8_t> before = memory->bytes();
+
+  auto device = std::make_unique<FailAgiRead>(&fixture.storage(), agi_offset);
+  MountOptions options;
+  options.read_write = true;
+  auto mounted = XfsFilesystem::Mount(std::move(device), options);
+  CHECK(!mounted.ok());
+  if (!mounted.ok()) CHECK_EQ(mounted.error().code, XfsError::kIoError);
+  CHECK(memory->bytes() == before);
+
   fixture.Reset();
 }
