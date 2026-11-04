@@ -71,8 +71,11 @@ check() {
 
 check "hello.txt content" \
     bash -c "test \"\$(tr -d '\r\n' < '$MNT/hello.txt')\" = 'hello from xfswin ux1'"
+# The fixture stores the bare digest (the Windows side parses it the same
+# way), so compare digests directly instead of `sha256sum -c`, which requires
+# "<digest>  <name>" lines.
 check "payload.bin unchanged" \
-    bash -c "cd '$MNT' && sha256sum -c payload.sha256 >/dev/null"
+    bash -c "cd '$MNT' && test \"\$(sha256sum payload.bin | awk '{print \$1}')\" = \"\$(tr -d '\r\n' < payload.sha256)\""
 check "ux1-rw directory exists" test -d "$MNT/ux1-rw"
 check "alpha.bin was renamed away" test ! -e "$MNT/ux1-rw/alpha.bin"
 check "beta.bin is 1000 bytes" \
