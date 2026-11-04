@@ -227,6 +227,20 @@ DeviceClass ClassifyDevicePath(std::string_view path) {
 // ---------------------------------------------------------------------------
 // Write policy
 // ---------------------------------------------------------------------------
+Status ValidateExpectedDeviceClass(DeviceClass actual,
+                                   const DeviceOpenPolicy& policy) {
+  if (policy.expected_device_class == DeviceClass::kUnknown ||
+      actual == policy.expected_device_class) {
+    return OkStatus();
+  }
+  return XFS_ERR(XfsError::kPermissionDenied,
+                 std::string("device class does not match the expected "
+                             "target: expected ") +
+                     ToString(policy.expected_device_class) + ", got " +
+                     ToString(actual))
+      .Metadata("device");
+}
+
 WriteEligibility EvaluateDeviceWriteClass(
     DeviceClass device_class, const DeviceGeometry& geometry,
     bool read_only_media, bool offline, bool is_system_disk, bool has_pagefile,

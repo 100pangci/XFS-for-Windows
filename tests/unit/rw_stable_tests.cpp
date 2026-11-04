@@ -406,6 +406,50 @@ TEST(rw_stable_unreadable_agi_fails_clean_mount_recovery) {
   fixture.Reset();
 }
 
+// A discovery caller pins the filesystem UUID.  A replacement filesystem on
+// the same path must be refused before recovery or metadata writes, and the
+// matching UUID must still mount.
+TEST(rw_stable_mount_enforces_expected_filesystem_uuid) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+  auto sb = ReadSuperblock(*memory, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) {
+    fixture.Reset();
+    return;
+  }
+
+  xfs::Uuid wrong = sb.value().uuid;
+  wrong[15] ^= 0x01;
+  MountOptions options;
+  options.read_write = true;
+  options.expected_uuid = wrong;
+  const std::vector<uint8_t> before = memory->bytes();
+  auto refused = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(!refused.ok());
+  if (!refused.ok()) {
+    CHECK_EQ(refused.error().code, XfsError::kBadUuid);
+    CHECK(refused.error().message.find("expected") != std::string::npos);
+  }
+  CHECK(memory->bytes() == before);
+
+  options.expected_uuid = sb.value().uuid;
+  auto mounted = XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(mounted.ok());
+  if (mounted.ok()) mounted.value().reset();
+  fixture.Reset();
+}
+
 // The in-place overwrite API writes mapped blocks directly and never performs
 // copy-on-write.  On a reflink image, a range still shared through refcountbt
 // must be refused before the first data byte is written: otherwise the write

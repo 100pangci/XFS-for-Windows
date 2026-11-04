@@ -54,6 +54,12 @@ struct MountOptions {
   // mounts only; the default). `false` is the "norecovery" behaviour: a dirty
   // log refuses the mount unless force_unsafe_ro is set.
   bool recover_dirty_log = true;
+  // Optional filesystem identity pin. When set, mounting fails unless the
+  // on-disk UUID equals this value. The check runs immediately after the
+  // superblock is read and before any recovery or other write, so a caller
+  // that identified a filesystem during discovery cannot be redirected to a
+  // replacement filesystem by a device swap.
+  std::optional<Uuid> expected_uuid;
   // Finish a mount-time recovery with a clean-unmount record (the standalone
   // `xfswin recover` shape). Read-write mounts keep the log writable instead.
   bool clean_log_after_recovery = false;

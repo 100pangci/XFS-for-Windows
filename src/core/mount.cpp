@@ -48,6 +48,16 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   if (!sb_result.ok()) return sb_result.error();
   XfsSuperblock sb = std::move(sb_result.value());
 
+  // Identity pin, checked before CheckMountable and before any recovery path
+  // can write.  Discovery and automount use it to bind the open device to the
+  // filesystem they identified.
+  if (options.expected_uuid && !UuidEqual(sb.uuid, *options.expected_uuid)) {
+    return XFS_ERR(XfsError::kBadUuid,
+                   "the device contains filesystem " + FormatUuid(sb.uuid) +
+                       ", expected " + FormatUuid(*options.expected_uuid))
+        .Metadata("superblock");
+  }
+
   Status mountable = CheckMountable(sb);
   if (!mountable.ok()) return mountable.error();
 

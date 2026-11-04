@@ -620,6 +620,13 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
       return result;
     }
     const bool read_write = mode == AutomountMode::kExperimentalReadWrite;
+    if (read_write &&
+        !UuidEqual(entry.fs_uuid, filesystem.probe.superblock.uuid)) {
+      result.status = XFS_ERR(XfsError::kPermissionDenied,
+                              "the enrolled filesystem UUID does not match the "
+                              "discovered filesystem; refusing read-write");
+      return result;
+    }
     if (read_write && entry.expected_device_class != DeviceClass::kUnknown &&
         filesystem.location.device_class != entry.expected_device_class) {
       result.status = XFS_ERR(XfsError::kPermissionDenied,
@@ -655,6 +662,13 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
       policy.expected_serial = entry.expected_serial;
       policy.expected_stable_id = entry.expected_stable_id;
       policy.expected_size_bytes = entry.expected_size_bytes;
+      // Entries from an older config may not carry a class pin.  Bind the
+      // live open to the class discovered for this insertion instead of
+      // leaving the class unchecked.
+      policy.expected_device_class =
+          entry.expected_device_class != DeviceClass::kUnknown
+              ? entry.expected_device_class
+              : filesystem.location.device_class;
     }
     policy.cache_mode = read_write ? DeviceCacheMode::kNoBuffering
                                    : DeviceCacheMode::kBuffered;
@@ -693,6 +707,10 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     MountOptions options;
     options.read_write = read_write;
     options.perf_stats = false;
+    // The device was identified by the discovery pass; make the mount itself
+    // verify that same filesystem before recovery or an automount RW session
+    // can write to it.
+    options.expected_uuid = filesystem.probe.superblock.uuid;
     auto mounted = XfsFilesystem::Mount(std::move(device), options);
     if (!mounted.ok()) {
       // A filesystem/feature/log error is never a device-not-ready retry.

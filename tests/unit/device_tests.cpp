@@ -508,3 +508,28 @@ TEST(device_expected_identity_pin) {
   policy.expected_size_bytes = kSize;
   CHECK(!xfs::MatchesExpectedDeviceIdentity(identity, 0, policy, &reason));
 }
+
+TEST(device_expected_class_pin) {
+  xfs::DeviceOpenPolicy policy;
+  // No pin: any live classification is accepted.
+  CHECK(xfs::ValidateExpectedDeviceClass(xfs::DeviceClass::kVirtualDisk,
+                                         policy)
+            .ok());
+
+  policy.expected_device_class = xfs::DeviceClass::kRemovableDisk;
+  CHECK(xfs::ValidateExpectedDeviceClass(xfs::DeviceClass::kRemovableDisk,
+                                         policy)
+            .ok());
+  auto refused =
+      xfs::ValidateExpectedDeviceClass(xfs::DeviceClass::kVirtualDisk, policy);
+  CHECK(!refused.ok());
+  CHECK(refused.error().code == xfs::XfsError::kPermissionDenied);
+  CHECK(refused.error().message.find("expected removable") !=
+        std::string::npos);
+  CHECK(refused.error().message.find("got virtual") != std::string::npos);
+
+  auto fixed =
+      xfs::ValidateExpectedDeviceClass(xfs::DeviceClass::kFixedDisk, policy);
+  CHECK(!fixed.ok());
+  CHECK(fixed.error().message.find("got fixed") != std::string::npos);
+}
