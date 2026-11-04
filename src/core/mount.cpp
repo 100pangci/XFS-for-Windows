@@ -96,6 +96,24 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         .Ino(fs->geometry_.rootino);
   }
 
+  // Every recovery-induced write, including the AGI unlinked-list completion
+  // that a clean-log `recover` performs, must first pass the same writable
+  // profile gate as a normal read-write mount.  Build the refusal once so the
+  // clean-log, dirty-log and post-recovery paths cannot drift apart.
+  auto check_writable_profile = [&]() -> Status {
+    Status profile = CheckWritableProfile(
+        fs->superblock_, fs->geometry_, options.recovery_only,
+        options.allow_rmapbt_qualification, options.recovery_only,
+        options.allow_reflink_qualification,
+        options.allow_parent_qualification);
+    if (profile.ok()) return profile;
+    auto error = profile.error();
+    error.message +=
+        " (read-only access is unaffected; mount without the "
+        "read-write option)";
+    return Status(std::move(error));
+  };
+
   // Log state: scanned and validated with the recovery engine (RW-5). A
   // read-write mount replays a dirty log; a read-only mount refuses unless the
   // caller explicitly asked for the unsafe pre-recovery view.
@@ -122,6 +140,11 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         // record behind the newest good one reads as clean to the scanner but
         // not to the record-latest classifier.
         if (options.read_write && options.clean_log_after_recovery) {
+          // RecoverScannedLog processes the AGI unlinked lists with
+          // transactions even for a clean log; refuse an unsupported profile
+          // before that first write, exactly as the dirty-log path does.
+          Status profile = check_writable_profile();
+          if (!profile.ok()) return profile.error();
           auto report = fs->RecoverScannedLog(log, RecoveryFinish::kCleanLog);
           if (!report.ok()) return report.error();
           recovered = true;
@@ -141,18 +164,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         if (can_recover) {
           // Never recover a filesystem this build would then refuse to
           // modify: check the profile first.
-          Status profile = CheckWritableProfile(
-              fs->superblock_, fs->geometry_, options.recovery_only,
-              options.allow_rmapbt_qualification, options.recovery_only,
-              options.allow_reflink_qualification,
-              options.allow_parent_qualification);
-          if (!profile.ok()) {
-            auto error = profile.error();
-            error.message +=
-                " (read-only access is unaffected; mount without the "
-                "read-write option)";
-            return error;
-          }
+          Status profile = check_writable_profile();
+          if (!profile.ok()) return profile.error();
           auto report = fs->RecoverScannedLog(
               log, options.clean_log_after_recovery
                        ? RecoveryFinish::kCleanLog
@@ -216,18 +229,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
-    Status profile = CheckWritableProfile(
-        fs->superblock_, fs->geometry_, options.recovery_only,
-        options.allow_rmapbt_qualification, options.recovery_only,
-        options.allow_reflink_qualification,
-        options.allow_parent_qualification);
-    if (!profile.ok()) {
-      auto error = profile.error();
-      error.message +=
-          " (read-only access is unaffected; mount without the read-write "
-          "option)";
-      return error;
-    }
+    Status profile = check_writable_profile();
+    if (!profile.ok()) return profile.error();
     // A writable mount must never proceed on a namespace whose forward
     // dirents and reverse parent pointers already disagree.  Recovery has
     // finished at this point, so this is a clean preflight over committed

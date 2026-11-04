@@ -8,9 +8,15 @@
 
 #include "support/fixture_device.h"
 #include "test_util.h"
+#include "xfs/ag.h"
 #include "xfs/block_device.h"
+#include "xfs/crc32c.h"
+#include "xfs/endian.h"
 #include "xfs/filesystem.h"
+#include "xfs/ondisk.h"
 #include "xfs/superblock.h"
+
+using namespace xfs;
 
 namespace {
 
@@ -113,6 +119,98 @@ TEST(rw_stable_commit_failure_after_log_flush_isolates_mount) {
       ReadLog(fixture, log_start, log_length);
   CHECK(log_after == log_before);
   CHECK(!fs.Flush().ok());
+
+  fixture.Reset();
+}
+
+// `xfswin recover` on a clean log still processes the AGI unlinked lists with
+// transactions.  An unsupported writable profile must be refused before that
+// first metadata write; the image digest is the evidence.
+TEST(rw_stable_clean_log_recover_checks_profile_before_first_write) {
+  auto& fixture = xfstest::FixtureImage::Instance();
+  fixture.Reset();
+  auto* memory = dynamic_cast<xfstest::MemoryBlockDevice*>(&fixture.storage());
+  CHECK(memory != nullptr);
+  if (!memory) {
+    fixture.Reset();
+    return;
+  }
+
+  uint64_t ino = 0;
+  uint32_t agno = 0;
+  uint32_t bucket = 0;
+  {
+    auto fs = fixture.Mount(/*read_write=*/true);
+    CHECK(fs.ok());
+    if (!fs.ok()) {
+      fixture.Reset();
+      return;
+    }
+    auto created = fs.value()->CreateRegularFile(
+        fs.value()->RootInode(), "clean-recover-unlinked", 0644, 0, 0);
+    CHECK(created.ok());
+    if (!created.ok()) {
+      fixture.Reset();
+      return;
+    }
+    ino = created.value();
+    CHECK(fs.value()->Unlink(fs.value()->RootInode(), "clean-recover-unlinked",
+                             /*defer_inode_free=*/true)
+              .ok());
+    // Close the log without processing the unlinked list: Linux's clean
+    // unmount has the same shape, and the next explicit recover must finish
+    // the list.
+    CHECK(fs.value()->WriteCleanUnmountRecord().ok());
+    agno = fs.value()->geometry().InoAgno(ino);
+    bucket = fs.value()->geometry().InoAgino(ino) % 64;
+  }
+  {
+    auto agi = xfs::ReadAgi(*memory, xfs::MakeGeometry(
+                                       xfs::ReadSuperblock(*memory, 0, true)
+                                           .value()),
+                            agno);
+    CHECK(agi.ok());
+    if (agi.ok()) CHECK(agi.value().unlinked[bucket] != 0xffffffffu);
+  }
+
+  // Make CheckWritableProfile refuse the image while keeping every other
+  // structure valid: set an unknown read-only-compatible feature bit.
+  auto sb = xfs::ReadSuperblock(*memory, 0, true);
+  CHECK(sb.ok());
+  if (!sb.ok()) {
+    fixture.Reset();
+    return;
+  }
+  std::vector<uint8_t> super(sb.value().sectsize, 0);
+  CHECK(memory->Read(0, super.data(), super.size()));
+  PutBE32(super.data(), xfs::ondisk::sb::kFeaturesRoCompat,
+          GetBE32(super.data(), xfs::ondisk::sb::kFeaturesRoCompat) |
+              (1u << 4));
+  UpdateXfsChecksum(super.data(), super.size(),
+                    xfs::ondisk::sb::kCrc);
+  CHECK(memory->Write(0, super.data(), super.size()));
+
+  const std::vector<uint8_t> before = memory->bytes();
+
+  xfs::MountOptions options;
+  options.read_write = true;
+  options.clean_log_after_recovery = true;  // the `xfswin recover` shape
+  options.recovery_only = true;
+  auto mounted = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&fixture.storage()),
+      options);
+  CHECK(!mounted.ok());
+  if (!mounted.ok()) CHECK_EQ(mounted.error().code,
+                              xfs::XfsError::kUnsupportedFeature);
+  CHECK(memory->bytes() == before);
+  {
+    auto agi = xfs::ReadAgi(*memory, xfs::MakeGeometry(
+                                       xfs::ReadSuperblock(*memory, 0, true)
+                                           .value()),
+                            agno);
+    CHECK(agi.ok());
+    if (agi.ok()) CHECK(agi.value().unlinked[bucket] != 0xffffffffu);
+  }
 
   fixture.Reset();
 }
