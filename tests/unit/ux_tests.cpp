@@ -568,7 +568,7 @@ TEST(ux_automount_config_legacy_mode_migrates_on_save) {
       "version = 1\n"
       "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
       "enabled = true\n"
-      "mode = read-write\n"
+      "mode = experimental-rw\n"
       "drive = E:\n"
       "expected-serial = AA00000000000489\n"
       "expected-stable-id = {E3BDCF9A-D368-E874-81CB-EC5639EC18E6}\n"
