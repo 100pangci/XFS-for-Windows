@@ -432,6 +432,169 @@ TEST(log_position_crosses_filesystem_block_count_boundary) {
   fixture.Reset();
 }
 
+TEST(log_record_data_wraps_to_the_next_cycle_at_the_physical_end) {
+  // Regression: a record header may sit on the last basic block of the log;
+  // its data area then continues at block 0 and every block there is stamped
+  // with the next cycle.  xlog_find_head() relies on this: the block just
+  // below the physical end and block 0 must never be more than one generation
+  // apart.  The writer used to reserve the whole 256 KiB transaction at
+  // BeginTransaction and wrap the position to block 0 up to 511 blocks early,
+  // leaving a hole stamped with the generation before last at the end.  Linux's
+  // head scan then reports a head that misses everything written after the
+  // wrap (observed with a recovered Linux buffer-cancel log whose completion
+  // and unmount records were invisible to the next mount).
+  xfstest::MemoryBlockDevice device(300ull << 20);
+  xfs::mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.quiet = true;
+  CHECK(xfs::mkfs::Format(device, options).ok());
+  auto mounted = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+      [] {
+        xfs::MountOptions m;
+        m.read_write = true;
+        return m;
+      }());
+  CHECK(mounted.ok());
+  if (!mounted.ok()) return;
+  const auto& geo = mounted.value()->geometry();
+  const auto& sb = mounted.value()->superblock();
+  const uint64_t log_start = geo.FsbToByte(sb.logstart);
+  const uint32_t log_blocks = static_cast<uint32_t>(
+      (static_cast<uint64_t>(sb.logblocks) << geo.block_log) / 512);
+  CHECK(log_blocks > 64);
+
+  // Seed a clean unmount record (header + data = 2 blocks) so the next write
+  // position is the last basic block of the log.
+  const uint32_t seed_block = log_blocks - 3;
+  LogRecordParams params;
+  params.cycle = 7;
+  params.block = seed_block;
+  params.tid = 0x55554e4d;
+  params.prev_block = 0xffffffffu;
+  params.tail_lsn = xfs::MakeLsn(params.cycle, params.block);
+  params.log_blocks = log_blocks;
+  params.uuid = sb.uuid;
+  auto seed = xfs::BuildLogRecord(params, {xfs::MakeUnmountOp()});
+  CHECK(seed.ok());
+  if (!seed.ok()) return;
+  CHECK(device.Write(log_start + uint64_t{seed_block} * 512,
+                     seed.value().data(), seed.value().size()));
+  auto position = xfs::ReadLogPosition(device, geo, sb);
+  CHECK(position.ok());
+  if (!position.ok()) return;
+  CHECK_EQ(position.value().cycle, 7u);
+  CHECK_EQ(position.value().next_block, log_blocks - 1);
+
+  auto txn = mounted.value()->BeginTransaction();
+  CHECK(txn.ok());
+  if (!txn.ok()) return;
+  std::vector<uint8_t> item(2000, 0);
+  xfs::StoreLE16(item.data(), lf::kItemBuf);
+  xfs::StoreLE16(item.data() + 2, 1);
+  txn.value().AddLogOp(item);
+  CHECK(mounted.value()->CommitTransaction(txn.value()).ok());
+
+  // The record header stayed on the last block and its data area continued at
+  // block 0, stamped with the next cycle (8).
+  auto check = xfs::CheckLogClean(device, geo, sb);
+  CHECK(check.ok());
+  if (check.ok()) {
+    CHECK(check.value().state == xfs::LogState::kDirty);
+    CHECK_EQ(check.value().cycle, 7u);
+    CHECK_EQ(check.value().block, log_blocks - 1);
+    CHECK(check.value().blocks > 1u);
+  }
+  uint8_t word[4] = {0, 0, 0, 0};
+  CHECK(device.Read(log_start, word, sizeof(word)));
+  CHECK_EQ(xfs::GetBE32(word), 8u);
+
+  // Closing the log writes the unmount record after the wrapped data, so the
+  // newest record (and the next write position) is in cycle 8.
+  CHECK(mounted.value()->WriteCleanUnmountRecord().ok());
+  check = xfs::CheckLogClean(device, geo, sb);
+  CHECK(check.ok());
+  if (check.ok()) CHECK(check.value().state == xfs::LogState::kClean);
+  position = xfs::ReadLogPosition(device, geo, sb);
+  CHECK(position.ok());
+  if (position.ok()) {
+    CHECK_EQ(position.value().cycle, 8u);
+    CHECK(position.value().next_block > 0u);
+  }
+}
+
+TEST(log_ring_wrap_with_large_transactions_scans_clean) {
+  // Fill the real 64 MiB log with maximum-size transactions until it wraps,
+  // then close it.  The transactions cross the physical end inside a record
+  // (data continued at block 0 with the next cycle), so this exercises
+  // xlog_find_head() on the layout the writer now produces for a wrap, not a
+  // hand-seeded position.
+  xfstest::MemoryBlockDevice device(300ull << 20);
+  xfs::mkfs::FormatOptions options;
+  options.block_size = 4096;
+  options.inode_size = 512;
+  options.quiet = true;
+  CHECK(xfs::mkfs::Format(device, options).ok());
+  auto mounted = xfs::XfsFilesystem::Mount(
+      std::make_unique<xfstest::BorrowedBlockDevice>(&device),
+      [] {
+        xfs::MountOptions m;
+        m.read_write = true;
+        return m;
+      }());
+  CHECK(mounted.ok());
+  if (!mounted.ok()) return;
+  const auto& geo = mounted.value()->geometry();
+  const auto& sb = mounted.value()->superblock();
+  const uint32_t log_blocks = static_cast<uint32_t>(
+      (static_cast<uint64_t>(sb.logblocks) << geo.block_log) / 512);
+  const uint64_t log_start = geo.FsbToByte(sb.logstart);
+
+  std::vector<uint8_t> item(250 * 1024, 0x5a);
+  xfs::StoreLE16(item.data(), lf::kItemBuf);
+  xfs::StoreLE16(item.data() + 2, 1);
+  const uint32_t per_txn = static_cast<uint32_t>(
+      (item.size() + lf::kRecordHeaderSize + 511) / 512 + 2);
+  const uint32_t txns = log_blocks / per_txn + 2;
+  bool saw_wrapped_record = false;
+  for (uint32_t i = 0; i < txns; ++i) {
+    auto txn = mounted.value()->BeginTransaction();
+    CHECK(txn.ok());
+    if (!txn.ok()) return;
+    txn.value().AddLogOp(item);
+    CHECK(mounted.value()->CommitTransaction(txn.value()).ok());
+  }
+  // A wrapped record has its header close enough to the end that its data
+  // area crosses it; block 0 then carries the next cycle.
+  std::vector<uint8_t> chunk(1 << 20);
+  for (uint64_t off = 0; off < uint64_t{log_blocks} * 512;
+       off += chunk.size()) {
+    const size_t len = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), uint64_t{log_blocks} * 512 - off));
+    CHECK(device.Read(log_start + off, chunk.data(), len));
+    for (size_t at = 0; at + 512 <= len; at += 512) {
+      const uint8_t* header = chunk.data() + at;
+      if (xfs::GetBE32(header) != lf::kRecordMagic) continue;
+      const uint32_t data_blocks =
+          xfs::GetBE32(header + lf::kRecLen) / 512;
+      const uint32_t block = static_cast<uint32_t>((off + at) / 512);
+      if (uint64_t{block} + 1 + data_blocks > log_blocks) {
+        saw_wrapped_record = true;
+      }
+    }
+  }
+  CHECK(saw_wrapped_record);
+
+  CHECK(mounted.value()->WriteCleanUnmountRecord().ok());
+  auto scan = xfs::ScanLog(device, sb, geo);
+  CHECK(scan.ok());
+  if (scan.ok()) CHECK(scan.value().state == xfs::LogState::kClean);
+  auto position = xfs::ReadLogPosition(device, geo, sb);
+  CHECK(position.ok());
+  if (position.ok()) CHECK(position.value().clean);
+}
+
 TEST(set_file_times_writes_inode_and_log) {
   auto& fixture = xfstest::FixtureImage::Instance();
   fixture.Reset();

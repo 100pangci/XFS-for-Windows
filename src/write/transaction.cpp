@@ -33,10 +33,12 @@ namespace {
 
 namespace lf = logfmt;
 
-// Room reserved at BeginTransaction so the record never has to be split across
-// the physical end of the log.  XLOG_MAX_RECORD_BSIZE is 256 KiB; with the 8
-// possible header blocks (main + 7 extension headers) the worst case is 520
-// basic blocks.  The actual size is checked again at commit.
+// Upper bound on one transaction.  XLOG_MAX_RECORD_BSIZE is 256 KiB; with the
+// 8 possible header blocks (main + 7 extension headers) the worst case is 520
+// basic blocks.  BeginTransaction uses this only to decide whether the
+// transaction can possibly reach the physical end (and therefore whether the
+// metadata-flush and recovery-tail-pin preconditions must be applied); the
+// actual placement and wrapping happen in CommitTransaction.
 constexpr uint32_t kReservedRecordBlocks =
     (lf::kMaxRecordBytes + lf::kCycleBlockSize - 1) / lf::kCycleBlockSize;
 
@@ -758,18 +760,25 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
     log_position_ = position.value();
     log_position_valid_ = true;
   }
-  // Never split a record across the physical end of the log: if the reserved
-  // space does not fit, wrap to block 0 and start a new cycle. The previous
-  // record link stays valid (it points near the end of the log).
-  if (static_cast<uint64_t>(log_position_.next_block) + kReservedRecordBlocks >
+  // A transaction whose records reach the physical end of the log has its
+  // last record's data area continued at block 0 with the next cycle, exactly
+  // like the kernel's iclog write.  That overwrites the oldest part of the
+  // ring, so before building this transaction:
+  //   * metadata protected by the records being overwritten must be durable;
+  //   * a pinned recovery tail must not start inside the overwritten window
+  //     (the replayed window is still authoritative until the intents are
+  //     completed), and refusing is the only crash-safe answer.
+  // The position itself does not move here: the record header still goes to
+  // the current head, and CommitTransaction wraps the data area.  Wrapping the
+  // whole transaction to block 0 at BeginTransaction (as an earlier version
+  // did) left the block just below the physical end stamped with a cycle two
+  // generations older than block 0.  xlog_find_head() reads that as a log
+  // whose newest cycle starts at block 0 and misses the records written after
+  // the wrap.
+  if (static_cast<uint64_t>(log_position_.next_block) +
+          kReservedRecordBlocks >
       log_position_.log_blocks) {
     if (recovery_tail_pin_.has_value()) {
-      // The replayed window is still authoritative and must not be
-      // overwritten.  Wrapping to block 0 is only safe when the pinned tail
-      // starts after the reserved record space in the current cycle.  If the
-      // active window already crosses block 0, the completion transaction
-      // cannot be written until the intents are resolved; refusing is the
-      // only crash-safe answer.
       const uint32_t pin_cycle =
           static_cast<uint32_t>(*recovery_tail_pin_ >> 32);
       const uint32_t pin_block = static_cast<uint32_t>(*recovery_tail_pin_);
@@ -797,14 +806,6 @@ Result<XfsTransaction> XfsFilesystem::BeginTransaction() {
         log_position_.tail_lsn =
             MakeLsn(log_position_.cycle, log_position_.next_block);
       }
-    }
-    XFS_DEBUG("log: wrapping to block 0 (cycle "
-              << log_position_.cycle << " -> " << log_position_.cycle + 1
-              << ")");
-    ++log_position_.cycle;
-    log_position_.next_block = 0;
-    if (!recovery_tail_pin_.has_value()) {
-      log_position_.tail_lsn = MakeLsn(log_position_.cycle, 0);
     }
   }
 
@@ -876,6 +877,15 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
         .Metadata("inode chunk");
   }
 
+  // The tail LSN is fixed before any record is built. Every piece of the
+  // transaction must carry the same h_tail_lsn: if a later piece named a newer
+  // tail (for example after a mid-transaction metadata flush) recovery could
+  // trim an earlier piece of this same transaction and lose its ops.
+  const uint64_t txn_tail_lsn =
+      recovery_tail_pin_.has_value()
+          ? *recovery_tail_pin_
+          : (metadata_flush_pending_ ? metadata_dirty_lsn_ : txn.lsn_);
+
   for (size_t i = 0; i < framed.size(); ++i) {
     LogRecordParams params;
     params.cycle = cycle;
@@ -885,10 +895,7 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     // Every piece points at the oldest record still needed. During intent
     // completion that is the pinned original recovery window, not the first
     // completion piece: a crash before COMMIT must re-replay the RUI too.
-    params.tail_lsn =
-        recovery_tail_pin_.has_value()
-            ? *recovery_tail_pin_
-            : (metadata_flush_pending_ ? metadata_dirty_lsn_ : txn.lsn_);
+    params.tail_lsn = txn_tail_lsn;
     params.log_blocks = log_position_.log_blocks;
     params.record_size = lf::kDefaultRecordSize;
     params.uuid = geometry_.meta_uuid;
@@ -896,26 +903,18 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
     if (!built.ok()) return built.error();
     const uint32_t blocks =
         static_cast<uint32_t>(built.value().size() / lf::kCycleBlockSize);
-    if (static_cast<uint64_t>(block) + blocks >
-        log_position_.log_blocks) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "transaction does not fit in the reserved log space")
-          .Metadata("transaction")
-          .Expected(kReservedRecordBlocks)
-          .Actual(total_blocks + blocks);
-    }
     total_blocks += blocks;
     records.push_back(BuiltRecord{params, std::move(built.value())});
     prev_block = block;
-    block += blocks;
-    if (block == log_position_.log_blocks) {
-      block = 0;
+    // The record may continue its data area at block 0 with the next cycle
+    // (BuildLogRecord handles the cycle stamping); the next record starts
+    // exactly there.
+    uint64_t next = static_cast<uint64_t>(block) + blocks;
+    if (next >= log_position_.log_blocks) {
+      next -= log_position_.log_blocks;
       ++cycle;
-    } else if (block > log_position_.log_blocks) {
-      return XFS_ERR(XfsError::kUnsupportedFeature,
-                     "transaction log record crosses the log end")
-          .Metadata("transaction");
     }
+    block = static_cast<uint32_t>(next);
   }
   if (total_blocks > kReservedRecordBlocks) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
@@ -930,9 +929,12 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
   MaybeCrash(CrashPoint::kBeforeLogWrite, TxnText(txn, "commit"));
   for (size_t i = 0; i < records.size(); ++i) {
     const BuiltRecord& record = records[i];
+    const uint64_t log_start = geometry_.FsbToByte(superblock_.logstart);
     const uint64_t record_offset =
-        geometry_.FsbToByte(superblock_.logstart) +
-        static_cast<uint64_t>(record.params.block) * lf::kCycleBlockSize;
+        log_start + static_cast<uint64_t>(record.params.block) *
+                        lf::kCycleBlockSize;
+    const uint32_t record_blocks =
+        static_cast<uint32_t>(record.bytes.size() / lf::kCycleBlockSize);
     if (!device_->Write(record_offset, record.bytes.data(),
                         lf::kRecordHeaderSize)) {
       return fail_after_log_io(XFS_ERR(XfsError::kIoError,
@@ -951,16 +953,44 @@ Status XfsFilesystem::CommitTransaction(XfsTransaction& txn) {
                  TxnText(txn, "record-header") + " records=" +
                      std::to_string(records.size()));
     }
-    if (record.bytes.size() > lf::kRecordHeaderSize) {
-      if (!device_->Write(record_offset + lf::kRecordHeaderSize,
-                          record.bytes.data() + lf::kRecordHeaderSize,
-                          record.bytes.size() - lf::kRecordHeaderSize)) {
-        return fail_after_log_io(
-            XFS_ERR(XfsError::kIoError,
-                    "failed to write log record data: " + device_->LastError())
-                .Offset(record_offset + lf::kRecordHeaderSize)
-                .Metadata("log"));
-      }
+    // A record whose data area crosses the physical end continues at block 0
+    // in the next cycle, as the kernel's iclog write does. The header always
+    // fits before the end (BuildLogRecord rejects a wrapping header), so the
+    // data starts at the next block and wraps at block 0.
+    uint32_t data_block = record.params.block + 1;
+    if (data_block >= log_position_.log_blocks) data_block -= log_position_.log_blocks;
+    const uint32_t data_blocks = record_blocks - 1;
+    const uint32_t before_end =
+        std::min<uint32_t>(data_blocks,
+                           log_position_.log_blocks - data_block);
+    const uint8_t* data = record.bytes.data() + lf::kRecordHeaderSize;
+    if (before_end != 0 &&
+        !device_->Write(log_start +
+                            static_cast<uint64_t>(data_block) *
+                                lf::kCycleBlockSize,
+                        data,
+                        static_cast<size_t>(before_end) *
+                            lf::kCycleBlockSize)) {
+      return fail_after_log_io(XFS_ERR(XfsError::kIoError,
+                                       "failed to write log record data: " +
+                                           device_->LastError())
+                                   .Offset(log_start +
+                                           static_cast<uint64_t>(data_block) *
+                                               lf::kCycleBlockSize)
+                                   .Metadata("log"));
+    }
+    if (data_blocks > before_end &&
+        !device_->Write(log_start,
+                        data + static_cast<size_t>(before_end) *
+                                   lf::kCycleBlockSize,
+                        static_cast<size_t>(data_blocks - before_end) *
+                            lf::kCycleBlockSize)) {
+      return fail_after_log_io(
+          XFS_ERR(XfsError::kIoError,
+                  "failed to write wrapped log record data: " +
+                      device_->LastError())
+              .Offset(log_start)
+              .Metadata("log"));
     }
   }
   const uint64_t first_record_offset =
@@ -1162,17 +1192,35 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
   if (!record.ok()) return record.error();
   const uint32_t record_blocks =
       static_cast<uint32_t>(record.value().size() / lf::kCycleBlockSize);
+  const uint64_t log_start = geometry_.FsbToByte(superblock_.logstart);
   const uint64_t record_offset =
-      geometry_.FsbToByte(superblock_.logstart) +
-      static_cast<uint64_t>(log_position_.next_block) *
-          lf::kCycleBlockSize;
+      log_start + static_cast<uint64_t>(log_position_.next_block) *
+                     lf::kCycleBlockSize;
+  // The unmount record is two blocks; if its data block crosses the physical
+  // end it continues at block 0 in the next cycle (BuildLogRecord stamps it).
+  const uint32_t before_end = std::min<uint32_t>(
+      record_blocks, log_position_.log_blocks - params.block);
   MaybeCrash(CrashPoint::kBeforeLogWrite, "clean-unmount");
   if (!device_->Write(record_offset, record.value().data(),
-                      record.value().size())) {
+                      static_cast<size_t>(before_end) *
+                          lf::kCycleBlockSize)) {
     return XFS_ERR(XfsError::kIoError,
                    "failed to write clean unmount record: " +
                        device_->LastError())
         .Offset(record_offset)
+        .Metadata("log");
+  }
+  if (record_blocks > before_end &&
+      !device_->Write(log_start,
+                      record.value().data() +
+                          static_cast<size_t>(before_end) *
+                              lf::kCycleBlockSize,
+                      static_cast<size_t>(record_blocks - before_end) *
+                          lf::kCycleBlockSize)) {
+    return XFS_ERR(XfsError::kIoError,
+                   "failed to write wrapped clean unmount record: " +
+                       device_->LastError())
+        .Offset(log_start)
         .Metadata("log");
   }
   if (!device_->Flush()) {
@@ -1189,11 +1237,13 @@ Status XfsFilesystem::WriteCleanUnmountRecord() {
   Status stamped = StampSuperblockLsn(
       MakeLsn(params.cycle, params.block) /* the record just written */);
   if (!stamped.ok()) return stamped;
-  log_position_.next_block += record_blocks;
-  if (log_position_.next_block >= log_position_.log_blocks) {
-    log_position_.next_block = 0;
+  uint64_t next = static_cast<uint64_t>(log_position_.next_block) +
+                  record_blocks;
+  if (next >= log_position_.log_blocks) {
+    next -= log_position_.log_blocks;
     ++log_position_.cycle;
   }
+  log_position_.next_block = static_cast<uint32_t>(next);
   log_position_.prev_block = params.block;
   log_position_.tail_lsn =
       MakeLsn(log_position_.cycle, log_position_.next_block);

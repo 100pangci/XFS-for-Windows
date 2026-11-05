@@ -194,7 +194,13 @@ Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
         .Metadata("log")
         .Offset(newest->offset);
   }
-  uint64_t data_off = newest->offset + uint64_t(newest->hdrs) * kSectorSize;
+  // The fixed header is at the record's own block; the first data block
+  // follows it, wrapping to block 0 when the record was written across the
+  // physical end of the ring (the kernel's iclog write does this routinely).
+  const uint32_t log_bb = static_cast<uint32_t>(log_bytes / kSectorSize);
+  uint64_t data_off =
+      log_start +
+      uint64_t((newest->block + newest->hdrs) % log_bb) * kSectorSize;
   if (!dev.Read(data_off, data.data(), data.size())) {
     return XFS_ERR(XfsError::kIoError, "failed to read log record data")
         .Metadata("log")

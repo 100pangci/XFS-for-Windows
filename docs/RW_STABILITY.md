@@ -385,6 +385,7 @@ The RW-STABLE-1 audit fixed these correctness findings, one commit each:
 | A malformed logged btree root was silently ignored | reject it in `BmbtToBmdr` |
 | The WinFsp path cache could reuse an inode generation | key the cache by inode generation |
 | A read-write mount refused a recoverable dirty log discovered at mount time | let read-write mounts replay it |
+| Wrapping a transaction before the physical end of the log left stale older-cycle blocks above the new cycle at block 0, a three-generation layout that `xlog_find_head` and this port misread; recovery reported an invalid log and a second replay double-applied operations | let records straddle the physical end exactly as the kernel's iclog write does: the header stays below the end, the data area continues at block 0 stamped with the next cycle, and `CheckLogClean` reads wrapped data as a ring |
 
 ## 11. Evidence ledger
 
