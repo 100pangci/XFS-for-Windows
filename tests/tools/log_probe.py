@@ -12,7 +12,8 @@ checks what a replaying kernel checks:
   * record header magic, version, cycle, uuid
   * h_lsn block part == the block the record was found at
   * h_len is a multiple of 512 (the kernel computes BTOBB(h_len))
-  * every 512-byte data block starts with the record cycle (cycle stamping)
+  * every 512-byte data block starts with its generation's cycle: the record
+    cycle below the physical end, cycle + 1 after the ring wraps
   * the record CRC (CRC32c over the header with the CRC field zeroed, then the
     data area)
   * the operation chain: start op, transaction header, items, commit op
@@ -254,10 +255,13 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
     if data_blocks > log_blocks or rec.blocks > log_blocks:
         rec.problems.append("record does not fit in the log")
         return rec
-    data_start = (block + rec.header_blocks) % log_blocks
+    # Keep the unwrapped data start: when the header blocks end exactly at the
+    # physical end, the first data block is the first block of the next cycle
+    # and must be stamped cycle + 1, exactly like the kernel's iclog split.
+    data_start = block + rec.header_blocks
     data = bytearray()
     remaining = data_blocks
-    phys = data_start
+    phys = data_start % log_blocks
     while remaining:
         run = min(remaining, log_blocks - phys)
         at = log_byte + phys * SECTOR
