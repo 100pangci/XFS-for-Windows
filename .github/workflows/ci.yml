@@ -5804,7 +5804,7 @@ jobs:
   # below; the hardware DEV-1R run is manual and is recorded separately.
   # ---------------------------------------------------------------------------
   rw-stable-qualification:
-    if: github.event_name != 'schedule' && github.event.inputs.soak_only != 'true'
+    if: ${{ always() && github.event_name != 'schedule' && github.event.inputs.soak_only != 'true' }}
     needs:
       - linux-build-test
       - linux-sanitizer
