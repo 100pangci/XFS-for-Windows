@@ -432,6 +432,44 @@ TEST(log_position_crosses_filesystem_block_count_boundary) {
   fixture.Reset();
 }
 
+TEST(log_check_reads_the_final_data_sector_within_device_bounds) {
+  // The log's final sector is also the device's final sector. A clean
+  // unmount record ends exactly there, so reading its first op must not
+  // request bytes after that sector.
+  LogRecordParams params = BaseParams();
+  params.block = params.log_blocks - 2;
+  params.tail_lsn = xfs::MakeLsn(params.cycle, params.block);
+  xfs::XfsGeometry geo;
+  geo.block_size = 4096;
+  geo.block_log = 12;
+  geo.agblklog = 9;
+  geo.agblocks = params.log_blocks / 8 + 1;
+  xfs::XfsSuperblock sb;
+  sb.logstart = 1;
+  sb.logblocks = params.log_blocks / 8;
+  sb.uuid = params.uuid;
+  const uint64_t log_start = geo.FsbToByte(sb.logstart);
+  const uint64_t log_bytes = uint64_t{sb.logblocks} << geo.block_log;
+  xfstest::MemoryBlockDevice device(log_start + log_bytes);
+  auto record = xfs::BuildLogRecord(params, {xfs::MakeUnmountOp()});
+  CHECK(record.ok());
+  if (!record.ok()) return;
+  CHECK_EQ(record.value().size(), 1024u);
+  CHECK(device.Write(log_start + uint64_t{params.block} * 512,
+                     record.value().data(), record.value().size()));
+
+  auto check = xfs::CheckLogClean(device, geo, sb);
+  CHECK(check.ok());
+  if (!check.ok()) return;
+  CHECK(check.value().state == xfs::LogState::kClean);
+  auto position = xfs::ReadLogPosition(device, geo, sb);
+  CHECK(position.ok());
+  if (!position.ok()) return;
+  CHECK(position.value().clean);
+  CHECK_EQ(position.value().cycle, params.cycle + 1);
+  CHECK_EQ(position.value().next_block, 0u);
+}
+
 TEST(log_record_data_wraps_to_the_next_cycle_at_the_physical_end) {
   // Regression: a record header may sit on the last basic block of the log;
   // its data area then continues at block 0 and every block there is stamped

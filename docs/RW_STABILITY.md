@@ -382,6 +382,7 @@ The RW-STABLE-1 audit fixed these correctness findings, one commit each:
 | In-place overwrite of a reflink-shared extent would modify both files | refuse with `kWriteNeedsCow` before data writes |
 | Automount could bind an enrolled UUID/class to a different live target | pin UUID and live device class |
 | `check` reported OK for an unreadable primary superblock | report it as corruption |
+| Clean-log inspection requested 528 bytes from a 512-byte data sector and falsely failed when that sector ended at the device boundary | read only the first 512-byte data sector, which contains the full operation header |
 | A malformed logged btree root was silently ignored | reject it in `BmbtToBmdr` |
 | The WinFsp path cache could reuse an inode generation | key the cache by inode generation |
 | A read-write mount refused a recoverable dirty log discovered at mount time | let read-write mounts replay it |

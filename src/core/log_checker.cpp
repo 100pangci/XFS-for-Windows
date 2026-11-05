@@ -188,7 +188,7 @@ Result<LogCheckResult> CheckLogClean(BlockDevice& dev,
   // record data sector is replaced by the cycle value on disk; the original
   // word is stored in h_cycle_data[0] of the record header.
   std::vector<uint8_t> hdr(kRecHeaderSize);
-  std::vector<uint8_t> data(kSectorSize + 16);
+  std::vector<uint8_t> data(kSectorSize);
   if (!dev.Read(newest->offset, hdr.data(), hdr.size())) {
     return XFS_ERR(XfsError::kIoError, "failed to read log record header")
         .Metadata("log")
