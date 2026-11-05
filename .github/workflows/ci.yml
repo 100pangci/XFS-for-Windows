@@ -5811,6 +5811,8 @@ jobs:
       - linux-concurrency
       - linux-concurrency-sanitizer
       - linux-concurrency-tsan
+      - windows-concurrency-core
+      - linux-verify-conc-windows
       - linux-stateful-fuzz
       - linux-stateful-fuzz-sanitizer
       - linux-verify-stateful-windows
