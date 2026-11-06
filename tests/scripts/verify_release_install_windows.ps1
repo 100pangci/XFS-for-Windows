@@ -355,7 +355,11 @@ try {
     $rwFixture = Attach-ReleaseVhd -FixtureName 'single-basic' -Writable
     $rwUuid = [string]$rwFixture.entry.partitions[0].uuid
     $rawLetter = Set-ReleaseRawVolumeLetter -Attached $rwFixture -Drive (Get-ReleaseFreeDrive)
-    Assert-Release ($roUuid -ne $rwUuid) 'read-only and read-write fixtures unexpectedly share a UUID'
+    # single-basic deliberately reuses the single fixture's XFS payload (and
+    # therefore its UUID) on a Microsoft basic-data partition so Windows
+    # exposes a volume for the drive-letter takeover.  The RW enrollment below
+    # replaces the read-only entry for this UUID; both fixtures are never
+    # attached at the same time.
     $enableRw = Invoke-ReleaseCli -Exe $currentInstalled.exe `
         -Arguments @('automount', 'enable', $rwUuid, '--drive', 'auto', '--rw', '--yes-i-really-mean-it') `
         -LogName 'enroll-rw'
