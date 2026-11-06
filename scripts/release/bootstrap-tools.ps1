@@ -81,10 +81,10 @@ try {
     if ($rustcMatch.Groups[1].Value -ne $rustVersion) {
         throw "rustc is $($rustcMatch.Groups[1].Value), expected $rustVersion."
     }
-    $host = $hostMatch.Groups[1].Value
+    $hostTarget = $hostMatch.Groups[1].Value
     $knownHosts = @($rustTargets.PSObject.Properties | ForEach-Object { [string]$_.Value })
-    if ($knownHosts -notcontains $host) {
-        throw "The Rust host target $host is not one of the pinned native targets: $($knownHosts -join ', ')."
+    if ($knownHosts -notcontains $hostTarget) {
+        throw "The Rust host target $hostTarget is not one of the pinned native targets: $($knownHosts -join ', ')."
     }
 
     $cmakeText = Invoke-External -FilePath $cmake -Arguments @('--version') -WorkingDirectory $repoRoot -Capture
@@ -93,7 +93,7 @@ try {
         throw "CMake $cmakeMinimum or newer is required; found: $cmakeText"
     }
 
-    Write-Host "Rust $rustVersion ($host) ready: $cargo"
+    Write-Host "Rust $rustVersion ($hostTarget) ready: $cargo"
     Write-Host "CMake $($cmakeMatch.Groups[1].Value) ready: $cmake"
 
     if ($ExportGitHubEnvironment) {

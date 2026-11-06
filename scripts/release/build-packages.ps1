@@ -173,18 +173,18 @@ function Get-CargoToolchain {
         throw "Could not parse rustc -vV: $rustcText"
     }
     $rustcVersion = $rustcMatch.Groups[1].Value
-    $host = $hostMatch.Groups[1].Value
+    $hostTarget = $hostMatch.Groups[1].Value
     if ($cargoVersion -ne $versionPin -or $rustcVersion -ne $versionPin) {
         throw "Rust toolchain is $rustcVersion/$cargoVersion but tooling-lock.json pins $versionPin. Install that toolchain or set XFSWIN_CARGO."
     }
-    if ($host -ne $targetPin) {
-        throw "The Rust host target is $host, but $Architecture requires $targetPin. Build each architecture on its native runner."
+    if ($hostTarget -ne $targetPin) {
+        throw "The Rust host target is $hostTarget, but $Architecture requires $targetPin. Build each architecture on its native runner."
     }
     return [pscustomobject]@{
         cargo = $cargo
         rustc = $rustc
         version = $versionPin
-        host = $host
+        host = $hostTarget
     }
 }
 

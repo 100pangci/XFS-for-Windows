@@ -669,7 +669,7 @@ function Get-ReleaseShortcuts {
     }
     $roots = @($roots | Select-Object -Unique)
     $shell = New-Object -ComObject WScript.Shell
-    $matches = @()
+    $shortcutMatches = @()
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         foreach ($link in Get-ChildItem -LiteralPath $root -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue) {
@@ -680,12 +680,12 @@ function Get-ReleaseShortcuts {
                 $targetFull = [IO.Path]::GetFullPath($target)
                 if ($targetFull.Equals((Join-Path $ProductDirectory 'xfswin.exe'), [StringComparison]::OrdinalIgnoreCase) -or
                     (Test-ReleasePathWithin $targetFull $ProductDirectory)) {
-                    $matches += $link.FullName
+                    $shortcutMatches += $link.FullName
                 }
             } catch {}
         }
     }
-    return @($matches)
+    return @($shortcutMatches)
 }
 
 function Invoke-ReleaseProcess {
