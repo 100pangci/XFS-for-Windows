@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - log record assembly.
 //
-// A record is one 512-byte header block followed by `h_len` data bytes
+// A record consists of one fixed 512-byte xlog_rec_header plus zero or more
+// 512-byte xlog_rec_ext_header blocks, followed by `h_len` bytes of log data
 // (a multiple of 512), containing a chain of operations:
 //
 //   [op START_TRANS, len 0]                     opens the transaction
@@ -12,10 +13,20 @@
 //   [op len M][item payload]
 //   [op COMMIT_TRANS, len 0]                    commits it
 //
-// Every 512-byte data block has its first word replaced by the record cycle
-// number (recovery uses those words to find the log head); the original words
-// are stored in the header. The CRC covers the header (with the CRC field
-// zeroed) plus the whole data area.
+// Records whose data needs more than the 64 cycle words in the fixed header
+// use xlog_rec_ext_header blocks. BuildLogRecord can assemble a complete legal
+// record image up to XLOG_MAX_RECORD_BSIZE; the transaction layer currently
+// writes 32 KiB records with one header block and splits larger transactions.
+//
+// All header blocks must fit before the physical end of the log, but the data
+// area may wrap across that boundary: data blocks that continue at the start
+// of the ring carry the next cycle. Every 512-byte data block has its first
+// word replaced by the cycle number of the generation that owns that physical
+// block (recovery uses those words to find the log head); the original words
+// are stored in h_cycle_data and the extension headers. The CRC covers the
+// first 328 bytes of the fixed header (with the CRC field zeroed), each
+// extension header's first 260 bytes, and the whole data area as stored
+// (including the cycle stamps).
 #pragma once
 
 #include <cstdint>
@@ -48,16 +59,28 @@ struct LogRecordParams {
   uint32_t prev_block = 0;    // block of the previous record (h_prev_block)
   uint64_t tail_lsn = 0;      // h_tail_lsn (oldest record still needed)
   uint32_t log_blocks = 0;    // total log size in 512-byte blocks
-  uint32_t record_size = 0;   // h_size (0 = default 32 KiB)
+  uint32_t record_size = 0;   // ignored by BuildLogRecord; h_size is derived
+                              // from the padded data length
   Uuid uuid{};
 };
 
-// Builds the complete on-disk image of one log record (header + data).
-// `ops` must be the full operation chain, including the START and COMMIT ops
-// (see the transaction layer). The result is a multiple of 512 bytes and can
-// be written at the record's block. Fails when the record does not fit the
-// log or would need extension header blocks (records above 32 KiB, which this
-// writer never produces).
+// Builds the complete in-memory image of one log record: the fixed header,
+// any extension headers and the data area. `ops` must be the full operation
+// chain, including the START and COMMIT ops (see the transaction layer); this
+// function checks only that it is non-empty. The result is a multiple of 512
+// bytes, laid out in logical record order. The header blocks start at
+// `params.block` and must fit before the physical end of the log. The data
+// area may continue at block 0 stamped with the next cycle, so a wrapping
+// caller writes it in ring order rather than as one physical extent.
+//
+// Fails when:
+//   - the log size is zero, or the record block is outside the log;
+//   - the cycle is 0 or 0xFFFFFFFF, or `ops` is empty;
+//   - the fixed/extension headers would cross the physical end of the log;
+//   - the complete image (headers plus padded data) would exceed
+//     XLOG_MAX_RECORD_BSIZE;
+//   - the record would not fit in the log (it would lap the ring);
+//   - the data needs more cycle-data slots than its headers provide.
 Result<std::vector<uint8_t>> BuildLogRecord(const LogRecordParams& params,
                                             const std::vector<LogOp>& ops);
 
