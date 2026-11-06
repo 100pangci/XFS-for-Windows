@@ -1,0 +1,32 @@
+{
+  "purpose": "Build/test interface contract only; never a runtime device or writable policy",
+  "package_builder": {
+    "script": "scripts/release/build-packages.ps1",
+    "parameters": ["BuildDirectory", "Architecture", "OutputDirectory", "WinFspMsi", "Configuration", "AllowExternalToolExecution"],
+    "synthetic_older_parameter": "SyntheticOlderVersion",
+    "synthetic_older_test_version": "0.0.0",
+    "public_portable": "xfswin-<version>-windows-<arch>.zip",
+    "public_installer": "xfswin-<version>-windows-<arch>-setup.exe",
+    "internal_msi": "testing/xfswin-<version>-windows-<arch>.msi",
+    "previous_installer": "testing/xfswin-0.0.0-windows-<arch>-setup.exe",
+    "metadata_file": "package-metadata-<arch>.json",
+    "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "toolchain", "build_timestamp", "signing", "testing"]
+  },
+  "acceptance_evidence": {
+    "filename": "qualification-<arch>.json",
+    "fields": ["architecture", "head_sha", "run_id", "installer_sha256", "installed_exe_sha256", "installed_metadata", "cases"],
+    "installed_metadata": "Actual installed version.json, including clean production Release flags",
+    "cases_format": "Object: exact case name -> passed, failed, or skipped",
+    "required_cases": ["clean-install", "version", "path", "service", "ro-mount", "rw-smoke", "active-upgrade-refusal", "upgrade", "legacy-config", "uninstall", "config-preservation", "reinstall", "dependency-failure", "failure-before-service", "failure-after-files", "failure-service-start", "upgrade-rollback"],
+    "all_cases_must_pass": true,
+    "architectures_must_share_run_id_and_sha": true
+  },
+  "installer_failure_injection": {
+    "transport": "Direct internal MSI: msiexec /i <product.msi> /qn /norestart XFSWIN_TEST_FAIL=<stage> /L*v <log>",
+    "property": "XFSWIN_TEST_FAIL",
+    "stages": ["before-service", "after-files", "service-start"],
+    "burn_forwarding_required": false
+  },
+  "manifest_cli": "python -I scripts/release/manifest.py create|verify --directory <public-assets> --version <CMake-version> --git-sha <full-SHA> --dependency-lock packaging/winfsp.lock.json --evidence-directory <actual-acceptance-evidence>",
+  "execution_scope": "External tool execution authorized in isolated project tool directories; installer/service/VHD operations only on isolated CI, never on the local host or existing physical disks"
+}

@@ -1,0 +1,13 @@
+{
+  "stage": "REL-1",
+  "base_sha": "2fb6dbbacd35de12ef82402d59f6f373d01268b2",
+  "base_pr": 21,
+  "base_ci_run": 42149338890,
+  "source_version": "0.1.0",
+  "baseline_windows_architectures": ["x64"],
+  "target_architectures": ["x64", "arm64"],
+  "prior_releases": [],
+  "prior_artifact_layout": "Developer CMake output build/src/<configuration>/xfswin.exe; no CMake install rules or installer",
+  "prior_winfsp_assumptions": "SDK/runtime detection is x64-specific; WinFsp driver/runtime must already be installed for mounts",
+  "qualification": "NOT READY"
+}
