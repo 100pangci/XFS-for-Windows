@@ -96,7 +96,7 @@ target_include_directories(xfs_core PUBLIC
 if(WIN32)
   target_sources(xfs_core PRIVATE deployment/deployment.cpp)
   # The deployment and service helpers are available even in WinFsp-OFF builds.
-  target_link_libraries(xfs_core PRIVATE advapi32)
+  target_link_libraries(xfs_core PRIVATE advapi32 shell32 ole32)
 endif()
 
 # CONC-1 deterministic scheduling hooks. Off by default: the production

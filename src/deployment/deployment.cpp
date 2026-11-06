@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <shlobj.h>
 #include <winver.h>
 #include <winsvc.h>
 
@@ -1173,17 +1174,20 @@ DeploymentPaths DefaultDeploymentPaths() {
   // LocalSystem service and manual mounts.  A process-controlled redirect
   // would silently remove the maintenance fence and let a new mount race an
   // upgrade.  Isolated tests pass an explicit root to ResolveDeploymentPaths.
-  wchar_t buffer[MAX_PATH + 1] = {};
-  const DWORD length =
-      GetEnvironmentVariableW(L"ProgramData", buffer, MAX_PATH + 1);
-  std::wstring program_data;
-  if (length > 0 && length <= MAX_PATH) {
-    program_data.assign(buffer, length);
-  } else {
-    program_data = L"C:\\ProgramData";
+  PWSTR program_data = nullptr;
+  const HRESULT resolved = SHGetKnownFolderPath(
+      FOLDERID_ProgramData, KF_FLAG_DONT_VERIFY, nullptr, &program_data);
+  std::filesystem::path root;
+  if (SUCCEEDED(resolved) && program_data != nullptr) {
+    root = std::filesystem::path(program_data);
   }
-  return ResolveDeploymentPaths(std::filesystem::path(program_data) /
-                                kProgramDataSubdirectory);
+  CoTaskMemFree(program_data);
+  if (root.empty() || !root.is_absolute()) {
+    // Callers must fail closed rather than use a per-process environment
+    // value, a guessed system drive or a relative maintenance directory.
+    return {};
+  }
+  return ResolveDeploymentPaths(root / kProgramDataSubdirectory);
 }
 
 Status EnsureDeploymentPaths(const DeploymentPaths& paths) {
@@ -1244,7 +1248,9 @@ bool MaintenanceFenceActive(const DeploymentPaths& paths) {
 Result<ActiveSessionScan> ScanActiveSessions(
     const DeploymentPaths& paths, const std::wstring& expected_exe) {
   if (paths.root.empty() || paths.sessions.empty()) {
-    return ActiveSessionScan{};
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "the machine deployment state directory is unavailable")
+        .Metadata("maintenance-fence");
   }
   auto mutex = OpenStartupMutex(10000);
   if (!mutex.ok()) return mutex.error();
@@ -2016,7 +2022,12 @@ Status MountStartGate::Acquire(const DeploymentPaths& paths,
                                const std::wstring& mount_point,
                                const std::wstring& owner_executable) {
   Release();
-  if (paths.root.empty() || paths.sessions.empty()) return OkStatus();
+  if (paths.root.empty() || paths.sessions.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "new XFS mounts are refused: the machine deployment "
+                   "state directory is unavailable")
+        .Metadata("maintenance-fence");
+  }
   std::error_code exists_error;
   if (!std::filesystem::exists(paths.sessions, exists_error)) {
     Status ensured = EnsureDeploymentPaths(paths);

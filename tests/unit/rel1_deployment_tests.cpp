@@ -225,10 +225,11 @@ TEST(rel1_fence_roundtrip_and_gate) {
   CHECK(after.value().sessions.empty());
 }
 
-TEST(rel1_gate_disabled_for_empty_root) {
+TEST(rel1_gate_refuses_unresolved_state_root) {
   xfs::MountStartGate gate;
-  CHECK(gate.Acquire(xfs::DeploymentPaths{}, L"X:", L"xfswin.exe").ok());
+  CHECK(!gate.Acquire(xfs::DeploymentPaths{}, L"X:", L"xfswin.exe").ok());
   CHECK(!gate.held());
+  CHECK(!xfs::ScanActiveSessions(xfs::DeploymentPaths{}, L"xfswin.exe").ok());
   gate.Release();
 }
 
@@ -621,6 +622,26 @@ TEST(rel1_default_paths_ignore_environment_override) {
   CHECK(paths.root != root.path());
   CHECK(paths.fence == paths.root / L"maintenance.fence");
   CHECK(paths.sessions == paths.root / L"sessions");
+}
+
+TEST(rel1_default_paths_ignore_programdata_environment_override) {
+  TempRoot root;
+  const DeploymentPaths expected = xfs::DefaultDeploymentPaths();
+  const wchar_t* name = L"ProgramData";
+  wchar_t previous[32768] = {};
+  const DWORD previous_length = GetEnvironmentVariableW(name, previous, 32768);
+  CHECK(SetEnvironmentVariableW(name, root.path().c_str()));
+  const DeploymentPaths actual = xfs::DefaultDeploymentPaths();
+  if (previous_length > 0 && previous_length < 32768) {
+    SetEnvironmentVariableW(name, previous);
+  } else {
+    SetEnvironmentVariableW(name, nullptr);
+  }
+  CHECK(!expected.root.empty());
+  CHECK(actual.root == expected.root);
+  CHECK(actual.fence == expected.fence);
+  CHECK(actual.sessions == expected.sessions);
+  CHECK(actual.root != root.path() / L"xfswin");
 }
 
 TEST(rel1_rollback_quiesce_without_transaction_is_noop) {

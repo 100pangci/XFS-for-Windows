@@ -106,7 +106,9 @@ struct DeploymentPaths {
 // %ProgramData%\xfswin.  There is no environment or command-line override in
 // production: the fence, the session leases and the installer capture must
 // always name the same machine-wide state the LocalSystem service observes.
-// Isolated tests and in-process callers that must use a private root pass it
+// Resolves the machine known folder instead of reading a process environment
+// variable. Returns empty paths when Windows cannot resolve it; maintenance
+// and mount startup reject those paths. Isolated tests pass a private root
 // explicitly through ResolveDeploymentPaths() / InstallerOptions::state_root.
 DeploymentPaths DefaultDeploymentPaths();
 DeploymentPaths ResolveDeploymentPaths(const std::filesystem::path& root);
@@ -196,9 +198,9 @@ class MountStartGate {
   MountStartGate(MountStartGate&&) = delete;
   MountStartGate& operator=(MountStartGate&&) = delete;
 
-  // `paths.root` empty disables the gate (builds without a deployment root);
-  // product callers always pass DefaultDeploymentPaths().  `mount_point` is
-  // "X:" or an absolute directory; `owner` names the component for records.
+  // Empty paths are refused: product callers always pass the machine-wide
+  // DefaultDeploymentPaths(). `mount_point` is "X:" or an absolute directory;
+  // `owner_executable` identifies the process image in the lease.
   Status Acquire(const DeploymentPaths& paths, const std::wstring& mount_point,
                  const std::wstring& owner_executable);
   void Release();
