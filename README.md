@@ -20,6 +20,41 @@ runtime dependencies.
 > are not qualified. The writer is not a drop-in replacement for the Linux XFS
 > driver: keep backups and do not widen the profile by hand.
 
+## Download and install
+
+REL-1 packaging is still being qualified. No release-qualified product setup or
+portable ZIP is available yet; check the [GitHub Releases
+page](https://github.com/100pangci/XFS-for-Windows/releases) for the first
+published version. The intended `0.1.0` release, the first delivery in the
+`0.x` series, will provide a native Windows setup package and a portable ZIP for
+each supported Windows architecture. See [docs/INSTALL.md](docs/INSTALL.md) for
+installation, use, upgrade and uninstall instructions.
+
+The setup package is the managed option: it installs for all users, registers
+the automount service, and handles the shared WinFsp runtime. The portable ZIP
+preserves the manual workflow: extract it to a folder and run `xfswin.exe`
+there. It does not register a service or copy WinFsp DLLs; install the official
+shared WinFsp runtime separately before mounting. There is no GUI, tray
+application or automatic updater.
+
+Once the package is available, start in an elevated PowerShell with WinFsp
+installed and change to the folder containing `xfswin.exe`:
+
+```powershell
+$exe = (Resolve-Path .\xfswin.exe).Path
+& $exe devices
+& $exe mount
+```
+
+Select a filesystem and accept an available drive letter. Mounts are read-only
+by default. A new setup installation starts the automount service with no
+entries, so it mounts nothing until you explicitly enroll a filesystem.
+Physical-device write policy and qualification are separate; fixed physical
+disks are not qualified for read-write, and 4Kn, UASP and media power-loss
+durability remain unqualified. Removable-device DEV-1R evidence covers only one
+tested device. Keep backups and review
+[docs/RW_STABILITY.md](docs/RW_STABILITY.md) before enabling writes.
+
 ## What it is
 
 | Layer | Role |
@@ -158,7 +193,7 @@ records are updated in the same namespace transaction. The generic
 `xfswin xattr` path refuses `parent.*` mutations; only the namespace core and
 recovery may touch them.
 
-## Quick start
+## Development quick start
 
 Build first (see [Development](#development)):
 
@@ -476,6 +511,10 @@ single owner of each filesystem invariant.
 | [docs/DEV1_REMOVABLE_QUALIFICATION.md](docs/DEV1_REMOVABLE_QUALIFICATION.md) | DEV-1R removable-media evidence ledger and manual qualification procedure (one-device hardware run passed 2026-11-01; fixed disks not ready) |
 | [docs/UX.md](docs/UX.md) | native Windows discovery, interactive mounting, drive letters, Explorer volume information, automount service and its read-only/DEV-1 boundary |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
+| [docs/INSTALL.md](docs/INSTALL.md) | installation, WinFsp prerequisite, first mount, upgrade, uninstall and preserved configuration |
+| [INSTALLER.md](INSTALLER.md) | WiX choice, WinFsp ownership and license, service maintenance, rollback and package build interface |
+| [RELEASE.md](RELEASE.md) | maintainer release gate, provenance evidence, signing, manifest and rollback |
+| [narrowUX.md](narrowUX.md) | the intentionally limited first packaged UX |
 
 ## Development
 

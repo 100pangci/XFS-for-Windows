@@ -9,5 +9,5 @@
   "prior_releases": [],
   "prior_artifact_layout": "Developer CMake output build/src/<configuration>/xfswin.exe; no CMake install rules or installer",
   "prior_winfsp_assumptions": "SDK/runtime detection is x64-specific; WinFsp driver/runtime must already be installed for mounts",
-  "qualification": "NOT READY"
+  "qualification_at_baseline": "NOT READY"
 }
