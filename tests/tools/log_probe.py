@@ -12,7 +12,8 @@ checks what a replaying kernel checks:
   * record header magic, version, cycle, uuid
   * h_lsn block part == the block the record was found at
   * h_len is a multiple of 512 (the kernel computes BTOBB(h_len))
-  * every 512-byte data block starts with the record cycle (cycle stamping)
+  * every 512-byte data block starts with its generation's cycle: the record
+    cycle below the physical end, cycle + 1 after the ring wraps
   * the record CRC (CRC32c over the header with the CRC field zeroed, then the
     data area)
   * the operation chain: start op, transaction header, items, commit op
@@ -243,14 +244,31 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
             f"h_lsn {rec.lsn:#x} != (cycle {rec.cycle}, block {block})")
     if image[offset + 304:offset + 320] != sb.uuid:
         rec.problems.append("uuid mismatch")
-    end = rec.offset + rec.header_blocks * SECTOR + rec.len
-    if rec.len == 0 or end > len(image) or rec.blocks > log_blocks:
+    # A record never has its header cross the physical end, but its data area
+    # may: the kernel's iclog write puts the continuation at block 0, stamped
+    # with the next cycle.  Read the data as a ring instead of assuming it is
+    # physically contiguous.
+    if block + rec.header_blocks > log_blocks:
+        rec.problems.append("record header crosses the physical end")
+        return rec
+    data_blocks = rec.len // SECTOR
+    if data_blocks > log_blocks or rec.blocks > log_blocks:
         rec.problems.append("record does not fit in the log")
         return rec
-
-    data_offset = rec.offset + rec.header_blocks * SECTOR
-    data = bytearray(image[data_offset:end])
-    header_bytes = image[rec.offset:data_offset]
+    # Keep the unwrapped data start: when the header blocks end exactly at the
+    # physical end, the first data block is the first block of the next cycle
+    # and must be stamped cycle + 1, exactly like the kernel's iclog split.
+    data_start = block + rec.header_blocks
+    data = bytearray()
+    remaining = data_blocks
+    phys = data_start % log_blocks
+    while remaining:
+        run = min(remaining, log_blocks - phys)
+        at = log_byte + phys * SECTOR
+        data += image[at:at + run * SECTOR]
+        remaining -= run
+        phys = 0
+    header_bytes = image[offset:offset + rec.header_blocks * SECTOR]
     # The CRC covers the fixed header, each extension header's 260 covered
     # bytes, then the data as it lies on disk (*with* the cycle words stamped
     # in; recovery verifies it before xlog_unpack_data restores them).
@@ -280,8 +298,9 @@ def parse_record(image: bytes, log_byte: int, log_blocks: int, sb: Superblock,
         return rec
 
     for index in range(len(data) // SECTOR):
-        if be32(image, rec.offset + rec.header_blocks * SECTOR +
-                index * SECTOR) != rec.cycle:
+        stamp = rec.cycle + (1 if data_start + index >= log_blocks else 0)
+        at = log_byte + ((data_start + index) % log_blocks) * SECTOR
+        if be32(image, at) != stamp:
             rec.problems.append(f"data block {index} not cycle stamped")
 
     # Undo the cycle stamping to decode the operation chain. The first 64

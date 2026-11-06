@@ -85,20 +85,20 @@ def main():
             raise SystemExit("%s does not match the Linux manifest" % rel)
 
     # More Windows activity on top of the Linux mutations.
-    run.run(["create", run.image, "/rw6c/final.bin", "--rw-experimental"])
+    run.run(["create", run.image, "/rw6c/final.bin", "--rw"])
     run.run(["reflink", run.image, "/linux/after.bin", "/rw6c/final.bin",
-             "0", "0", "0", "--rw-experimental"])
+             "0", "0", "0", "--rw"])
     # Make final.bin's last shared block partial, then grow it.  The grow must
     # CoW the shared block and zero the newly visible bytes.
     run.run(["truncate", run.image, "/rw6c/final.bin",
-             str(2 * BLOCK + 123), "--rw-experimental"])
+             str(2 * BLOCK + 123), "--rw"])
     run.run(["truncate", run.image, "/rw6c/final.bin",
-             str(2 * BLOCK + 250), "--rw-experimental"])
+             str(2 * BLOCK + 250), "--rw"])
     run.run(["pwrite", run.image, "/linux/source-clone.bin", "0",
-             "--rw-experimental",
+             "--rw",
              "--text=windows-final"])
     run.run(["unlink", run.image, "/linux/tiny-clone.bin",
-             "--rw-experimental"])
+             "--rw"])
     proc = subprocess.run([run.exe, "cat", run.image, "/linux/tiny-clone.bin"],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode == 0:

@@ -171,25 +171,43 @@ Result<std::vector<uint8_t>> BuildLogRecord(const LogRecordParams& params,
   }
   AppendZeroes(&data, rounded - data.size());
 
-  // The whole record (header + data) must fit before the physical end of the
-  // log; the transaction layer never splits a record across the end.
+  // The record header must fit before the physical end of the log.  The data
+  // area may cross the end: the blocks below the end are stamped with the
+  // record cycle and the blocks at the start of the ring with the next cycle,
+  // exactly as the kernel's iclog write wraps (h_cycle_data still holds the
+  // original first word of every data block).  A record may not lap the log.
   const uint64_t log_bytes =
       static_cast<uint64_t>(params.log_blocks) * lf::kCycleBlockSize;
-  if (lf::kRecordHeaderSize + rounded > log_bytes) {
+  if (static_cast<uint64_t>(params.block) + header_blocks >
+      params.log_blocks) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "log record header crosses the end of the log")
+        .Metadata("log record")
+        .Expected(params.log_blocks)
+        .Actual(params.block + header_blocks);
+  }
+  if (header_bytes + rounded > log_bytes) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "log record does not fit in the log")
         .Metadata("log record")
         .Expected(log_bytes)
-        .Actual(lf::kRecordHeaderSize + rounded);
+        .Actual(header_bytes + rounded);
   }
 
   // Block cycle stamping: the first word of every 512-byte data block becomes
-  // the record cycle; the original words go into the header.
+  // the cycle of the generation that owns that physical block.  Blocks below
+  // the physical end carry the record's cycle; the continuation at block 0
+  // belongs to the next cycle.  The original words go into the header.
+  const uint64_t data_start =
+      static_cast<uint64_t>(params.block) + header_blocks;
   std::vector<uint32_t> saved_words(rounded / lf::kCycleBlockSize, 0);
   for (size_t i = 0; i < saved_words.size(); ++i) {
     uint8_t* block = data.data() + i * lf::kCycleBlockSize;
     saved_words[i] = GetBE32(block, 0);
-    PutBE32(block, 0, params.cycle);
+    const uint64_t physical = data_start + i;
+    const uint32_t stamp =
+        physical >= params.log_blocks ? params.cycle + 1 : params.cycle;
+    PutBE32(block, 0, stamp);
   }
 
   // Header blocks: the fixed xlog_rec_header followed by one

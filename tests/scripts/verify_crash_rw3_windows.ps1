@@ -42,18 +42,18 @@ Copy-Item $fixture $baseEmpty -Force
 $baseUnlink = Join-Path $WorkDir 'base-unlink.img'
 Copy-Item $fixture $baseUnlink -Force
 Invoke-Ok 'create /c-doomed.bin' @('create', $baseUnlink, '/c-doomed.bin',
-    '--rw-experimental')
+    '--rw')
 $payload = Join-Path $WorkDir 'payload8k.bin'
 & $python (Join-Path $repo 'tests/tools/rw3_content.py') make-payload 8192 221 `
     $payload | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "payload generation failed" }
 Invoke-Ok 'write /c-doomed.bin' @('pwrite', $baseUnlink, '/c-doomed.bin', '0',
-    '--rw-experimental', "--from=$payload")
+    '--rw', "--from=$payload")
 
 $baseRmdir = Join-Path $WorkDir 'base-rmdir.img'
 Copy-Item $fixture $baseRmdir -Force
 Invoke-Ok 'mkdir /c-rmdir' @('mkdir', $baseRmdir, '/c-rmdir',
-    '--rw-experimental')
+    '--rw')
 
 # Points and how many transactions each scenario has. An unlink of a file with
 # data is three transactions (namespace, truncate, ifree); rmdir is two
@@ -107,7 +107,7 @@ foreach ($scenario in $scenarios) {
                 $point
             }
             $out = & $Exe $scenario.mode $image $scenario.name `
-                --rw-experimental 2>&1
+                --rw 2>&1
             $code = $LASTEXITCODE
             Remove-Item Env:XFSWIN_CRASH_AT
             $crashed = $false

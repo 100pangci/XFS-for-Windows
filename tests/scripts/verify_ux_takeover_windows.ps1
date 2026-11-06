@@ -212,7 +212,7 @@ function Enroll-ReadWrite([string]$Uuid) {
         "the RW enrollment did not show the identity pins: $($result.output)"
     Assert ($result.output.Contains('Read-write enrollment confirmed')) `
         "the RW enrollment was not confirmed explicitly: $($result.output)"
-    Assert ($result.output.Contains('(experimental-rw)')) `
+    Assert ($result.output.Contains('(read-write)')) `
         "the RW enrollment did not record read-write mode: $($result.output)"
 }
 
@@ -493,7 +493,7 @@ try {
     Assert-RawAt $rawLetter 'restore before RW enrollment'
     Enroll-ReadWrite $uuid
     $configText = Get-Content -Raw -Path $configPath
-    Assert ($configText.Contains('mode = experimental-rw')) `
+    Assert ($configText.Contains('mode = read-write')) `
         "the configuration did not record read-write mode: $configText"
     Assert ($configText.Contains('expected-stable-id =')) `
         "the configuration did not record the stable id pin: $configText"
@@ -508,7 +508,7 @@ try {
     Assert ($drive -eq $rawLetter) `
         "the RW mount is at $drive, expected the RAW letter $rawLetter"
     $status = Get-Status
-    Assert ($status.output.Contains('experimental-rw')) `
+    Assert ($status.output.Contains('read-write')) `
         "status does not report read-write mode: $($status.output)"
     Assert ($status.output.Contains("taken over from the Windows volume $($rawLetter.TrimEnd(':'))")) `
         "the RW mount did not take over the RAW letter: $($status.output)"
@@ -549,7 +549,7 @@ try {
     $drive = Wait-MountedDrive $uuid 90
     Assert ($drive -eq $rawLetter) "the final RW mount is at $drive, expected $rawLetter"
     $status = Get-Status
-    Assert ($status.output.Contains('experimental-rw')) `
+    Assert ($status.output.Contains('read-write')) `
         "the final pass is not read-write: $($status.output)"
     Assert (Test-Path "$drive\ux1-rw\notes.txt") `
         "the files written by the first RW pass are missing"

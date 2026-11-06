@@ -1,13 +1,13 @@
 # Reverse mapping ledger (RW-6B)
 
-Status: **qualified ordinary experimental writes** (`rmapbt=1,reflink=0`
+Status: **qualified ordinary writes** (`rmapbt=1,reflink=0`
 only). Code revision `5a41fca` passed all **65 jobs** in
 [run 40107607956](https://github.com/100pangci/XFS-for-Windows/actions/runs/40107607956),
-using ordinary `--rw-experimental`, including real-image structural/refusal
+using ordinary `--rw`, including real-image structural/refusal
 gates. Reflink/refcount/CoW and xattr modification remain refused **in this
 RW-6B milestone**; RW-6C added reflink/CoW and RW-6D added native xattrs (see
 [XATTR.md](XATTR.md)). This is
-experimental image-file support, not production/raw-device write support or
+image-file support, not production/raw-device write support or
 qualification of every possible kernel RUI producer; sampling limits remain
 explicit below.
 
@@ -695,7 +695,7 @@ Qualified code: **`5a41fca11ce53fa2bea618584a84eef93b17df52`**.
 **65/65 jobs successful**, no failed or skipped jobs.
 
 Mutation, ENOSPC, reverse and 330-case writer crash use **only ordinary
-`--rw-experimental`**, not `--rw-rmapbt-qualification`. Genuine surviving-RUI
+`--rw`**, not `--rw-rmapbt-qualification`. Genuine surviving-RUI
 completion and all 11 recovery crash/restart cases pass both Windows and Linux
 verification. WinFsp mount, raw-device verification, RW-0..RW-6A regressions,
 Linux reverse/final, negative metadata/ownership and shared-RUI refusals all pass.
@@ -733,7 +733,7 @@ Artifacts in that run (IDs retained for audit):
 | `rw6b-windows-round2` | 12565878338 | ordinary-gate reverse image and round2 expectations |
 | `rw6b-final-evidence` | 12566341325 | final Linux repair, layout and logprint evidence |
 
-These results authorize the ordinary **experimental image-file** writable
+These results authorize the ordinary **image-file** writable
 profile only for `rmapbt=1,reflink=0`. They do not authorize reflink/refcount,
 CoW, xattr mutation, raw-device writable mount, online repair, or claim genuine
 kernel samples for every RUI operation family (section 10).

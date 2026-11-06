@@ -1,10 +1,10 @@
 # The Linux `mkfs.xfs` default profile and the writable subset
 
-Status: **RW-6E qualification note.**  The modern parent-pointer profile is
-inside the experimental writable allow-list when it stays within the documented
-single-device/internal-log geometry.  The exact xfsprogs and kernel versions
-are recorded by CI; a plain `mkfs.xfs -f` image without `parent=0` is the
-acceptance fixture, not a hand-edited feature-bit hack.
+Status: **Supported writable profile (RW-6E).**  The modern parent-pointer
+profile is inside the supported writable allow-list when it stays within the
+documented single-device/internal-log geometry.  The exact xfsprogs and kernel
+versions are recorded by CI; a plain `mkfs.xfs -f` image without `parent=0`
+is the acceptance fixture, not a hand-edited feature-bit hack.
 
 ## Why this note exists
 
@@ -68,14 +68,14 @@ refused before the first write.
 * `XFS_SB_FEAT_INCOMPAT_LOG_XATTRS` (logged extended attributes), independent
   of parent pointers;
 * one internal log, one data device, no realtime device;
-* `dirblklog == blocklog` (one filesystem block per directory block).
+* `dirblklog == 0` (one filesystem block per directory block).
 
 Refused before the first write:
 
 * metadir, zoned and needs-repair;
 * quotas, realtime devices, external logs, unsupported log-incompat bits;
 * allocation groups of 2^31 blocks or more (reflink's CoW flag uses bit 31);
-* `dirblklog != blocklog` and `asciici`;
+* `dirblklog != 0` and `asciici`;
 * exchange-range *operations*: a log containing XMI/XMD is refused rather than
   replayed halfway.
 
@@ -97,7 +97,7 @@ The image must:
 
 1. contain the PARENT incompat bit (and exchange-range, as mkfs couples them);
 2. stay within the supported geometry above;
-3. mount read-write through this build with ordinary `--rw-experimental`;
+3. mount read-write through this build with ordinary `--rw`;
 4. pass `xfswin check`, the independent Python parent oracle, a Linux kernel
    mount, `xfs_repair -n` and `xfs_scrub` (when available).
 
@@ -187,7 +187,7 @@ for the measured coverage and remaining qualification gates.
 ## Consequences for compatibility claims
 
 * A plain modern `mkfs.xfs -f` image is the primary RW-6E fixture.  It is
-  accepted by ordinary `--rw-experimental` after the feature measurement and
+  accepted by ordinary `--rw` after the feature measurement and
   the parent audit pass.
 * An image formatted with `-n parent=0` remains a valid subset.
 * The exact qualified xfsprogs/kernel versions, and the full feature list, must

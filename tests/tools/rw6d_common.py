@@ -61,7 +61,7 @@ class Cli:
         self.exe = os.path.abspath(exe)
         self.image = os.path.abspath(image)
         self.work_dir = os.path.abspath(work_dir)
-        self.options = list(options or ["--rw-experimental"])
+        self.options = list(options or ["--rw"])
         os.makedirs(self.work_dir, exist_ok=True)
 
     def check(self):

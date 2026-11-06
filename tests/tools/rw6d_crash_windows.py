@@ -313,45 +313,45 @@ def apply_operation_args(kind, image, work):
     if kind == "set-short":
         return ["xattr", "set", image, "/short", "user.crash",
                 "--value-file=" + _value(work, b"crash-short"),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "set-remote":
         return ["xattr", "set", image, "/short", "user.crash-remote",
                 "--value-file=" + _value(work, pattern(9000, 0xd101)),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "replace-remote":
         return ["xattr", "set", image, "/remote", "user.remote",
                 "--value-file=" + _value(work, pattern(12000, 0xd102)),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "remote-to-local":
         return ["xattr", "set", image, "/remote", "user.remote",
                 "--value-file=" + _value(work, b"local-now"),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "remove-local":
         return ["xattr", "remove", image, "/remote", "user.local",
-                "--rw-experimental"]
+                "--rw"]
     if kind == "remove-remote":
         return ["xattr", "remove", image, "/remote", "user.remote2",
-                "--rw-experimental"]
+                "--rw"]
     if kind == "node-grow":
         return ["xattr", "set", image, "/node", "user.crash",
                 "--value-file=" + _value(work, pattern(600, 0xd103)),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "node-shrink":
         return ["xattr", "remove", image, "/node", "user.n050",
-                "--rw-experimental"]
+                "--rw"]
     if kind == "bmbt-add":
         return ["xattr", "set", image, "/bmbt", "user.crash",
                 "--value-file=" + _value(work, pattern(200, 0xd104)),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "dir-add":
         return ["xattr", "set", image, "/dir", "user.crash",
                 "--value-file=" + _value(work, pattern(100, 0xd105)),
-                "--rw-experimental"]
+                "--rw"]
     if kind == "delete":
-        return ["unlink", image, "/del", "--rw-experimental"]
+        return ["unlink", image, "/del", "--rw"]
     if kind == "rename":
         return ["rename", image, "/rename", "/renamed-crash",
-                "--rw-experimental"]
+                "--rw"]
     raise SystemExit("unknown crash operation %s" % kind)
 
 

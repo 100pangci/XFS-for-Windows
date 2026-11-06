@@ -113,14 +113,15 @@ void XfsFilesystem::CacheDirectoryRemove(uint64_t ino,
 
 void XfsFilesystem::MarkDeferredTimes(uint64_t ino,
                                       const XfsTimestamp& now) const {
-  // Drop the cached XfsFileInfo first so GetFileInfo rebuilds it through the
-  // OpenInode overlay. (Cache lock before the deferred lock, matching OpenInode.)
-  {
-    std::lock_guard<xfs::conc::Mutex> cache_lock(cache_mutex_);
-    info_cache_.erase(ino);
-  }
-  std::lock_guard<xfs::conc::Mutex> lock(deferred_mutex_);
+  // Publish the deferred timestamp and drop the cached XfsFileInfo as one
+  // critical section (cache lock before the deferred lock, matching
+  // GetFileInfo's insertion path).  If these were separate, a GetFileInfo
+  // that rebuilt the old inode in between could publish it after the erase and
+  // keep serving the stale mtime until the next metadata generation bump.
+  std::lock_guard<xfs::conc::Mutex> cache_lock(cache_mutex_);
+  std::lock_guard<xfs::conc::Mutex> deferred_lock(deferred_mutex_);
   deferred_times_[ino] = now;
+  info_cache_.erase(ino);
 }
 
 Status XfsFilesystem::CommitDeferredTimesUnderInodeLock(uint64_t ino) {

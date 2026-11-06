@@ -122,6 +122,10 @@ struct AdapterState {
   // "clear the whole map at 32768 entries" cache cliff.
   struct PathCacheEntry {
     uint64_t ino = 0;
+    // Inode generation at resolution time.  An inode number can be reused
+    // after its last close; the random di_gen lets a memoized path detect that
+    // the number now names a different file.
+    uint32_t generation = 0;
     std::list<std::wstring>::iterator lru;
   };
   std::unordered_map<std::wstring, PathCacheEntry> path_inode_cache;
@@ -234,7 +238,8 @@ NTSTATUS NtFromError(AdapterState& state, XfsError code) {
     // conversion transaction that this build does not implement yet.
     case XfsError::kWriteExtendsFile:
     case XfsError::kWriteNeedsAllocation:
-    case XfsError::kWriteNeedsConversion: return STATUS_NOT_SUPPORTED;
+    case XfsError::kWriteNeedsConversion:
+    case XfsError::kWriteNeedsCow: return STATUS_NOT_SUPPORTED;
     case XfsError::kNoSpace: return STATUS_DISK_FULL;
     case XfsError::kDirtyLog:
     case XfsError::kNeedsRepair: return STATUS_VOLUME_DIRTY;
@@ -315,11 +320,13 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   PerfStats& perf = PerfStats::Get();
   const bool perf_on = perf.enabled();
   uint64_t cached_ino = 0;
+  uint32_t cached_generation = 0;
   {
     std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.path_inode_cache.find(key);
     if (it != state.path_inode_cache.end()) {
       cached_ino = it->second.ino;
+      cached_generation = it->second.generation;
       state.path_cache_lru.splice(state.path_cache_lru.begin(),
                                   state.path_cache_lru, it->second.lru);
       it->second.lru = state.path_cache_lru.begin();
@@ -327,12 +334,14 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
   }
   if (cached_ino != 0) {
     auto inode = state.fs->OpenInode(cached_ino);
-    if (inode.ok()) {
+    if (inode.ok() && inode.value().gen == cached_generation) {
       if (perf_on) {
         perf.path_cache_hits.fetch_add(1, std::memory_order_relaxed);
       }
       return inode;
     }
+    // Missing, or the inode number was freed and reused for another file:
+    // the memoized path is no longer evidence for what that number names.
     std::lock_guard<xfs::conc::Mutex> lock(state.node_mutex);
     auto it = state.path_inode_cache.find(key);
     if (it != state.path_inode_cache.end()) {
@@ -359,6 +368,7 @@ Result<XfsInode> ResolvePathCached(AdapterState& state, PWSTR file_name) {
     state.path_cache_lru.push_front(key);
     state.path_inode_cache.emplace(
         key, AdapterState::PathCacheEntry{inode.value().ino,
+                                          inode.value().gen,
                                           state.path_cache_lru.begin()});
   }
   return inode;
@@ -2605,7 +2615,7 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
                           << " at " << WideToUtf8(config.mount_point)
                           << " (uuid " << FormatUuid(sb.uuid) << ")");
   if (config.read_write) {
-    XFS_WARN("read-write mount: experimental writer; create, overwrite, "
+    XFS_WARN("read-write mount: supported profile; create, overwrite, "
              "extend, truncate, delete, rename, hard links, symlinks, xattrs "
              "and reflinks are enabled (real disks require "
              "--device-write-qualification)");

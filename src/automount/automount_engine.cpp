@@ -344,7 +344,7 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     // mount's Note.  It has to include the drive-letter explanation (taken
     // over / preferred letter occupied), not only the read-only fallback.
     mount.mode_note = CombineNotes(session.drive_note, session.mode_note);
-    mount.read_write = session.mode == AutomountMode::kExperimentalReadWrite;
+    mount.read_write = session.mode == AutomountMode::kReadWrite;
     mount.drive_taken_over = TakeoverWasOwned(session.takeover);
     mount.original_windows_drive = session.takeover.original_drive;
     mount.device_path = session.location.disk_path;
@@ -689,7 +689,7 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     // profile) remain absolute and are not softened by the fallback.
     std::string mismatch;
     if (!EntryIdentityMatches(entry, filesystem->location, &mismatch) &&
-        entry.mode != AutomountMode::kExperimentalReadWrite) {
+        entry.mode != AutomountMode::kReadWrite) {
       es.state = AutomountEntryState::kRefused;
       es.detail = mismatch;
       LogEntryRefusal(entry, "identity:" + mismatch, "refused", mismatch);
@@ -966,12 +966,12 @@ bool AutomountEngine::ChooseDrive(const DiscoveredFilesystem& filesystem,
 AutomountMode AutomountEngine::EffectiveMode(
     const AutomountEntry& entry, const DiscoveredFilesystem& filesystem,
     std::string* note) const {
-  if (entry.mode != AutomountMode::kExperimentalReadWrite) {
+  if (entry.mode != AutomountMode::kReadWrite) {
     return AutomountMode::kReadOnly;
   }
   std::string mismatch;
   if (EntryIdentityMatches(entry, filesystem.location, &mismatch)) {
-    return AutomountMode::kExperimentalReadWrite;
+    return AutomountMode::kReadWrite;
   }
   if (note) {
     *note = "The configured read-write identity does not match this device (" +
@@ -1070,10 +1070,10 @@ bool AutomountEngine::EntryPolicyAccepts(
     }
   }
 
-  if (entry.mode != AutomountMode::kExperimentalReadWrite) {
+  if (entry.mode != AutomountMode::kReadWrite) {
     return true;
   }
-  if (effective_mode != AutomountMode::kExperimentalReadWrite) {
+  if (effective_mode != AutomountMode::kReadWrite) {
     // The identity pins did not match, so the entry runs read-only.  The
     // read-only policy has no class, system/pagefile or writable-profile
     // requirements beyond the journal and XFS verification already checked.

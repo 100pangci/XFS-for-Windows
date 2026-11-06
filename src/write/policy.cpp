@@ -72,6 +72,36 @@ Status CheckWritableProfile(const XfsSuperblock& sb, const XfsGeometry& geo,
         .Metadata("superblock")
         .Actual(geo.agblocks);
   }
+  // The documented writable profile is ftype=1 with 512-byte filesystem and
+  // log sectors.  The writer never exercised ftype=0 directories, alternate
+  // filesystem sector sizes or a striped log, so those inputs stay read-only
+  // instead of being accepted by accident.
+  if (!sb.features.ftype) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "directory ftype is disabled; only ftype=1 is supported "
+                   "for read-write")
+        .Metadata("superblock");
+  }
+  // A zero sb_logsectsize means the legacy/default 512-byte log sector.
+  const uint16_t log_sector_size = sb.logsectsize == 0 ? 512 : sb.logsectsize;
+  if (sb.sectsize != 512 || log_sector_size != 512) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "only 512-byte filesystem and log sectors are supported "
+                   "for read-write")
+        .Metadata("superblock")
+        .Expected(512)
+        .Actual(sb.sectsize == 512 ? log_sector_size : sb.sectsize);
+  }
+  // Linux mkfs writes sb_logsunit = 1 for a v2 log that has no stripe unit
+  // (xfs_mkfs.c); 0 is the legacy encoding for the same state.  The kernel
+  // only treats values above 1 as a real log stripe unit (xfs_log_rlimit.c,
+  // xfs_log.c), so both 0 and 1 mean "no stripe unit" and stay writable.
+  if (sb.logsunit > 1) {
+    return XFS_ERR(XfsError::kUnsupportedGeometry,
+                   "log stripe units are not supported for read-write")
+        .Metadata("superblock")
+        .Actual(sb.logsunit);
+  }
   if (sb.features.incompat_unknown) {
     return XFS_ERR(XfsError::kUnsupportedFeature,
                    "unknown incompatible features " +

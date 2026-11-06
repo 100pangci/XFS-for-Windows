@@ -370,8 +370,8 @@ states that CI did not prove real 4Kn hardware.
 
 | Target | Read-only | Writable |
 | --- | --- | --- |
-| image file | allowed | `--rw-experimental` |
-| attached VHD/VHDX | allowed | `--rw-experimental --device-write-qualification` |
+| image file | allowed | `--rw` |
+| attached VHD/VHDX | allowed | `--rw --device-write-qualification` |
 | removable disk | allowed | additionally `--allow-removable-disk-write` |
 | fixed disk | allowed | additionally `--allow-fixed-disk-write` (qualification only) |
 | mounted volume | read-only only; writable volume format/mount is refused | — |

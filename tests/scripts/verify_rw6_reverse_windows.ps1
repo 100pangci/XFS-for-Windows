@@ -32,11 +32,11 @@ Invoke-Ok 'read symlink' @('cat', $Image, '/linux/link')
 
 # One more Windows mutation after the Linux pass.
 Invoke-Ok 'create /win/after-linux.bin' @('create', $Image,
-    '/win/after-linux.bin', '--rw-experimental')
+    '/win/after-linux.bin', '--rw')
 Invoke-Ok 'write after-linux' @('pwrite', $Image, '/win/after-linux.bin', '0',
-    '--rw-experimental', '--text=windows-after-linux')
+    '--rw', '--text=windows-after-linux')
 Invoke-Ok 'truncate linux file' @('truncate', $Image, '/linux/reverse.bin',
-    '1024', '--rw-experimental')
+    '1024', '--rw')
 Invoke-Ok 'final check' @('check', $Image)
 & python (Join-Path $repo 'tests/tools/rw6_inode_probe.py') $Image
 if ($LASTEXITCODE -ne 0) { throw 'oracle rejected the final image' }

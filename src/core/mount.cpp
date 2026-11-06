@@ -36,19 +36,44 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
   if (!device) {
     return XFS_ERR(XfsError::kInvalidArgument, "no block device supplied");
   }
+  // A writable mount must never trust an unverified superblock.  verify_crc is
+  // a read-only diagnostics option; allowing it for read-write would skip the
+  // checksum that protects every geometry and feature decision below.
+  if (options.read_write && !options.verify_crc) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "read-write mounts require superblock CRC verification")
+        .Metadata("superblock");
+  }
   auto sb_result = ReadSuperblock(*device, 0, options.verify_crc);
   if (!sb_result.ok()) return sb_result.error();
   XfsSuperblock sb = std::move(sb_result.value());
+
+  // Identity pin, checked before CheckMountable and before any recovery path
+  // can write.  Discovery and automount use it to bind the open device to the
+  // filesystem they identified.
+  if (options.expected_uuid && !UuidEqual(sb.uuid, *options.expected_uuid)) {
+    return XFS_ERR(XfsError::kBadUuid,
+                   "the device contains filesystem " + FormatUuid(sb.uuid) +
+                       ", expected " + FormatUuid(*options.expected_uuid))
+        .Metadata("superblock");
+  }
 
   Status mountable = CheckMountable(sb);
   if (!mountable.ok()) return mountable.error();
 
   XfsGeometry geo = MakeGeometry(sb);
-  if (geo.dblocks * geo.block_size > device->Size()) {
+  // dblocks * block_size can overflow uint64 for a structurally valid but
+  // enormous geometry (for example 2^52 blocks of 4 KiB = 2^64 bytes).
+  // Divide instead of multiplying so the check itself cannot wrap to zero and
+  // let an image smaller than its declared filesystem through.
+  const uint64_t device_size = device->Size();
+  if (geo.block_size == 0 ||
+      geo.dblocks > device_size / geo.block_size) {
     return XFS_ERR(XfsError::kCorruptSuperblock,
-                   "filesystem larger than the device")
-        .Expected(device->Size())
-        .Actual(geo.dblocks * geo.block_size);
+                   "filesystem larger than the device (or its byte size "
+                   "overflows)")
+        .Expected(device_size)
+        .Actual(geo.dblocks);
   }
 
   auto fs = std::unique_ptr<XfsFilesystem>(new XfsFilesystem());
@@ -96,6 +121,24 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         .Ino(fs->geometry_.rootino);
   }
 
+  // Every recovery-induced write, including the AGI unlinked-list completion
+  // that a clean-log `recover` performs, must first pass the same writable
+  // profile gate as a normal read-write mount.  Build the refusal once so the
+  // clean-log, dirty-log and post-recovery paths cannot drift apart.
+  auto check_writable_profile = [&]() -> Status {
+    Status profile = CheckWritableProfile(
+        fs->superblock_, fs->geometry_, options.recovery_only,
+        options.allow_rmapbt_qualification, options.recovery_only,
+        options.allow_reflink_qualification,
+        options.allow_parent_qualification);
+    if (profile.ok()) return profile;
+    auto error = profile.error();
+    error.message +=
+        " (read-only access is unaffected; mount without the "
+        "read-write option)";
+    return Status(std::move(error));
+  };
+
   // Log state: scanned and validated with the recovery engine (RW-5). A
   // read-write mount replays a dirty log; a read-only mount refuses unless the
   // caller explicitly asked for the unsafe pre-recovery view.
@@ -122,6 +165,11 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         // record behind the newest good one reads as clean to the scanner but
         // not to the record-latest classifier.
         if (options.read_write && options.clean_log_after_recovery) {
+          // RecoverScannedLog processes the AGI unlinked lists with
+          // transactions even for a clean log; refuse an unsupported profile
+          // before that first write, exactly as the dirty-log path does.
+          Status profile = check_writable_profile();
+          if (!profile.ok()) return profile.error();
           auto report = fs->RecoverScannedLog(log, RecoveryFinish::kCleanLog);
           if (!report.ok()) return report.error();
           recovered = true;
@@ -141,18 +189,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
         if (can_recover) {
           // Never recover a filesystem this build would then refuse to
           // modify: check the profile first.
-          Status profile = CheckWritableProfile(
-              fs->superblock_, fs->geometry_, options.recovery_only,
-              options.allow_rmapbt_qualification, options.recovery_only,
-              options.allow_reflink_qualification,
-              options.allow_parent_qualification);
-          if (!profile.ok()) {
-            auto error = profile.error();
-            error.message +=
-                " (read-only access is unaffected; mount without the "
-                "read-write option)";
-            return error;
-          }
+          Status profile = check_writable_profile();
+          if (!profile.ok()) return profile.error();
           auto report = fs->RecoverScannedLog(
               log, options.clean_log_after_recovery
                        ? RecoveryFinish::kCleanLog
@@ -216,18 +254,8 @@ Result<std::unique_ptr<XfsFilesystem>> XfsFilesystem::Mount(
                      "(recovery was disabled with recover_dirty_log=false)")
           .Metadata("log");
     }
-    Status profile = CheckWritableProfile(
-        fs->superblock_, fs->geometry_, options.recovery_only,
-        options.allow_rmapbt_qualification, options.recovery_only,
-        options.allow_reflink_qualification,
-        options.allow_parent_qualification);
-    if (!profile.ok()) {
-      auto error = profile.error();
-      error.message +=
-          " (read-only access is unaffected; mount without the read-write "
-          "option)";
-      return error;
-    }
+    Status profile = check_writable_profile();
+    if (!profile.ok()) return profile.error();
     // A writable mount must never proceed on a namespace whose forward
     // dirents and reverse parent pointers already disagree.  Recovery has
     // finished at this point, so this is a clean preflight over committed

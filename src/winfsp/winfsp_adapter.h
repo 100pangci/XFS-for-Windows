@@ -1,8 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-// XFS for Windows - WinFsp native API adapter (read-only and experimental
-// read-write for an image or a qualified raw device).
+// XFS for Windows - WinFsp native API adapter (read-only, or read-write for
+// the supported profile on an image or a qualified raw device).
 #pragma once
 
 #ifdef XFSWIN_HAS_WINFSP

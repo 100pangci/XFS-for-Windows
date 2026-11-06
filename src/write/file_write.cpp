@@ -214,6 +214,8 @@ bool IsWrittenExtentForBlock(const std::vector<XfsExtent>& extents,
   return true;
 }
 
+}  // namespace
+
 // True when any written file-data extent in [first_block, last_block] has a
 // shared refcountbt record.  Reads the typed trees directly (the caller has no
 // open transaction yet); an unreadable tree is an error, never "not shared".
@@ -250,8 +252,6 @@ Result<bool> RangeHasSharedData(BlockDevice& dev, const XfsGeometry& geo,
   }
   return false;
 }
-
-}  // namespace
 
 Status XfsFilesystem::CleanupCowStagingLocked(
     const std::vector<CowRun>& runs) {

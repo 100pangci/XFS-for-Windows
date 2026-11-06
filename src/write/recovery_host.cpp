@@ -48,6 +48,7 @@
 #include "xfs/rmap_intent.h"
 #include "xfs/parent.h"
 #include "xfs/transaction.h"
+#include "xfs/write.h"
 #include "xfs/xattr_intent.h"
 #include "write/xattr_write_internal.h"
 
@@ -96,8 +97,12 @@ Result<XfsFilesystem::RecoverySummary> XfsFilesystem::AnalyzeJournal() const {
     // Unresolved intents the completion pass cannot finish are a refusal too:
     // the scan only proves the replay half can be done.
     for (const PendingIntent& intent : CollectPendingIntents(log)) {
+      // ATTRI is completed by the same deferred-intent pass as EFI/RUI/CUI/
+      // BUI; leaving it out made `xfswin check` report a recoverable log as
+      // unsupported even though mount/recover can finish it.
       if (intent.type == lf::kItemEfi || intent.type == lf::kItemRui ||
-          intent.type == lf::kItemCui || intent.type == lf::kItemBui) {
+          intent.type == lf::kItemCui || intent.type == lf::kItemBui ||
+          intent.type == lf::kItemAttri) {
         continue;
       }
       summary.unsupported_items.push_back(
@@ -114,6 +119,24 @@ Result<XfsFilesystem::RecoveryReport> XfsFilesystem::RecoverJournal(
     return XFS_ERR(XfsError::kReadOnlyVolume,
                    "journal recovery needs a writable device")
         .Metadata("log");
+  }
+  if (!superblock_.crc_verified) {
+    return XFS_ERR(XfsError::kUnsupportedFeature,
+                   "journal recovery requires a verified superblock CRC")
+        .Metadata("superblock");
+  }
+  // Recovery writes metadata and completion transactions, so it is subject to
+  // the same writable-profile allow-list as a read-write mount.  A caller that
+  // mounted with check_log=false could otherwise replay an unsupported image.
+  Status profile = CheckWritableProfile(
+      superblock_, geometry_, options_.recovery_only,
+      options_.allow_rmapbt_qualification, options_.recovery_only,
+      options_.allow_reflink_qualification,
+      options_.allow_parent_qualification);
+  if (!profile.ok()) {
+    auto error = profile.error();
+    error.message += " (journal recovery is a read-write operation)";
+    return error;
   }
   auto scan = ScanLog(*device_, superblock_, geometry_);
   if (!scan.ok()) return scan.error();
@@ -766,10 +789,13 @@ Result<uint64_t> XfsFilesystem::ProcessAgiUnlinkedLists(
   for (uint32_t agno = 0; agno < geometry_.agcount; ++agno) {
     auto agi = ReadAgi(*device_, geometry_, agno);
     if (!agi.ok()) {
-      XFS_WARN("recovery: cannot read AGI " << agno << ": "
-                                            << agi.error().message
-                                            << "; skipping its unlinked lists");
-      continue;
+      // A mount must not become writable while an AG's unlinked list is
+      // unreadable: an I/O error here leaves zero-link inodes that the
+      // filesystem claims to have processed.  Fail recovery and keep the log
+      // authoritative instead of skipping the AG.
+      XFS_ERROR("recovery: cannot read AGI " << agno << ": "
+                                             << agi.error().Format());
+      return agi.error();
     }
     for (uint32_t bucket = 0; bucket < ondisk::kAgiUnlinkedBuckets; ++bucket) {
       for (uint32_t step = 0; step < kMaxWalk; ++step) {

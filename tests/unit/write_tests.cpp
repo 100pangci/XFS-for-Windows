@@ -198,6 +198,8 @@ TEST(writable_profile_allow_list) {
   sb.features2 = ondisk::kVersion2Crc | ondisk::kVersion2Ftype;
   sb.features_incompat = ondisk::kIncompatFtype;
   sb.features.ftype = true;
+  sb.sectsize = 512;
+  sb.logsectsize = 512;
   sb.logstart = 4;
   sb.logblocks = 512;
   XfsGeometry geo = MakeGeometry(sb);
@@ -300,6 +302,18 @@ TEST(writable_profile_allow_list) {
   quota_inode.uquotino = 70;
   CHECK(!CheckWritableProfile(quota_inode, MakeGeometry(quota_inode)).ok());
 
+  // sb_logsunit is "no log stripe unit" when it is 0 or 1: legacy images use
+  // 0, Linux mkfs writes 1 for a v2 log without a stripe unit, and the kernel
+  // only treats values above 1 as a real stripe unit.  Both must be writable;
+  // a real stripe unit is refused below.
+  XfsSuperblock no_log_stripe = sb;
+  no_log_stripe.logsunit = 0;
+  CHECK(CheckWritableProfile(no_log_stripe,
+                             MakeGeometry(no_log_stripe)).ok());
+  no_log_stripe.logsunit = 1;
+  CHECK(CheckWritableProfile(no_log_stripe,
+                             MakeGeometry(no_log_stripe)).ok());
+
   // Geometry-level refusals.
   struct Case {
     const char* what;
@@ -316,6 +330,9 @@ TEST(writable_profile_allow_list) {
       {"log-incompat",
        [](XfsSuperblock& s) { s.features_log_incompat = 0x2; }},
       {"asciici", [](XfsSuperblock& s) { s.features.asciici = true; }},
+      {"ftype", [](XfsSuperblock& s) { s.features.ftype = false; }},
+      {"sector", [](XfsSuperblock& s) { s.sectsize = 4096; }},
+      {"log stripe", [](XfsSuperblock& s) { s.logsunit = 4096; }},
   };
   for (const auto& test : cases) {
     XfsSuperblock copy = sb;

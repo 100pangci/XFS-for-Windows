@@ -166,7 +166,7 @@ def main():
         # An inode-only create need not touch rmapbt at all. Allocate data for
         # an AG0 file so the corrupted AG0 tree is actually loaded/edited.
         allocation = ("fallocate", target, "/small/s00.bin", 1048576, 4096,
-                      "--rw-experimental")
+                      "--rw")
         control = invoke(args.exe, *allocation)
         assert control.returncode == 0, control.stdout + control.stderr
         cases = metadata_faults(source, args.exe)
@@ -190,7 +190,7 @@ def main():
         before = digest(target)
         if args.kind == "metadata":
             command = case[3]
-            result = (invoke(args.exe, command[0], target, *command[1:], "--rw-experimental")
+            result = (invoke(args.exe, command[0], target, *command[1:], "--rw")
                       if command else invoke(args.exe, *allocation))
         else:
             # Verify the injected log is still CRC-valid and reconstructable.

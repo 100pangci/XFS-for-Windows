@@ -161,6 +161,10 @@ struct DeviceOpenPolicy {
   std::string expected_serial;
   std::string expected_stable_id;
   uint64_t expected_size_bytes = 0;
+  // Optional live device-class pin.  The backend classifies the device it has
+  // just opened and fails the open when the class differs.  This closes the
+  // gap between a discovery snapshot and the raw open that actually writes.
+  DeviceClass expected_device_class = DeviceClass::kUnknown;
 
   // Conservative policy for an ordinary image-file read-write mount.
   static DeviceOpenPolicy ImageFileWritable() {
@@ -185,6 +189,11 @@ struct DeviceOpenPolicy {
     return policy;
   }
 };
+
+// Compares the class the backend actually classified for an opened device
+// with the optional class pin.  Returns kOk when the pin is kUnknown.
+Status ValidateExpectedDeviceClass(DeviceClass actual,
+                                   const DeviceOpenPolicy& policy);
 
 // ---------------------------------------------------------------------------
 // Geometry and request validation

@@ -689,6 +689,15 @@ std::unique_ptr<WindowsRawBlockDevice> WindowsRawBlockDevice::Open(
     device_class = ClassifyDisk(removable_media, bus_type);
   }
 
+  // The class enrollment was qualified against must be the class of the
+  // device this handle actually opened, not merely the class seen by an
+  // earlier discovery pass.
+  Status class_pin = ValidateExpectedDeviceClass(device_class, effective);
+  if (!class_pin.ok()) {
+    return close_and_fail(class_pin.error().message + " (path " +
+                          WideToUtf8(path) + ")");
+  }
+
   const bool is_disk = device_class == DeviceClass::kVirtualDisk ||
                        device_class == DeviceClass::kRemovableDisk ||
                        device_class == DeviceClass::kFixedDisk;

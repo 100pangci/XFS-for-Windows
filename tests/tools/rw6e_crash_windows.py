@@ -49,18 +49,18 @@ def main(argv):
     os.makedirs(args.work_dir, exist_ok=True)
 
     operations = [
-        ("create", ["create", "{img}", "/new", "--rw-experimental"]),
-        ("mkdir", ["mkdir", "{img}", "/newdir", "--rw-experimental"]),
+        ("create", ["create", "{img}", "/new", "--rw"]),
+        ("mkdir", ["mkdir", "{img}", "/newdir", "--rw"]),
         ("link", ["link", "{img}", "/d2/moved2", "/d1/linknew",
-                  "--rw-experimental"]),
-        ("unlink", ["unlink", "{img}", "/d1/x", "--rw-experimental"]),
+                  "--rw"]),
+        ("unlink", ["unlink", "{img}", "/d1/x", "--rw"]),
         ("rename", ["rename", "{img}", "/d1/x", "/d2/x2",
-                    "--rw-experimental"]),
+                    "--rw"]),
         ("replace", ["rename", "{img}", "/d1/x", "/d2/victim", "--replace",
-                     "--rw-experimental"]),
+                     "--rw"]),
         ("directory_move", ["rename", "{img}", "/d1/sub", "/d2/sub2",
-                            "--rw-experimental"]),
-        ("rmdir", ["rmdir", "{img}", "/d1/empty", "--rw-experimental"]),
+                            "--rw"]),
+        ("rmdir", ["rmdir", "{img}", "/d1/empty", "--rw"]),
     ]
     results = []
     for label, template in operations:

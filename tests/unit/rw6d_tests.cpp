@@ -312,6 +312,14 @@ TEST(rw6d_node_tree_growth_and_shrink) {
         fork.format == XattrForkFormat::kNone ||
         fork.format == XattrForkFormat::kExtentsEmpty);
   CHECK(fork.entries.empty());
+  // When the last attribute is removed and the attr fork is released, the
+  // inode must carry the empty EXTENTS encoding, not the zero-filled FMT_DEV
+  // value: xfs_repair -n treats aformat 0 with forkoff 0 as corruption it
+  // would reset (Linux xfs_ifork_zap_attr() also leaves EXTENTS).
+  auto empty_inode = image.fs->OpenInode(ino);
+  CHECK(empty_inode.ok());
+  CHECK(empty_inode.value().forkoff == 0);
+  CHECK(empty_inode.value().aformat == di::kFormatExtents);
   Finish(image);
 }
 

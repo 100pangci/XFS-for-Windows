@@ -2,7 +2,7 @@
 
 Status: **implemented, with hosted Linux interoperability verified by
 [run 40221845841](https://github.com/100pangci/XFS-for-Windows/actions/runs/40221845841).** Ordinary
-`--rw-experimental` now accepts a parent-pointer filesystem once the profile
+`--rw` now accepts a parent-pointer filesystem once the profile
 passes `CheckWritableProfile`. The evidence below distinguishes the passing
 interoperability workload from still-pending recovery and stress gates; a green
 CI run does not close every qualification row.
@@ -323,7 +323,7 @@ tested commit `e9993b31bdf39f00ac16439457a6571920eb0a38`:
   reported **5/5** edges/pointers for the modern formatter workload and
   **611/611** for the 1 KiB hardlink-heavy fixture.
 * `windows-rw6e-linux-roundtrip`: Windows accepted the Linux-created image
-  with ordinary `--rw-experimental`, mutated its namespace, and passed
+  with ordinary `--rw`, mutated its namespace, and passed
   `check --parents` and the Python oracle: **1023/1023** edges/pointers,
   with no parent-audit errors.
 * `linux-verify-rw6e-mutation`: the kernel verified the original 1011-entry,

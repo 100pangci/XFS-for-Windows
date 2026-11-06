@@ -1523,7 +1523,12 @@ class XattrWriter {
       Status s = DropAllAttrBlocks();
       if (!s.ok()) return s;
       target_forkoff_ = 0;
-      target_aformat_ = 0;
+      // An empty attr fork is EXTENTS, not the zero-filled FMT_DEV value.
+      // Linux's xfs_ifork_zap_attr() resets the released fork to EXTENTS, and
+      // xfs_repair -n reports aformat 0 with forkoff 0 as corruption that it
+      // "would reset".  Writing 0 here made otherwise valid images fail the
+      // Linux repair oracle.
+      target_aformat_ = di::kFormatExtents;
       target_anextents_ = 0;
       attr_image_.clear();
       attr_fields_ = 0;

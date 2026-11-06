@@ -351,7 +351,8 @@ Result<std::vector<uint64_t>> XfsFilesystem::ListAllocatedInodesLocked()
   BlockDevice& dev = *device_;
   uint64_t sb_lsn = superblock_.lsn;
   auto live_sb = ReadSuperblock(dev, 0, /*verify_crc=*/true);
-  if (live_sb.ok()) sb_lsn = live_sb.value().lsn;
+  if (!live_sb.ok()) return live_sb.error();
+  sb_lsn = live_sb.value().lsn;
   for (uint32_t agno = 0; agno < geo.agcount; ++agno) {
     auto headers = ReadAgHeaders(dev, geo, agno);
     if (!headers.ok()) return headers.error();
@@ -438,14 +439,19 @@ CheckReport XfsFilesystem::CheckConsistencyLocked(
   BlockDevice& dev = *device_;
 
   // Counters and the metadata LSN move with every mutation, so read the
-  // primary superblock again instead of trusting the mount-time copy.
+  // primary superblock again instead of trusting the mount-time copy.  An
+  // unreadable or invalid primary is a corruption result, never a reason to
+  // report the stale mount-time copy as OK.
   XfsSuperblock live_sb = superblock_;
   auto fresh_sb = ReadSuperblock(dev, 0, /*verify_crc=*/true);
-  if (fresh_sb.ok()) live_sb = fresh_sb.value();
-
-  report.Add("superblock", CheckStatus::kOk,
-             "magic/uuid/geometry OK, crc " +
-                 std::string(live_sb.crc_verified ? "verified" : "skipped"));
+  if (fresh_sb.ok()) {
+    live_sb = fresh_sb.value();
+    report.Add("superblock", CheckStatus::kOk,
+               "magic/uuid/geometry OK, crc " +
+                   std::string(live_sb.crc_verified ? "verified" : "skipped"));
+  } else {
+    report.Add("superblock", CheckStatus::kCorrupt, fresh_sb.error().Format());
+  }
 
   // Secondary superblocks.
   if (options.secondary_superblocks && geo.agcount > 1) {

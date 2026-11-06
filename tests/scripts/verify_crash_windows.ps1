@@ -77,7 +77,7 @@ foreach ($point in $points) {
     $image = Join-Path $WorkDir ("crash-" + $point.name + ".img")
     Copy-Item $pristine $image -Force
     $env:XFSWIN_CRASH_AT = $point.name
-    $output = & $Exe pwrite $image /hello.bin $data_offset --from=$overlay --rw-experimental 2>&1
+    $output = & $Exe pwrite $image /hello.bin $data_offset --from=$overlay --rw 2>&1
     $code = $LASTEXITCODE
     Remove-Item Env:XFSWIN_CRASH_AT
     $crashed = $false

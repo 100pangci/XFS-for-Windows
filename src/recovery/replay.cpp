@@ -752,34 +752,64 @@ void LogDinodeToDisk(const uint8_t* log, size_t log_size, uint8_t* disk,
 
 // xfs_bmbt_to_bmdr(): the logged data-fork btree root is a full btree block;
 // the inode fork stores the short header followed by fixed max-record key and
-// pointer arrays (the fork is sized for maxrecs, not numrecs).
-void BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
-                size_t dst_len) {
-  if (src_len < ondisk::btree::kLHeaderLenV5 || dst_len < 4) return;
+// pointer arrays (the fork is sized for maxrecs, not numrecs).  A root that
+// cannot be represented must fail the replay: silently keeping the old fork
+// root would apply only part of the logged inode change.
+Status BmbtToBmdr(const uint8_t* src, size_t src_len, uint8_t* dst,
+                  size_t dst_len) {
+  if (src_len < ondisk::btree::kLHeaderLenV5 || dst_len < 4) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "logged inode btree root region is truncated")
+        .Metadata("log item");
+  }
   const uint16_t level = GetBE16(src, ondisk::btree::kLevel);
   const uint16_t numrecs = GetBE16(src, ondisk::btree::kNumrecs);
   const size_t dst_maxrecs = (dst_len - 4) / 16;
-  if (numrecs > dst_maxrecs) return;
+  if (numrecs > dst_maxrecs) {
+    return XFS_ERR(XfsError::kCorruptInode,
+                   "logged inode btree root has more records than the inode "
+                   "fork can hold")
+        .Expected(dst_maxrecs)
+        .Actual(numrecs)
+        .Metadata("log item");
+  }
+  const size_t key_base = ondisk::btree::kLHeaderLenV5;
+  if (key_base > src_len ||
+      numrecs > (src_len - key_base) / ondisk::btree::kBmbtKeySize) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "logged inode btree root key array is truncated")
+        .Metadata("log item");
+  }
+  const size_t ptr_base =
+      key_base + static_cast<size_t>(numrecs) *
+                     ondisk::btree::kBmbtKeySize;
+  if (ptr_base > src_len ||
+      numrecs > (src_len - ptr_base) / ondisk::btree::kBmbtPtrSize) {
+    return XFS_ERR(XfsError::kCorruptBtree,
+                   "logged inode btree root pointer array is truncated")
+        .Metadata("log item");
+  }
   PutBE16(dst, 0, level);
   PutBE16(dst, 2, numrecs);
-  const size_t key_base = ondisk::btree::kLHeaderLenV5;
-  const size_t ptr_base = key_base + static_cast<size_t>(numrecs) *
-                                          ondisk::btree::kBmbtKeySize;
   const size_t dst_key_base = 4;
   const size_t dst_ptr_base =
       dst_key_base + dst_maxrecs * ondisk::btree::kBmbtKeySize;
   for (uint16_t i = 0; i < numrecs; ++i) {
-    const size_t key_off = key_base + static_cast<size_t>(i) * 8;
-    const size_t ptr_off = ptr_base + static_cast<size_t>(i) * 8;
-    const size_t dst_key_off = dst_key_base + static_cast<size_t>(i) * 8;
-    const size_t dst_ptr_off = dst_ptr_base + static_cast<size_t>(i) * 8;
-    if (key_off + 8 > src_len || ptr_off + 8 > src_len) break;
-    if (dst_key_off + 8 > dst_len || dst_ptr_off + 8 > dst_len) break;
-    std::memcpy(dst + dst_key_off, src + key_off, 8);
+    const size_t key_off =
+        key_base + static_cast<size_t>(i) * ondisk::btree::kBmbtKeySize;
+    const size_t ptr_off =
+        ptr_base + static_cast<size_t>(i) * ondisk::btree::kBmbtPtrSize;
+    const size_t dst_key_off =
+        dst_key_base + static_cast<size_t>(i) * ondisk::btree::kBmbtKeySize;
+    const size_t dst_ptr_off =
+        dst_ptr_base + static_cast<size_t>(i) * ondisk::btree::kBmbtPtrSize;
+    std::memcpy(dst + dst_key_off, src + key_off,
+                ondisk::btree::kBmbtKeySize);
     // An internal bmbt pointer is a plain big-endian fsblock.  (Only leaf
     // records use the 128-bit packed startblock/blockcount form.)
     StoreBE64(dst + dst_ptr_off, GetBE64(src, ptr_off));
   }
+  return OkStatus();
 }
 
 struct InodeLogFormat {
@@ -1125,7 +1155,13 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
       }
       // The logged region is a full in-core root block (header + max keys).
       // Only the short bmdr that BmbtToBmdr builds has to fit the fork.
-      BmbtToBmdr(region.data(), region.size(), dfork, dfork_size);
+      Status converted = BmbtToBmdr(region.data(), region.size(), dfork,
+                                   dfork_size);
+      if (!converted.ok()) {
+        ErrorContext error = converted.error();
+        error.ino = in_f.ino;
+        return error;
+      }
     } else {
       if (region.size() > dfork_size) {
         return XFS_ERR(XfsError::kCorruptInode,
@@ -1152,7 +1188,13 @@ Status Replayer::ReplayInodeItem(const RecoveredItem& item,
             .Ino(in_f.ino)
             .Metadata("log item");
       }
-      BmbtToBmdr(region.data(), region.size(), afork, afork_size);
+      Status converted = BmbtToBmdr(region.data(), region.size(), afork,
+                                   afork_size);
+      if (!converted.ok()) {
+        ErrorContext error = converted.error();
+        error.ino = in_f.ino;
+        return error;
+      }
     } else {
       if (region.size() > afork_size) {
         return XFS_ERR(XfsError::kCorruptInode,

@@ -31,44 +31,44 @@ function Invoke-Ok([string]$what, [string[]]$arguments) {
 }
 
 Invoke-Ok 'check Linux source image' @('check', $image)
-Invoke-Ok 'mkdir /win' @('mkdir', $image, '/win', '--rw-experimental')
+Invoke-Ok 'mkdir /win' @('mkdir', $image, '/win', '--rw')
 Invoke-Ok 'create /win/created.bin' @('create', $image, '/win/created.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /win/created.bin' @('pwrite', $image, '/win/created.bin', '0',
-    '--rw-experimental', '--text=windows-rw6')
-Invoke-Ok 'mkdir /win/dir' @('mkdir', $image, '/win/dir', '--rw-experimental')
+    '--rw', '--text=windows-rw6')
+Invoke-Ok 'mkdir /win/dir' @('mkdir', $image, '/win/dir', '--rw')
 Invoke-Ok 'create /win/dir/nested.bin' @('create', $image,
-    '/win/dir/nested.bin', '--rw-experimental')
+    '/win/dir/nested.bin', '--rw')
 Invoke-Ok 'write /win/dir/nested.bin' @('pwrite', $image,
-    '/win/dir/nested.bin', '0', '--rw-experimental', '--text=nested')
+    '/win/dir/nested.bin', '0', '--rw', '--text=nested')
 Invoke-Ok 'create /win/renamed.bin' @('create', $image, '/win/renamed.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'write /win/renamed.bin' @('pwrite', $image, '/win/renamed.bin',
-    '0', '--rw-experimental', '--text=renamed-by-windows')
+    '0', '--rw', '--text=renamed-by-windows')
 Invoke-Ok 'link' @('link', $image, '/win/renamed.bin', '/win/hardlink.bin',
-    '--rw-experimental')
+    '--rw')
 Invoke-Ok 'symlink' @('symlink', $image, 'created.bin', '/win/link',
-    '--rw-experimental')
+    '--rw')
 
 # Many separated writes: NREXT64 extent counters must stay exact through the
 # extents -> btree conversion.
 Invoke-Ok 'create /win/many.bin' @('create', $image, '/win/many.bin',
-    '--rw-experimental')
+    '--rw')
 $block = 4096
 for ($i = 0; $i -lt 30; $i++) {
     Invoke-Ok "fragmented write $i" @('pwrite', $image, '/win/many.bin',
-        ([string]($i * 2 * $block)), '--rw-experimental', '--text=x')
+        ([string]($i * 2 * $block)), '--rw', '--text=x')
 }
 
 # Allocate/free enough inodes to create new chunks and return them, exercising
 # finobt insertion/deletion, inobt removal and the inobtcount accounting.
 for ($i = 0; $i -lt 300; $i++) {
     Invoke-Ok "churn create $i" @('create', $image,
-        ("/win/dir/c{0:D3}.bin" -f $i), '--rw-experimental')
+        ("/win/dir/c{0:D3}.bin" -f $i), '--rw')
 }
 for ($i = 0; $i -lt 300; $i++) {
     Invoke-Ok "churn unlink $i" @('unlink', $image,
-        ("/win/dir/c{0:D3}.bin" -f $i), '--rw-experimental')
+        ("/win/dir/c{0:D3}.bin" -f $i), '--rw')
 }
 
 Invoke-Ok 'check' @('check', $image)

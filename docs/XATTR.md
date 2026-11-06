@@ -12,7 +12,7 @@ actually contains attribute intents is the part that still needs the debug
 kernel.
 
 The writable profile accepts attribute creation, replacement, removal and
-preservation on ordinary `--rw-experimental` mounts. This document, not the
+preservation on ordinary `--rw` mounts. This document, not the
 implementation status table in the README, is the qualification record.
 
 This milestone implements:
@@ -284,17 +284,17 @@ ordinary writable profile (see `docs/PARENT_POINTERS.md`).
 
 ## Policy and CLI
 
-Attribute writes require `--rw-experimental`, like every other write path.
+Attribute writes require `--rw`, like every other write path.
 Reads (`list`, `get`) work on any readable v5 filesystem.
 
 ```text
 xfswin xattr list <image> <path> [--json]
 xfswin xattr get  <image> <path> <name> [--hex | --output=<file>]
                   [--include-private]   # read a parent.* diagnostic value
-xfswin xattr set  <image> <path> <name> <value> --rw-experimental
+xfswin xattr set  <image> <path> <name> <value> --rw
                   [--value-file=<file> | --value-hex=<hex>]
                   [--create | --replace]
-xfswin xattr remove <image> <path> <name> --rw-experimental
+xfswin xattr remove <image> <path> <name> --rw
 ```
 
 Names are VFS names. `--create` is `XATTR_CREATE`, `--replace` is

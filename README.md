@@ -3,33 +3,37 @@
 [![CI](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml/badge.svg)](https://github.com/100pangci/XFS-for-Windows/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://mozilla.org/MPL/2.0/)
 
-Windows-native XFS v5: format, read, experimentally modify and recover modern
-XFS filesystems directly from Windows — no WSL, no Linux VM, no Linux
-filesystem driver passthrough. The parser, writer, journal engine and recovery
-path are C++20 in this repository; Linux and xfsprogs are used as external
-oracles in CI, not as runtime dependencies.
+Windows-native XFS v5: format, read, modify and recover modern XFS filesystems
+directly from Windows — no WSL, no Linux VM, no Linux filesystem driver
+passthrough. The parser, writer, journal engine and recovery path are C++20 in
+this repository; Linux and xfsprogs are used as external oracles in CI, not as
+runtime dependencies.
 
-> **Experimental read-write.** Image-file read-write is qualified in CI for the
-> documented profile. A physical removable USB disk mounted read-write passed
-> the manual DEV-1R qualification on **one tested device only** (Samsung Flash
-> Drive, USB BOT, 512/512-byte sectors). A fixed physical
-> `\\.\PhysicalDriveN` mounted read-write is **not qualified**: fixed disks stay
-> read + format only, 4Kn and UASP were not tested. Do not point the
-> experimental writer at a disk that holds data you care about.
+> **Read-write is supported for the documented profile.** The filesystem
+> writer, WinFsp read-write mount and automount read-write path are supported
+> for the allow-listed XFS v5 profile described in
+> [docs/RW_STABILITY.md](docs/RW_STABILITY.md). Device qualification is
+> separate: image files are supported; an attached VHD/VHDX passed DEV-1; a
+> physical removable USB disk passed DEV-1R on **one tested device only**
+> (Samsung Flash Drive, USB BOT, 512/512-byte sectors). A fixed physical
+> `\\.\PhysicalDriveN` mounted read-write is **not qualified**, and 4Kn/UASP
+> are not qualified. The writer is not a drop-in replacement for the Linux XFS
+> driver: keep backups and do not widen the profile by hand.
 
 ## What it is
 
 | Layer | Role |
 |---|---|
 | `xfswin` CLI | format, inspect, check, mutate, journal dump/recovery |
-| WinFsp adapter | native `X:` mount, read-only or experimental read-write |
+| WinFsp adapter | native `X:` mount, read-only or read-write for the supported profile |
 | XFS core | on-disk parser, typed structures, verifier, transaction writer |
 | Recovery engine | native replay of Windows- and Linux-written internal logs |
 
 The implementation covers XFS v5 with CRC, an internal log, one data device,
 nested directories, hard links, symlinks, reflinks, extended attributes,
-reverse mappings and parent pointers. It does not aim to be a complete Linux
-XFS replacement and it is not production storage software.
+reverse mappings and parent pointers. It is not a complete Linux XFS
+replacement; read-write support is scoped to the documented profile and the
+qualified targets in [docs/RW_STABILITY.md](docs/RW_STABILITY.md).
 
 **Why this is different:** there is no WSL, no Linux VM and no Linux filesystem
 driver passthrough. The parser, writer, journal engine and recovery path are
@@ -66,11 +70,13 @@ Three terms are used consistently below:
 
 | Term | Meaning |
 |---|---|
-| **Supported** | Read/write/recovery is exercised by CI against the tested image-file profile; physical devices are not part of that profile. One removable USB device has separate manual DEV-1R read-write evidence. |
-| **Experimental** | Implemented and tested locally/CI, but the API or on-disk workload is not yet part of the ordinary supported profile. |
+| **Supported** | Read, write, recovery and the documented read-write profile are exercised by CI and covered by the contract in [docs/RW_STABILITY.md](docs/RW_STABILITY.md). This is a filesystem-writer claim, not a blanket device or all-XFS claim. |
+| **Qualified hardware** | A separate, per-device qualification status for real disks. Qualification never widens the supported filesystem profile. |
 | **Unsupported / refused** | The reader may still open it, but a writable mount fails before the first write with the blocking feature named. |
 
-* **Image files:** format, read-only mount, experimental read-write.
+* **Image files:** format, read-only mount, supported read-write.
+* **WinFsp:** read-write mounts are supported for the allow-listed profile;
+  the read-only path remains available everywhere.
 * **Removable media:** the manual, identity-gated DEV-1R qualification passed on
   one device (Samsung Flash Drive, 64,160,400,896 bytes, USB BOT, 512-byte
   sectors) on 2026-11-01. See
@@ -79,15 +85,13 @@ Three terms are used consistently below:
   remains unqualified and is refused by default**; the removable-device path is
   qualified only on the tested hardware.
 * **`\\.\HarddiskVolumeX`:** read; format is outside v1.
-* **WinFsp:** the mount adapter builds when the SDK is present; CI installs and
-  exercises it on a Windows runner.
 * **Linux interoperability:** Linux mounts and mutates Windows output, and
   Windows reads and mutates Linux output. `xfs_repair -n`, `xfs_db` and
   `xfs_scrub` are the external oracles.
 
 ## Supported writable profile
 
-Ordinary `--rw-experimental` accepts a v5 filesystem with:
+Ordinary `--rw` accepts a v5 filesystem with:
 
 ```text
 crc=1, ftype=1, attr2
@@ -97,8 +101,11 @@ reflink on/off (refcountbt + CoW)
 parent pointers (XFS_SB_FEAT_INCOMPAT_PARENT)
 exchange-range as a feature bit (operation not implemented)
 XFS_SB_FEAT_INCOMPAT_LOG_XATTRS
-one internal log, one data device, no realtime device
-dirblklog == blocklog
+one internal log (512-byte log sector, no stripe unit: superblock value 0 or
+1), one data device, no realtime device
+512-byte filesystem sectors
+ftype=1, at most 64 inodes per block
+dirblklog == 0
 ```
 
 Refused before the first write: metadir, zoned, needs-repair, quotas, realtime,
@@ -190,13 +197,18 @@ point. Automount is **read-only by default**. For automatic read-write, enroll
 the device once with `$exe automount enable <uuid> --rw` and confirm the
 identity pins it prints (in a script, `--yes-i-really-mean-it`); subsequent
 insertions mount read-write only when the UUID, serial/stable id, size and
-device class all still match, otherwise they fall back to read-only. The older
-`--rw-experimental --device-write-qualification` spelling still works; fixed
-physical disks are refused, and removable disks need
-`--allow-removable-disk-write`. The only removable hardware with DEV-1R
-evidence is the Samsung Flash Drive (serial `AA00000000000489`, USB BOT,
-512/512-byte sectors); other removable devices and all fixed physical-disk
-read-write remain **NOT READY**.
+device class all still match, otherwise they fall back to read-only. Canonical
+`--rw` records the removable-device qualification after that identity
+confirmation and needs neither `--device-write-qualification` nor
+`--allow-removable-disk-write`. The deprecated `--rw-experimental`
+compatibility spelling retains the old explicit `--device-write-qualification`
+requirement and additionally needs `--allow-removable-disk-write` for
+removable disks. Existing `mode = experimental-rw` configuration files load
+unchanged and are rewritten as `mode = read-write` on the next save, with
+every identity pin preserved. Fixed physical disks are refused. The only
+removable hardware with DEV-1R evidence is the Samsung Flash Drive (serial
+`AA00000000000489`, USB BOT, 512/512-byte sectors); other removable devices
+and all fixed physical-disk read-write remain **NOT READY**.
 
 The configuration is `%ProgramData%\xfswin\automount.ini` (UUID-keyed and
 versioned). To disable automount completely, run `automount disable <uuid>`,
@@ -215,30 +227,34 @@ properties, event/retry semantics, troubleshooting and the CI coverage.
 & $exe mount test.img X:          # requires a WinFsp build
 ```
 
-### Experimental read-write (images; real devices under DEV-1 qualification)
+### Read-write (images; real devices under DEV-1/DEV-1R qualification)
 
 ```powershell
-& $exe mount test.img X: --rw-experimental
-& $exe create test.img /file --rw-experimental
-& $exe pwrite test.img /file 0 --rw-experimental --text=hello
-& $exe mkdir test.img /dir --rw-experimental
-& $exe rename test.img /file /dir/file --rw-experimental
-& $exe link test.img /dir/file /dir/second --rw-experimental
-& $exe unlink test.img /dir/second --rw-experimental
+& $exe mount test.img X: --rw
+& $exe create test.img /file --rw
+& $exe pwrite test.img /file 0 --rw --text=hello
+& $exe mkdir test.img /dir --rw
+& $exe rename test.img /file /dir/file --rw
+& $exe link test.img /dir/file /dir/second --rw
+& $exe unlink test.img /dir/second --rw
 & $exe check test.img
 ```
 
-`--rw-experimental` is the ordinary opt-in for image files. A writable mount
-or file-mutating command on a real disk needs `--rw-experimental
+`--rw` is the canonical opt-in for image files. A writable mount or
+file-mutating command on a real disk needs `--rw
 --device-write-qualification`; fixed and removable disks additionally need
-`--allow-fixed-disk-write` / `--allow-removable-disk-write`. `recover` and
-`format` keep their own `--yes-i-really-mean-it` confirmation and also require
+`--allow-fixed-disk-write` / `--allow-removable-disk-write`.
+`--rw-experimental` remains accepted as a deprecated alias for old scripts and
+prints a warning; it selects the same writer and does not bypass the profile,
+device policy, identity pins or volume ownership. `recover` and `format` keep
+their own `--yes-i-really-mean-it` confirmation and also require
 `--device-write-qualification` for a real device.
 `device-info`, `device-check` and `device-selftest` expose the probed geometry
 and write policy. See `docs/WINDOWS_BLOCK_DEVICE.md`.
 
-`--rw-parent-qualification` is a legacy development switch accepted as a
-no-op.
+`--rw-parent-qualification`, `--rw-reflink-qualification` and
+`--rw-rmapbt-qualification` are legacy development switches accepted as
+no-ops.
 
 ### Formatting modern / parent-pointer images
 
@@ -256,12 +272,12 @@ default feature set (minus metadir/realtime/quota).
 ### Extended attributes and reflinks
 
 ```powershell
-& $exe xattr set test.img /file user.alpha hello --rw-experimental
+& $exe xattr set test.img /file user.alpha hello --rw
 & $exe xattr list test.img /file --include-private
-& $exe xattr remove test.img /file user.alpha --rw-experimental
+& $exe xattr remove test.img /file user.alpha --rw
 
-& $exe reflink test.img /src /dst 0 0 4096 --rw-experimental
-& $exe pwrite test.img /dst 0 --rw-experimental --text=CoW
+& $exe reflink test.img /src /dst 0 0 4096 --rw
+& $exe pwrite test.img /dst 0 --rw --text=CoW
 ```
 
 `--include-private` is a diagnostic view; it is not a mutation path. Values
@@ -294,7 +310,7 @@ an unlinked directory has none.
 ```powershell
 & $exe journal test.img --json      # read-only structural dump
 & $exe recover test.img --yes-i-really-mean-it
-& $exe mount dirty.img X: --rw-experimental   # recovers on mount
+& $exe mount dirty.img X: --rw   # recovers on mount
 ```
 
 Recovery refuses, before the first write, any log item it cannot prove
@@ -322,7 +338,9 @@ cancellation, inode/icreate/buffer items, EFI/RUI/BUI/CUI and ATTRI/ATTRD
   ownership (every volume on the disk locked and dismounted), and an explicit
   class opt-in. A `\\.\PhysicalDriveN` path alone never enables writes; fixed
   disks are refused by default. See `docs/WINDOWS_BLOCK_DEVICE.md`.
-* **Experimental.** This is not a drop-in production XFS driver. Keep backups.
+* **Supported scope, not universal XFS.** The contract applies to the
+  allow-listed profile on qualified targets. This is not a drop-in production
+  XFS driver for every feature or device; keep backups.
 
 ## Validation / why trust it
 
@@ -404,12 +422,13 @@ single owner of each filesystem invariant.
 
 ## Current limitations
 
-* **Experimental raw-device writes.** A physical fixed disk mounted read-write
-  is not qualified. It is refused by default and reachable only through the
-  explicit device-write qualification opt-ins plus the device-class opt-in.
-  The removable path has one-device DEV-1R evidence (Samsung Flash Drive, USB
-  BOT, 512/512-byte sectors, 2026-11-01); other removable devices, fixed
-  physical disks, UASP, 4Kn and media power-loss durability remain unqualified.
+* **Raw-device writes are hardware-qualified, not part of the filesystem
+  writer claim.** A physical fixed disk mounted read-write is not qualified.
+  It is refused by default and reachable only through the explicit
+  device-write qualification opt-ins plus the device-class opt-in. The
+  removable path has one-device DEV-1R evidence (Samsung Flash Drive, USB BOT,
+  512/512-byte sectors, 2026-11-01); other removable devices, fixed physical
+  disks, UASP, 4Kn and media power-loss durability remain unqualified.
 * **Automount is read-only by default.** The service can mount qualified
   virtual disks and the DEV-1R removable profile read-write only after an
   explicit enrollment, identity pins and device-class opt-in. It never
@@ -437,6 +456,7 @@ single owner of each filesystem invariant.
 
 | Document | Contents |
 |---|---|
+| [docs/RW_STABILITY.md](docs/RW_STABILITY.md) | supported read-write contract, evidence matrix, fail-closed semantics and the hardware boundary |
 | [docs/DESIGN.md](docs/DESIGN.md) | layering and invariants |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | module map and invariant ownership |
 | [docs/JOURNAL.md](docs/JOURNAL.md) | log format, transactions, recovery boundaries |

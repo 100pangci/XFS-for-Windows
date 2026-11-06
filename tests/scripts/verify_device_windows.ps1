@@ -231,7 +231,7 @@ try {
             -RedirectStandardOutput $mountLog `
             -RedirectStandardError (Join-Path $ArtifactDir 'mount.err.log') `
             -ArgumentList @('mount', $rawPath, $MountPoint,
-                            '--rw-experimental', '--device-write-qualification')
+                            '--rw', '--device-write-qualification')
         try {
             $ready = $false
             for ($i = 0; $i -lt 60; ++$i) {
@@ -309,7 +309,7 @@ try {
             -RedirectStandardOutput $raceLog `
             -RedirectStandardError (Join-Path $ArtifactDir 'mount-race.err.log') `
             -ArgumentList @('mount', $rawPath, $MountPoint,
-                            '--rw-experimental', '--device-write-qualification')
+                            '--rw', '--device-write-qualification')
         try {
             $ready = $false
             for ($i = 0; $i -lt 60; ++$i) {

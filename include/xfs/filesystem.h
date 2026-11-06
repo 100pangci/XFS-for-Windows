@@ -54,6 +54,12 @@ struct MountOptions {
   // mounts only; the default). `false` is the "norecovery" behaviour: a dirty
   // log refuses the mount unless force_unsafe_ro is set.
   bool recover_dirty_log = true;
+  // Optional filesystem identity pin. When set, mounting fails unless the
+  // on-disk UUID equals this value. The check runs immediately after the
+  // superblock is read and before any recovery or other write, so a caller
+  // that identified a filesystem during discovery cannot be redirected to a
+  // replacement filesystem by a device swap.
+  std::optional<Uuid> expected_uuid;
   // Finish a mount-time recovery with a clean-unmount record (the standalone
   // `xfswin recover` shape). Read-write mounts keep the log writable instead.
   bool clean_log_after_recovery = false;
@@ -217,9 +223,12 @@ class XfsFilesystem {
   // ---- mutation API (read-write mounts only) ----
   // Overwrites bytes inside extents that are already allocated and written.
   // Never allocates, never converts an unwritten extent and never changes the
-  // inode size (see MapWrittenRange for the exact range rule). Returns the
-  // number of bytes written; on failure nothing is guaranteed to be intact
-  // beyond the reported error, but no metadata was touched either.
+  // inode size (see MapWrittenRange for the exact range rule). A range whose
+  // blocks are shared through refcountbt is refused with kWriteNeedsCow
+  // before any data is written, because an in-place write would change the
+  // other owner too; WriteFileData performs the copy-on-write instead.
+  // Returns the number of bytes written; on failure nothing is guaranteed to
+  // be intact beyond the reported error, but no metadata was touched either.
   //
   // A successful write also updates mtime/ctime through a metadata
   // transaction (RW-1), exactly like a Linux write: the data itself is not
@@ -515,6 +524,14 @@ class XfsFilesystem {
  private:
   XfsFilesystem() = default;
 
+  // A commit that fails after its log record may have reached stable storage
+  // must disable further writes: the log position was not advanced, so a new
+  // transaction would reuse the same blocks and overwrite the only durable
+  // copy of the failed transaction.  The mount stays readable and the caller
+  // must unmount and replay/repair before writing again.
+  Status WriteFailureStatus() const;
+  void PoisonWrites(const ErrorContext& error);
+
   // Names every core lock for the CONC-1 event log. The names are static
   // string literals; this runs once at mount.
   void InitConcurrencyLockNames() {
@@ -729,6 +746,10 @@ class XfsFilesystem {
   MountOptions options_;
   std::vector<std::string> warnings_;
   bool writable_ = false;
+  // Set when CommitTransaction fails after log I/O may have made the record
+  // durable.  All later transactions, flushes and clean-unmount writes fail.
+  bool write_failed_ = false;
+  std::optional<ErrorContext> write_failure_;
 
   // PERF-1 lock hierarchy (full description in docs/LOCKING.md):
   //   write_barrier_ -> per-inode locks (inode-number order) -> extent_map

@@ -1005,7 +1005,7 @@ TEST(rw6c_many_shared_extents_grow_and_collapse_real_tree) {
 }
 
 TEST(rw6c_ordinary_reflink_write_gate_is_open) {
-  // The public qualification ledger is complete; a plain --rw-experimental
+  // The public qualification ledger is complete; a plain --rw
   // mount now accepts the reflink profile and can create/write a file.
   Image image = MakeImage(true, true, 4096, true);
   XfsFilesystem& fs = *image.fs;

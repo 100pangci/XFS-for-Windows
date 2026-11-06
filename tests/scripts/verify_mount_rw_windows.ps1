@@ -134,7 +134,7 @@ Assert-DriveFree $Drive
 $outLog = Join-Path $tempDir 'xfswin-rw.out'
 $errLog = Join-Path $tempDir 'xfswin-rw.err'
 $proc = Start-Process -FilePath $script:exe `
-    -ArgumentList @('mount', $modified, $Drive, '--rw-experimental', '--verbose') `
+    -ArgumentList @('mount', $modified, $Drive, '--rw', '--verbose') `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
     -NoNewWindow -PassThru
 
@@ -324,7 +324,7 @@ try {
 foreach ($overlaySpec in $recipeData.overlays) {
     if ($overlaySpec.via -ne 'pwrite') { continue }
     & $script:exe pwrite $modified "/$($overlaySpec.path)" "$($overlaySpec.offset)" `
-        --rw-experimental --from=$overlayPath
+        --rw --from=$overlayPath
     if ($LASTEXITCODE -ne 0) { throw "xfswin pwrite failed" }
 }
 

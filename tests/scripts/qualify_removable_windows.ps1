@@ -1187,7 +1187,7 @@ function Run-WinFspFileOperations {
     Test-MountPointFree
     [void](Assert-TargetIdentity 'winfsp mount start')
     $trace = New-TracePath 'winfsp-clean-mount-trace'
-    $mountArgs = @('mount', $script:RawPath, $MountPoint, '--rw-experimental') + @($script:WritePolicyArgs)
+    $mountArgs = @('mount', $script:RawPath, $MountPoint, '--rw') + @($script:WritePolicyArgs)
     $mount = Start-MountHost -Arguments $mountArgs -Name 'winfsp-clean-rw' -TracePath $trace
     $control = $null
     $cleanUnmount = $false
@@ -1439,7 +1439,7 @@ function Run-CliFeatureQualification {
         winfsp_does_not_expose = @('hardlink', 'xattr', 'reflink', 'CLI CoW pwrite')
     }
     Write-Manifest
-    $flags = @('--rw-experimental') + @($script:WritePolicyArgs)
+    $flags = @('--rw') + @($script:WritePolicyArgs)
 
     $linkArgs = @('link', $script:RawPath, '/qa/hardlink-target.bin', '/qa/hardlink-created.bin') + $flags
     $linkTrace = New-TracePath 'cli-hardlink-trace'
@@ -1858,7 +1858,7 @@ function Invoke-RemovalScenario {
     try {
         Test-MountPointFree
         [void](Assert-TargetIdentity "removal-$Name mount start")
-        $mountArgs = @('mount', $script:RawPath, $MountPoint, '--rw-experimental') + @($script:WritePolicyArgs)
+        $mountArgs = @('mount', $script:RawPath, $MountPoint, '--rw') + @($script:WritePolicyArgs)
         $mount = Start-MountHost -Arguments $mountArgs -Name "removal-$Name-rw" -TracePath $trace
         Wait-MountReady -MountHost $mount -TimeoutSeconds $script:PhaseTimeouts.mount_ready_seconds
         Initialize-FlushApi

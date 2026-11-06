@@ -4,9 +4,9 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """RW-6C no-write refusal matrix.
 
-Ordinary `--rw-experimental` now accepts reflink, so this matrix checks the
+Ordinary `--rw` now accepts reflink, so this matrix checks the
 refusals that must remain: read-only commands never write, mutation without
-`--rw-experimental` is refused, and a reflink image whose directory blocks span
+`--rw` is refused, and a reflink image whose directory blocks span
 more than one filesystem block is still outside the writable profile.  The
 unsupported-geometry case uses a patched copy, and every refusal must leave
 that copy byte-identical.
@@ -124,23 +124,23 @@ def main():
     if args.require_rmapbt:
         check_read("rmap", ["rmap", image], "AG 0")
 
-    # Still read-only without --rw-experimental, and the legacy qualification
+    # Still read-only without --rw, and the legacy qualification
     # switch must not be usable as a substitute for the public opt-in.
     check_refused("create without rw", ["create", image, "/no-flag.bin"],
                   image, original,
-                  ("--rw-experimental", "modifies the image", "read-write"))
+                  ("--rw", "modifies the image", "read-write"))
     check_refused("inner qualification without rw",
                   ["reflink", image, src, dst, "0", "0", "0",
                    "--rw-reflink-qualification"],
                   image, original,
-                  ("--rw-experimental", "modifies the image", "read-write"))
+                  ("--rw", "modifies the image", "read-write"))
     check_refused("recover without confirmation", ["recover", image],
                   image, original,
                   ("yes-i-really-mean-it", "confirm", "read-write"))
 
     # dirblklog != 0 remains outside the writable profile.  Every mutation
     # command must fail during the mount preflight, before the first write.
-    rw = "--rw-experimental"
+    rw = "--rw"
     geometry = ("directory block", "read-write", "not supported")
     for name, argv in (
             ("create on unsupported geometry",
