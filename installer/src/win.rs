@@ -72,8 +72,15 @@ const LOCAL_EVENT_NAME: &str = "Local\\XFSWinSetup";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn win32_error(context: &str, code: u32) -> io::Error {
+    // Keep a missing registry key distinguishable from a real registry
+    // failure: every clean machine has no product key yet, and read_product
+    // must treat that as "not installed" rather than aborting setup.
+    let kind = match code {
+        2 | 3 => io::ErrorKind::NotFound, // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        _ => io::ErrorKind::Other,
+    };
     io::Error::new(
-        io::ErrorKind::Other,
+        kind,
         format!(
             "{context}: {} (0x{code:08x})",
             io::Error::from_raw_os_error(code as i32)
@@ -301,7 +308,7 @@ fn reg_open(subkey: &str, access: windows::Win32::System::Registry::REG_SAM_FLAG
 pub fn reg_string(subkey: &str, value: &str) -> io::Result<Option<String>> {
     let handle = match reg_open(subkey, KEY_READ) {
         Ok(handle) => handle,
-        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.0 as i32) => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(None)
         }
         Err(error) => return Err(error),
@@ -1076,4 +1083,16 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         let _ = CloseHandle(handle);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn win32_error_marks_missing_keys_as_not_found() {
+        assert_eq!(win32_error("open", 2).kind(), io::ErrorKind::NotFound);
+        assert_eq!(win32_error("open", 3).kind(), io::ErrorKind::NotFound);
+        assert_eq!(win32_error("open", 5).kind(), io::ErrorKind::Other);
+    }
 }
