@@ -1112,11 +1112,27 @@ function Start-ReleaseMount {
     return [pscustomobject]@{ process = $process; stdout = $stdoutTask; stderr = $stderrTask; stdout_path = $stdoutPath; stderr_path = $stderrPath; drive = $Drive }
 }
 
+function Save-ReleaseMountOutput {
+    param($Mount)
+    if ($null -eq $Mount) { return }
+    try {
+        if ($Mount.stdout_path) {
+            [IO.File]::WriteAllText($Mount.stdout_path, [string]$Mount.stdout.Result)
+        }
+    } catch {}
+    try {
+        if ($Mount.stderr_path) {
+            [IO.File]::WriteAllText($Mount.stderr_path, [string]$Mount.stderr.Result)
+        }
+    } catch {}
+}
+
 function Stop-ReleaseMount {
     param([string]$Exe, [string]$Drive, $Mount, [string]$LogName)
     $result = Invoke-ReleaseCli -Exe $Exe -Arguments @('unmount', $Drive) -LogName $LogName -TimeoutSeconds 120
     Assert-ReleaseCommandOk $result "xfswin unmount $Drive"
     Assert-Release $Mount.process.WaitForExit(60000) "manual mount process did not exit after unmount $Drive"
+    Save-ReleaseMountOutput $Mount
     Assert-Release ($Mount.process.ExitCode -eq 0) `
         "manual mount exited with $($Mount.process.ExitCode): $($Mount.stdout.Result) $($Mount.stderr.Result)"
 }

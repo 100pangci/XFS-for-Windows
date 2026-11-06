@@ -66,7 +66,7 @@ Assert-Release (Test-Path -LiteralPath $previousInstaller -PathType Leaf) `
     "synthetic older setup is missing: $previousInstaller"
 
 Initialize-ReleaseVhdContext -FixtureDirectory $Fixtures -OutputDirectory $OutputDirectory `
-    -RequiredFixtures @('single', 'single-basic')
+    -RequiredFixtures @('single', 'single-basic', 'whole-disk')
 $qualificationPath = Get-ReleaseQualificationPath $Architecture
 if (Test-Path -LiteralPath $qualificationPath) { Remove-Item -LiteralPath $qualificationPath -Force }
 Initialize-ReleaseCases @($script:ReleaseInstallCases + @(
@@ -468,7 +468,11 @@ try {
     Assert-Release ($beforeEntries.Contains('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')) 'the preservation configuration lost the legacy experimental-rw entry'
     Assert-Release ($configText.Contains('mode = experimental-rw')) 'the preservation configuration lost the legacy mode spelling'
 
-    $roFixture = Attach-ReleaseVhd -FixtureName 'single'
+    # The legacy `mount <device> <drive>` form reads the filesystem from the
+    # start of the device, so the manual session uses the whole-disk fixture
+    # whose XFS starts at offset 0.  The single fixture carries a GPT and its
+    # XFS partition starts at 1 MiB, which only discovery-based mounts resolve.
+    $roFixture = Attach-ReleaseVhd -FixtureName 'whole-disk'
     $manualDrive = Get-ReleaseFreeDrive
     $manualMount = Start-ReleaseMount -Exe $previousState.exe -Device $roFixture.raw -Drive $manualDrive -LogName 'previous-manual-mount'
     Assert-Release (Wait-ReleaseDriveReady $manualDrive 60) `
@@ -616,6 +620,8 @@ try {
             if (-not $manualMount.process.HasExited) {
                 try { $manualMount.process.Kill($true) } catch { try { $manualMount.process.Kill() } catch {} }
             }
+            [void]$manualMount.process.WaitForExit(5000)
+            Save-ReleaseMountOutput $manualMount
         }
         $manualMount = $null
         $manualDrive = ''
