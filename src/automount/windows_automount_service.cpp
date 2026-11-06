@@ -1616,6 +1616,15 @@ Status StopAutomountService(std::string* message) {
 }
 
 int RunAutomountService() {
+  // WinFsp is delay-loaded from the shared runtime under its registered
+  // absolute path.  The service environment does not include the WinFsp bin
+  // directory, so the delay-load thunk's bare LoadLibrary would fail on a
+  // clean machine unless the runtime is already loaded by name.
+  WinFspRuntimeInfo runtime;
+  Status runtime_status = PreloadWinFspRuntime(&runtime);
+  if (!runtime_status.ok()) {
+    return 1;
+  }
   FSP_SERVICE* service = nullptr;
   NTSTATUS status =
       FspServiceCreate(const_cast<PWSTR>(kServiceName), OnServiceStart,
