@@ -23,8 +23,11 @@
 #include <sstream>
 #include <thread>
 
+#include "xfswin_version.h"
+
 #include "xfs/block_device.h"
 #include "xfs/automount_config.h"
+#include "xfs/deployment.h"
 #include "xfs/device_discovery.h"
 #include "xfs/device_selection.h"
 #include "xfs/directory.h"
@@ -57,7 +60,12 @@ namespace {
 
 std::string JsonEscape(const std::string& text);
 
-constexpr const char* kVersion = "xfswin 0.1.0 (XFS v5 reader, writer, journal recovery)";
+// The version comes from project(CMakeLists VERSION); the CLI must never
+// hard-code a second copy that can disagree with the package metadata.
+std::string VersionText() {
+  return std::string("xfswin ") + XFSWIN_VERSION +
+         " (XFS v5 reader, writer, journal recovery)";
+}
 
 void PrintUsage() {
   std::cout <<
@@ -157,6 +165,27 @@ void PrintUsage() {
       "  automount run                 run in console mode (diagnostics/tests)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
+      "installer transaction (called by the MSI; not for interactive use):\n"
+      "  installer prepare             fence new mounts, capture the service,\n"
+      "                                stop it and wait for sessions to end\n"
+      "  installer apply               install/update and start the service\n"
+      "  installer remove              clean-stop and delete the service\n"
+      "  installer verify              verify payload, service and WinFsp 2.x\n"
+      "  installer commit              clear the maintenance fence\n"
+      "  installer rollback            restore the captured service state\n"
+      "  installer rollback-quiesce    clean-stop the transaction's service so\n"
+      "                                MSI rollback can restore the files\n"
+      "      --action <install|upgrade|uninstall>\n"
+      "                (rollback, commit and rollback-quiesce also accept\n"
+      "                 auto: derive the operation from prepare's capture)\n"
+      "      --install-path <absolute installed xfswin.exe>\n"
+      "      [--allow-service-absent]  verify with no service (fresh install)\n"
+      "      [--stop-timeout=MS]       session drain timeout (default 30000)\n"
+      "      [--fail <before-service|after-files|service-start|verify>]\n"
+      "                                installer-only fault injection\n"
+      "  The deployment state root is always %ProgramData%\\xfswin; the MSI and\n"
+      "  the service must observe the same fence and lease directory.\n"
+      "\n"
       "global options:\n"
       "  --verbose                     informational output\n"
       "  --debug                       detailed parser traversal output\n"
@@ -183,7 +212,11 @@ void PrintUsage() {
       "  xfswin mount\n"
       "  xfswin cat \\\\.\\PhysicalDrive2 /etc/hostname\n"
       "  xfswin mount test.img X:\n"
-      "  xfswin mount test.img X: --rw\n";
+      "  xfswin mount test.img X: --rw\n"
+      "\n"
+      "Mounting uses the shared WinFsp runtime (https://winfsp.dev).\n"
+      "Setup installs the pinned official MSI when needed; portable users\n"
+      "install WinFsp separately. No app-local WinFsp DLL is included.\n";
 }
 
 std::string HumanBytes(uint64_t bytes) {
@@ -4154,6 +4187,103 @@ int CommandAutomount(const std::vector<std::string>&, const Options&, bool,
 
 #endif  // XFSWIN_HAS_WINFSP
 
+// The installer transaction verbs.  They are intentionally only reachable
+// through the MSI custom actions (and tests); the command still validates its
+// own arguments and exits nonzero on every failure.
+int CommandInstaller(const std::vector<std::string>& args,
+                     const Options& cli_options,
+                     const std::string& action_text,
+                     const std::string& install_path,
+                     const std::string& failure,
+                     bool allow_service_absent, bool has_stop_timeout,
+                     uint32_t stop_timeout_ms) {
+  if (args.size() != 2) {
+    std::cerr << "usage: xfswin installer "
+                 "<prepare|apply|remove|verify|commit|rollback|"
+                 "rollback-quiesce> "
+                 "--action <install|upgrade|uninstall|auto> "
+                 "--install-path <xfswin.exe>\n";
+    return 1;
+  }
+  const std::string& verb = args[1];
+  const bool known = verb == "prepare" || verb == "apply" ||
+                     verb == "remove" || verb == "verify" ||
+                     verb == "commit" || verb == "rollback" ||
+                     verb == "rollback-quiesce";
+  if (!known) {
+    std::cerr << "error: unknown installer action '" << verb << "'\n";
+    return 1;
+  }
+  // The MSI schedules one rollback stop, one rollback restore and one commit
+  // action for the active package; their sequence conditions only exclude the
+  // old package's nested uninstall during RemoveExistingProducts.  Those verbs
+  // are invoked with --action auto, and the helper derives the operation from
+  // the fence and capture written by prepare.  rollback-quiesce needs no
+  // operation at all.
+  const bool auto_action = action_text == "auto";
+  InstallerAction action = InstallerAction::kInstall;
+  if (auto_action) {
+    if (verb != "rollback" && verb != "commit" &&
+        verb != "rollback-quiesce") {
+      std::cerr << "error: --action auto is valid only for rollback, commit "
+                   "and rollback-quiesce\n";
+      return 1;
+    }
+  } else if (!ParseInstallerAction(action_text, &action)) {
+    std::cerr << "error: --action must be install, upgrade, uninstall or "
+                 "auto\n";
+    return 1;
+  }
+  if (install_path.empty()) {
+    std::cerr << "error: --install-path is required\n";
+    return 1;
+  }
+  if (!failure.empty() && failure != "before-service" &&
+      failure != "after-files" && failure != "service-start" &&
+      failure != "verify") {
+    std::cerr << "error: --fail must be before-service, after-files, "
+                 "service-start or verify\n";
+    return 1;
+  }
+  InstallerOptions installer;
+  installer.action = action;
+  installer.use_captured_action = auto_action;
+  installer.install_path = std::filesystem::path(ToWide(install_path));
+  installer.injected_failure = failure;
+  installer.allow_service_absent = allow_service_absent;
+  if (has_stop_timeout) installer.stop_timeout_ms = stop_timeout_ms;
+
+  InstallerResult result;
+  if (verb == "prepare") {
+    result = PrepareInstaller(installer);
+  } else if (verb == "apply") {
+    result = ApplyInstaller(installer);
+  } else if (verb == "remove") {
+    result = RemoveInstaller(installer);
+  } else if (verb == "verify") {
+    result = VerifyInstaller(installer);
+  } else if (verb == "commit") {
+    result = CommitInstaller(installer);
+  } else if (verb == "rollback-quiesce") {
+    result = QuiesceInstaller(installer);
+  } else {
+    result = RollbackInstaller(installer);
+  }
+
+  const std::string text =
+      FormatInstallerResult(result, verb, cli_options.json);
+  if (cli_options.json) {
+    std::cout << text << "\n";
+  } else if (result.ok) {
+    std::cout << text;
+  } else {
+    std::cerr << text;
+  }
+  if (result.ok) return 0;
+  if (result.exit_code <= 0) return 1;
+  return static_cast<int>(std::min<int64_t>(result.exit_code, 127));
+}
+
 }  // namespace
 
 int Run(const std::vector<std::string>& args) {
@@ -4169,6 +4299,12 @@ int Run(const std::vector<std::string>& args) {
   bool replace_existing = false;
   std::string drive_option;
   bool drive_option_given = false;
+  std::string installer_action;
+  std::string installer_path;
+  std::string installer_fail;
+  bool installer_allow_absent = false;
+  bool installer_has_stop_timeout = false;
+  uint32_t installer_stop_timeout = 30000;
   for (size_t i = 0; i < args.size(); ++i) {
     const std::string& arg = args[i];
     if (arg == "--verbose" || arg == "-v") {
@@ -4230,6 +4366,42 @@ int Run(const std::vector<std::string>& args) {
       options.device_concurrency_rounds = static_cast<int>(rounds);
     } else if (arg == "--json") {
       options.json = true;
+    } else if (StartsWith(arg, "--action=")) {
+      installer_action = arg.substr(9);
+    } else if (arg == "--action") {
+      if (i + 1 >= args.size() || StartsWith(args[i + 1], "--")) {
+        std::cerr << "error: --action requires install, upgrade or uninstall\n";
+        return 1;
+      }
+      installer_action = args[++i];
+    } else if (StartsWith(arg, "--install-path=")) {
+      installer_path = arg.substr(15);
+    } else if (arg == "--install-path") {
+      if (i + 1 >= args.size() || StartsWith(args[i + 1], "--")) {
+        std::cerr << "error: --install-path requires an absolute path\n";
+        return 1;
+      }
+      installer_path = args[++i];
+    } else if (StartsWith(arg, "--fail=")) {
+      installer_fail = arg.substr(7);
+    } else if (arg == "--fail") {
+      if (i + 1 >= args.size() || StartsWith(args[i + 1], "--")) {
+        std::cerr << "error: --fail requires a fault point\n";
+        return 1;
+      }
+      installer_fail = args[++i];
+    } else if (arg == "--allow-service-absent") {
+      installer_allow_absent = true;
+    } else if (StartsWith(arg, "--stop-timeout=")) {
+      uint64_t milliseconds = 0;
+      if (!ParseU64(arg.substr(15), &milliseconds) ||
+          milliseconds < 1000 || milliseconds > 600000) {
+        std::cerr << "error: --stop-timeout must be between 1000 and 600000 "
+                     "milliseconds\n";
+        return 1;
+      }
+      installer_stop_timeout = static_cast<uint32_t>(milliseconds);
+      installer_has_stop_timeout = true;
     } else if (arg == "--replace") {
       // rename only: overwrite an existing file or empty directory target.
       replace_existing = true;
@@ -4323,7 +4495,7 @@ int Run(const std::vector<std::string>& args) {
       PrintUsage();
       return 0;
     } else if (arg == "--version") {
-      std::cout << kVersion << "\n";
+      std::cout << VersionText() << "\n";
       return 0;
     } else {
       positional.push_back(arg);
@@ -4380,6 +4552,13 @@ int Run(const std::vector<std::string>& args) {
   if (command == "automount") {
     return CommandAutomount(positional, options, drive_option_given,
                             drive_option);
+  }
+  if (command == "installer") {
+    return CommandInstaller(positional, options, installer_action,
+                            installer_path, installer_fail,
+                            installer_allow_absent,
+                            installer_has_stop_timeout,
+                            installer_stop_timeout);
   }
   if (command == "info") {
     if (positional.size() != 2) {

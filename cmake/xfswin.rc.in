@@ -28,6 +28,7 @@ BEGIN
             VALUE "OriginalFilename", "xfswin.exe\0"
             VALUE "ProductName", "XFS-for-Windows\0"
             VALUE "ProductVersion", "@PROJECT_VERSION@\0"
+            VALUE "Comments", "git=@XFSWIN_GIT_SHA@;arch=@XFSWIN_BUILD_ARCH@;configuration=@XFSWIN_BUILD_CONFIGURATION@;production=@XFSWIN_PRODUCTION_BUILD@;dirty=@XFSWIN_SOURCE_TREE_DIRTY@\0"
         END
     END
     BLOCK "VarFileInfo"

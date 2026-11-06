@@ -34,6 +34,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -50,6 +51,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include "winfsp/winfsp_adapter.h"
 #include "xfs/automount_config.h"
 #include "xfs/automount_engine.h"
+#include "xfs/deployment.h"
 #include "xfs/device_discovery.h"
 #include "xfs/filesystem.h"
 #include "xfs/partition_device.h"
@@ -619,6 +621,17 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
                               "the discovered filesystem has no raw device path");
       return result;
     }
+    // A maintenance fence refuses every new session.  The MountSession gate
+    // below is authoritative (it also covers other xfswin processes); this
+    // early check keeps discovery from opening a device while the installer
+    // is replacing the service.
+    if (MaintenanceFenceActive(DefaultDeploymentPaths())) {
+      result.status = XFS_ERR(XfsError::kPermissionDenied,
+                              "the XFS installation is in maintenance; no new "
+                              "automount session may start")
+                          .Metadata("maintenance-fence");
+      return result;
+    }
     const bool read_write = mode == AutomountMode::kReadWrite;
     if (read_write &&
         !UuidEqual(entry.fs_uuid, filesystem.probe.superblock.uuid)) {
@@ -801,7 +814,10 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
       record.detail = stopped.error().Format();
       EmitLog(record);
     }
-    return OkStatus();
+    // Propagate the durable-unmount failure.  The engine records the session
+    // as still stopping and the service stop reports a nonzero exit code, so
+    // the installer never treats a failed unmount as a clean stop.
+    return stopped;
   }
 
   bool IsSessionAlive(const std::string& session_id) override {
@@ -918,6 +934,7 @@ struct ServiceRuntime {
   std::unique_ptr<AutomountEngine> engine;
   std::thread worker;
   std::string last_runtime_fingerprint = "<unpublished>";
+  AutomountStopReport stop_report;
 };
 
 CONFIGRET RegisterInterfaceNotifications(const GUID& interface_class,
@@ -1031,7 +1048,7 @@ void WorkerMain(ServiceRuntime& runtime) {
       runtime.engine->NotifySettingsChanged(event_time);
     }
   }
-  runtime.engine->Stop(AutomountClock::now());
+  runtime.stop_report = runtime.engine->Stop(AutomountClock::now());
   runtime.PublishRuntimeStatus();
 }
 
@@ -1106,10 +1123,51 @@ NTSTATUS OnServiceStop(FSP_SERVICE* service) {
   FspServiceRequestTime(service, 30000);
   SetEvent(runtime->stop_event);
   if (runtime->worker.joinable()) runtime->worker.join();
-  runtime->engine->Stop(AutomountClock::now());
+  // The worker already stopped the engine; the second call is a no-op that
+  // returns an empty report when the engine is no longer running.
+  const AutomountStopReport again =
+      runtime->engine->Stop(AutomountClock::now());
+  AutomountStopReport report = runtime->stop_report;
+  report.failures.insert(report.failures.end(), again.failures.begin(),
+                         again.failures.end());
+  runtime->PublishRuntimeStatus();
   runtime->UnregisterNotifications();
+
+  const bool clean = report.clean();
+  if (!clean) {
+    for (const std::string& failure : report.failures) {
+      ServiceLog(EVENTLOG_ERROR_TYPE,
+                 L"XFS automount: clean stop failed: " +
+                     Utf8ToWide(failure));
+    }
+    // Preserve the failure for the installer after this process is gone.
+    // The file is never deleted by upgrade/uninstall.
+    const DeploymentPaths deployment = DefaultDeploymentPaths();
+    const Status ensured = EnsureDeploymentPaths(deployment);
+    const Status saved = ensured.ok()
+                             ? SaveShutdownFailureRecord(deployment,
+                                                         report.failures)
+                             : ensured;
+    if (!saved.ok()) {
+      ServiceLog(EVENTLOG_ERROR_TYPE,
+                 L"XFS automount: cannot record the clean-stop failure: " +
+                     Utf8ToWide(saved.error().Format()));
+    }
+  }
+
   delete runtime;
   service->UserContext = nullptr;
+  if (!clean) {
+    // WinFsp only copies Service->ExitCode into the SCM status when OnStop
+    // returns success, and a failed OnStop would leave the service in
+    // STOP_PENDING.  Complete the stop with a nonzero exit code instead: the
+    // installer sees the failure through QueryServiceStatusEx and can roll
+    // back, while the service itself reaches STOPPED.
+    service->ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
+    ServiceLog(EVENTLOG_INFORMATION_TYPE,
+               L"XFS automount: service stopped with a clean-stop failure");
+    return STATUS_SUCCESS;
+  }
   ServiceLog(EVENTLOG_INFORMATION_TYPE, L"XFS automount: service stopped");
   return STATUS_SUCCESS;
 }
@@ -1120,6 +1178,27 @@ NTSTATUS OnServiceControl(FSP_SERVICE* service, ULONG control, ULONG,
     FspServiceStop(service);
   }
   return STATUS_SUCCESS;
+}
+
+}  // namespace
+
+namespace {
+
+// Compares the SCM ImagePath executable with an explicit install path.  The
+// deployment layer owns the same rule; the service repeats it so the explicit
+// path API never touches another installation's service.
+std::wstring NormalizeServicePath(std::wstring text) {
+  std::replace(text.begin(), text.end(), L'/', L'\\');
+  if (text.rfind(L"\\\\?\\", 0) == 0) text.erase(0, 4);
+  if (text.rfind(L"\\??\\", 0) == 0) text.erase(0, 4);
+  while (text.size() > 3 && text.back() == L'\\') text.pop_back();
+  for (wchar_t& c : text) c = static_cast<wchar_t>(towlower(c));
+  return text;
+}
+
+bool SameServiceExecutable(const std::wstring& a, const std::wstring& b) {
+  if (a.empty() || b.empty()) return false;
+  return NormalizeServicePath(a) == NormalizeServicePath(b);
 }
 
 }  // namespace
@@ -1358,95 +1437,104 @@ AutomountServiceStatusInfo QueryAutomountServiceStatus() {
   return result;
 }
 
-Status InstallAutomountService(std::string* message) {
+Status InstallAutomountServiceAt(const std::filesystem::path& executable,
+                                 std::string* message) {
+  if (executable.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "the automount service executable path is empty")
+        .Metadata("automount-service");
+  }
+  const std::wstring exe = executable.wstring();
   AutomountServicePaths paths = DefaultAutomountServicePaths();
   Status directory = EnsureAutomountServicePaths(paths);
   if (!directory.ok()) return directory;
 
-  ScmHandle scm;
-  scm.handle = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-  if (!scm.handle) return ServiceFailure("open the service manager", GetLastError());
+  InstallerServiceConfig config;
+  Status queried = QueryInstallerService(&config);
+  if (!queried.ok()) return queried;
+  if (config.installed) {
+    if (SameServiceExecutable(config.binary_path, exe)) {
+      return XFS_ERR(XfsError::kAlreadyExists,
+                     "the XFS automount service is already installed")
+          .Metadata("automount-service");
+    }
+    return XFS_ERR(XfsError::kAlreadyExists,
+                   "the XFS automount service belongs to another executable: " +
+                       WideToUtf8(config.binary_path))
+        .Metadata("automount-service");
+  }
+  Status installed =
+      EnsureInstallerService(exe, kServiceDisplayName, nullptr);
+  if (!installed.ok()) return installed;
+  if (message) {
+    *message = "installed " + WideToUtf8(kServiceDisplayName) +
+               " (automatic start); configuration: " +
+               WideToUtf8(paths.config_file.wstring());
+  }
+  return OkStatus();
+}
 
+Status InstallAutomountService(std::string* message) {
   const std::wstring executable = ExecutablePath();
   if (executable.empty()) {
     return XFS_ERR(XfsError::kIoError,
                    "cannot determine the xfswin executable path")
         .Metadata("automount-service");
   }
-  const std::wstring command =
-      L"\"" + executable + L"\" automount run";
-  ServiceHandle service(CreateServiceW(
-      scm.handle, kServiceName, kServiceDisplayName, SERVICE_ALL_ACCESS,
-      SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-      command.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr));
-  if (!service) {
-    const DWORD code = GetLastError();
-    if (code == ERROR_SERVICE_EXISTS) {
-      return XFS_ERR(XfsError::kAlreadyExists,
-                     "the XFS automount service is already installed")
-          .Metadata("automount-service");
-    }
-    return ServiceFailure("create the automount service", code, kServiceName);
-  }
-  SERVICE_DESCRIPTIONW description{};
-  description.lpDescription = const_cast<LPWSTR>(kServiceDescription);
-  ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION,
-                        &description);
-  if (message) {
-    *message = "installed " + WideToUtf8(kServiceDisplayName) +
-               " (automatic start); configuration: " +
-               paths.config_file.string();
-  }
-  return OkStatus();
+  return InstallAutomountServiceAt(std::filesystem::path(executable), message);
 }
 
-Status UninstallAutomountService(std::string* message) {
-  ScmHandle scm;
-  scm.handle = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-  if (!scm.handle) return ServiceFailure("open the service manager", GetLastError());
-  ServiceHandle service(OpenServiceW(
-      scm.handle, kServiceName,
-      DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS));
-  if (!service) {
-    const DWORD code = GetLastError();
-    if (code == ERROR_SERVICE_DOES_NOT_EXIST) {
-      return XFS_ERR(XfsError::kNotFound,
-                     "the XFS automount service is not installed")
-          .Metadata("automount-service");
-    }
-    return ServiceFailure("open the automount service", code, kServiceName);
+Status UninstallAutomountServiceAt(const std::filesystem::path& executable,
+                                   std::string* message) {
+  if (executable.empty()) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "the automount service executable path is empty")
+        .Metadata("automount-service");
   }
-  SERVICE_STATUS_PROCESS status{};
-  std::string error;
-  if (!QueryServiceState(service.get(), &status, &error)) {
-    return XFS_ERR(XfsError::kIoError, error);
+  const std::wstring exe = executable.wstring();
+  InstallerServiceConfig config;
+  Status queried = QueryInstallerService(&config);
+  if (!queried.ok()) return queried;
+  if (!config.installed) {
+    return XFS_ERR(XfsError::kNotFound,
+                   "the XFS automount service is not installed")
+        .Metadata("automount-service");
   }
-  if (status.dwCurrentState != SERVICE_STOPPED) {
-    SERVICE_STATUS ignored{};
-    if (!ControlService(service.get(), SERVICE_CONTROL_STOP, &ignored)) {
-      const DWORD code = GetLastError();
-      if (code != ERROR_SERVICE_NOT_ACTIVE) {
-        return ServiceFailure("stop the automount service", code, kServiceName);
-      }
-    }
-    if (!WaitForState(service.get(), SERVICE_STOPPED, 30000, &error)) {
-      return XFS_ERR(XfsError::kIoError,
-                     "the automount service did not stop: " + error);
-    }
+  if (!SameServiceExecutable(config.binary_path, exe)) {
+    return XFS_ERR(XfsError::kAlreadyExists,
+                   "the XFS automount service belongs to another executable: " +
+                       WideToUtf8(config.binary_path))
+        .Metadata("automount-service");
   }
-  if (!DeleteService(service.get())) {
-    const DWORD code = GetLastError();
-    if (code != ERROR_SERVICE_MARKED_FOR_DELETE) {
-      return ServiceFailure("delete the automount service", code, kServiceName);
-    }
-    if (message) *message = "the automount service removal is pending";
-    return OkStatus();
+  std::string stop_message;
+  Status stopped = StopInstallerService(&stop_message);
+  if (!stopped.ok()) return stopped;
+  if (message && !stop_message.empty()) *message = stop_message;
+  bool pending = false;
+  Status deleted = DeleteInstallerService(&pending);
+  if (!deleted.ok()) return deleted;
+  if (pending) {
+    // DeleteService only marks the service; wait until the SCM has really
+    // forgotten it so a following install cannot see a stale entry.
+    Status waited = WaitInstallerServiceDeleted(30000);
+    if (!waited.ok()) return waited;
   }
   if (message) {
     *message =
         "removed the XFS automount service; configuration was preserved";
   }
   return OkStatus();
+}
+
+Status UninstallAutomountService(std::string* message) {
+  const std::wstring executable = ExecutablePath();
+  if (executable.empty()) {
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot determine the xfswin executable path")
+        .Metadata("automount-service");
+  }
+  return UninstallAutomountServiceAt(std::filesystem::path(executable),
+                                     message);
 }
 
 Status StartAutomountService(std::string* message) {

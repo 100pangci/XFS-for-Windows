@@ -2190,10 +2190,51 @@ TEST(ux_automount_service_stop_restores_the_windows_letter) {
   engine.Tick(kStart);
   CHECK_EQ(platform.sessions.size(), 1u);
 
-  engine.Stop(At(1000));
+  const auto report = engine.Stop(At(1000));
+  CHECK(report.clean());
   CHECK(platform.sessions.empty());
   CHECK_EQ(platform.restore_calls, 1);
   CHECK(platform.CountLogs("drive-letter-restore", "restored") == 1);
+  CHECK(!engine.running());
+}
+
+TEST(ux_automount_service_stop_reports_a_live_session_failure) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x45);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  platform.stop_failures = 2;
+
+  const auto report = engine.Stop(At(1000));
+  CHECK(!report.clean());
+  CHECK(!report.failures.empty());
+  CHECK(report.failures.front().find("did not stop in time") != std::string::npos);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(platform.restore_calls, 0);
+  CHECK(!engine.running());
+}
+
+TEST(ux_automount_service_stop_reports_windows_letter_restore_failure) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0x45);
+  platform.devices.push_back({MountedTakeoverFilesystem(uuid), true});
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  platform.restore_failures = 2;
+
+  const auto report = engine.Stop(At(1000));
+  CHECK(!report.clean());
+  CHECK(!report.failures.empty());
+  CHECK(report.failures.back().find("injected restore failure") != std::string::npos);
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.restore_calls, 2);
   CHECK(!engine.running());
 }
 

@@ -90,7 +90,14 @@ endif()
 
 target_include_directories(xfs_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
-  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+          "${PROJECT_BINARY_DIR}/generated")
+
+if(WIN32)
+  target_sources(xfs_core PRIVATE deployment/deployment.cpp)
+  # The deployment and service helpers are available even in WinFsp-OFF builds.
+  target_link_libraries(xfs_core PRIVATE advapi32)
+endif()
 
 # CONC-1 deterministic scheduling hooks. Off by default: the production
 # wrappers then reduce to direct std::mutex/std::shared_mutex calls and every
@@ -139,12 +146,17 @@ if(WIN32)
           DESTINATION .)
   install(FILES
     "${PROJECT_SOURCE_DIR}/docs/INSTALL.md"
-    "${PROJECT_SOURCE_DIR}/docs/INSTALLER.md"
-    "${PROJECT_SOURCE_DIR}/docs/RELEASE.md"
+    "${PROJECT_SOURCE_DIR}/INSTALLER.md"
+    "${PROJECT_SOURCE_DIR}/RELEASE.md"
     "${PROJECT_SOURCE_DIR}/docs/RW_STABILITY.md"
     "${PROJECT_SOURCE_DIR}/docs/UX.md"
     "${PROJECT_SOURCE_DIR}/docs/WINDOWS_BLOCK_DEVICE.md"
     DESTINATION docs)
+  install(FILES
+    "${PROJECT_SOURCE_DIR}/THIRD-PARTY-NOTICES/WinFsp-NOTICE.md"
+    "${PROJECT_SOURCE_DIR}/THIRD-PARTY-NOTICES/WinFsp-LICENSE.txt"
+    "${PROJECT_SOURCE_DIR}/THIRD-PARTY-NOTICES/README.md"
+    DESTINATION THIRD-PARTY-NOTICES)
 
   if(MSVC)
     target_compile_options(xfswin PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
@@ -175,9 +187,6 @@ if(XFSWIN_BUILD_WINFSP)
   target_include_directories(xfswin SYSTEM PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_link_libraries(xfs_core PRIVATE ${XFSWIN_WINFSP_LIBRARY})
   target_link_libraries(xfswin PRIVATE ${XFSWIN_WINFSP_LIBRARY})
-  # SDDL security descriptors and Service Control Manager access
-  target_link_libraries(xfs_core PRIVATE advapi32)
-  target_link_libraries(xfswin PRIVATE advapi32)
   # Configuration Manager device arrival/removal notifications
   target_link_libraries(xfswin PRIVATE cfgmgr32)
   # Delay-load the WinFsp runtime so all other commands work without it.

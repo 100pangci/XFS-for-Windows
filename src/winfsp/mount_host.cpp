@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "winfsp/winfsp_adapter.h"
+#include "xfs/deployment.h"
 #include "xfs/filesystem.h"
 #include "xfs/image_device.h"
 #include "xfs/partition_device.h"
@@ -64,18 +65,19 @@ int RunMountHost(const MountTarget& target, const std::string& drive,
                  bool perf_stats, bool allow_rmapbt_qualification,
                  bool allow_reflink_qualification,
                  const DeviceOpenPolicy* device_policy) {
-  // Delay-loaded WinFsp runtime: fail cleanly if it is not available.
-  HMODULE winfsp_dll = LoadLibraryW(L"winfsp-x64.dll");
-  if (!winfsp_dll) {
-    std::cerr
-        << "error: the WinFsp runtime (winfsp-x64.dll) was not found.\n"
-           "       WinFsp is required for mounting. Install WinFsp from "
-           "https://winfsp.dev and\n"
-           "       make sure the drive is free. Formatting and reading "
-           "images work without it.\n";
+  // Delay-loaded WinFsp runtime: resolve the architecture-matching official
+  // 2.x DLL and validate it before any imported call.  This replaces the old
+  // hard-coded winfsp-x64.dll lookup.
+  WinFspRuntimeInfo runtime;
+  Status runtime_status = PreloadWinFspRuntime(&runtime);
+  if (!runtime_status.ok()) {
+    std::cerr << "error: " << runtime_status.error().Format() << "\n"
+              << "       WinFsp 2.x is required for mounting. Install WinFsp "
+                 "from https://winfsp.dev and\n"
+                 "       make sure the drive is free. Formatting and reading "
+                 "images work without it.\n";
     return 1;
   }
-  FreeLibrary(winfsp_dll);
 
   std::string error;
   auto device = OpenTarget(target.path, /*writable=*/read_write, device_policy,
