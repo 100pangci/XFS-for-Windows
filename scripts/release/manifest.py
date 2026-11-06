@@ -28,6 +28,7 @@ REQUIRED_CASES = {
     "active-upgrade-refusal", "upgrade", "legacy-config", "uninstall",
     "config-preservation", "reinstall", "dependency-failure", "failure-before-service",
     "failure-after-files", "failure-service-start", "upgrade-rollback",
+    "active-service-upgrade-refusal", "failure-verify", "upgrade-verify-rollback",
 }
 MAX_PAYLOAD = 64 * 1024 * 1024
 

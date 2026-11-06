@@ -2,13 +2,22 @@
   "purpose": "Build/test interface contract only; never a runtime device or writable policy",
   "package_builder": {
     "script": "scripts/release/build-packages.ps1",
-    "parameters": ["BuildDirectory", "Architecture", "OutputDirectory", "WinFspMsi", "Configuration", "AllowExternalToolExecution"],
+    "parameters": ["BuildDirectory", "Architecture", "OutputDirectory", "WinFspMsi", "Configuration", "AllowExternalToolExecution", "AcceptWixEula"],
     "synthetic_older_parameter": "SyntheticOlderVersion",
+    "wix_osmf_eula": {
+      "automatic": false,
+      "default": false,
+      "accept_command": "wix eula accept wix7",
+      "ci_variable": "WIX_OSMF_EULA_ACCEPTED",
+      "note": "The builder never accepts the WiX 7 OSMF EULA implicitly; -AcceptWixEula or the explicit CI repository variable is required after the licensing decision"
+    },
     "synthetic_older_test_version": "0.0.0",
+    "synthetic_older_fixture": "Isolated clean worktree of the evaluated commit with only the CMake project version lowered; produces a complete 0.0.0 executable, version.json, MSI and Burn setup. The evaluated checkout and its artifact hashes are unchanged.",
     "public_portable": "xfswin-<version>-windows-<arch>.zip",
     "public_installer": "xfswin-<version>-windows-<arch>-setup.exe",
     "internal_msi": "testing/xfswin-<version>-windows-<arch>.msi",
-    "previous_installer": "testing/xfswin-0.0.0-windows-<arch>-setup.exe",
+    "synthetic_older_msi": "testing/xfswin-0.0.0-windows-<arch>-synthetic-older.msi",
+    "previous_installer": "testing/xfswin-previous-windows-<arch>-setup.exe",
     "metadata_file": "package-metadata-<arch>.json",
     "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "toolchain", "build_timestamp", "signing", "testing"]
   },
@@ -17,14 +26,15 @@
     "fields": ["architecture", "head_sha", "run_id", "installer_sha256", "installed_exe_sha256", "installed_metadata", "cases"],
     "installed_metadata": "Actual installed version.json, including clean production Release flags",
     "cases_format": "Object: exact case name -> passed, failed, or skipped",
-    "required_cases": ["clean-install", "version", "path", "service", "ro-mount", "rw-smoke", "active-upgrade-refusal", "upgrade", "legacy-config", "uninstall", "config-preservation", "reinstall", "dependency-failure", "failure-before-service", "failure-after-files", "failure-service-start", "upgrade-rollback"],
+    "required_cases": ["clean-install", "version", "path", "service", "ro-mount", "rw-smoke", "active-upgrade-refusal", "active-service-upgrade-refusal", "upgrade", "legacy-config", "uninstall", "config-preservation", "reinstall", "dependency-failure", "failure-before-service", "failure-after-files", "failure-service-start", "failure-verify", "upgrade-rollback", "upgrade-verify-rollback"],
     "all_cases_must_pass": true,
     "architectures_must_share_run_id_and_sha": true
   },
   "installer_failure_injection": {
     "transport": "Direct internal MSI: msiexec /i <product.msi> /qn /norestart XFSWIN_TEST_FAIL=<stage> /L*v <log>",
     "property": "XFSWIN_TEST_FAIL",
-    "stages": ["before-service", "after-files", "service-start"],
+    "stages": ["before-service", "after-files", "service-start", "verify"],
+    "verify_stage_contract": "The Apply action succeeds and a separate Verify action fails, exercising the verify rollback path",
     "burn_forwarding_required": false
   },
   "manifest_cli": "python -I scripts/release/manifest.py create|verify --directory <public-assets> --version <CMake-version> --git-sha <full-SHA> --dependency-lock packaging/winfsp.lock.json --evidence-directory <actual-acceptance-evidence>",

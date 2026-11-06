@@ -3,6 +3,8 @@ build*/
 out/
 out-*/
 CMakeUserPresets.json
+packaging/windows/bin/
+packaging/windows/obj/
 
 # Reference material (xfsprogs source etc.) - never part of the product
 reference/

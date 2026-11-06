@@ -1,0 +1,62 @@
+<Project Sdk="WixToolset.Sdk/7.0.1">
+  <!--
+    REL-1 per-machine MSI for XFS for Windows.
+
+    MSBuild inputs (scripts/release/build-packages.ps1 supplies them with
+    `dotnet build -c Release`):
+      Platform        x64 | arm64 (the SDK maps this to native InstallerPlatform)
+      ProductVersion  numeric project() version, e.g. 0.1.0
+      PayloadDir      cmake install output (xfswin.exe, LICENSE, README.md,
+                      version.json, docs/INSTALL.md)
+      ProductMsi      copy of the built MSI at the release-testing path
+      OutputPath      MSBuild output directory (absolute, outside the repo)
+
+    There is deliberately no default architecture.  A missing or unsupported
+    Platform fails the build instead of silently producing a non-native MSI.
+  -->
+  <PropertyGroup>
+    <InstallerPlatform Condition="'$(Platform)' == 'x64' OR '$(Platform)' == 'X64'">x64</InstallerPlatform>
+    <InstallerPlatform Condition="'$(Platform)' == 'arm64' OR '$(Platform)' == 'ARM64'">arm64</InstallerPlatform>
+    <OutputType>Package</OutputType>
+    <OutputName>xfswin-$(ProductVersion)-windows-$(InstallerPlatform)</OutputName>
+    <DefineConstants>ProductVersion=$(ProductVersion);ProductArchitecture=$(InstallerPlatform);PayloadDir=$(PayloadDir)</DefineConstants>
+    <SuppressValidation>false</SuppressValidation>
+    <!-- The WiX SDK adds a default Compile item for **/*.wxs (see
+         tools/wix.props, EnableDefaultCompileItems is true unless set).  This
+         directory also contains Bundle.wxs, so the default glob would compile
+         both sources and add Product.wxs twice.  Each project compiles exactly
+         the file included below.  MSBuild evaluates properties before items,
+         so setting this in the project body still suppresses the SDK item. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Product.wxs" />
+  </ItemGroup>
+
+  <Target Name="ValidatePackageInputs" BeforeTargets="BeforeBuild">
+    <Error Condition="'$(InstallerPlatform)' != 'x64' AND '$(InstallerPlatform)' != 'arm64'"
+           Text="Platform must be the native x64 or arm64 platform (got '$(Platform)')." />
+    <Error Condition="'$(ProductVersion)' == ''"
+           Text="ProductVersion is required (the numeric CMake project version)." />
+    <Error Condition="'$(PayloadDir)' == '' Or !Exists('$(PayloadDir)\xfswin.exe')"
+           Text="PayloadDir does not contain xfswin.exe: '$(PayloadDir)'" />
+  </Target>
+
+  <!-- The release script checks ProductMsi immediately after build.  Copy the
+       SDK output to that exact path; accept the direct, platform-subfolder and
+       TargetPath layouts the SDK may use for a custom OutputPath. -->
+  <Target Name="CopyProductMsi" AfterTargets="Build" Condition="'$(ProductMsi)' != ''">
+    <Copy SourceFiles="$(TargetPath)" DestinationFiles="$(ProductMsi)"
+          Condition="Exists('$(TargetPath)') And '$(TargetPath)' != '$(ProductMsi)'" />
+    <Copy SourceFiles="$(OutputPath)$(OutputName).msi" DestinationFiles="$(ProductMsi)"
+          Condition="!Exists('$(ProductMsi)') And Exists('$(OutputPath)$(OutputName).msi')" />
+    <ItemGroup>
+      <_XfsWinBuiltMsi Include="$(OutputPath)**\$(OutputName).msi" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_XfsWinBuiltMsi)" DestinationFiles="$(ProductMsi)"
+          Condition="!Exists('$(ProductMsi)') And '@(_XfsWinBuiltMsi)' != ''" />
+    <Error Condition="!Exists('$(ProductMsi)')"
+           Text="The WiX build did not produce the expected MSI: $(ProductMsi)" />
+  </Target>
+</Project>
