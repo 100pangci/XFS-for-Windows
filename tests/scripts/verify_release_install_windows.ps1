@@ -610,6 +610,11 @@ try {
     $failure = $_
     $results.status = 'failed'
     $results.error = $_.Exception.Message
+    try {
+        $diagnosticExe = if ($currentInstalled) { $currentInstalled.exe } else { '' }
+        Save-ReleaseFailureDiagnostics -Reason $results.error `
+            -XfswinExe $diagnosticExe -ConfigPath $configPath
+    } catch {}
 }
 
 try {

@@ -1583,3 +1583,70 @@ function Test-ReleaseWindowsWriteAndFlush {
         size = $actual.Length
     }
 }
+
+# Failure-time snapshot for the clean-machine acceptance run.  The automount
+# service reports every mount decision to the Application event log, so a CI
+# failure would otherwise show only that a drive never appeared.  Everything
+# here is best effort: a diagnostic failure must never mask the real one.
+function Save-ReleaseFailureDiagnostics {
+    param([string]$Reason, [string]$XfswinExe, [string]$ConfigPath)
+    $directory = $script:ReleaseOutputDirectory
+    if ([string]::IsNullOrWhiteSpace($directory)) { return }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("failure: $Reason")
+    $lines.Add("captured: $((Get-Date).ToUniversalTime().ToString('o'))")
+    $capture = {
+        param([string]$Title, [scriptblock]$Body)
+        $lines.Add('')
+        $lines.Add("===== $Title =====")
+        try {
+            $text = & $Body | Out-String -Width 4096
+            foreach ($line in ($text -split "`r?`n")) { $lines.Add($line) }
+        } catch {
+            $lines.Add("unavailable: $($_.Exception.Message)")
+        }
+    }
+    & $capture 'application events (last 30 minutes)' {
+        $since = (Get-Date).AddMinutes(-30)
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since } -ErrorAction SilentlyContinue)
+        $events | Where-Object {
+            $_.ProviderName -match '(?i)xfs|winfsp|automount' -or
+            $_.LevelDisplayName -match '^(?i:Error|Warning|Critical)$'
+        } | Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message | Format-List
+    }
+    & $capture 'disks' {
+        Get-Disk | Select-Object Number, FriendlyName, SerialNumber, Size,
+            PartitionStyle, OperationalStatus, HealthStatus, IsReadOnly,
+            IsBoot, IsSystem | Format-List
+    }
+    & $capture 'partitions' {
+        Get-Partition | Select-Object DiskNumber, PartitionNumber, DriveLetter,
+            Offset, Size, Type, IsReadOnly | Format-Table -AutoSize
+    }
+    & $capture 'volumes' {
+        Get-Volume | Select-Object DriveLetter, FileSystemType, FileSystemLabel,
+            Size, SizeRemaining, HealthStatus, OperationalStatus |
+            Format-Table -AutoSize
+    }
+    & $capture 'service' {
+        sc.exe qc XFSWinAutomount 2>&1
+        sc.exe query XFSWinAutomount 2>&1
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        & $capture 'automount.ini' {
+            Get-Content -LiteralPath $ConfigPath -Raw
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($XfswinExe) -and
+        (Test-Path -LiteralPath $XfswinExe -PathType Leaf)) {
+        & $capture 'installed status --verbose' {
+            & $XfswinExe status --verbose 2>&1
+        }
+    }
+    $text = $lines -join "`n"
+    try {
+        Set-Content -LiteralPath (Join-Path $directory 'failure-diagnostics.log') `
+            -Value $text -Encoding utf8
+    } catch {}
+    Write-Host $text
+}
