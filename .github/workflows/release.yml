@@ -455,7 +455,27 @@ jobs:
           $platform = '${{ matrix.platform }}'
           $build = Join-Path $env:RUNNER_TEMP "rel1-native-tests-$arch"
 
-          & cmake -S . -B $build -G 'Visual Studio 17 2022' -A $platform `
+          # The Windows runner images move between Visual Studio 2022 and
+          # 2026; use the generator for the installed toolchain instead of a
+          # hard-coded generator that may not exist on the native ARM64 image.
+          $vswhereCandidates = @()
+          foreach ($programFilesRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not [string]::IsNullOrWhiteSpace($programFilesRoot)) {
+              $vswhereCandidates += (Join-Path $programFilesRoot 'Microsoft Visual Studio\Installer\vswhere.exe')
+            }
+          }
+          $vswhere = $vswhereCandidates |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($vswhere)) {
+            throw "vswhere.exe was not found"
+          }
+          $vsVersion = (& $vswhere -latest -products * -property installationVersion |
+            Select-Object -First 1).Trim()
+          $vsMajor = [int]($vsVersion.Split('.')[0])
+          $generator = if ($vsMajor -ge 18) { 'Visual Studio 18 2026' } else { 'Visual Studio 17 2022' }
+
+          & cmake -S . -B $build -G $generator -A $platform `
             -DCMAKE_CONFIGURATION_TYPES=Release `
             -DXFSWIN_RELEASE_BUILD=ON `
             -DXFSWIN_STATIC_RUNTIME=ON `

@@ -112,6 +112,35 @@ function Get-VersionFromCMake {
     return $match.Groups[1].Value
 }
 
+function Get-VisualStudioGenerator {
+    if (-not [string]::IsNullOrWhiteSpace($env:XFSWIN_CMAKE_GENERATOR)) {
+        return $env:XFSWIN_CMAKE_GENERATOR
+    }
+    $candidates = @()
+    foreach ($root in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            $candidates += (Join-Path $root 'Microsoft Visual Studio\Installer\vswhere.exe')
+        }
+    }
+    $vswhere = $candidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($vswhere)) {
+        throw 'vswhere.exe was not found; set XFSWIN_CMAKE_GENERATOR to an installed Visual Studio generator.'
+    }
+    $versionText = Invoke-External -FilePath $vswhere `
+        -Arguments @('-latest', '-products', '*', '-property', 'installationVersion') `
+        -WorkingDirectory $repoRoot -Capture
+    $match = [regex]::Match($versionText, '^([0-9]+)\.')
+    if (-not $match.Success) {
+        throw "Could not determine the Visual Studio version from: $versionText"
+    }
+    $major = [int]$match.Groups[1].Value
+    if ($major -ge 18) { return 'Visual Studio 18 2026' }
+    if ($major -eq 17) { return 'Visual Studio 17 2022' }
+    throw "Unsupported Visual Studio version: $versionText. Set XFSWIN_CMAKE_GENERATOR explicitly."
+}
+
 function Get-WinFspSdkRoot {
     param(
         [Parameter(Mandatory = $true)][string]$Architecture
@@ -716,10 +745,7 @@ try {
     }
     $cmakeVersion = $cmakeMatch.Groups[1].Value
 
-    $generator = $env:XFSWIN_CMAKE_GENERATOR
-    if ([string]::IsNullOrWhiteSpace($generator)) {
-        $generator = 'Visual Studio 17 2022'
-    }
+    $generator = Get-VisualStudioGenerator
     $generatorPlatform = if ($Architecture -eq 'arm64') { 'ARM64' } else { 'x64' }
 
     $winFspSdkRoot = Get-WinFspSdkRoot -Architecture $Architecture
