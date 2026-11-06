@@ -197,16 +197,18 @@ point. Automount is **read-only by default**. For automatic read-write, enroll
 the device once with `$exe automount enable <uuid> --rw` and confirm the
 identity pins it prints (in a script, `--yes-i-really-mean-it`); subsequent
 insertions mount read-write only when the UUID, serial/stable id, size and
-device class all still match, otherwise they fall back to read-only. The older
-`--rw-experimental --device-write-qualification` spelling still works and
-keeps its legacy explicit-qualification requirement. Existing
-`mode = experimental-rw` configuration files load unchanged and are rewritten
-as `mode = read-write` on the next save, with every identity pin preserved.
-Fixed physical disks are refused, and removable disks need
-`--allow-removable-disk-write`. The only removable hardware with DEV-1R
-evidence is the Samsung Flash Drive (serial `AA00000000000489`, USB BOT,
-512/512-byte sectors); other removable devices and all fixed physical-disk
-read-write remain **NOT READY**.
+device class all still match, otherwise they fall back to read-only. Canonical
+`--rw` records the removable-device qualification after that identity
+confirmation and needs neither `--device-write-qualification` nor
+`--allow-removable-disk-write`. The deprecated `--rw-experimental`
+compatibility spelling retains the old explicit `--device-write-qualification`
+requirement and additionally needs `--allow-removable-disk-write` for
+removable disks. Existing `mode = experimental-rw` configuration files load
+unchanged and are rewritten as `mode = read-write` on the next save, with
+every identity pin preserved. Fixed physical disks are refused. The only
+removable hardware with DEV-1R evidence is the Samsung Flash Drive (serial
+`AA00000000000489`, USB BOT, 512/512-byte sectors); other removable devices
+and all fixed physical-disk read-write remain **NOT READY**.
 
 The configuration is `%ProgramData%\xfswin\automount.ini` (UUID-keyed and
 versioned). To disable automount completely, run `automount disable <uuid>`,
