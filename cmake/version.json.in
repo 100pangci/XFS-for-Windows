@@ -1,0 +1,13 @@
+{
+  "product": "XFS-for-Windows",
+  "version": "@PROJECT_VERSION@",
+  "git_sha": "@XFSWIN_GIT_SHA@",
+  "architecture": "@XFSWIN_BUILD_ARCH@",
+  "configuration": "@XFSWIN_BUILD_CONFIGURATION@",
+  "production_build": @XFSWIN_PRODUCTION_BUILD@,
+  "source_tree_dirty": @XFSWIN_SOURCE_TREE_DIRTY@,
+  "toolchain": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+  "generator": "@CMAKE_GENERATOR@",
+  "build_timestamp": "@XFSWIN_BUILD_TIMESTAMP@",
+  "source_url": "https://github.com/100pangci/XFS-for-Windows"
+}

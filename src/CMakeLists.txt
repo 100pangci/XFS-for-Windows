@@ -84,6 +84,10 @@ add_library(xfs_core STATIC
   win_name_map.cpp
 )
 
+if(XFSWIN_RELEASE_BUILD)
+  add_dependencies(xfs_core xfswin_release_source_check)
+endif()
+
 target_include_directories(xfs_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -117,11 +121,30 @@ if(WIN32)
   add_executable(xfswin
     cli/main.cpp
     cli/commands.cpp
+    "${PROJECT_BINARY_DIR}/generated/xfswin.rc"
   )
 
   target_link_libraries(xfswin PRIVATE xfs_core)
 
-  target_include_directories(xfswin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_include_directories(xfswin PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${PROJECT_BINARY_DIR}/generated")
+
+  # Stage an explicit runtime payload. Never package the build directory or
+  # copy WinFsp's shared runtime/driver into the product installation.
+  install(TARGETS xfswin RUNTIME DESTINATION .)
+  install(FILES "${PROJECT_SOURCE_DIR}/LICENSE"
+                "${PROJECT_SOURCE_DIR}/README.md"
+                "${PROJECT_BINARY_DIR}/generated/version.json"
+          DESTINATION .)
+  install(FILES
+    "${PROJECT_SOURCE_DIR}/docs/INSTALL.md"
+    "${PROJECT_SOURCE_DIR}/docs/INSTALLER.md"
+    "${PROJECT_SOURCE_DIR}/docs/RELEASE.md"
+    "${PROJECT_SOURCE_DIR}/docs/RW_STABILITY.md"
+    "${PROJECT_SOURCE_DIR}/docs/UX.md"
+    "${PROJECT_SOURCE_DIR}/docs/WINDOWS_BLOCK_DEVICE.md"
+    DESTINATION docs)
 
   if(MSVC)
     target_compile_options(xfswin PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
@@ -148,8 +171,8 @@ if(XFSWIN_BUILD_WINFSP)
     winfsp/mount_host.cpp
     automount/windows_automount_service.cpp
   )
-  target_include_directories(xfs_core PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
-  target_include_directories(xfswin PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
+  target_include_directories(xfs_core SYSTEM PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
+  target_include_directories(xfswin SYSTEM PRIVATE ${XFSWIN_WINFSP_INCLUDE_DIR})
   target_link_libraries(xfs_core PRIVATE ${XFSWIN_WINFSP_LIBRARY})
   target_link_libraries(xfswin PRIVATE ${XFSWIN_WINFSP_LIBRARY})
   # SDDL security descriptors and Service Control Manager access
@@ -159,20 +182,12 @@ if(XFSWIN_BUILD_WINFSP)
   target_link_libraries(xfswin PRIVATE cfgmgr32)
   # Delay-load the WinFsp runtime so all other commands work without it.
   if(MSVC)
-    target_link_options(xfswin PRIVATE "/DELAYLOAD:winfsp-x64.dll")
+    target_link_options(xfswin PRIVATE "/DELAYLOAD:${XFSWIN_WINFSP_LIBRARY_NAME}.dll")
     target_link_libraries(xfswin PRIVATE delayimp)
   endif()
-  # Make a locally extracted SDK runtime available to the build output (the
-  # driver still has to be installed system-wide by the WinFsp installer).
-  file(GLOB _winfsp_dlls LIST_DIRECTORIES false
-       "D:/SDK/WinFsp/winfsp-*/DYNAMIC/SxS/DYNAMIC/bin/winfsp-x64.dll")
-  list(LENGTH _winfsp_dlls _winfsp_dll_count)
-  if(_winfsp_dll_count GREATER 0)
-    list(GET _winfsp_dlls 0 _winfsp_dll)
-    add_custom_command(TARGET xfswin POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_winfsp_dll}" "$<TARGET_FILE_DIR:xfswin>")
-  endif()
+  # WinFsp is a separately installed, shared runtime and signed kernel driver.
+  # Its official pinned redistributable owns deployment; neither the build
+  # output nor our portable/install payload receives an app-local WinFsp DLL.
   target_compile_definitions(xfs_core PRIVATE XFSWIN_HAS_WINFSP=1)
   target_compile_definitions(xfswin PRIVATE XFSWIN_HAS_WINFSP=1)
   message(STATUS "xfswin: WinFsp mount support enabled")
