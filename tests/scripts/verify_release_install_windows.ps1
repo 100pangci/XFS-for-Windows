@@ -30,8 +30,7 @@
 #
 #   pwsh -File tests/scripts/verify_release_install_windows.ps1 `
 #       -Installer out/release/xfswin-0.1.0-windows-x64-setup.exe `
-#       -PreviousInstaller out/testing/xfswin-previous-windows-x64-setup.exe `
-#       -ProductMsi out/testing/xfswin-0.1.0-windows-x64.msi `
+#       -PreviousInstaller out/release/testing/xfswin-previous-windows-x64-setup.exe `
 #       -Fixtures out/ci-ux-images -OutputDirectory out/release-evidence `
 #       -Architecture x64 -AllowCiMachineChanges
 #
@@ -41,7 +40,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$PreviousInstaller,
-    [Parameter(Mandatory = $true)][string]$ProductMsi,
     [Parameter(Mandatory = $true)][string]$Fixtures,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidateSet('x64', 'arm64')][string]$Architecture,
@@ -62,15 +60,10 @@ if (-not [string]::IsNullOrWhiteSpace($Portable)) {
 } elseif ($package.has_portable) {
     [void](Assert-ReleasePortableArchive -Package $package -Path $package.portable_path)
 }
-$productMsi = Assert-ReleaseProductMsi -ProductMsi $ProductMsi -Package $package
-$previousInstaller = Get-ReleaseFullPath $PreviousInstaller
+$previous = Assert-ReleaseSyntheticSetup -PreviousInstaller $PreviousInstaller -Package $package
+$previousInstaller = $previous.path
 Assert-Release (Test-Path -LiteralPath $previousInstaller -PathType Leaf) `
     "synthetic older setup is missing: $previousInstaller"
-Assert-Release ((Get-ReleaseSha256 $previousInstaller) -ne $package.installer_sha256) `
-    'the synthetic older setup must not be the evaluated installer'
-$previousMachine = if ($Architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
-Assert-Release ((Get-ReleasePeMachine $previousInstaller) -eq $previousMachine) `
-    "synthetic older setup is not native $Architecture"
 
 Initialize-ReleaseVhdContext -FixtureDirectory $Fixtures -OutputDirectory $OutputDirectory `
     -RequiredFixtures @('single', 'single-basic')
@@ -117,7 +110,7 @@ function Wait-ServiceRunning {
 
 function Assert-ProductFiles([object]$State) {
     $required = @(
-        'xfswin.exe', 'version.json', 'LICENSE', 'README.md',
+        'xfswin.exe', 'uninstall.exe', 'version.json', 'LICENSE', 'README.md',
         (Join-Path 'docs' 'INSTALL.md')
     )
     foreach ($relative in $required) {
@@ -259,7 +252,7 @@ try {
     $machinePathBefore = Get-ReleaseMachinePath
     $results.machine_path_before = $machinePathBefore
 
-    $install = Invoke-ReleaseBundleInstall -Installer $package.installer -LogName 'clean-install'
+    $install = Invoke-ReleaseSetupInstall -Installer $package.installer -LogName 'clean-install'
     Assert-ReleaseCommandOk $install 'silent setup install'
     $currentInstalled = Assert-ReleaseInstalledPackage -Package $package -ExpectedVersion $package.version
     Assert-ProductFiles $currentInstalled
@@ -432,7 +425,7 @@ try {
     # Clean uninstall after the first install.  The configuration must be
     # preserved because ProgramData is never MSI-owned.
     # -----------------------------------------------------------------------
-    $cleanUninstall = Invoke-ReleaseBundleUninstall -Installer $package.installer -LogName 'clean-uninstall'
+    $cleanUninstall = Invoke-ReleaseSetupUninstall -Installer $package.installer -LogName 'clean-uninstall'
     Assert-ReleaseCommandOk $cleanUninstall 'silent setup uninstall'
     Assert-ReleaseProductRemoved -ExpectConfig $true -ExpectedConfigHash $configHash
     Assert-Release (Test-ReleaseWinFspInstalled) `
@@ -443,10 +436,12 @@ try {
     # Install the synthetic older setup, create the preservation configuration,
     # and refuse an upgrade while an A manual session is active.
     # -----------------------------------------------------------------------
-    $previousInstall = Invoke-ReleaseBundleInstall -Installer $previousInstaller -LogName 'install-previous'
+    $previousInstall = Invoke-ReleaseSetupInstall -Installer $previousInstaller -LogName 'install-previous'
     Assert-ReleaseCommandOk $previousInstall 'synthetic older setup install'
     $previousState = Get-ReleaseInstalledState
     Assert-Release ($null -ne $previousState) 'the synthetic older setup did not install xfswin.exe'
+    Assert-Release (Test-ReleaseVersionEqual ([string]$previousState.version_json.version) $package.synthetic_version) `
+        "synthetic older setup version '$($previousState.version_json.version)' is not $($package.synthetic_version)"
     Assert-Release ((Compare-ReleaseVersion ([string]$previousState.version_json.version) $package.version) -lt 0) `
         "synthetic older setup version '$($previousState.version_json.version)' is not older than $($package.version)"
     Assert-Release ([string]$previousState.version_json.architecture -eq $Architecture) `
@@ -474,7 +469,7 @@ try {
     $manualMount = Start-ReleaseMount -Exe $previousState.exe -Device $roFixture.raw -Drive $manualDrive -LogName 'previous-manual-mount'
     Assert-Release (Wait-ReleaseDriveReady $manualDrive 60) `
         "the synthetic older manual mount at $manualDrive did not become ready"
-    $activeRefusal = Invoke-ReleaseBundleInstall -Installer $package.installer -LogName 'active-upgrade-refusal'
+    $activeRefusal = Invoke-ReleaseSetupInstall -Installer $package.installer -LogName 'active-upgrade-refusal'
     Assert-Release (@(0, 3010) -notcontains [int]$activeRefusal.exit_code) `
         'setup accepted an upgrade while a session was active'
     $afterRefusal = Get-ReleaseInstalledState
@@ -508,7 +503,7 @@ try {
     Assert-ReleaseCommandOk $startPreviousOwned 'start the older service for active upgrade refusal'
     $previousOwned = Wait-ReleaseMountedDrive -Exe $previousState.exe -Uuid $rwUuid `
         -LogName 'wait-previous-owned' -TimeoutSeconds 90
-    $ownedRefusal = Invoke-ReleaseBundleInstall -Installer $package.installer `
+    $ownedRefusal = Invoke-ReleaseSetupInstall -Installer $package.installer `
         -LogName 'active-service-upgrade-refusal'
     Assert-Release (@(0, 3010) -notcontains [int]$ownedRefusal.exit_code) `
         'setup accepted an upgrade while a service-owned session was active'
@@ -531,7 +526,7 @@ try {
     # the preserved configuration, and automatically mounts the enrolled RW
     # VHD, which proves the legacy/fake entries did not disturb the live entry.
     # -----------------------------------------------------------------------
-    $upgrade = Invoke-ReleaseBundleInstall -Installer $package.installer -LogName 'upgrade'
+    $upgrade = Invoke-ReleaseSetupInstall -Installer $package.installer -LogName 'upgrade'
     Assert-ReleaseCommandOk $upgrade 'silent setup upgrade'
     $currentInstalled = Assert-ReleaseInstalledPackage -Package $package -ExpectedVersion $package.version
     Assert-ProductFiles $currentInstalled
@@ -563,7 +558,7 @@ try {
     # its own mount, restores the RAW Windows letter, removes binaries,
     # service, PATH and shortcut, and preserves the configuration.
     # -----------------------------------------------------------------------
-    $uninstall = Invoke-ReleaseBundleUninstall -Installer $package.installer -LogName 'active-uninstall'
+    $uninstall = Invoke-ReleaseSetupUninstall -Installer $package.installer -LogName 'active-uninstall'
     Assert-ReleaseCommandOk $uninstall 'silent setup uninstall with an active owned mount'
     Assert-Release (Wait-ReleaseDriveGone $mountedUpgrade.drive 90) `
         "owned RW drive $($mountedUpgrade.drive) survived uninstall"
@@ -581,7 +576,7 @@ try {
     # Reinstall with the preserved configuration.  The service must run and
     # mount nothing because no enrolled device is attached.
     # -----------------------------------------------------------------------
-    $reinstall = Invoke-ReleaseBundleInstall -Installer $package.installer -LogName 'reinstall'
+    $reinstall = Invoke-ReleaseSetupInstall -Installer $package.installer -LogName 'reinstall'
     Assert-ReleaseCommandOk $reinstall 'silent setup reinstall with preserved configuration'
     $currentInstalled = Assert-ReleaseInstalledPackage -Package $package -ExpectedVersion $package.version
     $service = Wait-ServiceRunning $currentInstalled.exe 120
@@ -595,7 +590,7 @@ try {
     Complete-ReleaseCase 'reinstall' 'passed' 'reinstall reused the preserved configuration, ran the service and mounted nothing'
 
     # Final uninstall and retention check.
-    $finalUninstall = Invoke-ReleaseBundleUninstall -Installer $package.installer -LogName 'final-uninstall'
+    $finalUninstall = Invoke-ReleaseSetupUninstall -Installer $package.installer -LogName 'final-uninstall'
     Assert-ReleaseCommandOk $finalUninstall 'silent setup final uninstall'
     Assert-ReleaseProductRemoved -ExpectConfig $true -ExpectedConfigHash $configHash
     Assert-Release (Test-ReleaseWinFspInstalled) `

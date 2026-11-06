@@ -38,7 +38,6 @@ env:
   WINFSP_VERSION: '2.1.25156'
   WINFSP_MSI_NAME: winfsp-2.1.25156.msi
   WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
-  WIX_VERSION: '7.0.1'
 
 jobs:
   # -------------------------------------------------------------------------
@@ -177,10 +176,10 @@ jobs:
   # Native Release /MT packages with WinFsp and without test hooks.
   #
   # build-packages.ps1 is the agreed package entry point.  It configures and
-  # builds the actual production payload, creates the public setup/ZIP, the
-  # internal MSI and the synthetic older fixture.  The package output is kept
-  # under the ignored out/ directory so the release CMake source-tree check
-  # still sees a clean checkout.
+  # builds the actual production payload, then builds the native Rust public
+  # setup, the acceptance-only test setup and the synthetic older fixture.
+  # The package output is kept under the ignored out/ directory so the release
+  # CMake source-tree check still sees a clean checkout.
   # -------------------------------------------------------------------------
   package:
     needs: release-info
@@ -212,6 +211,18 @@ jobs:
           & pwsh -NoProfile -File tests/release/release_common_tests.ps1
           if ($LASTEXITCODE -ne 0) { throw 'release metadata regression tests failed' }
 
+      - name: Install the pinned native Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lock = Get-Content -LiteralPath scripts/release/tooling-lock.json -Raw | ConvertFrom-Json
+          $version = [string]$lock.rust.version
+          $rustup = Get-Command rustup.exe -ErrorAction SilentlyContinue
+          if ($null -eq $rustup) { throw 'rustup.exe is required on the release runner' }
+          & $rustup.Source toolchain install $version --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $version failed" }
+          "RUSTUP_TOOLCHAIN=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Provision the pinned dependency and toolchain
         shell: pwsh
         run: |
@@ -226,7 +237,6 @@ jobs:
           }
 
           & pwsh -NoProfile -File scripts/release/bootstrap-tools.ps1 `
-            -ToolRoot (Join-Path $env:RUNNER_TEMP 'rel1-tools') `
             -AllowExternalToolExecution `
             -ExportGitHubEnvironment
           if ($LASTEXITCODE -ne 0) { throw "bootstrap-tools.ps1 failed" }
@@ -288,9 +298,6 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           $build = Join-Path $env:RUNNER_TEMP "rel1-package-build-$arch"
 
-          # Never accept the WiX 7 OSMF EULA implicitly.  A repository
-          # administrator must declare WIX_OSMF_EULA_ACCEPTED=true after the
-          # licensing decision; the default (unset) keeps the flag false.
           $buildParameters = @{
             BuildDirectory = $build
             Architecture = $arch
@@ -301,36 +308,26 @@ jobs:
             SyntheticOlderVersion = $true
             SyntheticOlderProductVersion = '0.0.0'
           }
-          if ('${{ vars.WIX_OSMF_EULA_ACCEPTED }}' -eq 'true') {
-            $buildParameters['AcceptWixEula'] = $true
-            Write-Host 'WiX OSMF EULA acceptance explicitly enabled by repository variable WIX_OSMF_EULA_ACCEPTED.'
-          } else {
-            Write-Host 'WiX OSMF EULA acceptance is NOT enabled; WiX 7 may stop with WIX7015 until the repository variable WIX_OSMF_EULA_ACCEPTED=true is declared after the licensing decision.'
-          }
           & pwsh -NoProfile -File scripts/release/build-packages.ps1 @buildParameters
           if ($LASTEXITCODE -ne 0) { throw "build-packages.ps1 failed" }
 
           $setup = Join-Path $out "xfswin-$version-windows-$arch-setup.exe"
           $zip = Join-Path $out "xfswin-$version-windows-$arch.zip"
           $metadataPath = Join-Path $out "package-metadata-$arch.json"
-          $internalMsi = Join-Path $out "testing\xfswin-$version-windows-$arch.msi"
+          $testSetup = Join-Path $out "testing\xfswin-$version-windows-$arch-test-setup.exe"
           $testingMetadata = Join-Path $out "testing\testing-metadata-$arch.json"
-          foreach ($path in @($setup, $zip, $metadataPath, $internalMsi, $testingMetadata)) {
+          foreach ($path in @($setup, $zip, $metadataPath, $testSetup, $testingMetadata)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
               throw "build-packages.ps1 did not produce $path"
             }
           }
 
           # build-packages.ps1 owns the complete 0.0.0 test-only fixture
-          # (isolated clean worktree, older executable/version.json, MSI and
-          # Burn setup).  The workflow must never synthesize one itself.
+          # (isolated clean worktree, older executable/version.json, payload
+          # archive and Rust setup).  The workflow must never synthesize one.
           $previous = Join-Path $out "testing\xfswin-previous-windows-$arch-setup.exe"
           if (-not (Test-Path -LiteralPath $previous -PathType Leaf)) {
             throw "build-packages.ps1 did not produce the 0.0.0 synthetic older setup: $previous"
-          }
-          $syntheticMsi = @(Get-ChildItem -LiteralPath (Join-Path $out 'testing') -File -Filter '*-synthetic-older.msi')
-          if ($syntheticMsi.Count -ne 1) {
-            throw "build-packages.ps1 did not produce exactly one synthetic older MSI"
           }
           $testingEvidence = Get-Content -LiteralPath $testingMetadata -Raw | ConvertFrom-Json
           if ($testingEvidence.synthetic_older.version -ne '0.0.0') {
@@ -341,6 +338,14 @@ jobs:
           }
           if ($testingEvidence.synthetic_older.evaluated_git_sha -ne $fullSha) {
             throw "testing metadata does not bind the evaluated source commit"
+          }
+          $testSetupHash = (Get-FileHash -LiteralPath $testSetup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $testSetupInfo = (Get-Item -LiteralPath $testSetup).VersionInfo
+          if ($testSetupInfo.Comments -notmatch ';acceptance=test-fail$') {
+            throw "the acceptance test setup does not identify its test-fail feature"
+          }
+          if ($testingEvidence.test_setup.sha256 -ne $testSetupHash) {
+            throw "testing metadata test setup SHA-256 mismatch"
           }
 
           $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
@@ -355,7 +360,7 @@ jobs:
           $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           foreach ($required in @('installer_name', 'installer_sha256', 'portable_name',
               'portable_sha256', 'payload_exe_sha256', 'toolchain', 'build_timestamp',
-              'signing', 'testing')) {
+              'signing', 'rust', 'cmake', 'testing')) {
             if ($null -eq $metadata.PSObject.Properties[$required]) {
               throw "package metadata is missing the REL1 top-level field '$required'"
             }
@@ -374,6 +379,13 @@ jobs:
           if ($metadata.assets.portable_zip.sha256 -ne $zipHash) { throw "package metadata assets.portable_zip mismatch" }
           $winFspSha = (Get-FileHash -LiteralPath $env:WINFSP_MSI -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($metadata.winfsp.sha256 -ne $winFspSha) { throw "package metadata WinFsp dependency mismatch" }
+          if ($metadata.testing.test_setup.sha256 -ne $testSetupHash) {
+            throw "package metadata test setup SHA-256 mismatch"
+          }
+          $rustVersion = [string](Get-Content -LiteralPath scripts/release/tooling-lock.json -Raw | ConvertFrom-Json).rust.version
+          if ($metadata.rust.version -ne $rustVersion -or $testingEvidence.rust.version -ne $rustVersion) {
+            throw "package/testing metadata does not record the pinned Rust $rustVersion toolchain"
+          }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead($zip)
@@ -418,8 +430,14 @@ jobs:
           if ((Get-NativePeMachine $setup) -ne $expectedMachine) {
             throw "the setup executable is not native $arch"
           }
+          if ((Get-NativePeMachine $testSetup) -ne $expectedMachine) {
+            throw "the acceptance test setup is not native $arch"
+          }
           if ((Get-NativePeMachine $previous) -ne $expectedMachine) {
             throw "the synthetic older setup is not native $arch"
+          }
+          if ((Get-FileHash -LiteralPath $testSetup -Algorithm SHA256).Hash.ToLowerInvariant() -eq $setupHash) {
+            throw "the acceptance test setup is the public setup"
           }
           if ((Get-FileHash -LiteralPath $previous -Algorithm SHA256).Hash.ToLowerInvariant() -eq $setupHash) {
             throw "the synthetic older setup is the evaluated installer"
@@ -562,7 +580,7 @@ jobs:
           path: out/release-${{ matrix.architecture }}/package-metadata-${{ matrix.architecture }}.json
           if-no-files-found: error
 
-      - name: Upload internal MSI, synthetic fixture and testing metadata
+      - name: Upload the test setup, synthetic fixture and testing metadata
         uses: actions/upload-artifact@v4
         with:
           name: release-internal-${{ matrix.architecture }}
@@ -644,7 +662,6 @@ jobs:
           & pwsh -NoProfile -File tests/scripts/verify_release_install_windows.ps1 `
             -Installer (Join-Path $PWD "package\xfswin-$version-windows-$arch-setup.exe") `
             -PreviousInstaller (Join-Path $PWD "internal\xfswin-previous-windows-$arch-setup.exe") `
-            -ProductMsi (Join-Path $PWD "internal\xfswin-$version-windows-$arch.msi") `
             -Fixtures (Join-Path $PWD 'ux-images') `
             -OutputDirectory (Join-Path $PWD 'acceptance-evidence') `
             -Architecture $arch `
@@ -732,7 +749,7 @@ jobs:
           & pwsh -NoProfile -File tests/scripts/verify_release_failures_windows.ps1 `
             -Installer (Join-Path $PWD "package\xfswin-$version-windows-$arch-setup.exe") `
             -PreviousInstaller (Join-Path $PWD "internal\xfswin-previous-windows-$arch-setup.exe") `
-            -ProductMsi (Join-Path $PWD "internal\xfswin-$version-windows-$arch.msi") `
+            -TestInstaller (Join-Path $PWD "internal\xfswin-$version-windows-$arch-test-setup.exe") `
             -Fixtures (Join-Path $PWD 'ux-images') `
             -OutputDirectory (Join-Path $PWD 'acceptance-evidence') `
             -Architecture $arch `

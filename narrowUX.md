@@ -6,7 +6,7 @@ This document records the intentionally small user-facing surface for the first 
 
 REL-1 offers two ways to obtain the same command-line product:
 
-- A per-machine WiX setup package for users who want a stable install path and managed service lifecycle.
+- A per-machine native Rust setup for users who want a stable install path and managed service lifecycle.
 - A portable ZIP for users who want to extract and run the CLI themselves. Portable means the product files need no installer; mounting still requires the shared WinFsp runtime.
 
 The product has no GUI, tray icon, background updater or account flow. The `xfswin` command and Windows service are the product interface. Product files live under `%ProgramFiles%\XFS-for-Windows` by default; automount settings and identity enrollment live under `%ProgramData%\xfswin`.

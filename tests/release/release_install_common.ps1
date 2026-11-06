@@ -227,6 +227,16 @@ function Get-ReleasePackage {
         "setup executable is not native $Architecture"
     $portablePath = Join-Path (Split-Path -Parent $installerPath) "xfswin-$version-windows-$Architecture.zip"
     $hasPortable = Test-Path -LiteralPath $portablePath -PathType Leaf
+    $testSetupSha = [string](Get-ReleasePropertyPath $metadata 'testing.test_setup.sha256')
+    $syntheticSetupSha = [string](Get-ReleasePropertyPath $metadata 'testing.synthetic_older.setup.sha256')
+    $syntheticVersion = [string](Get-ReleasePropertyPath $metadata 'testing.synthetic_older.version')
+    $syntheticExeSha = [string](Get-ReleasePropertyPath $metadata 'testing.synthetic_older.executable.sha256')
+    foreach ($pair in @(@('test setup', $testSetupSha), @('synthetic older setup', $syntheticSetupSha),
+                        @('synthetic older executable', $syntheticExeSha))) {
+        if (-not [string]::IsNullOrWhiteSpace($pair[1]) -and $pair[1] -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "package metadata has an invalid $($pair[0]) SHA-256"
+        }
+    }
     return [pscustomobject]@{
         installer = $installerPath
         installer_sha256 = $installerSha
@@ -239,7 +249,63 @@ function Get-ReleasePackage {
         portable_zip_sha256 = $zipSha
         portable_path = if ($hasPortable) { $portablePath } else { '' }
         has_portable = $hasPortable
+        test_setup_sha256 = $testSetupSha.ToLowerInvariant()
+        synthetic_setup_sha256 = $syntheticSetupSha.ToLowerInvariant()
+        synthetic_version = $syntheticVersion
+        synthetic_exe_sha256 = $syntheticExeSha.ToLowerInvariant()
     }
+}
+
+function Assert-ReleaseTestSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$TestInstaller,
+        [Parameter(Mandatory = $true)]$Package
+    )
+    $path = Get-ReleaseFullPath $TestInstaller
+    Assert-Release ([IO.Path]::GetFileName($path) -eq
+                    "xfswin-$($Package.version)-windows-$($Package.architecture)-test-setup.exe") `
+        "test setup name does not identify this version/architecture: $path"
+    Assert-Release (-not [string]::IsNullOrWhiteSpace($Package.test_setup_sha256)) `
+        'package metadata does not record the acceptance test setup SHA-256'
+    $sha = Get-ReleaseSha256 $path
+    Assert-Release ($sha -eq $Package.test_setup_sha256) `
+        "test setup SHA-256 does not match package metadata (actual $sha)"
+    Assert-Release ($sha -ne $Package.installer_sha256) `
+        'the acceptance test setup must not be the public setup'
+    $machine = if ($Package.architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
+    Assert-Release ((Get-ReleasePeMachine $path) -eq $machine) `
+        "test setup is not native $($Package.architecture)"
+    $info = (Get-Item -LiteralPath $path).VersionInfo
+    Assert-Release ($info.Comments -match ';acceptance=test-fail$') `
+        "test setup does not identify the acceptance build: '$($info.Comments)'"
+    return [pscustomobject]@{ path = $path; sha256 = $sha }
+}
+
+function Assert-ReleaseSyntheticSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$PreviousInstaller,
+        [Parameter(Mandatory = $true)]$Package
+    )
+    $path = Get-ReleaseFullPath $PreviousInstaller
+    Assert-Release ([IO.Path]::GetFileName($path) -eq
+                    "xfswin-previous-windows-$($Package.architecture)-setup.exe") `
+        "synthetic older setup name is unexpected: $path"
+    Assert-Release (-not [string]::IsNullOrWhiteSpace($Package.synthetic_setup_sha256)) `
+        'package metadata does not record the synthetic older setup SHA-256'
+    $sha = Get-ReleaseSha256 $path
+    Assert-Release ($sha -eq $Package.synthetic_setup_sha256) `
+        "synthetic older setup SHA-256 does not match package metadata (actual $sha)"
+    Assert-Release ($sha -ne $Package.installer_sha256) `
+        'the synthetic older setup must not be the evaluated installer'
+    Assert-Release (-not [string]::IsNullOrWhiteSpace($Package.synthetic_version)) `
+        'package metadata does not record the synthetic older version'
+    $machine = if ($Package.architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
+    Assert-Release ((Get-ReleasePeMachine $path) -eq $machine) `
+        "synthetic older setup is not native $($Package.architecture)"
+    $info = (Get-Item -LiteralPath $path).VersionInfo
+    Assert-Release ($info.ProductVersion -eq "$($Package.synthetic_version).0") `
+        "synthetic older setup version is '$($info.ProductVersion)', expected $($Package.synthetic_version).0"
+    return [pscustomobject]@{ path = $path; sha256 = $sha; version = $Package.synthetic_version }
 }
 
 function Get-ReleasePeMachine {
@@ -321,49 +387,96 @@ function Get-ReleaseMsiProperty {
     }
 }
 
-function Get-ReleaseMsiPlatform {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $installer = $null
-    $database = $null
-    $summary = $null
+# The Rust setup writes its own product registration and Add/Remove Programs
+# entry.  These are the acceptance contract, not MSI state.
+$script:ReleaseProductKey = 'SOFTWARE\XFS-for-Windows'
+$script:ReleaseArpKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7C4E2D19-6B8A-4F53-A1D0-3E9B5C7A2F64}'
+
+function Get-ReleaseRegistryValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$SubKey,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64)
     try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        $database = $installer.OpenDatabase($Path, 0)
-        $summary = $database.SummaryInformation(0)
-        return [string]$summary.Property(7)
-    } catch {
-        throw "could not read the MSI platform summary from '$Path': $($_.Exception.Message)"
-    } finally {
-        if ($summary) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($summary) }
-        if ($database) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($database) }
-        if ($installer) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
+        $key = $base.OpenSubKey($SubKey)
+        if ($null -eq $key) { return $null }
+        try {
+            return $key.GetValue($Value, $null,
+                [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+}
+
+function Test-ReleaseRegistryKey {
+    param([Parameter(Mandatory = $true)][string]$SubKey)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($SubKey)
+        if ($null -eq $key) { return $false }
+        $key.Dispose()
+        return $true
+    } finally { $base.Dispose() }
+}
+
+function Get-ReleaseProductRegistration {
+    if (-not (Test-ReleaseRegistryKey $script:ReleaseProductKey)) { return $null }
+    return [pscustomobject]@{
+        install_root = [string](Get-ReleaseRegistryValue $script:ReleaseProductKey 'InstallRoot')
+        version = [string](Get-ReleaseRegistryValue $script:ReleaseProductKey 'Version')
+        architecture = [string](Get-ReleaseRegistryValue $script:ReleaseProductKey 'Architecture')
     }
 }
 
-function Assert-ReleaseProductMsi {
-    param(
-        [Parameter(Mandatory = $true)][string]$ProductMsi,
-        [Parameter(Mandatory = $true)]$Package
-    )
-    $path = Get-ReleaseFullPath $ProductMsi
-    Assert-Release ((Split-Path -Leaf $path) -match '\.msi$') "ProductMsi is not an MSI file: $path"
-    $name = Get-ReleaseMsiProperty $path 'ProductName'
-    $version = Get-ReleaseMsiProperty $path 'ProductVersion'
-    $productCode = Get-ReleaseMsiProperty $path 'ProductCode'
-    Assert-Release ($name -match '(?i)XFS') "ProductMsi is not the XFS for Windows package: '$name'"
-    Assert-Release (Test-ReleaseVersionEqual $version $Package.version) `
-        "ProductMsi version '$version' does not match package version '$($Package.version)'"
-    Assert-Release ($productCode -match '^\{[0-9A-Fa-f-]{36}\}$') `
-        'ProductMsi has no valid ProductCode'
-    $platform = Get-ReleaseMsiPlatform $path
-    if ($Package.architecture -eq 'x64') {
-        Assert-Release ($platform -match '(?i)(x64|Intel64|AMD64)') `
-            "ProductMsi platform summary '$platform' is not native x64"
-    } else {
-        Assert-Release ($platform -match '(?i)(Arm64|ARM64)') `
-            "ProductMsi platform summary '$platform' is not native arm64"
+function Get-ReleaseArpRegistration {
+    if (-not (Test-ReleaseRegistryKey $script:ReleaseArpKey)) { return $null }
+    return [pscustomobject]@{
+        display_name = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'DisplayName')
+        display_version = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'DisplayVersion')
+        publisher = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'Publisher')
+        install_location = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'InstallLocation')
+        display_icon = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'DisplayIcon')
+        uninstall_string = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'UninstallString')
+        quiet_uninstall_string = [string](Get-ReleaseRegistryValue $script:ReleaseArpKey 'QuietUninstallString')
     }
-    return [pscustomobject]@{ path = $path; version = $version; product_code = $productCode; platform = $platform }
+}
+
+function Assert-ReleaseProductRegistration {
+    param(
+        [Parameter(Mandatory = $true)]$Package,
+        [string]$ExpectedVersion = ''
+    )
+    $product = Get-ReleaseProductRegistration
+    Assert-Release ($null -ne $product) `
+        'the setup did not write HKLM\SOFTWARE\XFS-for-Windows'
+    $expectedRoot = Get-ReleaseProductDirectory
+    Assert-Release ($product.install_root.Equals([IO.Path]::GetFullPath($expectedRoot),
+            [StringComparison]::OrdinalIgnoreCase)) `
+        "product InstallRoot is '$($product.install_root)', expected '$expectedRoot'"
+    $wantedVersion = if ($ExpectedVersion) { $ExpectedVersion } else { $Package.version }
+    Assert-Release (Test-ReleaseVersionEqual $product.version $wantedVersion) `
+        "product Version '$($product.version)' does not match '$wantedVersion'"
+    Assert-Release ($product.architecture -eq $Package.architecture) `
+        "product Architecture '$($product.architecture)' does not match $($Package.architecture)"
+    $arp = Get-ReleaseArpRegistration
+    Assert-Release ($null -ne $arp) `
+        'the setup did not write its Add/Remove Programs registration'
+    Assert-Release ($arp.display_name -eq 'XFS for Windows') `
+        "ARP DisplayName is '$($arp.display_name)'"
+    Assert-Release (Test-ReleaseVersionEqual $arp.display_version $wantedVersion) `
+        "ARP DisplayVersion '$($arp.display_version)' does not match '$wantedVersion'"
+    Assert-Release ($arp.install_location.Equals([IO.Path]::GetFullPath($expectedRoot),
+            [StringComparison]::OrdinalIgnoreCase)) `
+        "ARP InstallLocation is '$($arp.install_location)'"
+    Assert-Release ($arp.uninstall_string -match '(?i)uninstall\.exe"?\s+/uninstall') `
+        "ARP UninstallString does not target the installed uninstaller: '$($arp.uninstall_string)'"
+    Assert-Release ($arp.quiet_uninstall_string -match '(?i)/uninstall\s+/quiet') `
+        "ARP QuietUninstallString is not silent: '$($arp.quiet_uninstall_string)'"
+    return [pscustomobject]@{ product = $product; arp = $arp }
 }
 
 function Assert-ReleaseWinFspMsi {
@@ -403,23 +516,6 @@ function Find-ReleaseWinFspMsi {
     Assert-Release ($verified.Count -ge 1) `
         'the official pinned WinFsp MSI is required for the dependency-failure case (set WINFSP_MSI or place winfsp-*.msi beside the setup)'
     return $verified[0]
-}
-
-function Test-ReleaseMsiProductRegistered {
-    param([Parameter(Mandatory = $true)][string]$ProductCode)
-    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
-        $key = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
-        try {
-            $uninstall = $key.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-            if ($uninstall) {
-                try {
-                    $subKey = $uninstall.OpenSubKey($ProductCode)
-                    if ($subKey) { $subKey.Dispose(); return $true }
-                } finally { $uninstall.Dispose() }
-            }
-        } finally { $key.Dispose() }
-    }
-    return $false
 }
 
 function Get-ReleaseWinFspMsiInstalled {
@@ -649,37 +745,29 @@ function Assert-ReleaseCommandOk {
         "$Description failed ($($Result.exit_code)): $($Result.output)"
 }
 
-function Invoke-ReleaseBundleInstall {
-    param([string]$Installer, [string]$LogName)
-    $log = Join-Path $script:ReleaseOutputDirectory ($LogName + '.log')
-    $result = Invoke-ReleaseProcess -FilePath $Installer `
-        -Arguments @('/quiet', '/norestart') -LogPath $log -TimeoutSeconds 1800
-    return $result
-}
-
-function Invoke-ReleaseBundleUninstall {
-    param([string]$Installer, [string]$LogName)
-    $log = Join-Path $script:ReleaseOutputDirectory ($LogName + '.log')
-    return Invoke-ReleaseProcess -FilePath $Installer `
-        -Arguments @('/uninstall', '/quiet', '/norestart') -LogPath $log -TimeoutSeconds 1800
-}
-
-function Invoke-ReleaseMsi {
+function Invoke-ReleaseSetupInstall {
     param(
-        [string]$ProductMsi,
-        [string]$LogName,
-        [string]$FailurePoint = '',
-        [switch]$ForceRepair
+        [Parameter(Mandatory = $true)][string]$Installer,
+        [Parameter(Mandatory = $true)][string]$LogName,
+        [string[]]$ExtraArguments = @()
     )
-    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
-    $log = Join-Path $script:ReleaseOutputDirectory ($LogName + '.msi.log')
-    $arguments = @('/i', $ProductMsi, '/qn', '/norestart')
-    if ($ForceRepair) { $arguments += @('REINSTALL=ALL', 'REINSTALLMODE=amus') }
-    if ($FailurePoint) { $arguments += "XFSWIN_TEST_FAIL=$FailurePoint" }
-    $arguments += @('/l*v', $log)
-    return Invoke-ReleaseProcess -FilePath $msiexec -Arguments $arguments `
-        -LogPath (Join-Path $script:ReleaseOutputDirectory ($LogName + '.log')) `
-        -TimeoutSeconds 1800
+    $log = Join-Path $script:ReleaseOutputDirectory ($LogName + '.log')
+    $setupLog = Join-Path $script:ReleaseOutputDirectory ($LogName + '.setup.log')
+    $arguments = @('/quiet', '/norestart', '/log', $setupLog) + $ExtraArguments
+    return Invoke-ReleaseProcess -FilePath $Installer `
+        -Arguments $arguments -LogPath $log -TimeoutSeconds 1800
+}
+
+function Invoke-ReleaseSetupUninstall {
+    param(
+        [Parameter(Mandatory = $true)][string]$Installer,
+        [Parameter(Mandatory = $true)][string]$LogName
+    )
+    $log = Join-Path $script:ReleaseOutputDirectory ($LogName + '.log')
+    $setupLog = Join-Path $script:ReleaseOutputDirectory ($LogName + '.setup.log')
+    return Invoke-ReleaseProcess -FilePath $Installer `
+        -Arguments @('/uninstall', '/quiet', '/norestart', '/log', $setupLog) `
+        -LogPath $log -TimeoutSeconds 1800
 }
 
 function Initialize-ReleaseVhdContext {
@@ -1334,6 +1422,10 @@ function Assert-ReleaseNoProductInstalled {
         'XFS for Windows is already installed; acceptance requires a clean runner'
     Assert-Release ($null -eq (Get-ReleaseService)) `
         'XFSWinAutomount service already exists; acceptance requires a clean runner'
+    Assert-Release ($null -eq (Get-ReleaseProductRegistration)) `
+        'HKLM\SOFTWARE\XFS-for-Windows already exists; acceptance requires a clean runner'
+    Assert-Release ($null -eq (Get-ReleaseArpRegistration)) `
+        'the product Add/Remove Programs entry already exists; acceptance requires a clean runner'
 }
 
 function Assert-ReleaseInstalledPackage {
@@ -1363,6 +1455,7 @@ function Assert-ReleaseInstalledPackage {
     $machine = if ($Package.architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
     Assert-Release ((Get-ReleasePeMachine $state.exe) -eq $machine) `
         "installed xfswin.exe is not native $($Package.architecture)"
+    [void](Assert-ReleaseProductRegistration -Package $Package -ExpectedVersion $ExpectedVersion)
     return $state
 }
 
@@ -1391,6 +1484,10 @@ function Assert-ReleaseProductRemoved {
         'the installed xfswin.exe remains after uninstall'
     Assert-Release ($null -eq (Get-ReleaseService)) `
         'XFSWinAutomount service remains after uninstall'
+    Assert-Release ($null -eq (Get-ReleaseProductRegistration)) `
+        'HKLM\SOFTWARE\XFS-for-Windows remains after uninstall'
+    Assert-Release ($null -eq (Get-ReleaseArpRegistration)) `
+        'the product Add/Remove Programs entry remains after uninstall'
     Assert-Release (-not (Test-ReleasePathEntry (Get-ReleaseMachinePath) $directory)) `
         'machine PATH still includes the product directory after uninstall'
     Assert-Release (@(Get-ReleaseShortcuts $directory).Count -eq 0) `

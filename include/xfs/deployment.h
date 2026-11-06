@@ -3,10 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // XFS for Windows - REL-1 installer deployment contract.
 //
-// The product installer is a per-machine WiX Burn bundle around a per-machine
-// MSI.  The MSI never owns configuration: the %ProgramData%\xfswin directory
-// (configuration, identity enrollment, sessions and maintenance records) is
-// outside the MSI component tree and survives upgrade and ordinary uninstall.
+// The product installer is the native per-machine Rust setup.  Setup itself
+// never owns configuration: the %ProgramData%\xfswin directory (configuration,
+// identity enrollment, sessions and maintenance records) is outside the
+// installed product tree and survives upgrade and ordinary uninstall.
 //
 // The maintenance protocol uses protected state and a startup mutex:
 //
@@ -312,22 +312,20 @@ struct InstallerOptions {
   InstallerAction action = InstallerAction::kInstall;
   std::filesystem::path install_path;   // absolute installed xfswin.exe
   std::filesystem::path state_root;     // empty = DefaultDeploymentPaths()
-  // Installer-only failure injection (MSI property XFSWIN_TEST_FAIL passes
-  // this through): "before-service", "after-files", "service-start", "verify"
-  // or empty.  "verify" makes the standalone verify action fail after a
-  // successful apply, so MSI rollback is exercised with the new service
-  // already running.
+  // Installer-only failure injection (the acceptance test setup's /test-fail
+  // flag passes this through): "before-service", "after-files",
+  // "service-start", "verify" or empty.  "verify" makes the standalone verify
+  // action fail after a successful apply, so setup rollback is exercised with
+  // the new service already running.
   std::string injected_failure;
   // A fresh install may verify before the service exists; upgrade/uninstall
   // verification requires it unless this is set.
   bool allow_service_absent = false;
   uint32_t stop_timeout_ms = 30000;
-  // The MSI schedules one rollback stop action, one rollback restore action
-  // and one commit action for every transaction branch of the active package;
-  // their sequence condition only excludes the old package's nested uninstall
-  // during RemoveExistingProducts.  With this set, rollback and commit take
-  // their install/upgrade/uninstall operation from the fence and capture that
-  // prepare wrote instead of trusting the (absent) --action value.
+  // The setup runs rollback and commit after its transaction branch has been
+  // decided.  With this set (--action auto), rollback and commit take their
+  // install/upgrade/uninstall operation from the fence and capture that
+  // prepare wrote instead of trusting the verb's own action.
   bool use_captured_action = false;
 };
 
@@ -382,12 +380,12 @@ InstallerResult VerifyInstaller(const InstallerOptions& options);
 InstallerResult CommitInstaller(const InstallerOptions& options);
 InstallerResult RollbackInstaller(const InstallerOptions& options);
 
-// Rollback stop phase used by the MSI rollback sequence.  A rollback action
-// anchored after InstallFiles executes before Windows Installer restores the
-// files, so this operation clean-stops the transaction-owned automount
-// service (the only way to release a running xfswin.exe image) while leaving
-// the captured rollback state and the fence untouched.  RollbackInstaller then
-// runs after the files are back and restores the captured SCM state.  With no
+// Rollback stop phase used by the setup rollback sequence.  It executes before
+// the setup restores the previous files, so this operation clean-stops the
+// transaction-owned automount service (the only way to release a running
+// xfswin.exe image) while leaving the captured rollback state and the fence
+// untouched.  RollbackInstaller then runs after the files are back and
+// restores the captured SCM state.  With no
 // active fence there is nothing to stop and the operation succeeds.  It also
 // succeeds without touching the service when the transaction never reached
 // apply/remove: prepare writes the fence and capture before it refuses an

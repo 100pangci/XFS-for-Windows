@@ -15,7 +15,7 @@ The setup package installs product files and documentation under `%ProgramFiles%
 
 ## WinFsp requirement
 
-The setup bundle manages the official WinFsp runtime as a shared system dependency. The portable ZIP does not include WinFsp DLLs; install the official runtime separately before using `mount` or automount. The pinned REL-1 dependency is:
+The setup manages the official WinFsp runtime as a shared system dependency. The portable ZIP does not include WinFsp DLLs; install the official runtime separately before using `mount` or automount. The pinned REL-1 dependency is:
 
 - Official MSI: [winfsp-2.1.25156.msi](https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi)
 - SHA-256: `073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`

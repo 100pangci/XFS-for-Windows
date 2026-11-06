@@ -512,7 +512,7 @@ single owner of each filesystem invariant.
 | [docs/UX.md](docs/UX.md) | native Windows discovery, interactive mounting, drive letters, Explorer volume information, automount service and its read-only/DEV-1 boundary |
 | [docs/STATEFUL_FUZZING.md](docs/STATEFUL_FUZZING.md) | model-based stateful and crash fuzzing |
 | [docs/INSTALL.md](docs/INSTALL.md) | installation, WinFsp prerequisite, first mount, upgrade, uninstall and preserved configuration |
-| [INSTALLER.md](INSTALLER.md) | WiX choice, WinFsp ownership and license, service maintenance, rollback and package build interface |
+| [INSTALLER.md](INSTALLER.md) | native Rust setup, WinFsp ownership and license, service maintenance, rollback and package build interface |
 | [RELEASE.md](RELEASE.md) | maintainer release gate, provenance evidence, signing, manifest and rollback |
 | [narrowUX.md](narrowUX.md) | the intentionally limited first packaged UX |
 

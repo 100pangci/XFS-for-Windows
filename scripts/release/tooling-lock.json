@@ -1,30 +1,10 @@
 {
   "schema_version": 1,
-  "dotnet_sdk": {
-    "version": "8.0.404",
-    "metadata_url": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json",
-    "archives": {
-      "win-x64": {
-        "archive": "dotnet-sdk-8.0.404-win-x64.zip",
-        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.404/dotnet-sdk-8.0.404-win-x64.zip",
-        "sha512": "fe2a799726fafa252352e6397dd790717f7263903408ccfedb0fb275ba93f96a7840dacc7f188e94d87671313d2a48480ea8387408ed5772b43c363e2dbba1ba"
-      },
-      "win-arm64": {
-        "archive": "dotnet-sdk-8.0.404-win-arm64.zip",
-        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.404/dotnet-sdk-8.0.404-win-arm64.zip",
-        "sha512": "d3ce21557b9ed09e7e705930a4b7ebb602882f55721a87570e9f9f571754a0dcb218d0354f97cb1364ba43f67ecf1d9e7240b4cc4454f475dd4af65291a9f939"
-      }
-    }
-  },
-  "wix": {
-    "version": "7.0.1",
-    "tool_package": "wix",
-    "sdk_package": "WixToolset.Sdk",
-    "nuget_source": "https://api.nuget.org/v3/index.json",
-    "osmf_eula": {
-      "automatic": false,
-      "accept_command": ["eula", "accept", "wix7"],
-      "ci_variable": "WIX_OSMF_EULA_ACCEPTED"
+  "rust": {
+    "version": "1.97.0",
+    "targets": {
+      "x64": "x86_64-pc-windows-msvc",
+      "arm64": "aarch64-pc-windows-msvc"
     }
   },
   "cmake": {

@@ -3,15 +3,16 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Build the REL-1 Windows release assets for one architecture:
-#   - portable ZIP derived from the CMake install tree (manifest.py names)
-#   - internal per-machine MSI (CMake install tree with THIRD-PARTY-NOTICES/)
-#   - Burn setup executable embedding the official WinFsp MSI
+#   - portable ZIP derived from the CMake install tree
+#   - native Rust setup executable embedding a verified payload ZIP and the
+#     official WinFsp MSI
+#   - an acceptance-only setup built with the test-fail feature
 #   - package-metadata-<arch>.json
 #   - optional 0.0.0 test-only older fixture under testing/:
-#     xfswin.exe + version.json + MSI + Burn setup, built from an isolated
-#     clean worktree of the evaluated commit with only the CMake project
-#     version lowered.  The evaluated checkout and its artifact hashes are
-#     never modified.
+#     a synthetic older payload and Rust setup built from an isolated clean
+#     worktree of the evaluated commit with only the CMake project version
+#     lowered.  The evaluated checkout and its artifact hashes are never
+#     modified.
 #
 # Usage:
 #   pwsh -File scripts/release/build-packages.ps1 `
@@ -22,9 +23,10 @@
 #       -AllowExternalToolExecution
 #
 # Tool isolation:
-#   Run scripts/release/bootstrap-tools.ps1 first (or set XFSWIN_TOOL_ROOT).
-#   NuGet restores are redirected into <ToolRoot>\nuget-packages and MSBuild
-#   intermediate files into BuildDirectory. Nothing is installed machine-wide.
+#   The build uses the installed Rust toolchain pinned by tooling-lock.json
+#   and CMake.  Cargo target directories live under BuildDirectory; nothing is
+#   installed machine-wide.  Cargo runs with --locked so Cargo.lock is part of
+#   the release input.
 #
 # WinFsp SDK:
 #   The build needs the WinFsp SDK headers/import library, never an app-local
@@ -33,15 +35,8 @@
 #
 # Signing:
 #   Optional WINDOWS_SIGNING_CERT/WINDOWS_SIGNING_PASSWORD. When present the
-#   staged xfswin.exe is signed before MSI packaging, the MSI before the Burn
-#   bundle is built, and the Burn engine/final bundle are signed last.
-#
-# WiX 7 OSMF EULA:
-#   WiX 7 may require accepting the OSMF EULA before MSI/Burn commands. This
-#   script never accepts it implicitly. -AcceptWixEula is false by default;
-#   when passed explicitly it runs `wix eula accept wix7` in the isolated tool
-#   directory before building. CI additionally requires the explicit
-#   repository variable WIX_OSMF_EULA_ACCEPTED=true.
+#   staged xfswin.exe is signed before the payload archive is built and every
+#   setup executable is signed after its payload is embedded.
 #
 # Both architectures must be built into the same OutputDirectory before
 # -FinalizeManifest can create/verify release-manifest.json and SHA256SUMS.txt.
@@ -62,7 +57,6 @@ param(
     [switch]$AllowExternalToolExecution,
     [switch]$SyntheticOlderVersion,
     [string]$SyntheticOlderProductVersion = '0.0.0',
-    [switch]$AcceptWixEula,
     [switch]$FinalizeManifest,
     [string]$EvidenceDirectory
 )
@@ -118,24 +112,6 @@ function Get-VersionFromCMake {
     return $match.Groups[1].Value
 }
 
-function Assert-WixProjectPin {
-    param(
-        [Parameter(Mandatory = $true)][string]$ProjectPath,
-        [Parameter(Mandatory = $true)][string]$ExpectedVersion
-    )
-    if (-not (Test-Path -LiteralPath $ProjectPath -PathType Leaf)) {
-        throw "Missing shared WiX project (owned by the integration owner): $ProjectPath"
-    }
-    $text = Get-Content -LiteralPath $ProjectPath -Raw -Encoding UTF8
-    $match = [regex]::Match($text, 'Sdk\s*=\s*"WixToolset\.Sdk/([^"]+)"')
-    if (-not $match.Success) {
-        throw "WiX project does not pin WixToolset.Sdk: $ProjectPath"
-    }
-    if ($match.Groups[1].Value -ne $ExpectedVersion) {
-        throw "WiX project pins WixToolset.Sdk/$($match.Groups[1].Value), expected ${ExpectedVersion}: $ProjectPath"
-    }
-}
-
 function Get-WinFspSdkRoot {
     param(
         [Parameter(Mandatory = $true)][string]$Architecture
@@ -166,90 +142,204 @@ function Get-WinFspSdkRoot {
     throw 'WinFsp SDK not found. Set XFSWIN_WINFSP_ROOT or WINFSP_ROOT to the SDK root containing inc/ and lib/. The build never installs the WinFsp MSI.'
 }
 
-function Invoke-WixEulaAcceptance {
-    # Explicit, opt-in only.  Never called unless -AcceptWixEula was passed
-    # after the OSMF licensing decision.
+function Get-CargoToolchain {
     param(
-        [Parameter(Mandatory = $true)][string]$DotnetPath,
-        [Parameter(Mandatory = $true)][string]$ToolRootPath
+        [Parameter(Mandatory = $true)]$ToolingLock,
+        [Parameter(Mandatory = $true)][string]$Architecture
     )
-    $wixToolDirectory = Join-Path $ToolRootPath 'wix-tool'
-    $manifest = Join-Path $wixToolDirectory '.config\dotnet-tools.json'
-    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-        throw "The isolated WiX tool manifest is missing: $manifest. Run scripts/release/bootstrap-tools.ps1 first."
+    $rustPin = $ToolingLock.rust
+    $versionPin = Get-RequiredJsonString -Object $rustPin -Name 'version' -Context 'Rust lock'
+    $targetPin = Get-RequiredJsonString -Object $rustPin.targets -Name $Architecture -Context 'Rust lock targets'
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:XFSWIN_CARGO)) { $candidates += $env:XFSWIN_CARGO }
+    $cargo = Resolve-CommandPath -Name 'cargo.exe' -Candidates $candidates
+    if ($null -eq $cargo) {
+        throw 'cargo.exe was not found; install the pinned Rust toolchain or set XFSWIN_CARGO.'
     }
-    Write-Host 'Accepting the WiX 7 OSMF EULA explicitly (wix eula accept wix7)...'
-    Invoke-External -FilePath $DotnetPath `
-        -Arguments @('tool', 'run', 'wix', '--', 'eula', 'accept', 'wix7') `
-        -WorkingDirectory $wixToolDirectory
+    $rustc = Resolve-CommandPath -Name 'rustc.exe'
+    if ($null -eq $rustc) {
+        throw 'rustc.exe was not found; install the pinned Rust toolchain.'
+    }
+    $cargoText = Invoke-External -FilePath $cargo -Arguments @('--version') -WorkingDirectory $repoRoot -Capture
+    $cargoMatch = [regex]::Match($cargoText, '^cargo\s+([0-9]+\.[0-9]+\.[0-9]+)')
+    if (-not $cargoMatch.Success) {
+        throw "Could not parse cargo --version: $cargoText"
+    }
+    $cargoVersion = $cargoMatch.Groups[1].Value
+    $rustcText = Invoke-External -FilePath $rustc -Arguments @('-vV') -WorkingDirectory $repoRoot -Capture
+    $rustcMatch = [regex]::Match($rustcText, '(?m)^rustc\s+([0-9]+\.[0-9]+\.[0-9]+)')
+    $hostMatch = [regex]::Match($rustcText, '(?m)^host:\s+(\S+)')
+    if (-not $rustcMatch.Success -or -not $hostMatch.Success) {
+        throw "Could not parse rustc -vV: $rustcText"
+    }
+    $rustcVersion = $rustcMatch.Groups[1].Value
+    $host = $hostMatch.Groups[1].Value
+    if ($cargoVersion -ne $versionPin -or $rustcVersion -ne $versionPin) {
+        throw "Rust toolchain is $rustcVersion/$cargoVersion but tooling-lock.json pins $versionPin. Install that toolchain or set XFSWIN_CARGO."
+    }
+    if ($host -ne $targetPin) {
+        throw "The Rust host target is $host, but $Architecture requires $targetPin. Build each architecture on its native runner."
+    }
+    return [pscustomobject]@{
+        cargo = $cargo
+        rustc = $rustc
+        version = $versionPin
+        host = $host
+    }
 }
 
-function Invoke-WixProjectBuild {
+function Get-PythonInvoker {
+    $candidates = @($env:XFSWIN_PYTHON) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return @{ FilePath = [System.IO.Path]::GetFullPath($candidate); Prefix = @() }
+        }
+    }
+    $python = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($null -ne $python) {
+        return @{ FilePath = $python.Source; Prefix = @() }
+    }
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($null -ne $py) {
+        return @{ FilePath = $py.Source; Prefix = @('-3') }
+    }
+    throw 'Python 3 was not found; set XFSWIN_PYTHON to run the release payload builder and manifest validator.'
+}
+
+function New-EmbeddedPayload {
     param(
-        [Parameter(Mandatory = $true)][string]$ProjectFileName,
-        [Parameter(Mandatory = $true)][string]$Label,
-        [Parameter(Mandatory = $true)][string]$ProductVersion,
-        [string]$PayloadDirectory,
-        [string]$MsiPath
+        [Parameter(Mandatory = $true)][string]$AppDirectory,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$GitSha,
+        [Parameter(Mandatory = $true)][string]$Architecture,
+        [Parameter(Mandatory = $true)][string]$OutputPath
     )
-    $projectPath = Join-Path $repoRoot "packaging\windows\$ProjectFileName"
-    $outputPath = Join-Path $BuildDirectory "wix-$Label-$Architecture\out"
-    $objectPath = Join-Path $BuildDirectory "wix-$Label-$Architecture\obj"
-    [void](New-Item -ItemType Directory -Path $outputPath -Force)
-    [void](New-Item -ItemType Directory -Path $objectPath -Force)
-
-    $arguments = @(
-        'build', $projectPath,
-        '-c', 'Release',
-        '--nologo',
-        "-p:Platform=$Architecture",
-        "-p:ProductVersion=$ProductVersion",
-        "-p:WinFspMsi=$winFspMsiPath",
-        ('-p:OutputPath=' + $outputPath + '\'),
-        ('-p:BaseIntermediateOutputPath=' + $objectPath + '\'),
-        ('-p:MSBuildProjectExtensionsPath=' + $objectPath + '\'),
-        "-p:RestoreSources=$nugetSource"
+    $python = Get-PythonInvoker
+    $script = Join-Path $repoRoot 'scripts\release\make_payload.py'
+    $arguments = @($python.Prefix) + @(
+        '-I', $script,
+        '--app-dir', $AppDirectory,
+        '--winfsp-msi', $winFspMsiPath,
+        '--winfsp-version', $winFspVersion,
+        '--winfsp-sha256', $winFspSha256,
+        '--output', $OutputPath,
+        '--version', $Version,
+        '--git-sha', $GitSha,
+        '--architecture', $Architecture
     )
-    if (-not [string]::IsNullOrWhiteSpace($PayloadDirectory)) {
-        $arguments += "-p:PayloadDir=$PayloadDirectory"
-    }
-    if (-not [string]::IsNullOrWhiteSpace($MsiPath)) {
-        $arguments += "-p:ProductMsi=$MsiPath"
-    }
-
+    $text = Invoke-External -FilePath $python.FilePath -Arguments $arguments -WorkingDirectory $repoRoot -Capture
     try {
-        Invoke-External -FilePath $dotnet -Arguments $arguments -WorkingDirectory $repoRoot
+        $payload = $text | ConvertFrom-Json -ErrorAction Stop
     } catch {
-        $message = $_.Exception.Message
-        if ($message -match 'WIX7015' -or $message -match '(?i)OSMF|EULA') {
-            throw ("WiX 7 stopped with its OSMF EULA requirement (WIX7015). Review the OSMF terms; " +
-                'if the licensing decision allows it, re-run with -AcceptWixEula (CI: declare the ' +
-                'repository variable WIX_OSMF_EULA_ACCEPTED=true) or run "wix eula accept wix7" yourself. ' +
-                "The build did not accept anything automatically. Original error: $message")
-        }
-        throw
+        throw "make_payload.py did not return JSON metadata: $text"
     }
+    if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+        throw "make_payload.py did not produce $OutputPath"
+    }
+    $actual = Get-FileSha256 -Path $OutputPath
+    if ($actual -ne [string]$payload.sha256) {
+        throw "payload archive SHA-256 does not match its builder metadata (actual $actual, reported $($payload.sha256))"
+    }
+    if ([int]$payload.file_count -lt 2) {
+        throw "payload archive is unexpectedly empty: $($payload.file_count) entries"
+    }
+    return [pscustomobject]@{
+        path = $OutputPath
+        sha256 = $actual
+        size_bytes = (Get-Item -LiteralPath $OutputPath).Length
+        file_count = [int]$payload.file_count
+    }
+}
 
-    if (-not [string]::IsNullOrWhiteSpace($MsiPath) -and
-        -not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
-        # Do not trust only the project-level copy target: locate the MSI the
-        # SDK actually emitted (including a platform subdirectory) and place it
-        # at the release testing path the acceptance scripts consume.
-        $producedMsi = @(Get-ChildItem -LiteralPath $outputPath -Recurse -File -Filter '*.msi' -ErrorAction SilentlyContinue)
-        if ($producedMsi.Count -ne 1) {
-            throw "WiX project $ProjectFileName must produce exactly one MSI in $outputPath; found $($producedMsi.Count)."
+function Invoke-RustSetupBuild {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$PayloadZip,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$GitSha,
+        [Parameter(Mandatory = $true)][string]$TargetDirectory,
+        [switch]$TestBuild
+    )
+    $cargoTarget = Join-Path $BuildDirectory $TargetDirectory
+    Assert-FreshDirectory -Path $cargoTarget -Name "Cargo target directory for $Label"
+    $previousCargoTarget = $env:CARGO_TARGET_DIR
+    $previousPayload = $env:XFSWIN_SETUP_PAYLOAD_ZIP
+    $previousVersion = $env:XFSWIN_SETUP_VERSION
+    $previousGit = $env:XFSWIN_SETUP_GIT_SHA
+    $previousArch = $env:XFSWIN_SETUP_ARCH
+    $previousWinFspHash = $env:XFSWIN_SETUP_WINFSP_SHA256
+    $previousResources = $env:XFSWIN_SETUP_REQUIRE_RESOURCES
+    try {
+        $env:CARGO_TARGET_DIR = $cargoTarget
+        $env:XFSWIN_SETUP_PAYLOAD_ZIP = $PayloadZip
+        $env:XFSWIN_SETUP_VERSION = $Version
+        $env:XFSWIN_SETUP_GIT_SHA = $GitSha
+        $env:XFSWIN_SETUP_ARCH = $Architecture
+        $env:XFSWIN_SETUP_WINFSP_SHA256 = $WinFspSha256
+        $env:XFSWIN_SETUP_REQUIRE_RESOURCES = '1'
+        $manifest = Join-Path $repoRoot 'installer\Cargo.toml'
+        $arguments = @('build', '--release', '--locked', '--manifest-path', $manifest)
+        if ($TestBuild) {
+            $arguments += @('--features', 'test-fail')
         }
-        $msiParent = Split-Path -Parent $MsiPath
-        if (-not (Test-Path -LiteralPath $msiParent -PathType Container)) {
-            [void](New-Item -ItemType Directory -Path $msiParent -Force)
-        }
-        Copy-Item -LiteralPath $producedMsi[0].FullName -Destination $MsiPath -ErrorAction Stop
+        Invoke-External -FilePath $cargo.cargo -Arguments $arguments `
+            -WorkingDirectory (Join-Path $repoRoot 'installer')
+    } finally {
+        $env:CARGO_TARGET_DIR = $previousCargoTarget
+        $env:XFSWIN_SETUP_PAYLOAD_ZIP = $previousPayload
+        $env:XFSWIN_SETUP_VERSION = $previousVersion
+        $env:XFSWIN_SETUP_GIT_SHA = $previousGit
+        $env:XFSWIN_SETUP_ARCH = $previousArch
+        $env:XFSWIN_SETUP_WINFSP_SHA256 = $previousWinFspHash
+        $env:XFSWIN_SETUP_REQUIRE_RESOURCES = $previousResources
     }
-    if (-not [string]::IsNullOrWhiteSpace($MsiPath) -and
-        -not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
-        throw "WiX project $ProjectFileName did not produce the expected MSI: $MsiPath"
+    $produced = Join-Path $cargoTarget 'release\xfswin-setup.exe'
+    if (-not (Test-Path -LiteralPath $produced -PathType Leaf)) {
+        throw "Cargo build '$Label' did not produce $produced"
     }
-    return $outputPath
+    return $produced
+}
+
+function Test-RustSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$GitSha,
+        [Parameter(Mandatory = $true)][int]$ExpectedPeMachine,
+        [switch]$TestBuild
+    )
+    $file = Get-Item -LiteralPath $Path
+    if ($file.Length -lt 1048576) {
+        throw "setup executable is unexpectedly small: $($file.Length) bytes"
+    }
+    if ($file.Length -gt 268435456) {
+        throw "setup executable exceeds 256 MiB: $($file.Length) bytes"
+    }
+    if ((Get-PeMachine -Path $Path) -ne $ExpectedPeMachine) {
+        throw "setup executable is $(Get-PeMachineName -Machine (Get-PeMachine -Path $Path)), expected native $Architecture."
+    }
+    $info = $file.VersionInfo
+    if ($info.ProductName -ne 'XFS for Windows' -or
+        $info.FileDescription -ne 'XFS for Windows Setup' -or
+        $info.OriginalFilename -ne 'xfswin-setup.exe') {
+        throw "setup version resources are incomplete: $($info.ProductName) / $($info.FileDescription) / $($info.OriginalFilename)"
+    }
+    $expectedVersion = "$Version.0"
+    if ($info.ProductVersion -ne $expectedVersion -or $info.FileVersion -ne $expectedVersion) {
+        throw "setup version resources are $($info.FileVersion)/$($info.ProductVersion), expected $expectedVersion."
+    }
+    $acceptance = if ($TestBuild) { 'test-fail' } else { 'none' }
+    $expectedComments = "git=$GitSha;arch=$Architecture;acceptance=$acceptance"
+    if ($info.Comments -ne $expectedComments) {
+        throw "setup build identity is '$($info.Comments)', expected '$expectedComments'."
+    }
+    return [pscustomobject]@{
+        path = [System.IO.Path]::GetFullPath($Path)
+        sha256 = Get-FileSha256 -Path $Path
+        size_bytes = $file.Length
+        version = $info.ProductVersion
+        comments = $info.Comments
+    }
 }
 
 function Test-StagedPayload {
@@ -260,10 +350,6 @@ function Test-StagedPayload {
         [Parameter(Mandatory = $true)][string]$Architecture,
         [Parameter(Mandatory = $true)][int]$ExpectedPeMachine
     )
-    # Product.wxs consumes this exact CMake install layout for the MSI payload:
-    # a THIRD-PARTY-NOTICES directory beside the documented portable files.
-    # The portable ZIP is a derived view with manifest.py-compatible names
-    # (THIRD-PARTY-NOTICES.txt and licenses/WinFsp-LICENSE.txt).
     $allowedFiles = @(
         'xfswin.exe',
         'LICENSE',
@@ -427,7 +513,6 @@ function New-PortablePayload {
         throw 'The CMake install tree does not contain the WinFsp notice/license files needed for the portable payload.'
     }
 
-    # manifest.py allows these exact names only, not the MSI's notice folder.
     Copy-Item -LiteralPath $noticeSource -Destination (Join-Path $PortableDirectory 'THIRD-PARTY-NOTICES.txt') -ErrorAction Stop
     $licensesDirectory = Join-Path $PortableDirectory 'licenses'
     [void](New-Item -ItemType Directory -Path $licensesDirectory -ErrorAction Stop)
@@ -538,26 +623,9 @@ function Test-PortableZip {
     }
 }
 
-function Find-BundleExecutable {
-    param(
-        [Parameter(Mandatory = $true)][string]$Directory,
-        [Parameter(Mandatory = $true)][string]$ExpectedName
-    )
-    $executables = @(Get-ChildItem -LiteralPath $Directory -File -Filter '*.exe')
-    if ($executables.Count -eq 0) {
-        throw "Bundle build produced no executable in $Directory"
-    }
-    $preferred = @($executables | Where-Object { $_.Name -ieq $ExpectedName })
-    if ($preferred.Count -eq 1) { return $preferred[0] }
-    $nonEngine = @($executables | Where-Object { $_.Name -notmatch '(?i)engine' })
-    if ($nonEngine.Count -eq 1) { return $nonEngine[0] }
-    throw "Ambiguous Burn bundle output in ${Directory}: $($executables.Name -join ', ')"
-}
-
 function Invoke-ReleaseSigning {
     param(
         [string]$TargetPath,
-        [ValidateSet('File', 'Bundle')][string]$TargetKind = 'File',
         [switch]$ValidateConfiguration
     )
     $signScript = Join-Path $PSScriptRoot 'sign.ps1'
@@ -565,30 +633,12 @@ function Invoke-ReleaseSigning {
         & $signScript -ValidateOnly
         return
     }
-    & $signScript -Path $TargetPath -Kind $TargetKind -ToolRoot $ToolRoot -Dotnet $dotnet
-}
-
-function Get-PythonInvoker {
-    $candidates = @($env:XFSWIN_PYTHON) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return @{ FilePath = [System.IO.Path]::GetFullPath($candidate); Prefix = @() }
-        }
-    }
-    $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($null -ne $python) {
-        return @{ FilePath = $python.Source; Prefix = @() }
-    }
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($null -ne $py) {
-        return @{ FilePath = $py.Source; Prefix = @('-3') }
-    }
-    throw 'Python 3 was not found; set XFSWIN_PYTHON to run the release manifest validator.'
+    & $signScript -Path $TargetPath -Kind File
 }
 
 try {
     if (-not $AllowExternalToolExecution) {
-        throw 'build-packages runs CMake, .NET/MSBuild, WiX and optional signing tools. Re-run with -AllowExternalToolExecution to confirm.'
+        throw 'build-packages runs CMake, Rust/Cargo and optional signing tools. Re-run with -AllowExternalToolExecution to confirm.'
     }
 
     $repoRoot = Get-ReleaseRepoRoot
@@ -622,18 +672,9 @@ try {
     $winFspUrl = Get-RequiredJsonString -Object $winFspLock -Name 'url' -Context 'WinFsp lock'
     $winFspSha256 = (Get-RequiredJsonString -Object $winFspLock -Name 'sha256' -Context 'WinFsp lock').ToLowerInvariant()
     $winFspMinimumVersion = Get-RequiredJsonString -Object $winFspLock -Name 'minimum_version' -Context 'WinFsp lock'
-
-    $dotnetPin = $toolingLock.dotnet_sdk
-    $wixPin = $toolingLock.wix
     $cmakePin = $toolingLock.cmake
-    $dotnetVersionPin = Get-RequiredJsonString -Object $dotnetPin -Name 'version' -Context '.NET SDK lock'
-    $wixVersionPin = Get-RequiredJsonString -Object $wixPin -Name 'version' -Context 'WiX lock'
-    $nugetSource = Get-RequiredJsonString -Object $wixPin -Name 'nuget_source' -Context 'WiX lock'
     $cmakeMinimumVersion = Get-RequiredJsonString -Object $cmakePin -Name 'minimum_version' -Context 'CMake lock'
 
-    if ($wixVersionPin -ne '7.0.1') {
-        throw "Release tooling is pinned to WiX 7.0.1, not $wixVersionPin."
-    }
     if ($winFspSha256 -notmatch '^[0-9a-f]{64}$') {
         throw 'WinFsp lock SHA-256 is not a 64-character hexadecimal digest.'
     }
@@ -663,69 +704,12 @@ try {
         throw 'Release packages require a clean committed source tree; commit or discard the pending changes first.'
     }
 
-    if ([string]::IsNullOrWhiteSpace($env:XFSWIN_TOOL_ROOT)) {
-        $ToolRoot = Join-Path $repoRoot 'out\tools'
-    } else {
-        $ToolRoot = Assert-AbsolutePath -Path $env:XFSWIN_TOOL_ROOT -Name 'XFSWIN_TOOL_ROOT'
-    }
-    [void](New-Item -ItemType Directory -Path $ToolRoot -Force)
-    $env:NUGET_PACKAGES = Join-Path $ToolRoot 'nuget-packages'
-    [void](New-Item -ItemType Directory -Path $env:NUGET_PACKAGES -Force)
-    $env:NUGET_HTTP_CACHE_PATH = Join-Path $ToolRoot 'nuget-http-cache'
-    [void](New-Item -ItemType Directory -Path $env:NUGET_HTTP_CACHE_PATH -Force)
-    $env:DOTNET_CLI_HOME = Join-Path $ToolRoot 'dotnet-home'
-    [void](New-Item -ItemType Directory -Path $env:DOTNET_CLI_HOME -Force)
-
-    $nativeRid = Get-NativeDotnetRid
-    $dotnetCandidates = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:XFSWIN_DOTNET)) {
-        $dotnetCandidates += $env:XFSWIN_DOTNET
-    }
-    $toolchainPath = Join-Path $ToolRoot 'toolchain.json'
-    if (Test-Path -LiteralPath $toolchainPath -PathType Leaf) {
-        $toolchain = Read-JsonFile -Path $toolchainPath
-        $sdkProperty = $toolchain.PSObject.Properties['dotnet_sdk']
-        if ($null -ne $sdkProperty) {
-            $pathProperty = $sdkProperty.Value.PSObject.Properties['path']
-            if ($null -ne $pathProperty -and $pathProperty.Value -is [string] -and
-                -not [string]::IsNullOrWhiteSpace($pathProperty.Value)) {
-                $dotnetCandidates += $pathProperty.Value
-            }
-        }
-    }
-    $dotnetCandidates += (Join-Path $ToolRoot "dotnet-sdk-$dotnetVersionPin-$nativeRid\dotnet.exe")
-    $nativeSdkPattern = '-' + [regex]::Escape($nativeRid) + '$'
-    foreach ($sdkDirectory in @(Get-ChildItem -LiteralPath $ToolRoot -Directory -Filter 'dotnet-sdk-*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $nativeSdkPattern -or $_.Name -match '^dotnet-sdk-[0-9]+\.[0-9]+\.[0-9]+$' } |
-        Sort-Object Name -Descending)) {
-        $dotnetCandidates += (Join-Path $sdkDirectory.FullName 'dotnet.exe')
-    }
-    $dotnetCandidates += (Join-Path $ToolRoot 'dotnet\dotnet.exe')
-    $dotnet = Resolve-CommandPath -Name 'dotnet.exe' -Candidates $dotnetCandidates
-    if ($null -eq $dotnet) {
-        throw 'dotnet.exe was not found. Run scripts/release/bootstrap-tools.ps1 or set XFSWIN_DOTNET.'
-    }
-    Assert-NativeDotnetHost -DotnetPath $dotnet -NativeRid $nativeRid
-    $env:DOTNET_ROOT = Split-Path -Parent $dotnet
-    $env:PATH = $env:DOTNET_ROOT + ';' + $env:PATH
-    $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
-    $env:DOTNET_NOLOGO = '1'
-    $reportedDotnetVersion = Invoke-External -FilePath $dotnet -Arguments @('--version') -WorkingDirectory $ToolRoot -Capture
-    if ($reportedDotnetVersion.Trim() -ne $dotnetVersionPin) {
-        throw "dotnet --version reported '$reportedDotnetVersion', expected the pinned $dotnetVersionPin. Re-run bootstrap-tools.ps1."
-    }
-
-    if ($AcceptWixEula) {
-        Invoke-WixEulaAcceptance -DotnetPath $dotnet -ToolRootPath $ToolRoot
-    } else {
-        Write-Host 'WiX 7 OSMF EULA acceptance is disabled (default). If WiX stops with WIX7015, review the OSMF terms and pass -AcceptWixEula explicitly.'
-    }
-
+    $cargo = Get-CargoToolchain -ToolingLock $toolingLock -Architecture $Architecture
     $cmake = Resolve-CommandPath -Name 'cmake.exe' -Candidates @($env:XFSWIN_CMAKE)
     if ($null -eq $cmake) {
         throw 'cmake.exe was not found; set XFSWIN_CMAKE or add CMake to PATH.'
     }
-    $cmakeVersionOutput = Invoke-External -FilePath $cmake -Arguments @('--version') -WorkingDirectory $ToolRoot -Capture
+    $cmakeVersionOutput = Invoke-External -FilePath $cmake -Arguments @('--version') -WorkingDirectory $repoRoot -Capture
     $cmakeMatch = [regex]::Match($cmakeVersionOutput, 'cmake version ([0-9]+\.[0-9]+\.[0-9]+)')
     if (-not $cmakeMatch.Success -or [version]$cmakeMatch.Groups[1].Value -lt [version]$cmakeMinimumVersion) {
         throw "CMake $cmakeMinimumVersion or newer is required; found: $cmakeVersionOutput"
@@ -736,11 +720,9 @@ try {
     if ([string]::IsNullOrWhiteSpace($generator)) {
         $generator = 'Visual Studio 17 2022'
     }
+    $generatorPlatform = if ($Architecture -eq 'arm64') { 'ARM64' } else { 'x64' }
 
     $winFspSdkRoot = Get-WinFspSdkRoot -Architecture $Architecture
-
-    Assert-WixProjectPin -ProjectPath (Join-Path $repoRoot 'packaging\windows\Product.wixproj') -ExpectedVersion $wixVersionPin
-    Assert-WixProjectPin -ProjectPath (Join-Path $repoRoot 'packaging\windows\Bundle.wixproj') -ExpectedVersion $wixVersionPin
 
     [void](Get-SigningEnvironment)
     $signing = Get-SigningEnvironment
@@ -754,7 +736,7 @@ try {
 
     $zipName = "xfswin-$version-windows-$Architecture.zip"
     $setupName = "xfswin-$version-windows-$Architecture-setup.exe"
-    $msiName = "xfswin-$version-windows-$Architecture.msi"
+    $testSetupName = "xfswin-$version-windows-$Architecture-test-setup.exe"
     $testingDirectory = Join-Path $OutputDirectory 'testing'
     [void](New-Item -ItemType Directory -Path $testingDirectory -Force)
 
@@ -775,22 +757,17 @@ try {
     if (Test-Path -LiteralPath $zipPath) { throw "Refusing to overwrite an existing portable ZIP: $zipPath" }
     if (Test-Path -LiteralPath $setupPath) { throw "Refusing to overwrite an existing setup executable: $setupPath" }
 
-    $allowedTestingMsiNames = @{}
-    foreach ($arch in @('x64', 'arm64')) {
-        $allowedTestingMsiNames["xfswin-$version-windows-$arch.msi"] = $true
+    $testSetupPath = Join-Path $testingDirectory $testSetupName
+    if (Test-Path -LiteralPath $testSetupPath) {
+        throw "Refusing to overwrite an existing acceptance setup: $testSetupPath"
     }
-    $existingTestingMsi = @(Get-ChildItem -LiteralPath $testingDirectory -File -Filter 'xfswin-*.msi')
-    $unexpectedTestingMsi = @($existingTestingMsi | Where-Object {
-        -not $allowedTestingMsiNames.ContainsKey($_.Name) -and
-        $_.Name -notmatch '^xfswin-[0-9]+\.[0-9]+\.[0-9]+-windows-(x64|arm64)-synthetic-older\.msi$'
+    $existingTesting = @(Get-ChildItem -LiteralPath $testingDirectory -File | Where-Object {
+        $_.Name -match '^xfswin-.*\.exe$'
     })
-    if ($unexpectedTestingMsi.Count -ne 0) {
-        throw "testing/ contains stale or unrelated MSIs: $($unexpectedTestingMsi.Name -join ', ')"
-    }
-
-    $internalMsiPath = Join-Path $testingDirectory $msiName
-    if (Test-Path -LiteralPath $internalMsiPath) {
-        throw "Refusing to overwrite an existing internal MSI: $internalMsiPath"
+    $allowedTestingPattern = '^xfswin-(?:' + [regex]::Escape($version) + '|previous)-windows-(?:x64|arm64)(?:-test)?-setup\.exe$'
+    $unexpectedTesting = @($existingTesting | Where-Object { $_.Name -notmatch $allowedTestingPattern })
+    if ($unexpectedTesting.Count -ne 0) {
+        throw "testing/ contains stale or unrelated setup executables: $($unexpectedTesting.Name -join ', ')"
     }
     $packageMetadataPath = Join-Path $OutputDirectory "package-metadata-$Architecture.json"
     if (Test-Path -LiteralPath $packageMetadataPath) {
@@ -802,7 +779,6 @@ try {
     }
 
     $syntheticVersion = $null
-    $syntheticMsiPath = $null
     $syntheticSetupPath = $null
     $syntheticSetupName = $null
     if ($SyntheticOlderVersion) {
@@ -814,21 +790,14 @@ try {
         if (-not $syntheticMatch.Success) {
             throw "SyntheticOlderProductVersion must be numeric major.minor.build: $syntheticVersion"
         }
-        $major = [int]$syntheticMatch.Groups[1].Value
-        $minor = [int]$syntheticMatch.Groups[2].Value
-        $build = [int]$syntheticMatch.Groups[3].Value
-        if ($major -gt 255 -or $minor -gt 255 -or $build -gt 65535) {
-            throw "SyntheticOlderProductVersion exceeds MSI ProductVersion field limits: $syntheticVersion"
+        foreach ($index in 1..3) {
+            if ([int]$syntheticMatch.Groups[$index].Value -gt 65535) {
+                throw "SyntheticOlderProductVersion exceeds the Windows version resource range: $syntheticVersion"
+            }
         }
         if ([version]$syntheticVersion -ge [version]$version) {
             throw "SyntheticOlderProductVersion ($syntheticVersion) must be strictly older than the product version ($version)."
         }
-        $syntheticMsiPath = Join-Path $testingDirectory "xfswin-$syntheticVersion-windows-$Architecture-synthetic-older.msi"
-        if (Test-Path -LiteralPath $syntheticMsiPath) {
-            throw "Refusing to overwrite an existing synthetic older MSI: $syntheticMsiPath"
-        }
-        # Name consumed verbatim by verify_release_install_windows.ps1 and
-        # verify_release_failures_windows.ps1 (-PreviousInstaller).
         $syntheticSetupName = "xfswin-previous-windows-$Architecture-setup.exe"
         $syntheticSetupPath = Join-Path $testingDirectory $syntheticSetupName
         if (Test-Path -LiteralPath $syntheticSetupPath) {
@@ -845,7 +814,7 @@ try {
         '-S', $repoRoot,
         '-B', $BuildDirectory,
         '-G', $generator,
-        '-A', $Architecture,
+        '-A', $generatorPlatform,
         '-DCMAKE_BUILD_TYPE=Release',
         '-DXFSWIN_RELEASE_BUILD=ON',
         '-DXFSWIN_STATIC_RUNTIME=ON',
@@ -870,58 +839,63 @@ try {
         -ExpectedPeMachine $expectedPeMachine
 
     $stagedExe = Join-Path $stagingDirectory 'xfswin.exe'
-    Invoke-ReleaseSigning -TargetPath $stagedExe -TargetKind File
+    Invoke-ReleaseSigning -TargetPath $stagedExe
     $payloadExeSha256 = Get-FileSha256 -Path $stagedExe
 
-    # Derive the portable view with manifest.py-compatible notice names; the
-    # MSI still receives the CMake install tree with THIRD-PARTY-NOTICES/.
     $portableDirectory = Join-Path $BuildDirectory "portable-$Architecture"
     New-PortablePayload -Staging $stagingDirectory -PortableDirectory $portableDirectory
     New-PortableZip -Staging $portableDirectory -Destination $zipPath
     Test-PortableZip -ZipPath $zipPath -Version $version -GitSha $gitSha -Architecture $Architecture
     $zipSha256 = Get-FileSha256 -Path $zipPath
 
-    [void](Invoke-WixProjectBuild `
-        -ProjectFileName 'Product.wixproj' `
-        -Label 'product' `
-        -ProductVersion $version `
-        -PayloadDirectory $stagingDirectory `
-        -MsiPath $internalMsiPath)
+    $payloadPath = Join-Path $BuildDirectory "payload-$Architecture.zip"
+    $payload = New-EmbeddedPayload `
+        -AppDirectory $stagingDirectory `
+        -Version $version `
+        -GitSha $gitSha `
+        -Architecture $Architecture `
+        -OutputPath $payloadPath
 
-    Invoke-ReleaseSigning -TargetPath $internalMsiPath -TargetKind File
-    $internalMsiSha256 = Get-FileSha256 -Path $internalMsiPath
-
-    $bundleOutput = Invoke-WixProjectBuild `
-        -ProjectFileName 'Bundle.wixproj' `
-        -Label 'bundle' `
-        -ProductVersion $version `
-        -MsiPath $internalMsiPath
-    $bundleExecutable = Find-BundleExecutable -Directory $bundleOutput -ExpectedName $setupName
-    Copy-Item -LiteralPath $bundleExecutable.FullName -Destination $setupPath
-    $setupMachine = Get-PeMachine -Path $setupPath
-    if ($setupMachine -ne $expectedPeMachine) {
-        throw "Setup executable is $(Get-PeMachineName -Machine $setupMachine), expected native $Architecture."
-    }
-    Invoke-ReleaseSigning -TargetPath $setupPath -TargetKind Bundle
+    $publicBuild = Invoke-RustSetupBuild `
+        -Label "public-$Architecture" `
+        -PayloadZip $payload.path `
+        -Version $version `
+        -GitSha $gitSha `
+        -TargetDirectory "cargo-public-$Architecture"
+    Copy-Item -LiteralPath $publicBuild -Destination $setupPath -ErrorAction Stop
+    $publicSetup = Test-RustSetup -Path $setupPath -Version $version -GitSha $gitSha -ExpectedPeMachine $expectedPeMachine
+    Invoke-ReleaseSigning -TargetPath $setupPath
     $setupSha256 = Get-FileSha256 -Path $setupPath
     $setupSize = (Get-Item -LiteralPath $setupPath).Length
-    if ($setupSize -gt 268435456) {
-        throw "Setup executable exceeds 256 MiB: $setupSize bytes"
+
+    $testBuild = Invoke-RustSetupBuild `
+        -Label "test-$Architecture" `
+        -PayloadZip $payload.path `
+        -Version $version `
+        -GitSha $gitSha `
+        -TargetDirectory "cargo-test-$Architecture" `
+        -TestBuild
+    Copy-Item -LiteralPath $testBuild -Destination $testSetupPath -ErrorAction Stop
+    $testSetup = Test-RustSetup -Path $testSetupPath -Version $version -GitSha $gitSha `
+        -ExpectedPeMachine $expectedPeMachine -TestBuild
+    Invoke-ReleaseSigning -TargetPath $testSetupPath
+    $testSetupSha256 = Get-FileSha256 -Path $testSetupPath
+    if ($testSetupSha256 -eq $setupSha256) {
+        throw 'The acceptance test setup is identical to the public setup.'
     }
 
     # Coherent 0.0.0 test-only older fixture: an isolated clean worktree of the
-    # evaluated commit with only the CMake project version lowered.  It is
-    # built with the same production options, signs through the same pipeline,
-    # and produces its own xfswin.exe, version.json, MSI and Burn setup.  The
-    # evaluated checkout, its clean-tree guard and its artifact hashes are not
-    # touched.
+    # evaluated commit with only the CMake project version lowered.  It is built
+    # with the same production options and produces its own xfswin.exe,
+    # version.json, payload archive and Rust setup.  The evaluated checkout, its
+    # clean-tree guard and its artifact hashes are never touched.
     $syntheticGitSha = $null
     $fixtureExeSha256 = $null
     $fixtureVersionJsonSha256 = $null
-    $syntheticMsiSha256 = $null
+    $syntheticPayload = $null
     $syntheticSetupSha256 = $null
     $syntheticMetadata = $null
-    if ($null -ne $syntheticMsiPath) {
+    if ($null -ne $syntheticSetupPath) {
         $fixtureSource = Join-Path ([System.IO.Path]::GetTempPath()) ('xfswin-synthetic-source-' + [Guid]::NewGuid().ToString('N'))
         $fixtureBuild = Join-Path ([System.IO.Path]::GetTempPath()) ('xfswin-synthetic-build-' + [Guid]::NewGuid().ToString('N'))
         $fixtureWorktreeAdded = $false
@@ -941,13 +915,11 @@ try {
                 throw "The isolated synthetic source does not report version $syntheticVersion."
             }
 
-            # Commit inside the worktree only.  This satisfies CMake's
-            # production clean-tree guard without ever modifying the evaluated
-            # checkout or its HEAD.
             Invoke-External -FilePath $git -Arguments @(
                 '-C', $fixtureSource,
                 '-c', 'user.name=REL-1 Fixture',
                 '-c', 'user.email=rel1-fixture@invalid',
+                '-c', 'commit.gpgsign=false',
                 'commit', '-am', "REL-1 synthetic older version $syntheticVersion"
             ) -WorkingDirectory $repoRoot
             $syntheticGitSha = (Invoke-External -FilePath $git -Arguments @('-C', $fixtureSource, 'rev-parse', 'HEAD') -WorkingDirectory $repoRoot -Capture).Trim().ToLowerInvariant()
@@ -969,7 +941,7 @@ try {
                 '-S', $fixtureSource,
                 '-B', $fixtureBuild,
                 '-G', $generator,
-                '-A', $Architecture,
+                '-A', $generatorPlatform,
                 '-DCMAKE_BUILD_TYPE=Release',
                 '-DXFSWIN_RELEASE_BUILD=ON',
                 '-DXFSWIN_STATIC_RUNTIME=ON',
@@ -992,39 +964,31 @@ try {
                 -Architecture $Architecture `
                 -ExpectedPeMachine $expectedPeMachine)
             $fixtureExe = Join-Path $fixtureStaging 'xfswin.exe'
-            Invoke-ReleaseSigning -TargetPath $fixtureExe -TargetKind File
+            Invoke-ReleaseSigning -TargetPath $fixtureExe
             $fixtureExeSha256 = Get-FileSha256 -Path $fixtureExe
             if ($fixtureExeSha256 -eq $payloadExeSha256) {
                 throw 'The synthetic older executable is identical to the evaluated payload; the fixture is not an older build.'
             }
             $fixtureVersionJsonSha256 = Get-FileSha256 -Path (Join-Path $fixtureStaging 'version.json')
 
-            [void](Invoke-WixProjectBuild `
-                -ProjectFileName 'Product.wixproj' `
-                -Label "synthetic-$syntheticVersion" `
-                -ProductVersion $syntheticVersion `
-                -PayloadDirectory $fixtureStaging `
-                -MsiPath $syntheticMsiPath)
-            Invoke-ReleaseSigning -TargetPath $syntheticMsiPath -TargetKind File
-            $syntheticMsiSha256 = Get-FileSha256 -Path $syntheticMsiPath
-            if ($syntheticMsiSha256 -eq $internalMsiSha256) {
-                throw 'The synthetic older MSI is identical to the evaluated MSI.'
-            }
+            $syntheticPayloadPath = Join-Path $fixtureBuild "payload-$Architecture.zip"
+            $syntheticPayload = New-EmbeddedPayload `
+                -AppDirectory $fixtureStaging `
+                -Version $syntheticVersion `
+                -GitSha $syntheticGitSha `
+                -Architecture $Architecture `
+                -OutputPath $syntheticPayloadPath
 
-            $syntheticBundleOutput = Invoke-WixProjectBuild `
-                -ProjectFileName 'Bundle.wixproj' `
-                -Label "synthetic-bundle-$syntheticVersion" `
-                -ProductVersion $syntheticVersion `
-                -MsiPath $syntheticMsiPath
-            $syntheticBundleExecutable = Find-BundleExecutable `
-                -Directory $syntheticBundleOutput `
-                -ExpectedName "xfswin-$syntheticVersion-windows-$Architecture-setup.exe"
-            Copy-Item -LiteralPath $syntheticBundleExecutable.FullName -Destination $syntheticSetupPath -ErrorAction Stop
-            $syntheticSetupMachine = Get-PeMachine -Path $syntheticSetupPath
-            if ($syntheticSetupMachine -ne $expectedPeMachine) {
-                throw "Synthetic older setup is $(Get-PeMachineName -Machine $syntheticSetupMachine), expected native $Architecture."
-            }
-            Invoke-ReleaseSigning -TargetPath $syntheticSetupPath -TargetKind Bundle
+            $syntheticBuild = Invoke-RustSetupBuild `
+                -Label "synthetic-$Architecture" `
+                -PayloadZip $syntheticPayload.path `
+                -Version $syntheticVersion `
+                -GitSha $syntheticGitSha `
+                -TargetDirectory "cargo-synthetic-$Architecture"
+            Copy-Item -LiteralPath $syntheticBuild -Destination $syntheticSetupPath -ErrorAction Stop
+            $syntheticSetup = Test-RustSetup -Path $syntheticSetupPath -Version $syntheticVersion `
+                -GitSha $syntheticGitSha -ExpectedPeMachine $expectedPeMachine
+            Invoke-ReleaseSigning -TargetPath $syntheticSetupPath
             $syntheticSetupSha256 = Get-FileSha256 -Path $syntheticSetupPath
             if ($syntheticSetupSha256 -eq $setupSha256) {
                 throw 'The synthetic older setup is the evaluated installer.'
@@ -1045,12 +1009,10 @@ try {
                     authenticode_status = (Get-AuthenticodeStatusText -Path $fixtureExe)
                 }
                 version_json_sha256 = $fixtureVersionJsonSha256
-                msi = [ordered]@{
-                    name = [System.IO.Path]::GetFileName($syntheticMsiPath)
-                    path = 'testing/' + [System.IO.Path]::GetFileName($syntheticMsiPath)
-                    sha256 = $syntheticMsiSha256
-                    size_bytes = (Get-Item -LiteralPath $syntheticMsiPath).Length
-                    authenticode_status = (Get-AuthenticodeStatusText -Path $syntheticMsiPath)
+                payload = [ordered]@{
+                    sha256 = $syntheticPayload.sha256
+                    size_bytes = $syntheticPayload.size_bytes
+                    file_count = $syntheticPayload.file_count
                 }
                 setup = [ordered]@{
                     name = $syntheticSetupName
@@ -1075,16 +1037,17 @@ try {
         }
     }
 
-    $sdkPackageDirectory = Join-Path $env:NUGET_PACKAGES "wixtoolset.sdk\$wixVersionPin"
-    if (-not (Test-Path -LiteralPath $sdkPackageDirectory -PathType Container)) {
-        throw "WiX SDK $wixVersionPin was not restored into the isolated cache: $sdkPackageDirectory"
-    }
-
     $payloadAuthenticode = Get-AuthenticodeStatusText -Path $stagedExe
-    $msiAuthenticode = Get-AuthenticodeStatusText -Path $internalMsiPath
     $setupAuthenticode = Get-AuthenticodeStatusText -Path $setupPath
+    $testSetupAuthenticode = Get-AuthenticodeStatusText -Path $testSetupPath
     $winFspAuthenticode = Get-AuthenticodeStatusText -Path $winFspMsiPath
     $signingMode = if ($null -ne $signing) { 'signed' } else { 'unsigned' }
+    $rustMetadata = [ordered]@{
+        version = $cargo.version
+        host = $cargo.host
+        cargo = $cargo.cargo
+        rustc = $cargo.rustc
+    }
 
     $testingMetadata = [ordered]@{
         schema_version = 1
@@ -1092,12 +1055,19 @@ try {
         version = $version
         git_sha = $gitSha
         architecture = $Architecture
-        internal_msi = [ordered]@{
-            name = $msiName
-            path = 'testing/' + $msiName
-            sha256 = $internalMsiSha256
-            size_bytes = (Get-Item -LiteralPath $internalMsiPath).Length
-            authenticode_status = $msiAuthenticode
+        public_setup = [ordered]@{
+            name = $setupName
+            sha256 = $setupSha256
+            size_bytes = $setupSize
+            authenticode_status = $setupAuthenticode
+        }
+        test_setup = [ordered]@{
+            name = $testSetupName
+            path = 'testing/' + $testSetupName
+            sha256 = $testSetupSha256
+            size_bytes = (Get-Item -LiteralPath $testSetupPath).Length
+            features = @('test-fail')
+            authenticode_status = $testSetupAuthenticode
         }
         synthetic_older = $syntheticMetadata
         winfsp = [ordered]@{
@@ -1108,9 +1078,10 @@ try {
             sha256 = $winFspSha256
             authenticode_status = $winFspAuthenticode
         }
-        wix_version = $wixVersionPin
-        dotnet_sdk_version = $dotnetVersionPin
-        dotnet_sdk_rid = $nativeRid
+        rust = $rustMetadata
+        cmake = [ordered]@{
+            version = $cmakeVersion
+        }
     }
     Write-JsonFile -Path $testingMetadataPath -Object $testingMetadata
 
@@ -1149,32 +1120,31 @@ try {
             }
             version_json_sha256 = $versionJsonSha256
         }
+        payload = [ordered]@{
+            sha256 = $payload.sha256
+            size_bytes = $payload.size_bytes
+            file_count = $payload.file_count
+        }
         signing = [ordered]@{
             configured = ($null -ne $signing)
             mode = $signingMode
             artifacts = [ordered]@{
                 payload_exe = $payloadAuthenticode
                 setup = $setupAuthenticode
+                test_setup = $testSetupAuthenticode
+                synthetic_setup = if ($null -ne $syntheticMetadata) { $syntheticMetadata.setup.authenticode_status } else { $null }
             }
         }
-        wix = [ordered]@{
-            version = $wixVersionPin
-            sdk_package = $wixPin.sdk_package
-        }
-        dotnet_sdk = [ordered]@{
-            version = $dotnetVersionPin
-            rid = $nativeRid
-            native = $true
-        }
+        rust = $rustMetadata
         cmake = [ordered]@{
             version = $cmakeVersion
         }
         testing = [ordered]@{
             metadata_name = "testing-metadata-$Architecture.json"
-            internal_msi = [ordered]@{
-                name = $msiName
-                path = 'testing/' + $msiName
-                sha256 = $internalMsiSha256
+            test_setup = [ordered]@{
+                name = $testSetupName
+                path = 'testing/' + $testSetupName
+                sha256 = $testSetupSha256
             }
             synthetic_older = $syntheticMetadata
         }
@@ -1223,13 +1193,14 @@ try {
     Write-Host "REL-1 $Architecture package build completed."
     Write-Host "Portable ZIP : $zipPath ($zipSha256)"
     Write-Host "Setup        : $setupPath ($setupSha256)"
-    Write-Host "Internal MSI : $internalMsiPath ($internalMsiSha256)"
-    if ($null -ne $syntheticMsiPath) {
-        Write-Host "Synthetic MSI : $syntheticMsiPath ($syntheticMsiSha256)"
+    Write-Host "Test setup   : $testSetupPath ($testSetupSha256)"
+    if ($null -ne $syntheticSetupPath) {
         Write-Host "Synthetic setup: $syntheticSetupPath ($syntheticSetupSha256)"
     }
+    Write-Host "Payload      : $($payload.path) ($($payload.sha256))"
     Write-Host "Metadata     : $packageMetadataPath"
-    Write-Host "Signing      : $signingMode (payload=$payloadAuthenticode, msi=$msiAuthenticode, setup=$setupAuthenticode)"
+    Write-Host "Rust         : $($cargo.version) ($($cargo.host))"
+    Write-Host "Signing      : $signingMode (payload=$payloadAuthenticode, setup=$setupAuthenticode, test=$testSetupAuthenticode)"
 } catch {
     throw ("REL-1 package build failed: " + $_.Exception.Message)
 }

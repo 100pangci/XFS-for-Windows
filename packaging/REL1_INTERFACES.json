@@ -2,24 +2,26 @@
   "purpose": "Build/test interface contract only; never a runtime device or writable policy",
   "package_builder": {
     "script": "scripts/release/build-packages.ps1",
-    "parameters": ["BuildDirectory", "Architecture", "OutputDirectory", "WinFspMsi", "Configuration", "AllowExternalToolExecution", "AcceptWixEula"],
+    "parameters": ["BuildDirectory", "Architecture", "OutputDirectory", "WinFspMsi", "Configuration", "AllowExternalToolExecution"],
     "synthetic_older_parameter": "SyntheticOlderVersion",
-    "wix_osmf_eula": {
-      "automatic": false,
-      "default": false,
-      "accept_command": "wix eula accept wix7",
-      "ci_variable": "WIX_OSMF_EULA_ACCEPTED",
-      "note": "The builder never accepts the WiX 7 OSMF EULA implicitly; -AcceptWixEula or the explicit CI repository variable is required after the licensing decision"
+    "rust_toolchain": {
+      "lock_file": "scripts/release/tooling-lock.json",
+      "version": "1.97.0",
+      "native_targets": {
+        "x64": "x86_64-pc-windows-msvc",
+        "arm64": "aarch64-pc-windows-msvc"
+      },
+      "note": "The setup is a native Rust executable. Each architecture is built with cargo --release --locked on its native runner; x64 emulation is never used for ARM64."
     },
     "synthetic_older_test_version": "0.0.0",
-    "synthetic_older_fixture": "Isolated clean worktree of the evaluated commit with only the CMake project version lowered; produces a complete 0.0.0 executable, version.json, MSI and Burn setup. The evaluated checkout and its artifact hashes are unchanged.",
+    "synthetic_older_fixture": "Isolated clean worktree of the evaluated commit with only the CMake project version lowered; produces a complete 0.0.0 executable, version.json, payload archive and Rust setup. The evaluated checkout and its artifact hashes are unchanged.",
     "public_portable": "xfswin-<version>-windows-<arch>.zip",
     "public_installer": "xfswin-<version>-windows-<arch>-setup.exe",
-    "internal_msi": "testing/xfswin-<version>-windows-<arch>.msi",
-    "synthetic_older_msi": "testing/xfswin-0.0.0-windows-<arch>-synthetic-older.msi",
+    "acceptance_test_setup": "testing/xfswin-<version>-windows-<arch>-test-setup.exe",
     "previous_installer": "testing/xfswin-previous-windows-<arch>-setup.exe",
     "metadata_file": "package-metadata-<arch>.json",
-    "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "toolchain", "build_timestamp", "signing", "testing"]
+    "testing_metadata_file": "testing/testing-metadata-<arch>.json",
+    "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "toolchain", "build_timestamp", "rust", "cmake", "signing", "testing"]
   },
   "acceptance_evidence": {
     "filename": "qualification-<arch>.json",
@@ -31,11 +33,11 @@
     "architectures_must_share_run_id_and_sha": true
   },
   "installer_failure_injection": {
-    "transport": "Direct internal MSI: msiexec /i <product.msi> /qn /norestart XFSWIN_TEST_FAIL=<stage> /L*v <log>",
-    "property": "XFSWIN_TEST_FAIL",
+    "transport": "Acceptance test setup only: xfswin-<version>-windows-<arch>-test-setup.exe /quiet /norestart /test-fail <stage> /log <log>",
+    "feature": "test-fail",
     "stages": ["before-service", "after-files", "service-start", "verify"],
     "verify_stage_contract": "The Apply action succeeds and a separate Verify action fails, exercising the verify rollback path",
-    "burn_forwarding_required": false
+    "public_setup_rejects_test_fail": true
   },
   "manifest_cli": "python -I scripts/release/manifest.py create|verify --directory <public-assets> --version <CMake-version> --git-sha <full-SHA> --dependency-lock packaging/winfsp.lock.json --evidence-directory <actual-acceptance-evidence>",
   "execution_scope": "External tool execution authorized in isolated project tool directories; installer/service/VHD operations only on isolated CI, never on the local host or existing physical disks"

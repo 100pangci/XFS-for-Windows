@@ -6,18 +6,18 @@
 #
 # This script consumes the qualification evidence produced by
 # verify_release_install_windows.ps1 for the same architecture/installer/run,
-# then exercises the internal MSI failure-injection property with the official
-# product MSI:
+# then exercises the setup's acceptance-only fault injection with the test
+# setup built alongside the public setup:
 #
-#   * XFSWIN_TEST_FAIL=before-service, after-files and service-start must fail
-#     the install and roll back files, service, PATH, shortcuts and MSI
-#     registration;
+#   * /test-fail before-service, after-files, service-start and verify must
+#     fail the install and roll back files, service, PATH, shortcuts and
+#     product/ARP registration;
 #   * a failed major upgrade must restore the synthetic older installation,
-#     its binary and its running service;
-#   * the dependency failure path uses only the official pinned WinFsp MSI:
-#     the dependency is removed, an MSI policy blocks the dependency install,
-#     the bundle must fail without leaving the product, then the official MSI
-#     is reinstalled and its runtime is verified.
+#     its binary, its registration and its running service;
+#   * the dependency failure path uses the public setup and only the official
+#     pinned WinFsp MSI: the dependency is removed, an MSI policy blocks the
+#     dependency install, the setup must fail without leaving the product,
+#     then the official MSI is reinstalled and its runtime is verified.
 #
 # No VHD is mounted here; the VHD temp directory is still constrained to
 # RUNNER_TEMP and every disk operation, if any, goes through the exact
@@ -25,8 +25,8 @@
 #
 #   pwsh -File tests/scripts/verify_release_failures_windows.ps1 `
 #       -Installer out/release/xfswin-0.1.0-windows-x64-setup.exe `
-#       -PreviousInstaller out/testing/xfswin-previous-windows-x64-setup.exe `
-#       -ProductMsi out/testing/xfswin-0.1.0-windows-x64.msi `
+#       -PreviousInstaller out/release/testing/xfswin-previous-windows-x64-setup.exe `
+#       -TestInstaller out/release/testing/xfswin-0.1.0-windows-x64-test-setup.exe `
 #       -Fixtures out/ci-ux-images -OutputDirectory out/release-evidence `
 #       -Architecture x64 -AllowCiMachineChanges
 #
@@ -36,7 +36,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$PreviousInstaller,
-    [Parameter(Mandatory = $true)][string]$ProductMsi,
+    [Parameter(Mandatory = $true)][string]$TestInstaller,
     [Parameter(Mandatory = $true)][string]$Fixtures,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [Parameter(Mandatory = $true)][ValidateSet('x64', 'arm64')][string]$Architecture,
@@ -51,15 +51,12 @@ $script:ReleaseArchitecture = $Architecture
 $package = Get-ReleasePackage -Installer $Installer -Architecture $Architecture
 $script:ReleaseInstallerPath = $package.installer
 $gitIdentity = Get-ReleaseGitIdentity
-$productMsi = Assert-ReleaseProductMsi -ProductMsi $ProductMsi -Package $package
-$previousInstaller = Get-ReleaseFullPath $PreviousInstaller
+$previous = Assert-ReleaseSyntheticSetup -PreviousInstaller $PreviousInstaller -Package $package
+$previousInstaller = $previous.path
 Assert-Release (Test-Path -LiteralPath $previousInstaller -PathType Leaf) `
     "synthetic older setup is missing: $previousInstaller"
-Assert-Release ((Get-ReleaseSha256 $previousInstaller) -ne $package.installer_sha256) `
-    'the synthetic older setup must not be the evaluated installer'
-$previousMachine = if ($Architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
-Assert-Release ((Get-ReleasePeMachine $previousInstaller) -eq $previousMachine) `
-    "synthetic older setup is not native $Architecture"
+$testSetup = Assert-ReleaseTestSetup -TestInstaller $TestInstaller -Package $package
+$testInstaller = $testSetup.path
 
 Initialize-ReleaseVhdContext -FixtureDirectory $Fixtures -OutputDirectory $OutputDirectory `
     -RequiredFixtures @()
@@ -93,7 +90,8 @@ function Wait-ProductAbsent {
     for ($attempt = 0; $attempt -lt ($TimeoutSeconds * 2); ++$attempt) {
         $state = Get-ReleaseInstalledState
         $service = Get-ReleaseService
-        $registered = Test-ReleaseMsiProductRegistered $productMsi.product_code
+        $registered = (Test-ReleaseRegistryKey $script:ReleaseProductKey) -or
+                      (Test-ReleaseRegistryKey $script:ReleaseArpKey)
         if ($null -eq $state -and $null -eq $service -and -not $registered) {
             return $true
         }
@@ -104,9 +102,11 @@ function Wait-ProductAbsent {
 
 function Assert-CleanFailureState {
     Assert-Release (Wait-ProductAbsent 90) `
-        'a failed install left product files, service or MSI registration behind'
-    Assert-Release (-not (Test-ReleaseMsiProductRegistered $productMsi.product_code)) `
-        'the failed product MSI is still registered'
+        'a failed install left product files, service or product/ARP registration behind'
+    Assert-Release ($null -eq (Get-ReleaseProductRegistration)) `
+        'the failed setup left HKLM\SOFTWARE\XFS-for-Windows behind'
+    Assert-Release ($null -eq (Get-ReleaseArpRegistration)) `
+        'the failed setup left its Add/Remove Programs entry behind'
     $productDirectory = Get-ReleaseProductDirectory
     $remainingFiles = @()
     if (Test-Path -LiteralPath $productDirectory -PathType Container) {
@@ -123,6 +123,10 @@ function Assert-CleanFailureState {
         'a failed install created ProgramData automount configuration'
     Assert-Release (-not (Test-Path -LiteralPath (Join-Path $env:ProgramData 'xfswin\maintenance.fence'))) `
         'a failed install left the maintenance fence behind'
+    $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `
+        -Filter 'XFS-for-Windows.xfswin-*' -ErrorAction SilentlyContinue)
+    Assert-Release ($leftover.Count -eq 0) `
+        "a failed install left setup staging/backup directories behind: $($leftover.FullName -join ', ')"
 }
 
 function Get-MsiPolicyState {
@@ -229,8 +233,6 @@ try {
     if (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath -Force }
 
     Assert-ReleaseNoProductInstalled
-    Assert-Release (-not (Test-ReleaseMsiProductRegistered $productMsi.product_code)) `
-        'the product MSI is already registered on the runner'
     Assert-Release (Test-ReleaseWinFspInstalled) `
         'dependency-failure requires the official WinFsp runtime to be installed first'
 
@@ -247,7 +249,7 @@ try {
             Assert-Release (-not (Test-ReleaseWinFspInstalled)) `
                 'WinFsp is still installed before the dependency-failure setup'
             Set-DisableMsiPolicy
-            $dependencyFailure = Invoke-ReleaseBundleInstall -Installer $package.installer `
+            $dependencyFailure = Invoke-ReleaseSetupInstall -Installer $package.installer `
                 -LogName 'dependency-failure'
             Assert-Release (@(0, 3010) -notcontains [int]$dependencyFailure.exit_code) `
                 'setup accepted an install while the required WinFsp dependency could not be installed'
@@ -266,7 +268,8 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    # Internal MSI failure injection from a clean state.
+    # Setup fault injection from a clean state.  Only the acceptance test
+    # setup accepts /test-fail; the public setup rejects it.
     # -----------------------------------------------------------------------
     $failurePoints = @(
         @{ case = 'failure-before-service'; value = 'before-service' },
@@ -278,11 +281,11 @@ try {
         Invoke-ReleaseCase $point.case {
             Assert-ReleaseNoProductInstalled
             Assert-Release (Test-ReleaseWinFspInstalled) `
-                'WinFsp must be present before the product MSI failure case'
-            $failed = Invoke-ReleaseMsi -ProductMsi $productMsi.path `
-                -LogName $point.case -FailurePoint $point.value
+                'WinFsp must be present before the setup failure case'
+            $failed = Invoke-ReleaseSetupInstall -Installer $testInstaller `
+                -LogName $point.case -ExtraArguments @('/test-fail', $point.value)
             Assert-Release (@(0, 3010) -notcontains [int]$failed.exit_code) `
-                "XFSWIN_TEST_FAIL=$($point.value) did not fail the MSI"
+                "/test-fail $($point.value) did not fail the setup"
             Assert-CleanFailureState
         }
     }
@@ -295,7 +298,7 @@ try {
         Assert-ReleaseNoProductInstalled
         Assert-Release (Test-ReleaseWinFspInstalled) `
             'WinFsp must be present before the upgrade rollback case'
-        $installPrevious = Invoke-ReleaseBundleInstall -Installer $previousInstaller -LogName 'rollback-install-previous'
+        $installPrevious = Invoke-ReleaseSetupInstall -Installer $previousInstaller -LogName 'rollback-install-previous'
         Assert-ReleaseCommandOk $installPrevious 'synthetic older setup install for rollback'
         $before = Get-ReleaseInstalledState
         Assert-Release ($null -ne $before) 'the synthetic older setup did not install'
@@ -304,27 +307,31 @@ try {
         [void](Wait-ServiceFromPath $before.exe 120)
 
         foreach ($stage in @('after-files', 'verify')) {
-            $failedUpgrade = Invoke-ReleaseMsi -ProductMsi $productMsi.path `
-                -LogName "upgrade-rollback-$stage" -FailurePoint $stage
+            $failedUpgrade = Invoke-ReleaseSetupInstall -Installer $testInstaller `
+                -LogName "upgrade-rollback-$stage" -ExtraArguments @('/test-fail', $stage)
             Assert-Release (@(0, 3010) -notcontains [int]$failedUpgrade.exit_code) `
-                "XFSWIN_TEST_FAIL=$stage did not fail the major upgrade"
+                "/test-fail $stage did not fail the major upgrade"
             $restored = Wait-InstalledHash $before.exe_sha256 120
             Assert-Release ($null -ne $restored) `
                 "the $stage failure did not restore the synthetic older executable"
             Assert-Release ([string]$restored.version_json.version -eq [string]$before.version_json.version) `
                 "the $stage rollback changed the installed version"
             [void](Wait-ServiceFromPath $restored.exe 120)
-            Assert-Release (-not (Test-ReleaseMsiProductRegistered $productMsi.product_code)) `
-                "the $stage failure left the evaluated MSI product registered"
+            [void](Assert-ReleaseProductRegistration -Package $package `
+                -ExpectedVersion ([string]$before.version_json.version))
             Assert-Release (-not (Test-Path -LiteralPath (Join-Path $env:ProgramData 'xfswin\maintenance.fence'))) `
                 "the $stage rollback left the maintenance fence behind"
+            $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `
+                -Filter 'XFS-for-Windows.xfswin-*' -ErrorAction SilentlyContinue)
+            Assert-Release ($leftover.Count -eq 0) `
+                "the $stage rollback left setup staging/backup directories behind: $($leftover.FullName -join ', ')"
             if ($stage -eq 'verify') {
                 Complete-ReleaseCase 'upgrade-verify-rollback' 'passed' `
                     'new service started; failed verification restored the original executable and running service'
             }
         }
 
-        $removePrevious = Invoke-ReleaseBundleUninstall -Installer $previousInstaller -LogName 'rollback-remove-previous'
+        $removePrevious = Invoke-ReleaseSetupUninstall -Installer $previousInstaller -LogName 'rollback-remove-previous'
         Assert-ReleaseCommandOk $removePrevious 'synthetic older setup uninstall after rollback'
         Assert-Release (Wait-ProductAbsent 90) `
             'the synthetic older installation survived its uninstall'
@@ -350,7 +357,7 @@ try {
         } else {
             $previousInstaller
         }
-        $cleanup = Invoke-ReleaseBundleUninstall -Installer $uninstaller -LogName 'cleanup-product-uninstall'
+        $cleanup = Invoke-ReleaseSetupUninstall -Installer $uninstaller -LogName 'cleanup-product-uninstall'
         if (@(0, 3010) -notcontains [int]$cleanup.exit_code -and -not $failure) {
             $failure = [Exception]::new("cleanup product uninstall failed ($($cleanup.exit_code)): $($cleanup.output)")
         }
