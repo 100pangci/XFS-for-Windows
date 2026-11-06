@@ -1,0 +1,1056 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# REL-1 release pipeline.
+#
+# Pull requests and ordinary manual runs build, package and qualify the
+# installer but never publish.  A push of the exact v<project-version> tag, or
+# an explicit manual publish=true run on that validated tag, repeats the same
+# work and only then reaches the single publishing job.
+#
+# The filesystem/RW qualification remains the existing CI workflow, invoked
+# through workflow_call so there is only one definition of those gates.  This
+# file owns packaging, installer lifecycle acceptance and publication only.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after every gate passes (tag refs only)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  WINFSP_VERSION: '2.1.25156'
+  WINFSP_MSI_NAME: winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  WIX_VERSION: '7.0.1'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # One release identity for every job: the numeric CMake project version and
+  # the full checked-out commit.  Tag identity and main ancestry are enforced
+  # here before any publishing decision is made.
+  # -------------------------------------------------------------------------
+  release-info:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      full_sha: ${{ steps.version.outputs.full_sha }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+      is_tag: ${{ steps.gate.outputs.is_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the version and the full source commit
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^[[:space:]]*project\(XFS-for-Windows VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n 1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "cannot read a numeric project version from CMakeLists.txt" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^0\.[0-9]+\.[0-9]+$ ]]; then
+            echo "the first delivery must remain on the 0.x line, got $version" >&2
+            exit 1
+          fi
+          sha="$(git rev-parse HEAD)"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "checkout is not a full commit object: $sha" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "project version $version at $sha"
+
+      - name: Decide whether this run may publish
+        id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          MANUAL_PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          full_sha='${{ steps.version.outputs.full_sha }}'
+          is_tag=false
+          should_publish=false
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "pull requests never publish"
+          elif [[ "$MANUAL_PUBLISH" == "true" ]]; then
+            if [[ "$REF_TYPE" != "tag" ]]; then
+              echo "manual publish requires a tag ref, not $REF_TYPE" >&2
+              exit 1
+            fi
+            if [[ "$REF_NAME" != "v$version" ]]; then
+              echo "manual publish tag '$REF_NAME' does not match project version v$version" >&2
+              exit 1
+            fi
+            is_tag=true
+            should_publish=true
+          elif [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+            if [[ "$REF_NAME" != "v$version" ]]; then
+              echo "tag '$REF_NAME' does not match project version v$version" >&2
+              exit 1
+            fi
+            is_tag=true
+            should_publish=true
+          else
+            echo "not a v$version tag; this run is qualification only"
+          fi
+
+          if [[ "$is_tag" == "true" ]]; then
+            tag_sha="$(git rev-parse "refs/tags/$REF_NAME^{commit}")"
+            if [[ "$tag_sha" != "$full_sha" ]]; then
+              echo "tag $REF_NAME resolves to $tag_sha, checkout is $full_sha" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "$should_publish" == "true" ]]; then
+            git fetch --no-tags --filter=blob:none origin main
+            if ! git merge-base --is-ancestor "$full_sha" FETCH_HEAD; then
+              echo "$full_sha is not reachable from origin/main" >&2
+              exit 1
+            fi
+            echo "publishing is enabled after every gate passes"
+          fi
+
+          echo "is_tag=$is_tag" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # The complete existing core/RW qualification, unchanged.  Reusing ci.yml
+  # through workflow_call keeps one definition of the filesystem gates.
+  # -------------------------------------------------------------------------
+  core-qualification:
+    uses: ./.github/workflows/ci.yml
+
+  # -------------------------------------------------------------------------
+  # Release metadata contract: require the evidence-directory API and run the
+  # create/verify rejection tests before any package output is trusted.
+  # -------------------------------------------------------------------------
+  manifest-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require the evidence-directory interface
+        run: |
+          set -euo pipefail
+          if ! python3 scripts/release/manifest.py create --help 2>&1 | grep -q -- '--evidence-directory'; then
+            echo "manifest.py does not implement create --evidence-directory; refusing to gate a release with a stale manifest API" >&2
+            exit 1
+          fi
+          if ! python3 scripts/release/manifest.py verify --help 2>&1 | grep -q -- '--evidence-directory'; then
+            echo "manifest.py does not implement verify --evidence-directory; refusing to gate a release with a stale manifest API" >&2
+            exit 1
+          fi
+
+      - name: Manifest create/verify negative tests
+        run: python3 tests/release/test_manifest.py
+
+  # -------------------------------------------------------------------------
+  # Native Release /MT packages with WinFsp and without test hooks.
+  #
+  # build-packages.ps1 is the agreed package entry point.  It configures and
+  # builds the actual production payload, creates the public setup/ZIP, the
+  # internal MSI and the synthetic older fixture.  The package output is kept
+  # under the ignored out/ directory so the release CMake source-tree check
+  # still sees a clean checkout.
+  # -------------------------------------------------------------------------
+  package:
+    needs: release-info
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2025
+            platform: x64
+          - architecture: arm64
+            runner: windows-11-arm
+            platform: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      # Signing credentials are available only for a validated publishing tag.
+      # PR and qualification-only builds are unsigned, including same-repo PRs.
+      # Partial signing configuration still fails on a publishing run.
+      WINDOWS_SIGNING_CERT: ${{ needs.release-info.outputs.should_publish == 'true' && secrets.WINDOWS_SIGNING_CERT || '' }}
+      WINDOWS_SIGNING_PASSWORD: ${{ needs.release-info.outputs.should_publish == 'true' && secrets.WINDOWS_SIGNING_PASSWORD || '' }}
+      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ needs.release-info.outputs.should_publish == 'true' && secrets.WINDOWS_SIGNING_TIMESTAMP_URL || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision the pinned dependency and toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $winFspDir = Join-Path $env:RUNNER_TEMP 'rel1-winfsp'
+          & pwsh -NoProfile -File scripts/release/get-winfsp.ps1 `
+            -DestinationDirectory $winFspDir
+          if ($LASTEXITCODE -ne 0) { throw "get-winfsp.ps1 failed" }
+          $winFspMsi = Join-Path $winFspDir '${{ env.WINFSP_MSI_NAME }}'
+          if (-not (Test-Path -LiteralPath $winFspMsi -PathType Leaf)) {
+            throw "the verified WinFsp MSI is missing: $winFspMsi"
+          }
+
+          & pwsh -NoProfile -File scripts/release/bootstrap-tools.ps1 `
+            -ToolRoot (Join-Path $env:RUNNER_TEMP 'rel1-tools') `
+            -AllowExternalToolExecution `
+            -ExportGitHubEnvironment
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-tools.ps1 failed" }
+
+          # Build-packages needs the SDK headers/libs.  The official MSI is
+          # also installed on this isolated package runner because CTest runs
+          # the real WinFsp adapter tests below.
+          $install = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
+            -ArgumentList @('/i', $winFspMsi, '/qn', '/norestart') -Wait -PassThru
+          if (@(0, 3010) -notcontains $install.ExitCode) {
+            throw "official WinFsp MSI install failed with $($install.ExitCode)"
+          }
+
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'rel1-winfsp-sdk'
+          New-Item -ItemType Directory -Force $adminRoot | Out-Null
+          $admin = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
+            -ArgumentList @('/a', $winFspMsi, '/qn', "TARGETDIR=$adminRoot") -Wait -PassThru
+          if ($admin.ExitCode -ne 0) {
+            Write-Warning "WinFsp administrative extraction returned $($admin.ExitCode); using the installed SDK layout"
+          }
+
+          $libraryName = if ('${{ matrix.architecture }}' -eq 'arm64') { 'winfsp-a64.lib' } else { 'winfsp-x64.lib' }
+          $roots = @($adminRoot)
+          if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+            $roots += (Join-Path ${env:ProgramFiles(x86)} 'WinFsp')
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+            $roots += (Join-Path $env:ProgramFiles 'WinFsp')
+          }
+          $sdkRoot = $null
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+            $header = Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'winfsp.h' `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\inc\\winfsp\\winfsp\.h$' } |
+              Select-Object -First 1
+            if ($null -eq $header) { continue }
+            $candidate = Split-Path (Split-Path (Split-Path $header.FullName -Parent) -Parent) -Parent
+            if (Test-Path -LiteralPath (Join-Path $candidate "lib\$libraryName") -PathType Leaf) {
+              $sdkRoot = [IO.Path]::GetFullPath($candidate)
+              break
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+            throw "the official WinFsp MSI did not provide inc/winfsp/winfsp.h and lib/$libraryName for native ${{ matrix.architecture }}"
+          }
+
+          "WINFSP_MSI=$winFspMsi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "XFSWIN_WINFSP_ROOT=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the official setup and portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ needs.release-info.outputs.version }}'
+          $fullSha = '${{ needs.release-info.outputs.full_sha }}'
+          $arch = '${{ matrix.architecture }}'
+          $out = Join-Path $PWD "out\release-$arch"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $build = Join-Path $env:RUNNER_TEMP "rel1-package-build-$arch"
+
+          # Never accept the WiX 7 OSMF EULA implicitly.  A repository
+          # administrator must declare WIX_OSMF_EULA_ACCEPTED=true after the
+          # licensing decision; the default (unset) keeps the flag false.
+          $buildParameters = @{
+            BuildDirectory = $build
+            Architecture = $arch
+            OutputDirectory = $out
+            WinFspMsi = $env:WINFSP_MSI
+            Configuration = 'Release'
+            AllowExternalToolExecution = $true
+            SyntheticOlderVersion = $true
+            SyntheticOlderProductVersion = '0.0.0'
+          }
+          if ('${{ vars.WIX_OSMF_EULA_ACCEPTED }}' -eq 'true') {
+            $buildParameters['AcceptWixEula'] = $true
+            Write-Host 'WiX OSMF EULA acceptance explicitly enabled by repository variable WIX_OSMF_EULA_ACCEPTED.'
+          } else {
+            Write-Host 'WiX OSMF EULA acceptance is NOT enabled; WiX 7 may stop with WIX7015 until the repository variable WIX_OSMF_EULA_ACCEPTED=true is declared after the licensing decision.'
+          }
+          & pwsh -NoProfile -File scripts/release/build-packages.ps1 @buildParameters
+          if ($LASTEXITCODE -ne 0) { throw "build-packages.ps1 failed" }
+
+          $setup = Join-Path $out "xfswin-$version-windows-$arch-setup.exe"
+          $zip = Join-Path $out "xfswin-$version-windows-$arch.zip"
+          $metadataPath = Join-Path $out "package-metadata-$arch.json"
+          $internalMsi = Join-Path $out "testing\xfswin-$version-windows-$arch.msi"
+          $testingMetadata = Join-Path $out "testing\testing-metadata-$arch.json"
+          foreach ($path in @($setup, $zip, $metadataPath, $internalMsi, $testingMetadata)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "build-packages.ps1 did not produce $path"
+            }
+          }
+
+          # build-packages.ps1 owns the complete 0.0.0 test-only fixture
+          # (isolated clean worktree, older executable/version.json, MSI and
+          # Burn setup).  The workflow must never synthesize one itself.
+          $previous = Join-Path $out "testing\xfswin-previous-windows-$arch-setup.exe"
+          if (-not (Test-Path -LiteralPath $previous -PathType Leaf)) {
+            throw "build-packages.ps1 did not produce the 0.0.0 synthetic older setup: $previous"
+          }
+          $syntheticMsi = @(Get-ChildItem -LiteralPath (Join-Path $out 'testing') -File -Filter '*-synthetic-older.msi')
+          if ($syntheticMsi.Count -ne 1) {
+            throw "build-packages.ps1 did not produce exactly one synthetic older MSI"
+          }
+          $testingEvidence = Get-Content -LiteralPath $testingMetadata -Raw | ConvertFrom-Json
+          if ($testingEvidence.synthetic_older.version -ne '0.0.0') {
+            throw "testing metadata does not describe the 0.0.0 synthetic older fixture"
+          }
+          if ($testingEvidence.synthetic_older.executable.sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "testing metadata lacks the synthetic older executable SHA-256"
+          }
+          if ($testingEvidence.synthetic_older.evaluated_git_sha -ne $fullSha) {
+            throw "testing metadata does not bind the evaluated source commit"
+          }
+
+          $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+          if ($metadata.version -ne $version) { throw "package metadata version mismatch" }
+          if ($metadata.git_sha -ne $fullSha) { throw "package metadata git_sha mismatch" }
+          if ($metadata.architecture -ne $arch) { throw "package metadata architecture mismatch" }
+          if ([string]::IsNullOrWhiteSpace([string]$metadata.toolchain) -or
+              [string]::IsNullOrWhiteSpace([string]$metadata.build_timestamp)) {
+            throw "package metadata is missing toolchain/build_timestamp"
+          }
+          $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          foreach ($required in @('installer_name', 'installer_sha256', 'portable_name',
+              'portable_sha256', 'payload_exe_sha256', 'toolchain', 'build_timestamp',
+              'signing', 'testing')) {
+            if ($null -eq $metadata.PSObject.Properties[$required]) {
+              throw "package metadata is missing the REL1 top-level field '$required'"
+            }
+          }
+          if ($metadata.installer_name -ne (Split-Path -Leaf $setup)) {
+            throw "package metadata installer_name mismatch"
+          }
+          if ($metadata.portable_name -ne (Split-Path -Leaf $zip)) {
+            throw "package metadata portable_name mismatch"
+          }
+          if ($metadata.installer_sha256 -ne $setupHash) { throw "package metadata setup SHA-256 mismatch" }
+          if ($metadata.portable_sha256 -ne $zipHash -or $metadata.portable_zip_sha256 -ne $zipHash) {
+            throw "package metadata ZIP SHA-256 mismatch"
+          }
+          if ($metadata.assets.setup.sha256 -ne $setupHash) { throw "package metadata assets.setup mismatch" }
+          if ($metadata.assets.portable_zip.sha256 -ne $zipHash) { throw "package metadata assets.portable_zip mismatch" }
+          $winFspSha = (Get-FileHash -LiteralPath $env:WINFSP_MSI -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($metadata.winfsp.sha256 -ne $winFspSha) { throw "package metadata WinFsp dependency mismatch" }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $entry = $archive.GetEntry('xfswin.exe')
+            if ($null -eq $entry) { throw "the portable ZIP has no xfswin.exe" }
+            $stream = $entry.Open()
+            try {
+              $hasher = [Security.Cryptography.SHA256]::Create()
+              try {
+                $payloadHash = ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+              } finally { $hasher.Dispose() }
+            } finally { $stream.Dispose() }
+          } finally { $archive.Dispose() }
+          if ($metadata.payload_exe_sha256 -ne $payloadHash -or
+              $metadata.assets.payload_exe.sha256 -ne $payloadHash) {
+            throw "package metadata payload SHA-256 does not match the portable ZIP xfswin.exe"
+          }
+          if ($testingEvidence.synthetic_older.executable.sha256 -eq $payloadHash) {
+            throw "the synthetic older executable is the evaluated payload"
+          }
+          if (-not ([version]([string]$testingEvidence.synthetic_older.version) -lt [version]$version)) {
+            throw "the synthetic fixture version is not older than the evaluated version"
+          }
+          if ($testingEvidence.synthetic_older.setup.sha256 -eq $setupHash) {
+            throw "the synthetic older setup is the evaluated installer"
+          }
+
+          function Get-NativePeMachine([string]$Path) {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              throw "missing PE DOS header: $Path"
+            }
+            $offset = [BitConverter]::ToInt32($bytes, 0x3C)
+            if ($offset -lt 64 -or $offset -gt ($bytes.Length - 6) -or
+                $bytes[$offset] -ne 0x50 -or $bytes[$offset + 1] -ne 0x45) {
+              throw "invalid PE header: $Path"
+            }
+            return [int][BitConverter]::ToUInt16($bytes, $offset + 4)
+          }
+          $expectedMachine = if ($arch -eq 'arm64') { 0xAA64 } else { 0x8664 }
+          if ((Get-NativePeMachine $setup) -ne $expectedMachine) {
+            throw "the setup executable is not native $arch"
+          }
+          if ((Get-NativePeMachine $previous) -ne $expectedMachine) {
+            throw "the synthetic older setup is not native $arch"
+          }
+          if ((Get-FileHash -LiteralPath $previous -Algorithm SHA256).Hash.ToLowerInvariant() -eq $setupHash) {
+            throw "the synthetic older setup is the evaluated installer"
+          }
+
+      # The packaging build sets XFSWIN_BUILD_TESTS=OFF.  This independent
+      # native Release build keeps the exact production options and enables
+      # CTest, then verifies the actual /MT and WinFsp imports of the binary.
+      - name: Build and test the native Release configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ needs.release-info.outputs.version }}'
+          $arch = '${{ matrix.architecture }}'
+          $platform = '${{ matrix.platform }}'
+          $build = Join-Path $env:RUNNER_TEMP "rel1-native-tests-$arch"
+
+          & cmake -S . -B $build -G 'Visual Studio 17 2022' -A $platform `
+            -DCMAKE_CONFIGURATION_TYPES=Release `
+            -DXFSWIN_RELEASE_BUILD=ON `
+            -DXFSWIN_STATIC_RUNTIME=ON `
+            -DXFSWIN_BUILD_WINFSP=ON `
+            -DXFSWIN_WINFSP_ROOT="$env:XFSWIN_WINFSP_ROOT" `
+            -DXFSWIN_BUILD_TESTS=ON `
+            -DXFSWIN_TEST_HOOKS=OFF `
+            -DXFSWIN_CONCURRENCY_HOOKS=OFF `
+            -DXFSWIN_BUILD_FUZZERS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "native test configure failed" }
+
+          & cmake --build $build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "native test build failed" }
+
+          $exe = Get-ChildItem -LiteralPath (Join-Path $build 'src') -Recurse -File -Filter 'xfswin.exe' |
+            Where-Object { $_.FullName -match '\\Release\\' } | Select-Object -First 1
+          if ($null -eq $exe) { throw "the native Release xfswin.exe was not found" }
+
+          # The WinFsp adapter loads the shared runtime DLL at execution time.
+          # Put it beside the Release executables for the CTest run; it is never
+          # added to the product payload.
+          $winFspDllName = if ($arch -eq 'arm64') { 'winfsp-a64.dll' } else { 'winfsp-x64.dll' }
+          $winFspDll = $null
+          $winFspRoots = @()
+          foreach ($programFilesRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not [string]::IsNullOrWhiteSpace($programFilesRoot)) {
+              $winFspRoots += (Join-Path $programFilesRoot 'WinFsp')
+            }
+          }
+          foreach ($winFspRoot in $winFspRoots) {
+            if (-not (Test-Path -LiteralPath $winFspRoot -PathType Container)) { continue }
+            $winFspDll = Get-ChildItem -LiteralPath $winFspRoot -Recurse -File -Filter $winFspDllName `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $winFspDll) { break }
+          }
+          if ($null -eq $winFspDll) { throw "the WinFsp runtime DLL $winFspDllName was not found" }
+          foreach ($releaseDir in @((Split-Path -Parent $exe.FullName), (Join-Path $build 'tests\Release'))) {
+            if (Test-Path -LiteralPath $releaseDir -PathType Container) {
+              Copy-Item -LiteralPath $winFspDll.FullName -Destination (Join-Path $releaseDir $winFspDllName) -Force
+            }
+          }
+          $env:PATH = (Split-Path -Parent $exe.FullName) + ';' + $env:PATH
+
+          & ctest --test-dir $build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "native Release CTest failed" }
+
+          $dumpbinCommand = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          $dumpbin = $null
+          if ($null -ne $dumpbinCommand) {
+            $dumpbin = $dumpbinCommand.Source
+          } else {
+            $vswhereCandidates = @()
+            foreach ($programFilesRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+              if (-not [string]::IsNullOrWhiteSpace($programFilesRoot)) {
+                $vswhereCandidates += (Join-Path $programFilesRoot 'Microsoft Visual Studio\Installer\vswhere.exe')
+              }
+            }
+            $vswhere = $vswhereCandidates |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
+            if ([string]::IsNullOrWhiteSpace($vswhere)) {
+              throw "vswhere.exe was not found for the import check"
+            }
+            $installation = (& $vswhere -latest -products * -property installationPath | Select-Object -First 1).Trim()
+            if ([string]::IsNullOrWhiteSpace($installation)) { throw "Visual Studio was not located" }
+            $dumpbinFile = Get-ChildItem -LiteralPath (Join-Path $installation 'VC\Tools\MSVC') `
+              -Recurse -File -Filter 'dumpbin.exe' | Select-Object -First 1
+            if ($null -ne $dumpbinFile) { $dumpbin = $dumpbinFile.FullName }
+          }
+          if ([string]::IsNullOrWhiteSpace($dumpbin)) { throw "dumpbin.exe was not found" }
+          function Assert-ReleaseImports([string]$Path) {
+            $imports = (& $dumpbin /nologo /imports $Path 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /imports failed for $Path" }
+            if ($imports -match '(?i)(vcruntime|msvcp|ucrtbase|api-ms-win-crt)[^\\/]*\.dll') {
+              throw "Release binary still imports a dynamic MSVC/UCRT runtime: $Path"
+            }
+            if ($imports -notmatch '(?i)(winfsp[^\\/]*\.dll|WINFSPSYS)') {
+              throw "Release binary does not import the WinFsp runtime: $Path"
+            }
+          }
+          Assert-ReleaseImports $exe.FullName
+
+          # Validate the actual packaged payload too, not only the test build.
+          $portableZip = Join-Path $PWD "out\release-$arch\xfswin-$version-windows-$arch.zip"
+          if (-not (Test-Path -LiteralPath $portableZip -PathType Leaf)) {
+            throw "the released portable ZIP is missing: $portableZip"
+          }
+          $payloadDir = Join-Path $env:RUNNER_TEMP "rel1-package-payload-$arch"
+          if (Test-Path -LiteralPath $payloadDir) {
+            Remove-Item -LiteralPath $payloadDir -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $portableZip -DestinationPath $payloadDir
+          $packageExe = Join-Path $payloadDir 'xfswin.exe'
+          if (-not (Test-Path -LiteralPath $packageExe -PathType Leaf)) {
+            throw "the released portable ZIP has no xfswin.exe"
+          }
+          Assert-ReleaseImports $packageExe
+          Copy-Item -LiteralPath $winFspDll.FullName -Destination (Join-Path $payloadDir $winFspDllName) -Force
+          $packageVersionOutput = (& $packageExe --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $packageVersionOutput -notmatch [regex]::Escape("xfswin $version")) {
+            throw "the packaged Release --version did not identify $version`: $packageVersionOutput"
+          }
+
+          $versionOutput = (& $exe.FullName --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape("xfswin $version")) {
+            throw "native Release --version did not identify $version`: $versionOutput"
+          }
+
+      - name: Upload the public setup and portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-public-${{ matrix.architecture }}
+          path: |
+            out/release-${{ matrix.architecture }}/xfswin-${{ needs.release-info.outputs.version }}-windows-${{ matrix.architecture }}-setup.exe
+            out/release-${{ matrix.architecture }}/xfswin-${{ needs.release-info.outputs.version }}-windows-${{ matrix.architecture }}.zip
+          if-no-files-found: error
+
+      - name: Upload package metadata separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package-metadata-${{ matrix.architecture }}
+          path: out/release-${{ matrix.architecture }}/package-metadata-${{ matrix.architecture }}.json
+          if-no-files-found: error
+
+      - name: Upload internal MSI, synthetic fixture and testing metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-internal-${{ matrix.architecture }}
+          path: out/release-${{ matrix.architecture }}/testing/
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Clean installer lifecycle on a fresh native runner per architecture.  This
+  # is the parent acceptance script: clean install, native/version checks,
+  # read-only mount, real RW write/flush, active-upgrade refusal, legacy
+  # upgrade/config preservation, uninstall and reinstall.  It executes the
+  # actual setup binary from the package artifact.
+  # -------------------------------------------------------------------------
+  installer-acceptance:
+    needs: [release-info, package, core-qualification]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2025
+          - architecture: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-public-${{ matrix.architecture }}
+          path: package
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package-metadata-${{ matrix.architecture }}
+          path: package
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-internal-${{ matrix.architecture }}
+          path: internal
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: ux-images
+
+      - name: Download the fixed official WinFsp MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $winFspDir = Join-Path $env:RUNNER_TEMP 'rel1-winfsp'
+          & pwsh -NoProfile -File scripts/release/get-winfsp.ps1 `
+            -DestinationDirectory $winFspDir
+          if ($LASTEXITCODE -ne 0) { throw "get-winfsp.ps1 failed" }
+          $winFspMsi = Join-Path $winFspDir '${{ env.WINFSP_MSI_NAME }}'
+          if (-not (Test-Path -LiteralPath $winFspMsi -PathType Leaf)) {
+            throw "the verified official WinFsp MSI is missing: $winFspMsi"
+          }
+          $expected = '${{ env.WINFSP_MSI_SHA256 }}'.ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $winFspMsi -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "the official WinFsp MSI SHA-256 mismatch: expected $expected, got $actual"
+          }
+          "WINFSP_MSI=$winFspMsi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run the clean-machine installer acceptance suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ needs.release-info.outputs.version }}'
+          $fullSha = '${{ needs.release-info.outputs.full_sha }}'
+          $arch = '${{ matrix.architecture }}'
+          # Parent evidence binds GITHUB_SHA to the checked-out commit.  Use the
+          # release identity resolved from HEAD so annotated tag object ids can
+          # never make the provenance disagree with the packaged commit.
+          $env:GITHUB_SHA = $fullSha
+          & pwsh -NoProfile -File tests/scripts/verify_release_install_windows.ps1 `
+            -Installer (Join-Path $PWD "package\xfswin-$version-windows-$arch-setup.exe") `
+            -PreviousInstaller (Join-Path $PWD "internal\xfswin-previous-windows-$arch-setup.exe") `
+            -ProductMsi (Join-Path $PWD "internal\xfswin-$version-windows-$arch.msi") `
+            -Fixtures (Join-Path $PWD 'ux-images') `
+            -OutputDirectory (Join-Path $PWD 'acceptance-evidence') `
+            -Architecture $arch `
+            -Portable (Join-Path $PWD "package\xfswin-$version-windows-$arch.zip") `
+            -AllowCiMachineChanges
+          if ($LASTEXITCODE -ne 0) { throw "clean-machine installer acceptance failed" }
+
+      - name: Upload the install qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-install-qualification-${{ matrix.architecture }}
+          path: acceptance-evidence/
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # Failure injection and rollback on a separate fresh native runner per
+  # architecture.  The parent script consumes the install evidence from the
+  # clean-runner job, merges the failure cases, and requires the complete set.
+  # -------------------------------------------------------------------------
+  installer-failure:
+    needs: [release-info, package, core-qualification, installer-acceptance]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2025
+          - architecture: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-public-${{ matrix.architecture }}
+          path: package
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package-metadata-${{ matrix.architecture }}
+          path: package
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-internal-${{ matrix.architecture }}
+          path: internal
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ux-images
+          path: ux-images
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-install-qualification-${{ matrix.architecture }}
+          path: acceptance-evidence
+
+      - name: Install the pinned official WinFsp runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $winFspDir = Join-Path $env:RUNNER_TEMP 'rel1-winfsp'
+          & pwsh -NoProfile -File scripts/release/get-winfsp.ps1 `
+            -DestinationDirectory $winFspDir
+          if ($LASTEXITCODE -ne 0) { throw "get-winfsp.ps1 failed" }
+          $winFspMsi = Join-Path $winFspDir '${{ env.WINFSP_MSI_NAME }}'
+          $install = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
+            -ArgumentList @('/i', $winFspMsi, '/qn', '/norestart') -Wait -PassThru
+          if (@(0, 3010) -notcontains $install.ExitCode) {
+            throw "official WinFsp MSI install failed with $($install.ExitCode)"
+          }
+          "WINFSP_MSI=$winFspMsi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run the installer failure and rollback suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ needs.release-info.outputs.version }}'
+          $fullSha = '${{ needs.release-info.outputs.full_sha }}'
+          $arch = '${{ matrix.architecture }}'
+          $env:GITHUB_SHA = $fullSha
+          & pwsh -NoProfile -File tests/scripts/verify_release_failures_windows.ps1 `
+            -Installer (Join-Path $PWD "package\xfswin-$version-windows-$arch-setup.exe") `
+            -PreviousInstaller (Join-Path $PWD "internal\xfswin-previous-windows-$arch-setup.exe") `
+            -ProductMsi (Join-Path $PWD "internal\xfswin-$version-windows-$arch.msi") `
+            -Fixtures (Join-Path $PWD 'ux-images') `
+            -OutputDirectory (Join-Path $PWD 'acceptance-evidence') `
+            -Architecture $arch `
+            -AllowCiMachineChanges
+          if ($LASTEXITCODE -ne 0) { throw "installer failure acceptance failed" }
+
+      - name: Upload the merged qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-qualification-${{ matrix.architecture }}
+          path: |
+            acceptance-evidence/qualification-${{ matrix.architecture }}.json
+            acceptance-evidence/release-failures-${{ matrix.architecture }}-results.json
+            acceptance-evidence/*.log
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # Aggregate gate and manifest creation.  Runs even when dependencies failed
+  # so the result is an explicit NOT READY, never a green skipped run.
+  # -------------------------------------------------------------------------
+  release-qualification:
+    if: ${{ always() }}
+    needs:
+      - release-info
+      - manifest-tests
+      - core-qualification
+      - package
+      - installer-acceptance
+      - installer-failure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require every release gate to succeed exactly
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          bad = {name: job.get("result", "missing")
+                 for name, job in needs.items()
+                 if job.get("result") != "success"}
+          if bad:
+              print("REL-1 release qualification is NOT READY:", file=sys.stderr)
+              for name, result in sorted(bad.items()):
+                  print(f"  {name}: {result}", file=sys.stderr)
+              sys.exit(1)
+          print(f"REL-1 release qualification: READY ({len(needs)} jobs passed)")
+          PY
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-public-*
+          path: release-assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-package-metadata-*
+          path: release-metadata
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-qualification-*
+          path: acceptance-evidence
+          merge-multiple: true
+
+      - name: Require both native setups, ZIPs, metadata and evidences
+        run: |
+          set -euo pipefail
+          version='${{ needs.release-info.outputs.version }}'
+          for arch in x64 arm64; do
+            test -f "release-assets/xfswin-$version-windows-$arch-setup.exe"
+            test -f "release-assets/xfswin-$version-windows-$arch.zip"
+            test -f "release-metadata/package-metadata-$arch.json"
+            test -f "acceptance-evidence/qualification-$arch.json"
+          done
+          ls -l release-assets release-metadata acceptance-evidence
+
+      - name: Validate package metadata against the actual four public assets
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+          FULL_SHA: ${{ needs.release-info.outputs.full_sha }}
+          WINFSP_SHA256: ${{ env.WINFSP_MSI_SHA256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+          import zipfile
+
+          version = os.environ["VERSION"]
+          full_sha = os.environ["FULL_SHA"]
+          winfsp_sha = os.environ["WINFSP_SHA256"].lower()
+          assets = pathlib.Path("release-assets")
+          metadata_root = pathlib.Path("release-metadata")
+
+          for arch in ("x64", "arm64"):
+              metadata = json.loads((metadata_root / f"package-metadata-{arch}.json").read_text(encoding="utf-8"))
+              if metadata.get("version") != version:
+                  sys.exit(f"package-metadata-{arch}.json: version mismatch")
+              if metadata.get("git_sha") != full_sha:
+                  sys.exit(f"package-metadata-{arch}.json: git_sha mismatch")
+              if metadata.get("architecture") != arch:
+                  sys.exit(f"package-metadata-{arch}.json: architecture mismatch")
+              for key in ("toolchain", "build_timestamp"):
+                  if not metadata.get(key):
+                      sys.exit(f"package-metadata-{arch}.json: missing {key}")
+              if metadata.get("winfsp", {}).get("sha256", "").lower() != winfsp_sha:
+                  sys.exit(f"package-metadata-{arch}.json: WinFsp dependency mismatch")
+
+              setup = assets / f"xfswin-{version}-windows-{arch}-setup.exe"
+              portable = assets / f"xfswin-{version}-windows-{arch}.zip"
+              setup_sha = hashlib.sha256(setup.read_bytes()).hexdigest()
+              zip_sha = hashlib.sha256(portable.read_bytes()).hexdigest()
+              if metadata.get("installer_sha256") != setup_sha:
+                  sys.exit(f"package-metadata-{arch}.json: setup SHA-256 mismatch")
+              if metadata.get("portable_zip_sha256") != zip_sha:
+                  sys.exit(f"package-metadata-{arch}.json: ZIP SHA-256 mismatch")
+              if metadata.get("assets", {}).get("setup", {}).get("sha256") != setup_sha:
+                  sys.exit(f"package-metadata-{arch}.json: assets.setup SHA-256 mismatch")
+              if metadata.get("assets", {}).get("portable_zip", {}).get("sha256") != zip_sha:
+                  sys.exit(f"package-metadata-{arch}.json: assets.portable_zip SHA-256 mismatch")
+              with zipfile.ZipFile(portable) as archive:
+                  payload = archive.read("xfswin.exe")
+              payload_sha = hashlib.sha256(payload).hexdigest()
+              if metadata.get("payload_exe_sha256") != payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: payload SHA-256 mismatch")
+              if metadata.get("assets", {}).get("payload_exe", {}).get("sha256") != payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: assets.payload_exe SHA-256 mismatch")
+          print("package metadata matches the four public assets")
+          PY
+
+      - name: Create and verify the release manifest with the evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/manifest.py create \
+            --directory release-assets \
+            --version '${{ needs.release-info.outputs.version }}' \
+            --git-sha '${{ needs.release-info.outputs.full_sha }}' \
+            --dependency-lock packaging/winfsp.lock.json \
+            --evidence-directory acceptance-evidence
+          python3 scripts/release/manifest.py verify \
+            --directory release-assets \
+            --version '${{ needs.release-info.outputs.version }}' \
+            --git-sha '${{ needs.release-info.outputs.full_sha }}' \
+            --dependency-lock packaging/winfsp.lock.json \
+            --evidence-directory acceptance-evidence
+
+      - name: Write the qualification summary
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+          FULL_SHA: ${{ needs.release-info.outputs.full_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path("acceptance-evidence")
+          total = success = skipped = failed = 0
+          cases = {}
+          for arch in ("x64", "arm64"):
+              evidence = json.loads((root / f"qualification-{arch}.json").read_text(encoding="utf-8"))
+              outcomes = evidence.get("cases", {})
+              cases[arch] = {name: outcomes[name] for name in sorted(outcomes)}
+              total += len(outcomes)
+              success += sum(1 for value in outcomes.values() if value == "passed")
+              failed += sum(1 for value in outcomes.values() if value == "failed")
+              skipped += sum(1 for value in outcomes.values() if value not in ("passed", "failed"))
+          if skipped or failed or success != total or total == 0:
+              sys.exit(f"qualification summary is not clean: total={total} success={success} skipped={skipped} failed={failed}")
+          report = {
+              "product": "XFS-for-Windows",
+              "kind": "release-qualification",
+              "run_id": os.environ["RUN_ID"],
+              "head_sha": os.environ["FULL_SHA"],
+              "version": os.environ["VERSION"],
+              "total": total,
+              "success": success,
+              "skipped": skipped,
+              "failed": failed,
+              "success_count": success,
+              "skipped_count": skipped,
+              "failure_count": failed,
+              "cases": cases,
+          }
+          pathlib.Path("release-assets/qualification.json").write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
+          print(json.dumps(report))
+          PY
+
+      - name: Upload the release assets, manifest and qualification summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-final
+          path: |
+            release-assets/xfswin-${{ needs.release-info.outputs.version }}-windows-x64-setup.exe
+            release-assets/xfswin-${{ needs.release-info.outputs.version }}-windows-x64.zip
+            release-assets/xfswin-${{ needs.release-info.outputs.version }}-windows-arm64-setup.exe
+            release-assets/xfswin-${{ needs.release-info.outputs.version }}-windows-arm64.zip
+            release-assets/release-manifest.json
+            release-assets/SHA256SUMS.txt
+            release-assets/qualification.json
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # The only publishing job.  It is additionally gated by should_publish,
+  # false for pull requests and non-tag manual runs, and it rechecks the exact
+  # tag/commit/main ancestry on a fresh checkout.  Only this job has write
+  # permission to repository contents.
+  # -------------------------------------------------------------------------
+  publish:
+    needs: [release-info, release-qualification]
+    if: >-
+      ${{
+        always() &&
+        needs.release-info.result == 'success' &&
+        needs.release-qualification.result == 'success' &&
+        needs.release-info.outputs.should_publish == 'true' &&
+        github.event_name != 'pull_request'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recheck the tag, commit and main ancestry
+        env:
+          FULL_SHA: ${{ needs.release-info.outputs.full_sha }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          version='${{ needs.release-info.outputs.version }}'
+          test "$REF_TYPE" = "tag"
+          test "$REF_NAME" = "v$version"
+          test "$(git rev-parse HEAD)" = "$FULL_SHA"
+          test "$(git rev-parse "refs/tags/$REF_NAME^{commit}")" = "$FULL_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$FULL_SHA" FETCH_HEAD
+          echo "tag $REF_NAME -> $FULL_SHA is on main"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-final
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-qualification-*
+          path: acceptance-evidence
+          merge-multiple: true
+
+      - name: Verify the manifest on the publishing runner
+        run: |
+          set -euo pipefail
+          python3 scripts/release/manifest.py verify \
+            --directory release-assets \
+            --version '${{ needs.release-info.outputs.version }}' \
+            --git-sha '${{ needs.release-info.outputs.full_sha }}' \
+            --dependency-lock packaging/winfsp.lock.json \
+            --evidence-directory acceptance-evidence
+
+      - name: Upload to an owned draft, then publish the complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FULL_SHA: ${{ needs.release-info.outputs.full_sha }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.release-info.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          marker="<!-- xfswin-rel1 source=$FULL_SHA run=$RUN_ID -->"
+          if existing="$(gh release view "$tag" --json isDraft,body,assets 2>/dev/null)"; then
+            # Retry only a draft created by this exact source/run. Published
+            # releases and unrelated drafts must never be overwritten.
+            EXISTING_RELEASE="$existing" EXPECTED_MARKER="$marker" python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          release = json.loads(os.environ["EXISTING_RELEASE"])
+          if release.get("isDraft") is not True or os.environ["EXPECTED_MARKER"] not in release.get("body", ""):
+              sys.exit("refusing to overwrite a published release or an unrelated draft")
+          version = os.environ["VERSION"]
+          expected = {f"xfswin-{version}-windows-{arch}{suffix}"
+                      for arch in ("x64", "arm64") for suffix in (".zip", "-setup.exe")}
+          expected.update(("release-manifest.json", "SHA256SUMS.txt"))
+          actual = {asset["name"] for asset in release.get("assets", [])}
+          if not actual <= expected:
+              sys.exit(f"draft contains unexpected assets: {sorted(actual - expected)}")
+          PY
+          else
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "XFS for Windows $VERSION" \
+              --notes "XFS for Windows $VERSION. Verify every download against SHA256SUMS.txt. The bundled WinFsp ${WINFSP_VERSION} runtime is the unmodified official installer (GPLv3 with the FLOSS exception) and remains installed until removed separately. $marker"
+          fi
+          gh release upload "$tag" --clobber \
+            "release-assets/xfswin-$VERSION-windows-x64-setup.exe" \
+            "release-assets/xfswin-$VERSION-windows-x64.zip" \
+            "release-assets/xfswin-$VERSION-windows-arm64-setup.exe" \
+            "release-assets/xfswin-$VERSION-windows-arm64.zip" \
+            release-assets/release-manifest.json \
+            release-assets/SHA256SUMS.txt
+          gh release edit "$tag" --draft=false

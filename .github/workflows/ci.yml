@@ -13,6 +13,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # REL-1 calls this workflow unchanged from the release pipeline.  The soak
+  # remains schedule/manual-only; a reusable call never starts it.
+  workflow_call:
   schedule:
     - cron: '0 3 * * 0'
   workflow_dispatch:
