@@ -39,7 +39,13 @@ function Read-JsonFile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing JSON file: $Path"
     }
-    return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $parameters = @{ InputObject = (Get-Content -LiteralPath $Path -Raw -Encoding UTF8) }
+    # PowerShell 7.5+ otherwise turns ISO timestamp strings into DateTime,
+    # which breaks the release metadata's JSON string contract.
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        $parameters['DateKind'] = 'String'
+    }
+    return (ConvertFrom-Json @parameters)
 }
 
 function Get-RequiredJsonString {
@@ -49,6 +55,14 @@ function Get-RequiredJsonString {
         [Parameter(Mandatory = $true)][string]$Context
     )
     $property = $Object.PSObject.Properties[$Name]
+    # Earlier PowerShell versions have no DateKind switch. Their JSON parser
+    # also converts string dates, so recover a culture-independent UTC string.
+    if ($null -ne $property -and $property.Value -is [DateTime]) {
+        return $property.Value.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($null -ne $property -and $property.Value -is [DateTimeOffset]) {
+        return $property.Value.UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
     if ($null -eq $property -or -not ($property.Value -is [string]) -or
         [string]::IsNullOrWhiteSpace($property.Value)) {
         throw "$Context is missing a non-empty '$Name' string."

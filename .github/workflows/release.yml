@@ -206,6 +206,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Release helper JSON regression tests
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tests/release/release_common_tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'release metadata regression tests failed' }
+
       - name: Provision the pinned dependency and toolchain
         shell: pwsh
         run: |
