@@ -79,13 +79,15 @@ Do not enroll a physical device for read-write unless its device class and hardw
 
 ## Remove a USB device safely
 
-A read-write automount owns the physical disk exclusively. Windows may therefore omit that USB device from the **Safely Remove Hardware** list while the XFS drive is mounted. Before unplugging it, release the automount session from an elevated PowerShell window:
+A read-write automount owns the physical disk exclusively. Before unplugging it, release the automount session from an elevated PowerShell window:
 
 ```powershell
 & $exe automount eject F:
 ```
 
-Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata and restores the Windows volume mount point; automatic mounting is suspended while that device stays attached. Then use the taskbar's **Safely Remove Hardware** entry to eject the device and unplug it only after Windows confirms removal. Reinsert the device to mount it again automatically.
+Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata and restores the Windows volume mount point; automatic mounting is suspended while that device stays attached. Once it reports that the filesystem was released, unplug the device.
+
+Windows usually classifies USB mass storage as **Quick removal** (removal policy 3). Those devices never appear in the taskbar's **Safely Remove Hardware** list because Windows treats an unplug as safe by design — which does not hold for a mounted XFS filesystem, so always run `automount eject` first. If the device is configured for **Better performance**, the Safely Remove Hardware entry is available after the release; eject it there and unplug once Windows confirms. Reinsert the device to mount it again automatically.
 
 Do not pull the device out while the XFS drive is mounted: a power loss during a read-write session can leave the XFS journal dirty, and automount will then refuse to mount it until `xfswin recover` has replayed that journal. Recovery writes filesystem metadata and must be run deliberately against the exact device.
 

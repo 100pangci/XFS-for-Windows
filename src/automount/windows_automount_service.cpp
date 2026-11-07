@@ -1021,9 +1021,16 @@ void ProcessEjectRequests(ServiceRuntime& runtime) {
     }
   }
   if (!std::filesystem::exists(accepted, ec)) return;
-  std::ifstream input(accepted, std::ios::binary);
   std::string line;
-  if (!std::getline(input, line)) {
+  bool has_line = false;
+  {
+    // The stream must be closed before the file is deleted: the CRT opens it
+    // without FILE_SHARE_DELETE, so an open handle turns the remove below into
+    // a sharing violation and the same request would be applied on every pass.
+    std::ifstream input(accepted, std::ios::binary);
+    has_line = static_cast<bool>(std::getline(input, line));
+  }
+  if (!has_line) {
     std::filesystem::remove(accepted, ec);
     WriteEjectResult(result, "error\tthe request is empty");
     return;
