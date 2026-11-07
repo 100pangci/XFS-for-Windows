@@ -4,6 +4,7 @@
 #include "xfs/windows_raw_device.h"
 
 #include "xfs/log.h"
+#include "xfs/volume_ownership.h"
 
 #ifdef _WIN32
 
@@ -308,6 +309,20 @@ int VolumeDiskRelation(HANDLE volume, uint32_t disk_number) {
     buffer.resize(needed);
   }
   return -1;
+}
+
+// GetDriveTypeW requires a root path with a trailing backslash.  Volume names
+// from FindFirstVolumeW have that form; the ownership loop strips it before
+// opening the volume, so restore it here.  An unrecognized value is treated
+// as unknown, which keeps the conservative refusal.
+VolumeDriveType VolumeDriveTypeForPath(const std::wstring& volume_name) {
+  std::wstring root = volume_name;
+  if (root.empty() || root.back() != L'\\') root.push_back(L'\\');
+  const UINT type = GetDriveTypeW(root.c_str());
+  if (type > static_cast<UINT>(VolumeDriveType::kRamDisk)) {
+    return VolumeDriveType::kUnknown;
+  }
+  return static_cast<VolumeDriveType>(type);
 }
 
 DeviceBusType MapBusType(STORAGE_BUS_TYPE bus) {
@@ -890,6 +905,17 @@ bool WindowsRawBlockDevice::LockVolumes(std::string* error) {
     size_t len = wcslen(volume_name);
     if (len && volume_name[len - 1] == L'\\') {
       volume_name[len - 1] = L'\0';
+    }
+
+    // Optical drives are enumerated as volumes but are not part of any
+    // disk's block namespace.  Windows fails the disk-extent query on them,
+    // which previously turned an attached CD/DVD drive (even without media)
+    // into a blanket refusal of every writable whole-disk open.  Skipping
+    // only this provably non-disk volume keeps the conservative refusal for
+    // every other volume whose relation cannot be established.
+    if (VolumeTypeIsProvablyNotOnLocalDisk(
+            VolumeDriveTypeForPath(volume_name))) {
+      continue;
     }
 
     HANDLE volume = CreateFileW(volume_name, GENERIC_READ | GENERIC_WRITE,

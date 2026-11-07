@@ -65,6 +65,15 @@ namespace {
 using SteadyClock = std::chrono::steady_clock;
 
 constexpr wchar_t kServiceName[] = L"XFSWinAutomount";
+// A one-slot, machine-wide command file.  The CLI writes it with the same
+// protected configuration directory ACL as automount.ini; the service takes
+// ownership by renaming it to .accepted before acting on the request, then
+// writes the result to .result.  No elevation or service control code is
+// reimplemented by the installer/launcher layer.
+constexpr wchar_t kEjectRequestName[] = L"eject.request";
+constexpr wchar_t kEjectAcceptedName[] = L"eject.request.accepted";
+constexpr wchar_t kEjectResultName[] = L"eject.result";
+constexpr uint32_t kEjectResultTimeoutMs = 20000;
 constexpr wchar_t kServiceDisplayName[] = L"XFS for Windows automount";
 constexpr wchar_t kServiceDescription[] =
     L"Discovers attached XFS filesystems and mounts configured filesystems "
@@ -977,6 +986,69 @@ HANDLE CreateConfigWatcher(const std::filesystem::path& directory) {
           FILE_NOTIFY_CHANGE_LAST_WRITE);
 }
 
+bool WriteEjectResult(const std::filesystem::path& path,
+                      const std::string& text) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) return false;
+  file << text;
+  file.flush();
+  return static_cast<bool>(file);
+}
+
+// The service owns this one-slot channel.  A stale .accepted file is finished
+// first, so a service restart never drops a request that was already claimed.
+// Only the engine may decide that a filesystem can be released; this shell
+// merely parses the UUID and reports the engine's answer.
+void ProcessEjectRequests(ServiceRuntime& runtime) {
+  const std::filesystem::path directory = runtime.paths.directory;
+  const std::filesystem::path request = directory / kEjectRequestName;
+  const std::filesystem::path accepted = directory / kEjectAcceptedName;
+  const std::filesystem::path result = directory / kEjectResultName;
+  std::error_code ec;
+  if (std::filesystem::exists(request, ec)) {
+    std::filesystem::remove(result, ec);
+    std::filesystem::remove(accepted, ec);
+    std::filesystem::rename(request, accepted, ec);
+    if (ec) {
+      AutomountLogRecord record;
+      record.level = AutomountLogLevel::kWarn;
+      record.event = "eject-request";
+      record.result = "failed";
+      record.detail = "cannot claim the request: " + ec.message();
+      runtime.platform->EmitLog(record);
+      WriteEjectResult(result, "error\tcannot claim the request");
+      return;
+    }
+  }
+  if (!std::filesystem::exists(accepted, ec)) return;
+  std::ifstream input(accepted, std::ios::binary);
+  std::string line;
+  if (!std::getline(input, line)) {
+    std::filesystem::remove(accepted, ec);
+    WriteEjectResult(result, "error\tthe request is empty");
+    return;
+  }
+  Uuid uuid{};
+  bool ok = ParseUuid(line, &uuid);
+  std::string detail;
+  if (ok) {
+    ok = runtime.engine->Eject(uuid, AutomountClock::now(), &detail);
+  } else {
+    detail = "the request does not contain a valid filesystem UUID";
+  }
+  std::filesystem::remove(accepted, ec);
+  WriteEjectResult(result, std::string(ok ? "ok\t" : "error\t") + detail);
+  AutomountLogRecord record;
+  record.level = ok ? AutomountLogLevel::kInfo : AutomountLogLevel::kWarn;
+  record.event = "eject-request";
+  record.uuid = line;
+  record.result = ok ? "released" : "refused";
+  record.detail = detail;
+  runtime.platform->EmitLog(record);
+  runtime.engine->Tick(AutomountClock::now());
+  runtime.PublishRuntimeStatus();
+}
+
 DWORD WaitTimeoutFor(std::optional<AutomountTimePoint> next,
                      AutomountTimePoint now) {
   if (!next) return INFINITE;
@@ -992,11 +1064,19 @@ DWORD WaitTimeoutFor(std::optional<AutomountTimePoint> next,
 void WorkerMain(ServiceRuntime& runtime) {
   enum class WakeKind : uint8_t { kStop, kDevice, kConfig };
   while (true) {
+    ProcessEjectRequests(runtime);
     runtime.engine->Tick(AutomountClock::now());
     runtime.PublishRuntimeStatus();
     const AutomountTimePoint now = AutomountClock::now();
-    const DWORD timeout =
-        WaitTimeoutFor(runtime.engine->NextWake(now), now);
+    DWORD timeout = WaitTimeoutFor(runtime.engine->NextWake(now), now);
+    // The protected-directory watcher is the primary request signal, but a
+    // short bounded wait also polls for a pending request if the notification
+    // is delayed or temporarily unavailable.
+    std::error_code request_error;
+    if (std::filesystem::exists(runtime.paths.directory / kEjectRequestName,
+                                request_error)) {
+      timeout = std::min<DWORD>(timeout, 250);
+    }
 
     HANDLE handles[3] = {};
     WakeKind kinds[3] = {};
@@ -1032,8 +1112,10 @@ void WorkerMain(ServiceRuntime& runtime) {
     const AutomountTimePoint event_time = AutomountClock::now();
     if (kind == WakeKind::kDevice) {
       ResetEvent(runtime.device_event);
+      ProcessEjectRequests(runtime);
       runtime.engine->NotifyDeviceChanged(event_time);
     } else if (kind == WakeKind::kConfig) {
+      ProcessEjectRequests(runtime);
       if (!FindNextChangeNotification(runtime.config_notify)) {
         const DWORD code = GetLastError();
         FindCloseChangeNotification(runtime.config_notify);
@@ -1097,6 +1179,23 @@ NTSTATUS OnServiceStart(FSP_SERVICE* service, ULONG, PWSTR*) {
     runtime->platform->EmitLog(record);
   }
   runtime->config_notify = CreateConfigWatcher(runtime->paths.directory);
+  // A request left over from a stopped service must not be silently applied as
+  // if the user had just asked for it.  Report the stale state and clear it.
+  {
+    std::error_code ec;
+    const std::filesystem::path request =
+        runtime->paths.directory / kEjectRequestName;
+    const std::filesystem::path accepted =
+        runtime->paths.directory / kEjectAcceptedName;
+    if (std::filesystem::exists(request, ec) ||
+        std::filesystem::exists(accepted, ec)) {
+      std::filesystem::remove(request, ec);
+      std::filesystem::remove(accepted, ec);
+      WriteEjectResult(runtime->paths.directory / kEjectResultName,
+                       "error\tthe automount service was restarted before the "
+                       "request completed");
+    }
+  }
 
   runtime->engine->Start(AutomountClock::now());
   try {
@@ -1612,6 +1711,82 @@ Status StopAutomountService(std::string* message) {
                    "the automount service did not stop: " + error);
   }
   if (message) *message = "the automount service is stopped";
+  return OkStatus();
+}
+
+Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail) {
+  const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
+  if (service.state != AutomountServiceState::kRunning) {
+    return XFS_ERR(XfsError::kIoError,
+                   "the XFS automount service is not running")
+        .Metadata("automount-eject");
+  }
+  const AutomountServicePaths paths = DefaultAutomountServicePaths();
+  const std::filesystem::path directory = paths.directory;
+  const std::filesystem::path request = directory / kEjectRequestName;
+  const std::filesystem::path accepted = directory / kEjectAcceptedName;
+  const std::filesystem::path result = directory / kEjectResultName;
+  std::error_code ec;
+  if (std::filesystem::exists(request, ec) ||
+      std::filesystem::exists(accepted, ec)) {
+    return XFS_ERR(XfsError::kAlreadyExists,
+                   "another safe-removal request is still being processed")
+        .Metadata("automount-eject");
+  }
+  if (!std::filesystem::exists(directory, ec)) {
+    return XFS_ERR(XfsError::kNotFound,
+                   "the automount configuration directory does not exist")
+        .Metadata("automount-eject");
+  }
+  std::filesystem::remove(result, ec);
+  if (ec && std::filesystem::exists(result, ec)) {
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot clear the previous safe-removal result: " +
+                       ec.message())
+        .Metadata("automount-eject");
+  }
+  {
+    std::ofstream file(request, std::ios::binary | std::ios::trunc);
+    if (!file) {
+      return XFS_ERR(XfsError::kPermissionDenied,
+                     "cannot write the safe-removal request; run as "
+                     "Administrator")
+          .Metadata("automount-eject");
+    }
+    file << FormatUuid(fs_uuid) << '\n';
+    file.flush();
+    if (!file) {
+      std::filesystem::remove(request, ec);
+      return XFS_ERR(XfsError::kIoError,
+                     "cannot flush the safe-removal request")
+          .Metadata("automount-eject");
+    }
+  }
+  const ULONGLONG started = GetTickCount64();
+  std::string text;
+  for (;;) {
+    std::ifstream input(result, std::ios::binary);
+    if (input) {
+      std::getline(input, text);
+      if (!text.empty()) break;
+    }
+    if (GetTickCount64() - started >= kEjectResultTimeoutMs) {
+      std::filesystem::remove(request, ec);
+      return XFS_ERR(XfsError::kIoError,
+                     "the automount service did not answer the safe-removal "
+                     "request")
+          .Metadata("automount-eject");
+    }
+    Sleep(100);
+  }
+  const size_t tab = text.find('\t');
+  const bool ok = text.rfind("ok\t", 0) == 0;
+  const std::string message =
+      tab == std::string::npos ? text : text.substr(tab + 1);
+  if (detail) *detail = message;
+  if (!ok) {
+    return XFS_ERR(XfsError::kIoError, message).Metadata("automount-eject");
+  }
   return OkStatus();
 }
 

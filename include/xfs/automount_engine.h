@@ -225,6 +225,12 @@ class AutomountEngine {
   void NotifyDeviceChanged(AutomountTimePoint now, std::string hint = {});
   // The configuration changed on disk (service control or file watcher).
   void NotifySettingsChanged(AutomountTimePoint now);
+  // Releases an enrolled filesystem for safe removal: stops its session
+  // (clean metadata flush and drive-letter restore) and keeps it unmounted
+  // while the device stays attached.  Automatic mounting resumes after the
+  // device has been removed and inserted again.  Returns false when the UUID
+  // is not an enabled automount entry; `detail` receives the reason.
+  bool Eject(const Uuid& uuid, AutomountTimePoint now, std::string* detail);
 
   // Runs all work that is due at `now` (debounced device pass, periodic
   // reconciliation, retry).  Safe to call as often as the service loop wakes.
@@ -235,6 +241,7 @@ class AutomountEngine {
   std::optional<AutomountTimePoint> NextWake(AutomountTimePoint now) const;
 
   const AutomountStatus& status() const { return status_; }
+  bool IsSuspended(const Uuid& uuid) const;
   // Used by the service when a session reports a terminal device failure.
   // The engine removes its record and schedules a reconciliation; the session
   // itself is never reused.
@@ -357,6 +364,10 @@ class AutomountEngine {
   // never persisted and never overrides an explicit preference or a letter
   // Windows did assign.
   std::map<std::string, std::string> remembered_drives_;
+  // Filesystems released for safe removal while their device is still
+  // attached.  A discovery pass that no longer sees the device clears the
+  // suspension so a later insertion mounts it again.  Never persisted.
+  std::map<std::string, std::string> suspended_;
   // The restored Windows letter per filesystem, used while the volume is still
   // attached (see RestoredDriveHint).
   std::map<std::string, RestoredDriveHint> restored_drives_;

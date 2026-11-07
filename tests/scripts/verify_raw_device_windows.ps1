@@ -15,7 +15,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Xfswin,
     [Parameter(Mandatory = $true)][string]$VhdPath,
-    [int]$SizeMB = 512
+    [int]$SizeMB = 512,
+    [string]$OpticalImagePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,11 +52,26 @@ $diskNumber = $disk.Number
 "attached VHD as disk $diskNumber ($($disk.FriendlyName), $($disk.Size) bytes)"
 
 $rawPath = "\\.\PhysicalDrive$diskNumber"
+$opticalImage = $null
 
 try {
     # Make sure the disk is writable and online.
     Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction SilentlyContinue
     Set-Disk -Number $diskNumber -IsReadOnly $false -ErrorAction SilentlyContinue
+
+    # The optical fixture reproduces the host configuration that used to make
+    # every writable whole-disk open fail: FindFirstVolumeW also returns the
+    # CD-ROM volume, and Windows cannot report disk extents for it.  The
+    # ownership preflight must skip only that provably non-disk volume.
+    if ($OpticalImagePath) {
+        $opticalImage = (Resolve-Path -LiteralPath $OpticalImagePath).Path
+        $opticalVolume = Mount-DiskImage -ImagePath $opticalImage -PassThru |
+            Get-Volume
+        Assert ($null -ne $opticalVolume -and
+            [string]$opticalVolume.DriveType -eq 'CD-ROM') `
+            "the optical fixture did not mount as a CD-ROM volume"
+        "mounted optical fixture at $($opticalVolume.DriveLetter):"
+    }
 
     "== xfswin list =="
     & $Xfswin list
@@ -84,6 +100,11 @@ try {
     # that the \\.\PhysicalDriveN path works end to end.
     "RAW DEVICE CHECKS PASSED"
 } finally {
+    if ($opticalImage) {
+        "== dismounting optical fixture =="
+        Dismount-DiskImage -ImagePath $opticalImage -ErrorAction SilentlyContinue |
+            Out-Null
+    }
     "== detaching VHD =="
     @"
 select vdisk file="$VhdPath"

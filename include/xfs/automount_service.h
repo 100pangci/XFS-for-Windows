@@ -110,6 +110,13 @@ Status UninstallAutomountService(std::string* message);
 Status StartAutomountService(std::string* message);
 Status StopAutomountService(std::string* message);
 
+// Requests a clean release of one enrolled filesystem while its device stays
+// attached, so Windows Safe Removal can take the device offline.  The request
+// is validated against the live service state, never against the target drive
+// letter alone.  The engine suspends automatic mounting until the device has
+// actually been removed and reinserted.  `detail` receives the result text.
+Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail);
+
 // Runs the WinFsp service loop.  When the process was not started by the SCM
 // this falls back to console mode (Ctrl+C stops), which is how the test suite
 // exercises the real event loop.  Returns a process exit code.

@@ -77,6 +77,18 @@ Read-write automount is a separate, explicit enrollment. The command displays th
 
 Do not enroll a physical device for read-write unless its device class and hardware are explicitly qualified. Identity pins prevent a different device with the same filesystem UUID from inheriting write access. See the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/UX.md) and the qualification records for the exact boundaries.
 
+## Remove a USB device safely
+
+A read-write automount owns the physical disk exclusively. Windows may therefore omit that USB device from the **Safely Remove Hardware** list while the XFS drive is mounted. Before unplugging it, release the automount session from an elevated PowerShell window:
+
+```powershell
+& $exe automount eject F:
+```
+
+Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata and restores the Windows volume mount point; automatic mounting is suspended while that device stays attached. Then use the taskbar's **Safely Remove Hardware** entry to eject the device and unplug it only after Windows confirms removal. Reinsert the device to mount it again automatically.
+
+Do not pull the device out while the XFS drive is mounted: a power loss during a read-write session can leave the XFS journal dirty, and automount will then refuse to mount it until `xfswin recover` has replayed that journal. Recovery writes filesystem metadata and must be run deliberately against the exact device.
+
 ## Upgrade and uninstall
 
 To upgrade a setup installation, run the newer setup package for the same architecture. Existing automount configuration and read-write identity enrollment in `%ProgramData%\xfswin` are retained. The installer does not scan or modify XFS media. Unmount active filesystems before upgrading; an upgrade is refused while mount sessions are active so the running executable is not replaced underneath them.

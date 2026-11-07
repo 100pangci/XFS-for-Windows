@@ -191,6 +191,9 @@ void AutomountEngine::NotifyDeviceChanged(AutomountTimePoint now,
   // A device state change may make a previously missing device readable.
   retries_.clear();
   exhausted_.clear();
+  // A removal is the signal that a filesystem released for safe removal may be
+  // inserted again.  Do not clear the suspension yet: discovery is the
+  // authoritative evidence that the device is actually gone.
   const auto window = std::chrono::milliseconds(config_.debounce_ms);
   const auto candidate = now + window;
   if (!pending_reconcile_) {
@@ -211,14 +214,83 @@ void AutomountEngine::NotifySettingsChanged(AutomountTimePoint now) {
   pending_reconcile_ = now;
 }
 
+bool AutomountEngine::IsSuspended(const Uuid& uuid) const {
+  return suspended_.find(UuidKey(uuid)) != suspended_.end();
+}
+
+bool AutomountEngine::Eject(const Uuid& uuid, AutomountTimePoint now,
+                            std::string* detail) {
+  const std::string key = UuidKey(uuid);
+  const AutomountEntry* entry = config_.Find(uuid);
+  if (!entry || !entry->enabled) {
+    if (detail) *detail = "the filesystem is not enrolled for automount";
+    return false;
+  }
+  if (IsSuspended(uuid)) {
+    if (detail) *detail = "the filesystem is already released for removal";
+    return true;
+  }
+
+  // Record the release intent before touching the session.  A failed stop is
+  // retried by reconciliation, and without the suspension that retry would
+  // restart the mount the user just asked to release.
+  suspended_[key] = "released for safe removal";
+
+  bool pending_stop = false;
+  for (const auto& stopping : stopping_) {
+    if (stopping.uuid == key) pending_stop = true;
+  }
+  if (pending_stop) {
+    if (detail) {
+      *detail = "the previous mount session is still stopping; the release "
+                "completes when it has";
+    }
+    ScheduleReconcile(now + std::chrono::seconds(1));
+    return false;
+  }
+
+  for (auto it = mounts_.begin(); it != mounts_.end(); ++it) {
+    if (!UuidEqual(it->fs_uuid, uuid)) continue;
+    MountedSession session = std::move(*it);
+    mounts_.erase(it);
+    Status stopped = StopSession(
+        session, now, "the filesystem was released for safe removal");
+    if (!stopped.ok()) {
+      if (detail) {
+        *detail = "the mount session did not stop cleanly: " +
+                  stopped.error().Format() +
+                  "; the release is retried automatically";
+      }
+      Log(AutomountLogLevel::kError, "eject", key, session.drive, "",
+          "failed", stopped.error().Format());
+      ScheduleReconcile(now + std::chrono::seconds(1));
+      return false;
+    }
+    break;
+  }
+
+  retries_.erase(key);
+  exhausted_.erase(key);
+  restored_drives_.erase(key);
+  // Keep remembered_drives_: the same device should return at its old letter
+  // after reinsertion, even though the Windows mount point was restored.
+  Log(AutomountLogLevel::kInfo, "eject", key, "", "", "released",
+      "automatic mounting is suspended until the device is reinserted");
+  if (detail) {
+    *detail = "the filesystem was released for safe removal; remove the device "
+              "and reinsert it to mount again";
+  }
+  pending_reconcile_ = now;
+  return true;
+}
+
 void AutomountEngine::Tick(AutomountTimePoint now) {
   if (!running_) return;
   bool due = settings_changed_;
   if (pending_reconcile_ && now >= *pending_reconcile_) due = true;
   if (next_periodic_ && now >= *next_periodic_) due = true;
-  for (const auto& [key, retry] : retries_) {
-    (void)key;
-    if (now >= retry.next_at) {
+  for (const auto& retry : retries_) {
+    if (now >= retry.second.next_at) {
       due = true;
       break;
     }
@@ -241,9 +313,8 @@ std::optional<AutomountTimePoint> AutomountEngine::NextWake(
   };
   if (pending_reconcile_) consider(*pending_reconcile_);
   if (next_periodic_) consider(*next_periodic_);
-  for (const auto& [key, retry] : retries_) {
-    (void)key;
-    consider(retry.next_at);
+  for (const auto& retry : retries_) {
+    consider(retry.second.next_at);
   }
   for (const auto& pending : pending_restores_) {
     consider(pending.next_at);
@@ -338,6 +409,15 @@ void AutomountEngine::PruneRetries() {
       ++it;
     }
   }
+  for (auto it = suspended_.begin(); it != suspended_.end();) {
+    Uuid uuid{};
+    if (!ParseUuid(it->first, &uuid) || !config_.Find(uuid) ||
+        !config_.Find(uuid)->enabled) {
+      it = suspended_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
@@ -377,11 +457,43 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
   RetryStoppingSessions(now);
   RetryPendingRestores(now);
 
+  // A release for safe removal lasts only as long as Windows still reports the
+  // filesystem as attached.  Once discovery no longer sees it, forget the
+  // suspension; the insertion notification then starts a fresh mount cycle.
+  // An incomplete discovery is not evidence of removal: a stuck device or a
+  // busy disk must not silently resume a mount the user just released.
+  if (!suspended_.empty()) {
+    auto ejection_report = platform_.Discover(settings_.discovery);
+    if (ejection_report.ok() && !ejection_report.value().incomplete) {
+      for (auto it = suspended_.begin(); it != suspended_.end();) {
+        Uuid uuid{};
+        bool present = ParseUuid(it->first, &uuid);
+        if (present) {
+          present = false;
+          for (const auto& filesystem : ejection_report.value().filesystems) {
+            if (UuidEqual(filesystem.probe.superblock.uuid, uuid)) {
+              present = true;
+              break;
+            }
+          }
+        }
+        if (present) {
+          ++it;
+        } else {
+          Log(AutomountLogLevel::kInfo, "eject", it->first, "", "",
+              "device-removed",
+              "the released device is no longer attached; automatic mounting "
+              "is resumed");
+          it = suspended_.erase(it);
+        }
+      }
+    }
+  }
+
   const auto period =
       std::chrono::seconds(std::max<uint32_t>(1, config_.reconcile_seconds));
   next_periodic_ = now + period;
 
-  std::string discovery_error;
   auto discovered = platform_.Discover(settings_.discovery);
   if (!discovered.ok()) {
     status_.last_reconcile_valid = false;
@@ -433,6 +545,9 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
         es.drive_taken_over = TakeoverWasOwned(mounted->takeover);
         es.original_windows_drive = mounted->takeover.original_drive;
         es.detail = CombineNotes(mounted->drive_note, mounted->mode_note);
+      } else if (IsSuspended(entry.fs_uuid)) {
+        es.state = AutomountEntryState::kWaitingForDevice;
+        es.detail = "released for safe removal; reinsert the device to mount again";
       } else {
         es.state = AutomountEntryState::kWaitingForDevice;
         es.detail = "device discovery is unavailable";
@@ -579,6 +694,13 @@ void AutomountEngine::Reconcile(AutomountTimePoint now, bool reload_config) {
     if (!entry.enabled) {
       es.state = AutomountEntryState::kDisabled;
       es.detail = "automatic mounting is disabled";
+      status_.entries.push_back(std::move(es));
+      continue;
+    }
+
+    if (IsSuspended(entry.fs_uuid)) {
+      es.state = AutomountEntryState::kWaitingForDevice;
+      es.detail = "released for safe removal; reinsert the device to mount again";
       status_.entries.push_back(std::move(es));
       continue;
     }
