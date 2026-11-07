@@ -126,8 +126,9 @@ function Assert-CleanFailureState {
         'a failed install left the maintenance fence behind'
     $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `
         -Filter 'XFS-for-Windows.xfswin-*' -ErrorAction SilentlyContinue)
+    $leftoverList = ($leftover | ForEach-Object { $_.FullName }) -join ', '
     Assert-Release ($leftover.Count -eq 0) `
-        "a failed install left setup staging/backup directories behind: $($leftover.FullName -join ', ')"
+        "a failed install left setup staging/backup directories behind: $leftoverList"
 }
 
 function Get-MsiPolicyState {
@@ -324,8 +325,9 @@ try {
                 "the $stage rollback left the maintenance fence behind"
             $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `
                 -Filter 'XFS-for-Windows.xfswin-*' -ErrorAction SilentlyContinue)
+            $leftoverList = ($leftover | ForEach-Object { $_.FullName }) -join ', '
             Assert-Release ($leftover.Count -eq 0) `
-                "the $stage rollback left setup staging/backup directories behind: $($leftover.FullName -join ', ')"
+                "the $stage rollback left setup staging/backup directories behind: $leftoverList"
             if ($stage -eq 'verify') {
                 Complete-ReleaseCase 'upgrade-verify-rollback' 'passed' `
                     'new service started; failed verification restored the original executable and running service'
