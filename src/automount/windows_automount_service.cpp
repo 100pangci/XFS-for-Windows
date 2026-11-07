@@ -1072,8 +1072,9 @@ void WorkerMain(ServiceRuntime& runtime) {
     // The protected-directory watcher is the primary request signal, but a
     // short bounded wait also polls for a pending request if the notification
     // is delayed or temporarily unavailable.
+    std::error_code request_error;
     if (std::filesystem::exists(runtime.paths.directory / kEjectRequestName,
-                                std::error_code{})) {
+                                request_error)) {
       timeout = std::min<DWORD>(timeout, 250);
     }
 
