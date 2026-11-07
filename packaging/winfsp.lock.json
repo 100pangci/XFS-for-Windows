@@ -1,0 +1,15 @@
+{
+  "product": "WinFsp",
+  "version": "2.1.25156",
+  "minimum_version": "2.1.25156",
+  "filename": "winfsp-2.1.25156.msi",
+  "url": "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi",
+  "sha256": "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a",
+  "product_code": "{C79D9B29-3AF0-45B3-9DB9-226F3C2D2204}",
+  "upgrade_code": "{5466A3D8-3AA1-4240-B6A0-3A051940A3EC}",
+  "distribution": "official-unmodified-retained-shared",
+  "license": "GPL-3.0-only WITH WinFsp-FLOSS-exception",
+  "license_url": "https://github.com/winfsp/winfsp/raw/refs/tags/v2.1/License.txt",
+  "repository": "https://github.com/winfsp/winfsp",
+  "copyright": "WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"
+}

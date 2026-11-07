@@ -38,6 +38,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <vector>
 
 #include "xfs/concurrency_hooks.h"
+#include "xfs/deployment.h"
 #include "xfs/log.h"
 #include "xfs/perf_stats.h"
 #include "xfs/ondisk.h"
@@ -60,6 +61,16 @@ std::string WideToUtf8(const std::wstring& w) {
 
 std::u16string ToU16(const std::wstring& w) {
   return std::u16string(w.begin(), w.end());
+}
+
+// Image path recorded in the deployment session lease so the installer can
+// tell this installation's sessions from another process that merely happens
+// to hold a mount point.
+std::wstring CurrentImagePath() {
+  wchar_t buffer[32768] = {};
+  const DWORD length = GetModuleFileNameW(nullptr, buffer, 32768);
+  if (length == 0 || length >= 32768) return {};
+  return std::wstring(buffer, length);
 }
 
 struct DirChild {
@@ -2308,6 +2319,11 @@ struct MountSession::Impl {
   std::mutex join_mutex;
   bool joined = false;
   std::thread waiter;
+  // Registered for the lifetime of the visible mount point.  Acquired before
+  // FspFileSystemSetMountPoint and released immediately after the mount point
+  // is removed, so the installer never observes a released lease while the
+  // drive still resolves.
+  MountStartGate deployment_gate;
 
   ~Impl() {
     // A session destroyed without Stop() still has to release the drive.
@@ -2354,6 +2370,10 @@ struct MountSession::Impl {
       }
     }
     FspFileSystemRemoveMountPoint(winfsp);
+    // The mount point is gone; the maintenance transaction may now treat this
+    // session as ended.  Releasing after the remove call is what makes the
+    // lease a truthful "drive letter still visible" record.
+    deployment_gate.Release();
     FspFileSystemDelete(winfsp);
     winfsp = nullptr;
     if (state->security_descriptor) {
@@ -2457,6 +2477,13 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
     teardown();
     return error;
   };
+
+  // Validate and keep the official 2.x runtime loaded before WinFsp creates
+  // any object.  The adapter is delay-loaded, so a missing runtime must be a
+  // clean error here, not an exception from the first imported call.
+  WinFspRuntimeInfo runtime_info;
+  Status runtime_status = PreloadWinFspRuntime(&runtime_info);
+  if (!runtime_status.ok()) return fail(runtime_status.error());
 
   const XfsGeometry& geo = state.fs->geometry();
   const XfsSuperblock& sb = state.fs->superblock();
@@ -2574,6 +2601,13 @@ Result<std::unique_ptr<MountSession>> MountSession::Start(
         XfsError::kIoError,
         "the XFS device failed before the WinFsp mount became visible"));
   }
+
+  // Register with the maintenance protocol before the mount point becomes
+  // visible.  This refuses a new session while an installer holds the fence
+  // and closes the check-fence/start-mount race through the shared mutex.
+  Status gated = impl->deployment_gate.Acquire(
+      DefaultDeploymentPaths(), config.mount_point, CurrentImagePath());
+  if (!gated.ok()) return fail(gated.error());
 
   // Start serving before the drive letter exists. Once the mount point is
   // created, Windows and other processes may issue requests immediately;

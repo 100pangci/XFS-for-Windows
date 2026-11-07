@@ -99,6 +99,13 @@ Result<AutomountRuntimeStatus> LoadAutomountRuntimeStatus(
     const std::filesystem::path& path);
 
 Status InstallAutomountService(std::string* message);
+// Explicit-path variants for callers that manage a service for a specific
+// xfswin.exe; the wrappers below use the running process image.  The uninstall
+// variant only removes a service that still points at that image.
+Status InstallAutomountServiceAt(const std::filesystem::path& executable,
+                                 std::string* message);
+Status UninstallAutomountServiceAt(const std::filesystem::path& executable,
+                                   std::string* message);
 Status UninstallAutomountService(std::string* message);
 Status StartAutomountService(std::string* message);
 Status StopAutomountService(std::string* message);

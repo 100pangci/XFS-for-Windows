@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "rust": {
+    "version": "1.97.0",
+    "targets": {
+      "x64": "x86_64-pc-windows-msvc",
+      "arm64": "aarch64-pc-windows-msvc"
+    }
+  },
+  "cmake": {
+    "minimum_version": "3.24.0"
+  }
+}

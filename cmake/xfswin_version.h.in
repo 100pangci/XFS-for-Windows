@@ -1,0 +1,12 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Generated from the project() version in CMakeLists.txt. Do not edit.
+#pragma once
+
+#define XFSWIN_VERSION "@PROJECT_VERSION@"
+#define XFSWIN_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define XFSWIN_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define XFSWIN_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define XFSWIN_GIT_SHA "@XFSWIN_GIT_SHA@"
+#define XFSWIN_BUILD_ARCH "@XFSWIN_BUILD_ARCH@"

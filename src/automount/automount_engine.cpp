@@ -136,20 +136,38 @@ void AutomountEngine::Start(AutomountTimePoint now) {
       "initial discovery without waiting for a device notification");
 }
 
-void AutomountEngine::Stop(AutomountTimePoint now) {
-  if (!running_) return;
+AutomountStopReport AutomountEngine::Stop(AutomountTimePoint now) {
+  AutomountStopReport report;
+  if (!running_) return report;
   Log(AutomountLogLevel::kInfo, "engine-stop", "", "", "", "stopping",
       "unmounting every automount-owned session");
   for (auto& session : mounts_) {
-    StopSession(session, now, "automount service is stopping");
+    const Status stopped =
+        StopSession(session, now, "automount service is stopping");
+    if (!stopped.ok()) {
+      report.failures.push_back(
+          "session " + session.drive + " (" + UuidKey(session.fs_uuid) +
+          ") did not unmount cleanly: " + stopped.error().Format());
+    }
   }
   mounts_.clear();
   RetryStoppingSessions(now);
+  for (const auto& stopping : stopping_) {
+    report.failures.push_back(
+        "session " + stopping.drive + " (" + stopping.uuid +
+        ") is still stopping: " +
+        (stopping.last_error.empty() ? std::string("unknown error")
+                                     : stopping.last_error));
+  }
   stopping_.clear();
   for (auto& pending : pending_restores_) pending.next_at = now;
   RetryPendingRestores(now);
   for (const auto& pending : pending_restores_) {
     if (pending.takeover.mount_point.empty()) continue;
+    report.failures.push_back(
+        "the original Windows mount point " + pending.takeover.mount_point +
+        " could not be restored before the service stopped: " +
+        pending.takeover.error);
     Log(AutomountLogLevel::kError, "drive-letter-restore", pending.uuid,
         pending.takeover.original_drive, "", "failed",
         "the original Windows mount point " + pending.takeover.mount_point +
@@ -163,6 +181,7 @@ void AutomountEngine::Stop(AutomountTimePoint now) {
   first_pending_event_.reset();
   next_periodic_.reset();
   running_ = false;
+  return report;
 }
 
 void AutomountEngine::NotifyDeviceChanged(AutomountTimePoint now,
@@ -1127,9 +1146,9 @@ bool AutomountEngine::EntryPolicyAccepts(
   return true;
 }
 
-void AutomountEngine::StopSession(MountedSession& session,
-                                  AutomountTimePoint now,
-                                  const std::string& reason) {
+Status AutomountEngine::StopSession(MountedSession& session,
+                                    AutomountTimePoint now,
+                                    const std::string& reason) {
   const std::string uuid = UuidKey(session.fs_uuid);
   Log(AutomountLogLevel::kInfo, "unmount", uuid,
       session.drive, LocationText(session.location), "stopping", reason);
@@ -1142,6 +1161,7 @@ void AutomountEngine::StopSession(MountedSession& session,
     stopping.session_id = session.session_id;
     stopping.drive = session.drive;
     stopping.uuid = uuid;
+    stopping.last_error = stopped.error().Format();
     stopping.attempts = 1;
     stopping.takeover = session.takeover;
     stopping_.push_back(std::move(stopping));
@@ -1150,13 +1170,14 @@ void AutomountEngine::StopSession(MountedSession& session,
     // reconciliation.  The original Windows mount point is restored only
     // after the WinFsp letter is free.
     ScheduleReconcile(now + std::chrono::seconds(1));
-    return;
+    return stopped;
   }
   Log(AutomountLogLevel::kInfo, "unmount", uuid,
       session.drive, LocationText(session.location), "unmounted", reason);
   // Restore only after the WinFsp session is gone: SetVolumeMountPointW must
   // not race a WinFsp mount that still defines the same letter.
   RestoreTakeover(&session.takeover, uuid, now, reason);
+  return OkStatus();
 }
 
 void AutomountEngine::RestoreTakeover(DriveLetterTakeover* takeover,
@@ -1273,6 +1294,7 @@ void AutomountEngine::RetryStoppingSessions(AutomountTimePoint now) {
       it = stopping_.erase(it);
       continue;
     }
+    it->last_error = stopped.error().Format();
     ++it->attempts;
     if (it->attempts >= 3) {
       Log(AutomountLogLevel::kError, "unmount", it->uuid, it->drive, "",

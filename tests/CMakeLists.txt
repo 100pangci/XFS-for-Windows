@@ -22,6 +22,7 @@ add_executable(xfs_tests
   unit/recovery_tests.cpp
   unit/device_tests.cpp
   unit/ux_tests.cpp
+  unit/rel1_deployment_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
 )

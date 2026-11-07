@@ -186,6 +186,15 @@ struct AutomountStatus {
 using AutomountConfigLoader =
     std::function<Result<AutomountConfigLoad>()>;
 
+// Lifecycle-only report from Stop().  It lets the service propagate a failed
+// clean unmount or an unrestored drive letter to the installer instead of
+// pretending the stop was clean.  It carries status text only: no policy and
+// no mount decision depends on it.
+struct AutomountStopReport {
+  std::vector<std::string> failures;
+  bool clean() const { return failures.empty(); }
+};
+
 class AutomountEngine {
  public:
   AutomountEngine(AutomountPlatform& platform,
@@ -204,7 +213,9 @@ class AutomountEngine {
   // the device already inserted.
   void Start(AutomountTimePoint now);
   // Stops every session owned by this engine.  Used for service stop/uninstall.
-  void Stop(AutomountTimePoint now);
+  // The returned report lists sessions whose durable unmount or drive-letter
+  // restore failed; Stop itself keeps the existing cleanup semantics.
+  AutomountStopReport Stop(AutomountTimePoint now);
   bool running() const { return running_; }
 
   // A Windows device arrival/removal notification.  The hint is diagnostic
@@ -256,6 +267,7 @@ class AutomountEngine {
     std::string session_id;
     std::string drive;
     std::string uuid;
+    std::string last_error;
     uint32_t attempts = 0;
     // Restored only after StopMount confirms the WinFsp letter is free.  The
     // volume may be gone by then; the restore operation decides.
@@ -290,8 +302,8 @@ class AutomountEngine {
                      uint32_t* attempts_out);
   bool RetryDue(const Uuid& uuid, AutomountTimePoint now) const;
   void PruneRetries();
-  void StopSession(MountedSession& session, AutomountTimePoint now,
-                   const std::string& reason);
+  Status StopSession(MountedSession& session, AutomountTimePoint now,
+                     const std::string& reason);
   void RetryStoppingSessions(AutomountTimePoint now);
   // Restores after a session ends.  Failures become pending restores that are
   // retried by reconciliation; success is logged, never assumed.
