@@ -55,6 +55,61 @@ function Assert-ReleaseCiAuthorization {
         "RUNNER_TEMP does not exist: $env:RUNNER_TEMP"
 }
 
+function Test-ReleasePagefileEntryResolves {
+    param([string]$Entry)
+    $token = ([string]$Entry).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) { return $true }
+    # Entries may carry the optional " <initial MB> <maximum MB>" suffix.
+    $token = ($token -split '\s+')[0]
+    if ($token.Length -ge 2 -and $token[1] -eq ':') {
+        $letter = $token.Substring(0, 1)
+        if ($letter -eq '?') {
+            return [bool](Get-Volume -DriveLetter $env:SystemDrive.Substring(0, 1) -ErrorAction SilentlyContinue)
+        }
+        return [bool](Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue)
+    }
+    if ($token -match '^\\\\\?\\Volume\{[0-9a-fA-F-]+\}') {
+        return Test-Path -LiteralPath ($Matches[0] -replace '^\\\\\?\\', '\\?\')
+    }
+    return $false
+}
+
+# GitHub's windows-11-arm image configures PagingFiles as "D:\pagefile.sys"
+# while the runner has no D: volume; Windows itself places the active pagefile
+# on the system drive.  The product deliberately refuses a writable whole-disk
+# open when it cannot resolve every configured pagefile volume, so the isolated
+# CI machine must describe its real pagefile.  This rewrites only the test
+# machine's configuration to the pagefile Windows is actually using; the
+# product's system/pagefile refusal is not changed.
+function Initialize-ReleaseCiPagefileConfiguration {
+    param([switch]$AllowCiMachineChanges)
+    if (-not $AllowCiMachineChanges -or $env:GITHUB_ACTIONS -ne 'true') { return }
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    $item = Get-Item -LiteralPath $key
+    $kind = $item.GetValueKind('PagingFiles')
+    Assert-Release ($kind -eq 'MultiString') `
+        "the CI runner's PagingFiles value is $kind, expected MultiString"
+    $entries = @((Get-ItemProperty -LiteralPath $key -Name 'PagingFiles').PagingFiles)
+    $unresolved = @($entries | Where-Object { -not (Test-ReleasePagefileEntryResolves $_) })
+    if ($unresolved.Count -eq 0) { return }
+    $active = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue |
+        ForEach-Object { [string]$_.Name } |
+        Where-Object { $_ -match '^[A-Za-z]:\\' })
+    $replacements = if ($active.Count -gt 0) {
+        @($active | ForEach-Object { "$_ 0 0" })
+    } else {
+        @("$env:SystemDrive\pagefile.sys 0 0")
+    }
+    Set-ItemProperty -LiteralPath $key -Name 'PagingFiles' -Value ([string[]]$replacements)
+    $after = @((Get-ItemProperty -LiteralPath $key -Name 'PagingFiles').PagingFiles)
+    foreach ($entry in $after) {
+        Assert-Release (Test-ReleasePagefileEntryResolves $entry) `
+            "the CI pagefile configuration still references a missing volume: $entry"
+    }
+    Write-Host ("CI pagefile configuration normalized: '" +
+        ($unresolved -join '; ') + "' -> '" + ($after -join '; ') + "'")
+}
+
 function Get-ReleaseFullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     return [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)

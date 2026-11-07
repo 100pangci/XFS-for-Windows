@@ -51,6 +51,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\release\release_install_common.ps1')
 
 Assert-ReleaseCiAuthorization -AllowCiMachineChanges:$AllowCiMachineChanges
+Initialize-ReleaseCiPagefileConfiguration -AllowCiMachineChanges:$AllowCiMachineChanges
 $script:ReleaseArchitecture = $Architecture
 $package = Get-ReleasePackage -Installer $Installer -Architecture $Architecture
 $script:ReleaseInstallerPath = $package.installer
