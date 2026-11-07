@@ -428,7 +428,9 @@ function Get-ReleaseMsiProperty {
         $database = $installer.OpenDatabase($Path, 0)
         Assert-Release ($null -ne $database) "could not open MSI database: $Path"
         $view = $database.OpenView("SELECT Value FROM Property WHERE Property='$Property'")
-        $view.Execute()
+        # A bare COM void call emits a null pipeline object in PowerShell;
+        # left uncaptured it turns the function's result into "$null + value".
+        [void]$view.Execute()
         $record = $view.Fetch()
         if ($null -eq $record) { return '' }
         return [string]$record.StringData(1)
