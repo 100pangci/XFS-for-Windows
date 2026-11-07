@@ -3517,6 +3517,7 @@ jobs:
           pwsh -NoProfile -File tests/scripts/verify_raw_device_windows.ps1 `
             -Xfswin "bin\xfswin.exe" `
             -VhdPath "$PWD\vhd\xfswin.vhd" `
+            -OpticalImagePath "$PWD\tests\fixtures\optical-volume.iso" `
             -SizeMB 512
 
       - name: Upload the VHD (raw payload for Linux verification)

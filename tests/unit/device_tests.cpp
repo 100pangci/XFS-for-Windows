@@ -20,6 +20,7 @@
 #include "test_util.h"
 #include "xfs/device_policy.h"
 #include "xfs/image_device.h"
+#include "xfs/volume_ownership.h"
 
 #ifdef _WIN32
 #include <process.h>
@@ -89,6 +90,19 @@ TEST(device_geometry_rejects_nonsense) {
                                     &reason));
   CHECK(!xfs::IsValidDeviceGeometry(Geometry(1 << 20, 1024, 4096, 512),
                                     &reason));
+}
+
+TEST(volume_ownership_ignores_only_optical_volumes) {
+  using xfs::VolumeDriveType;
+  CHECK(xfs::VolumeTypeIsProvablyNotOnLocalDisk(VolumeDriveType::kCdRom));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(VolumeDriveType::kFixed));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(
+      VolumeDriveType::kRemovable));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(VolumeDriveType::kRemote));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(VolumeDriveType::kRamDisk));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(
+      VolumeDriveType::kNoRootDir));
+  CHECK(!xfs::VolumeTypeIsProvablyNotOnLocalDisk(VolumeDriveType::kUnknown));
 }
 
 TEST(device_request_validation_is_overflow_safe) {
