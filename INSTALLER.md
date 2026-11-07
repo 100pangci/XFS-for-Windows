@@ -14,7 +14,7 @@ The setup is a self-developed native Rust executable that embeds a verified payl
 
 This removes the prior WiX dependency and its OSMF EULA/licensing decision. The setup still delegates every “can this device be written?” decision to the product: it never enumerates disks, probes XFS media or chooses a writable mode. The only authority remains the xfswin core, DEV-1 policy, the RW-STABLE writable profile and automount policy.
 
-The product version has a single source: `project(... VERSION 0.1.0)` in the root `CMakeLists.txt`. The release build passes that numeric version to the Rust build; the setup's file version, product version, embedded payload manifest and installed `version.json` all derive from it. This is the first `0.x` delivery, not a `1.0` stability claim.
+The product version has a single source: the `VERSION` argument of `project()` in the root `CMakeLists.txt`. The release build passes that numeric version to the Rust build; the setup's file version, product version, embedded payload manifest and installed `version.json` all derive from it. This is the first `0.x` delivery, not a stability claim for a later major version.
 
 ## Files and persistent state
 

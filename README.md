@@ -22,13 +22,7 @@ runtime dependencies.
 
 ## Download and install
 
-REL-1 packaging is still being qualified. No release-qualified product setup or
-portable ZIP is available yet; check the [GitHub Releases
-page](https://github.com/100pangci/XFS-for-Windows/releases) for the first
-published version. The intended `0.1.0` release, the first delivery in the
-`0.x` series, will provide a native Windows setup package and a portable ZIP for
-each supported Windows architecture. See [docs/INSTALL.md](docs/INSTALL.md) for
-installation, use, upgrade and uninstall instructions.
+This release provides a native Windows setup package and a portable ZIP for both x64 and ARM64. Download the file matching the processor architecture of Windows from the [GitHub Releases page](https://github.com/100pangci/XFS-for-Windows/releases). See [docs/INSTALL.md](docs/INSTALL.md) for installation, use, upgrade and uninstall instructions. REL-1 packaging is qualified on native x64 and native ARM64 GitHub Windows runners; the evidence record is in `RELEASE.md`.
 
 The setup package is the managed option: it installs for all users, registers
 the automount service, and handles the shared WinFsp runtime. The portable ZIP

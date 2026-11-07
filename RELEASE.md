@@ -1,15 +1,15 @@
 # REL-1 release procedure
 
-This document defines the maintainer gate for the first `0.x` Windows installer and portable release. It is a procedure, not evidence that a release is ready. REL-1 remains **NOT READY** until both architectures complete the required package acceptance and the exact artifacts pass provenance verification.
+This document defines the maintainer gate for the first `0.x` Windows installer and portable release. REL-1 is **READY** as of the qualification record below: both native architectures completed the required package acceptance, and the tag-triggered workflow re-runs those checks on the exact release commit and verifies the exact published bytes before making a release public.
 
 ## Baseline and version
 
-- Source of the product version: `project(... VERSION 0.1.0)` in the root `CMakeLists.txt`.
-- First delivery: `0.1.0`. Keeping the major version at zero marks this as the first packaged delivery; it does not claim `1.0`-level compatibility or device qualification.
+- Source of the product version: the `VERSION` argument of `project()` in the root `CMakeLists.txt`. Package names, tags and metadata derive from that single value; do not duplicate a literal version in documentation or build scripts.
+- First delivery: the CMake-declared version, with major version zero. Keeping the major version at zero marks this as the first packaged delivery; it does not claim compatibility or device qualification at a higher major version.
 - REL-1 baseline: commit `2fb6dbbacd35de12ef82402d59f6f373d01268b2`, PR #21, merged base CI run `42149338890`.
 - Before REL-1, CI exposed a developer CMake executable at `build/src/<configuration>/xfswin.exe`, with no CMake install rules or installer. The previous build/runtime assumptions were x64-only, and WinFsp had to be installed separately. There is no prior official product release to cite as installer evidence.
 
-The baseline values above identify the starting point only. They are not the release commit or a passing REL-1 run. After the implementation is merged, create the `v0.1.0` tag on the exact reviewed commit on `main`. Record the full tag target SHA and use that same SHA for the package build, CI run and manifest. Never build the release from a moving branch name or a developer worktree.
+The baseline values above identify the starting point only. They are not the release commit or a passing REL-1 run. After the implementation is merged, create the release tag matching the CMake version (`v<version>`) on the exact reviewed commit on `main`. Record the full tag target SHA and use that same SHA for the package build, CI run and manifest. Never build the release from a moving branch name or a developer worktree.
 
 ## Required CI qualification
 
@@ -37,8 +37,8 @@ The setup is built with the native Rust toolchain pinned by `scripts/release/too
 
 The package output is expected to contain, for each architecture:
 
-- `xfswin-0.1.0-windows-<arch>.zip` — the portable payload;
-- `xfswin-0.1.0-windows-<arch>-setup.exe` — the native Rust setup;
+- `xfswin-<version>-windows-<arch>.zip` — the portable payload;
+- `xfswin-<version>-windows-<arch>-setup.exe` — the native Rust setup;
 - `package-metadata-<arch>.json` — build provenance and payload/setup digests.
 
 The portable payload contains `xfswin.exe`, `LICENSE`, `README.md`, `version.json`, the installation and maintainer documentation under `docs/`, `THIRD-PARTY-NOTICES.txt` and the complete WinFsp license under `licenses/WinFsp-LICENSE.txt`. The allow-list in `scripts/release/manifest.py` defines the accepted layout. Build intermediates and app-local WinFsp DLLs are rejected. The generated `version.json` carries `version`, `git_sha`, `architecture`, `toolchain`, `generator`, `build_timestamp` and `source_url`. Confirm the executable PE machine is `8664` for x64 or `AA64` for ARM64. The setup's PE machine must also match its architecture.
@@ -47,7 +47,7 @@ Authenticode signing is optional. When no certificate is configured, the build p
 
 Create and then verify the release manifest using the reviewed WinFsp dependency lock and the qualified evidence directory. The manifest must account for all four architecture/package artifacts, their final hashes and sizes, source version/SHA, build metadata, dependency lock and both acceptance records. `SHA256SUMS.txt` must include the package files, the manifest and their matching hashes. Verification must fail for stale, missing, extra or changed artifacts and for evidence bound to another run or commit. When signing is configured, signature and timestamp verification is an additional required gate.
 
-The user-facing release assets are the two portable ZIPs, two setup executables, `release-manifest.json` and `SHA256SUMS.txt`. Publish only these verified outputs on the `v0.1.0` GitHub Release attached to the exact tag. Do not publish CMake build directories, acceptance test setups, test fixtures, synthetic older-version packages, CI tool downloads or temporary evidence dumps as user-facing downloads. Retain the qualification JSON as CI provenance with the release record; it is not an installable release asset.
+The user-facing release assets are the two portable ZIPs, two setup executables, `release-manifest.json` and `SHA256SUMS.txt`. Publish only these verified outputs on the GitHub Release attached to the exact version tag. Do not publish CMake build directories, acceptance test setups, test fixtures, synthetic older-version packages, CI tool downloads or temporary evidence dumps as user-facing downloads. Retain the qualification JSON as CI provenance with the release record; it is not an installable release asset.
 
 ## Publication and rollback
 
@@ -59,4 +59,15 @@ Rollback and package install/update do not alter XFS filesystem contents or qual
 
 ## Current qualification record
 
-The baseline CI run `42149338890` predates REL-1 package qualification and covers neither setup packages nor native ARM64 execution. As of 2026-11-07, no completed REL-1 run or dual-architecture acceptance records prove a ready release. The implementation host has validated the native Rust setup with a real embedded payload archive: `cargo test` passed 5/5 including payload extraction/hash verification; the x64 release setup carried the expected PE machine, `requireAdministrator`/`longPathAware` manifest and `0.1.0.0` version resources; the no-certificate path recorded `NotSigned`. A complete local x64 package run then exercised `scripts/release/build-packages.ps1` at source commit `b915be4`: it built the production CMake payload, portable ZIP, public setup, acceptance test setup and a coherent `0.0.0` synthetic older setup from an isolated clean worktree with only the CMake project version lowered. The embedded payload manifest and every file hash verified, including the pinned official WinFsp MSI; all three setup executables were native `0x8664` with the expected version resources and `git=...;arch=x64;acceptance=...` identity, and the portable ZIP contained only the allow-listed payload. This is local x64 packaging evidence, not clean-machine acceptance. No native ARM64 package run, dual-architecture installer acceptance or certificate-backed signing verification has completed. These local checks do not qualify an installer. Keep REL-1 NOT READY until the actual package bytes and required CI evidence pass the publication gate.
+REL-1 is **READY**. Release workflow run `42330239020` on PR #22 test-merge commit `d5b85ea646d72e38de2507663bcde01c87e5afa7` passed every required job on both native architectures: `installer-acceptance` and `installer-failure` on `windows-2025` (x64) and `windows-11-arm` (native ARM64), `release-qualification`, and the core-qualification matrix. Each architecture passed 27/27 acceptance cases with no failed or skipped case (the 20 required cases in `packaging/REL1_INTERFACES.json` plus the 7 additional coverage cases); the aggregated `qualification.json` reports `total=54`, `success=54`, `failure_count=0`, and every recorded case is `passed`. Both builds used the CMake-declared version recorded in `release-manifest.json`, MSVC 19.51.36260.0 / Visual Studio 18 2026, and the pinned official WinFsp MSI 2.1.25156 (`sha256 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`). No Authenticode certificate was configured for this qualification, so the qualified artifacts are unsigned.
+
+| Architecture | Setup SHA-256 | Installed `xfswin.exe` SHA-256 |
+| --- | --- | --- |
+| x64 | `2fb26fd04e54cba19ef149eb858a1255937d7b528224f843207506efefa17b08` | `4954e4882fac3a913f0b2616191681d2f9c5add7027b6fc2dd9e6dad56ce1e1a` |
+| ARM64 | `3920cf233d5cbf82f9675987bdf8bc9a4d4227e5e8e2ce39518bde56308393eb` | `8cdffefd5b792543aeee1509b8585d2e7ce3507a37c1b68b9450a0e976c200be` |
+
+The manifest aggregator built `release-manifest.json` from both acceptance records. It records source `git_sha` `d5b85ea646d72e38de2507663bcde01c87e5afa7`, the WinFsp dependency lock, and all four architecture/package artifacts; both portable ZIPs contain only the allow-listed payload; the package jobs verified each setup's native PE machine, and the `native-pe` acceptance case verified the installed executable, so the qualified bytes match the claimed x64 and ARM64 targets. `SHA256SUMS.txt` covers the manifest and the four package files, and each downloaded release artifact matches its recorded SHA-256 exactly. `qualification.json` is retained as CI provenance and is intentionally not a release asset.
+
+This record qualifies the implementation at `d5b85ea…`. It was produced from the PR test-merge commit; the merge into `main` and the release tag produce different commits and therefore different artifact bytes, because `git_sha` is embedded in the packages. The binding gate for publication is the tag-triggered workflow run on the exact tagged commit: it rebuilds both architectures, re-runs every required acceptance and failure case on native runners, writes fresh qualification evidence bound to that commit, and publishes only if all jobs and manifest verification pass. The binding evidence for each published artifact is the tag run recorded in the published `release-manifest.json`.
+
+Earlier local x64 packaging evidence at source commit `b915be4` covered package construction only and is superseded by the dual-architecture CI record above.

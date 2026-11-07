@@ -1,13 +1,13 @@
 # Install and use XFS for Windows
 
-REL-1 packaging is still being qualified. Until a release appears on the [GitHub Releases page](https://github.com/100pangci/XFS-for-Windows/releases), there is no release-qualified product installer or portable bundle to download. The instructions below describe the intended `0.1.0` packages, the first delivery in the `0.x` series; the release page is the source for actual files and availability. The portable ZIP includes this guide, the CLI and stability guides, maintainer documentation and third-party license notices. Links to hardware qualification records below open the versioned source documentation on GitHub.
+This release is the first REL-1 delivery: native Windows setup packages and portable ZIPs for x64 and ARM64, published on the [GitHub Releases page](https://github.com/100pangci/XFS-for-Windows/releases). The instructions below describe those packages; the release page is the source for actual files, names and availability, and the package qualification record is in [RELEASE.md](https://github.com/100pangci/XFS-for-Windows/blob/main/RELEASE.md). The portable ZIP includes this guide, the CLI and stability guides, maintainer documentation and third-party license notices. Links to hardware qualification records below open the versioned source documentation on GitHub.
 
 ## Choose an install method
 
 | Method | What it does | Best for |
 |---|---|---|
-| Windows setup (`xfswin-0.1.0-windows-x64-setup.exe` or `...-arm64-setup.exe`) | Installs the matching native build for all users, registers and starts the automount service, and installs WinFsp when needed. | A stable, managed installation with upgrades and uninstall through Windows. |
-| Portable ZIP (`xfswin-0.1.0-windows-x64.zip` or `...-arm64.zip`) | Extracts `xfswin.exe`, its license and documentation, and build-version metadata. It does not register a service or copy WinFsp files. | Running the CLI from a folder you manage, or keeping a portable copy. |
+| Windows setup (`xfswin-<version>-windows-<arch>-setup.exe`) | Installs the matching native build for all users, registers and starts the automount service, and installs WinFsp when needed. | A stable, managed installation with upgrades and uninstall through Windows. |
+| Portable ZIP (`xfswin-<version>-windows-<arch>.zip`) | Extracts `xfswin.exe`, its license and documentation, and build-version metadata. It does not register a service or copy WinFsp files. | Running the CLI from a folder you manage, or keeping a portable copy. |
 
 Choose the package for the processor architecture of Windows. Setup requires administrator approval because it installs a per-machine service and the shared WinFsp runtime. The portable ZIP does not require an installer, but raw-device discovery and service management still require an elevated PowerShell window.
 
@@ -20,7 +20,7 @@ The setup manages the official WinFsp runtime as a shared system dependency. The
 - Official MSI: [winfsp-2.1.25156.msi](https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi)
 - SHA-256: `073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`
 
-Check the downloaded MSI hash before running it. An already-installed compatible WinFsp 2.x runtime is kept; setup does not downgrade it. See [INSTALLER.md](https://github.com/100pangci/XFS-for-Windows/blob/v0.1.0/INSTALLER.md) for compatibility and license details.
+Check the downloaded MSI hash before running it. An already-installed compatible WinFsp 2.x runtime is kept; setup does not downgrade it. See [INSTALLER.md](https://github.com/100pangci/XFS-for-Windows/blob/main/INSTALLER.md) for compatibility and license details.
 
 ## First mount
 
@@ -36,7 +36,7 @@ Check the downloaded MSI hash before running it. An already-installed compatible
 
 4. Select an entry by number, UUID or label. Press Enter at the drive-letter prompt to accept an available letter.
 
-A normal mount is read-only. `xfswin devices` and discovery of raw disks require Administrator rights. WinFsp is required for a mounted drive. The full CLI, drive-letter rules and automount behavior are in the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/v0.1.0/docs/UX.md).
+A normal mount is read-only. `xfswin devices` and discovery of raw disks require Administrator rights. WinFsp is required for a mounted drive. The full CLI, drive-letter rules and automount behavior are in the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/UX.md).
 
 For a VHD or image file, an explicit mount can be requested with a drive letter:
 
@@ -44,7 +44,7 @@ For a VHD or image file, an explicit mount can be requested with a drive letter:
 & $exe mount .\disk.img X:
 ```
 
-Read-write image operations require the documented `--rw` opt-in and supported writable profile. Physical-device write policy is separate from image-file support. A physical fixed disk is not qualified for read-write, and 4Kn, UASP and media power-loss durability remain unqualified. Removable-device read-write qualification applies only to the single tested device in [DEV-1R](https://github.com/100pangci/XFS-for-Windows/blob/v0.1.0/docs/DEV1_REMOVABLE_QUALIFICATION.md); it does not qualify other devices. Keep backups and review the [read-write stability contract](https://github.com/100pangci/XFS-for-Windows/blob/v0.1.0/docs/RW_STABILITY.md) before enabling writes.
+Read-write image operations require the documented `--rw` opt-in and supported writable profile. Physical-device write policy is separate from image-file support. A physical fixed disk is not qualified for read-write, and 4Kn, UASP and media power-loss durability remain unqualified. Removable-device read-write qualification applies only to the single tested device in [DEV-1R](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/DEV1_REMOVABLE_QUALIFICATION.md); it does not qualify other devices. Keep backups and review the [read-write stability contract](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/RW_STABILITY.md) before enabling writes.
 
 ## Optional automount
 
@@ -75,7 +75,7 @@ Read-write automount is a separate, explicit enrollment. The command displays th
 & $exe automount enable 11111111-1111-4111-8111-111111111111 --rw
 ```
 
-Do not enroll a physical device for read-write unless its device class and hardware are explicitly qualified. Identity pins prevent a different device with the same filesystem UUID from inheriting write access. See the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/v0.1.0/docs/UX.md) and the qualification records for the exact boundaries.
+Do not enroll a physical device for read-write unless its device class and hardware are explicitly qualified. Identity pins prevent a different device with the same filesystem UUID from inheriting write access. See the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/UX.md) and the qualification records for the exact boundaries.
 
 ## Upgrade and uninstall
 
