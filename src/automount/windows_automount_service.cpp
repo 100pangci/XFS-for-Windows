@@ -16,12 +16,15 @@
 // not define.  Mirror the adapter's include order: no status macros from
 // windows.h, then ntstatus.h.  cfgmgr32/winsvc are ordinary user-mode SDK
 // headers and can be included in between.
+#define INITGUID
 #define WIN32_NO_STATUS
 #include <windows.h>
 #undef WIN32_NO_STATUS
 #include <winternl.h>
 #include <ntstatus.h>
 #include <cfgmgr32.h>
+#include <devpkey.h>
+#include <winioctl.h>
 #include <winsvc.h>
 typedef NTSTATUS* PNTSTATUS;
 
@@ -1793,6 +1796,196 @@ Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail) {
   if (detail) *detail = message;
   if (!ok) {
     return XFS_ERR(XfsError::kIoError, message).Metadata("automount-eject");
+  }
+  return OkStatus();
+}
+
+namespace {
+
+// Resolves the PnP device instance ID ("USBSTOR\DISK&VEN_...\<serial>&0") of
+// the disk device that owns a disk-interface symbolic link.
+std::string DeviceInstanceIdOfDiskInterface(const std::wstring& symlink) {
+  DEVPROPTYPE type = 0;
+  ULONG size = 0;
+  CONFIGRET cr = CM_Get_Device_Interface_PropertyW(
+      symlink.c_str(), &DEVPKEY_Device_InstanceId, &type, nullptr, &size, 0);
+  // Asking for the required size with a null buffer returns CR_BUFFER_SMALL,
+  // not CR_SUCCESS; cfgmgr32 fills in the size in that case.
+  if ((cr != CR_SUCCESS && cr != CR_BUFFER_SMALL) || size == 0) return {};
+  std::wstring instance_id(size / sizeof(wchar_t) + 1, L'\0');
+  ULONG buffer_size =
+      static_cast<ULONG>(instance_id.size() * sizeof(wchar_t));
+  cr = CM_Get_Device_Interface_PropertyW(
+      symlink.c_str(), &DEVPKEY_Device_InstanceId, &type,
+      reinterpret_cast<PBYTE>(instance_id.data()), &buffer_size, 0);
+  if (cr != CR_SUCCESS || type != DEVPROP_TYPE_STRING) return {};
+  while (!instance_id.empty() && instance_id.back() == L'\0') {
+    instance_id.pop_back();
+  }
+  return WideToUtf8(instance_id);
+}
+
+// The DEV-1 stable id is the text form of the storage device GUID reported by
+// IOCTL_STORAGE_GET_DEVICE_NUMBER_EX.  It never appears in the PnP instance ID,
+// so the disk itself has to be opened and queried to bind the pin to a devnode.
+bool ParseStableGuid(const std::string& text, GUID* guid) {
+  if (text.size() != 38 || text.front() != '{' || text.back() != '}') {
+    return false;
+  }
+  unsigned int d1 = 0, d2 = 0, d3 = 0, b[8] = {};
+  if (std::sscanf(text.c_str(),
+                  "{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}", &d1, &d2, &d3,
+                  &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6],
+                  &b[7]) != 11) {
+    return false;
+  }
+  guid->Data1 = d1;
+  guid->Data2 = static_cast<unsigned short>(d2);
+  guid->Data3 = static_cast<unsigned short>(d3);
+  for (int i = 0; i < 8; ++i) guid->Data4[i] = static_cast<unsigned char>(b[i]);
+  return true;
+}
+
+// True when the open disk handle reports the given storage GUID.  Mirrors the
+// raw-device identity rules: the GUID must come from the driver without a
+// random-generation flag, or it is not the stable identity.
+bool DiskHandleMatchesStableId(HANDLE disk, const GUID& expected) {
+#ifdef IOCTL_STORAGE_GET_DEVICE_NUMBER_EX
+  STORAGE_DEVICE_NUMBER_EX number{};
+  number.Version = sizeof(number);
+  number.Size = sizeof(number);
+  DWORD returned = 0;
+  if (!DeviceIoControl(disk, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, nullptr, 0,
+                       &number, sizeof(number), &returned, nullptr)) {
+    return false;
+  }
+  if (number.Version == 0 || returned < sizeof(number) ||
+      number.Size < sizeof(number)) {
+    return false;
+  }
+  if ((number.Flags & STORAGE_DEVICE_FLAGS_RANDOM_DEVICEGUID_REASON_CONFLICT) ||
+      (number.Flags & STORAGE_DEVICE_FLAGS_RANDOM_DEVICEGUID_REASON_NOHWID)) {
+    return false;
+  }
+  return std::memcmp(&number.DeviceGuid, &expected, sizeof(GUID)) == 0;
+#else
+  (void)disk;
+  (void)expected;
+  return false;
+#endif
+}
+
+}  // namespace
+
+Status SetDiskRemovalPolicy(const std::string& stable_id,
+                            bool better_performance, std::string* detail) {
+  GUID expected{};
+  if (!ParseStableGuid(stable_id, &expected)) {
+    return XFS_ERR(XfsError::kInvalidArgument,
+                   "the device identity is not a storage GUID")
+        .Metadata("removal-policy");
+  }
+  ULONG list_size = 0;
+  CONFIGRET cr = CM_Get_Device_Interface_List_SizeW(
+      &list_size, const_cast<LPGUID>(&kDiskInterfaceClass), nullptr,
+      CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+  if (cr != CR_SUCCESS || list_size == 0) {
+    return XFS_ERR(XfsError::kNotFound,
+                   "no disk devices are currently attached")
+        .Metadata("removal-policy");
+  }
+  std::wstring symlinks(list_size, L'\0');
+  cr = CM_Get_Device_Interface_ListW(
+      const_cast<LPGUID>(&kDiskInterfaceClass), nullptr, symlinks.data(),
+      list_size, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+  if (cr != CR_SUCCESS) {
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot enumerate disk devices (cfgmgr32 error " +
+                       std::to_string(static_cast<int>(cr)) + ")")
+        .Metadata("removal-policy");
+  }
+  // Bind the stable-id GUID to exactly one live disk devnode.  Opening the
+  // disk itself (zero access, shared) is the same authority discovery uses and
+  // avoids guessing from serial numbers or disk numbers.  An ambiguous match
+  // is refused rather than changing another disk's policy.
+  std::wstring target_symlink;
+  int matches = 0;
+  for (const wchar_t* p = symlinks.data(); *p != L'\0';
+       p += wcslen(p) + 1) {
+    const std::wstring symlink(p);
+    HANDLE disk = CreateFileW(symlink.c_str(), 0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (disk == INVALID_HANDLE_VALUE) continue;
+    const bool match = DiskHandleMatchesStableId(disk, expected);
+    CloseHandle(disk);
+    if (!match) continue;
+    ++matches;
+    if (matches > 1) {
+      return XFS_ERR(XfsError::kAlreadyExists,
+                     "several attached disks match the device identity " +
+                         stable_id)
+          .Metadata("removal-policy");
+    }
+    target_symlink = symlink;
+  }
+  if (target_symlink.empty()) {
+    return XFS_ERR(XfsError::kNotFound,
+                   "no attached disk matches the device identity " + stable_id)
+        .Metadata("removal-policy");
+  }
+  const std::string target_instance =
+      DeviceInstanceIdOfDiskInterface(target_symlink);
+  if (target_instance.empty()) {
+    return XFS_ERR(XfsError::kIoError,
+                   "the matching disk has no PnP device instance")
+        .Metadata("removal-policy");
+  }
+  const std::wstring target_instance_wide = Utf8ToWide(target_instance);
+  DEVINST devnode = 0;
+  cr = CM_Locate_DevNodeW(&devnode,
+                          const_cast<DEVINSTID_W>(target_instance_wide.c_str()),
+                          CM_LOCATE_DEVNODE_NORMAL);
+  if (cr != CR_SUCCESS) {
+    return XFS_ERR(XfsError::kIoError,
+                   "cannot locate the device node for " + target_instance)
+        .Metadata("removal-policy");
+  }
+  const DEVPROPKEY* key = &DEVPKEY_Device_RemovalPolicyOverride;
+  if (better_performance) {
+    // CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL: write caching is enabled and
+    // the device shows up in Safely Remove Hardware.
+    const UINT32 orderly = CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL;
+    cr = CM_Set_DevNode_PropertyW(
+        devnode, key, DEVPROP_TYPE_UINT32,
+        reinterpret_cast<PBYTE>(const_cast<UINT32*>(&orderly)), sizeof(orderly),
+        0);
+  } else {
+    // A null buffer with DEVPROP_TYPE_EMPTY deletes the property; passing the
+    // value type with a zero-length buffer is rejected with CR_INVALID_DATA.
+    cr = CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_EMPTY, nullptr, 0,
+                                  0);
+    if (cr == CR_NO_SUCH_VALUE || cr == CR_INVALID_PROPERTY ||
+        cr == CR_NO_SUCH_DEVICE_INTERFACE) {
+      cr = CR_SUCCESS;
+    }
+  }
+  if (cr != CR_SUCCESS) {
+    const std::string text =
+        std::string("cannot change the removal policy (cfgmgr32 error ") +
+        std::to_string(static_cast<int>(cr)) + ")";
+    return XFS_ERR(cr == CR_ACCESS_DENIED ? XfsError::kPermissionDenied
+                                          : XfsError::kIoError,
+                   text)
+        .Metadata("removal-policy");
+  }
+  if (detail) {
+    *detail = better_performance
+                  ? "the disk now uses the Better performance removal policy; "
+                    "it appears in Safely Remove Hardware; reinsert the device "
+                    "for the setting to take effect"
+                  : "the disk now uses the default (Quick removal) policy; "
+                    "reinsert the device for the setting to take effect";
   }
   return OkStatus();
 }

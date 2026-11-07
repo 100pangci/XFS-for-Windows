@@ -267,6 +267,7 @@ expected-device-class = unknown
 device-qualification = false
 allow-removable-disk = false
 allow-fixed-disk = false
+removal-policy-overridden = false
 ```
 
 `XFSWIN_AUTOMOUNT_CONFIG` overrides the path for console/test runs; an
@@ -282,6 +283,11 @@ virtual disks (VHD/VHDX), so a virtual-disk entry pins the stable id (the
 volume `DeviceGuid`), the size and the class; every physical device class must
 pin its serial. The service still re-reads all of them from the live device on
 every insertion.
+
+`removal-policy-overridden` records that xfswin itself switched the device's
+Windows removal policy to Better performance. Only then does `automount
+disable` restore the Windows default; a removal policy the user set in Device
+Manager is never removed by xfswin.
 
 ### Read-only default and the read-write boundary
 
@@ -408,7 +414,7 @@ sessions it owns; manually mounted drives (`xfswin mount`) are left alone.
 | Explorer says "You need to format the disk in drive F:" | The RAW volume's letter was not (or not yet) taken over. Check `xfswin status` for `Drive letter: taken over ...` versus `allocated`; a non-exact volume match or multiple drive letters deliberately fall back and leave the RAW letter alone. |
 | RAW `F:` and XFS `G:` both visible | The takeover was refused (multiple letters, non-RAW volume, or an identity mismatch). Run `xfswin status --debug` and the event log; do not assign the RAW letter manually while the service owns the mount. |
 | `A:`/`B:` rejected | Windows conventions reserve them; choose another letter. |
-| USB device absent from Safely Remove Hardware | Windows normally classifies USB mass storage as Quick removal (policy 3), so it never lists the device there. Run `xfswin automount eject <drive>` as Administrator and unplug once it reports the release; reinserting resumes automount. Devices set to Better performance appear in the list after the release. |
+| USB device absent from Safely Remove Hardware | `automount enable --rw` switches a removable disk to Windows **Better performance**; reinsert it once and the taskbar lists the device. Run `xfswin automount eject <drive>` before ejecting it there. `--quick-removal` selects the Quick removal default instead (and undoes an earlier Better performance enrollment), where the taskbar never lists the device: eject with xfswin and unplug directly. |
 | `the XFS journal is dirty` after an unplug | The metadata flush was interrupted. Run `xfswin recover` against the exact raw device, as Administrator, after confirming its identity. Automount refuses a dirty journal until recovery is complete. |
 
 ## Automated coverage

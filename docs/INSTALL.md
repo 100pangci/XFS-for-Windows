@@ -77,6 +77,16 @@ Read-write automount is a separate, explicit enrollment. The command displays th
 
 Do not enroll a physical device for read-write unless its device class and hardware are explicitly qualified. Identity pins prevent a different device with the same filesystem UUID from inheriting write access. See the [UX guide](https://github.com/100pangci/XFS-for-Windows/blob/main/docs/UX.md) and the qualification records for the exact boundaries.
 
+When `automount enable --rw` enrolls a removable disk, xfswin also switches that disk's Windows removal policy to **Better performance** (a per-device, reversible setting). This enables Windows write caching and makes the disk appear in the taskbar's **Safely Remove Hardware** list. The policy change requires Administrator privileges; reinsert the disk once for it to take effect. It never replaces the DEV-1 qualification or identity pins — those remain the only authority for writable access.
+
+Pass `--quick-removal` to select Windows' default **Quick removal** policy instead (including when an earlier enrollment had switched the disk to Better performance):
+
+```powershell
+& $exe automount enable <fs> --rw --yes-i-really-mean-it --quick-removal
+```
+
+Quick removal devices never appear in the Safely Remove Hardware list because Windows treats an unplug as safe by design — which does not hold for a mounted XFS filesystem, so always run `automount eject` first. `automount disable` also restores the default policy; an ordinary upgrade or uninstall does not change Windows device settings.
+
 ## Remove a USB device safely
 
 A read-write automount owns the physical disk exclusively. Before unplugging it, release the automount session from an elevated PowerShell window:
@@ -87,7 +97,7 @@ A read-write automount owns the physical disk exclusively. Before unplugging it,
 
 Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata and restores the Windows volume mount point; automatic mounting is suspended while that device stays attached. Once it reports that the filesystem was released, unplug the device.
 
-Windows usually classifies USB mass storage as **Quick removal** (removal policy 3). Those devices never appear in the taskbar's **Safely Remove Hardware** list because Windows treats an unplug as safe by design — which does not hold for a mounted XFS filesystem, so always run `automount eject` first. If the device is configured for **Better performance**, the Safely Remove Hardware entry is available after the release; eject it there and unplug once Windows confirms. Reinsert the device to mount it again automatically.
+With the default **Better performance** policy, the disk appears in the taskbar's **Safely Remove Hardware** list after the release; eject it there and unplug once Windows confirms. With `--quick-removal`, unplug directly after `automount eject` confirms the release. Reinsert the device to mount it again automatically.
 
 Do not pull the device out while the XFS drive is mounted: a power loss during a read-write session can leave the XFS journal dirty, and automount will then refuse to mount it until `xfswin recover` has replayed that journal. Recovery writes filesystem metadata and must be run deliberately against the exact device.
 

@@ -51,6 +51,11 @@ struct AutomountEntry {
   bool device_qualification = false;
   bool allow_removable_disk = false;
   bool allow_fixed_disk = false;
+  // True when xfswin itself switched this device's Windows removal policy to
+  // Better performance.  Only then does `automount disable` restore the
+  // Windows default: an override the user set in Device Manager is never
+  // removed by xfswin.
+  bool removal_policy_overridden = false;
 };
 
 struct AutomountConfig {

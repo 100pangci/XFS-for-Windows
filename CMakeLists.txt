@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 cmake_minimum_required(VERSION 3.24)
-project(XFS-for-Windows VERSION 0.1.1 LANGUAGES CXX)
+project(XFS-for-Windows VERSION 0.1.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

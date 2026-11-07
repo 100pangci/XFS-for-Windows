@@ -158,6 +158,8 @@ void PrintUsage() {
       "      --rw [--yes-i-really-mean-it]\n"
       "                                enroll for read-write access (identity\n"
       "                                pins are recorded after confirmation)\n"
+      "      --quick-removal           use Windows Quick removal instead of\n"
+      "                                switching the disk to Better performance\n"
       "      --rw-experimental --device-write-qualification\n"
       "      [--allow-removable-disk-write]\n"
       "                                legacy enrollment spelling (deprecated)\n"
@@ -201,6 +203,8 @@ void PrintUsage() {
       "                                under the DEV-1 device policy\n"
       "  --allow-fixed-disk-write      additionally allow a fixed disk\n"
       "  --allow-removable-disk-write  additionally allow a removable disk\n"
+      "  --quick-removal               use Windows Quick removal for an enrolled\n"
+      "                                removable disk (undoes Better performance)\n"
       "  --device-cache-mode=<mode>    buffered | write-through | no-buffering |\n"
       "                                no-buffering-write-through\n"
       "  Real-device writes require --device-write-qualification and the\n"
@@ -4036,11 +4040,41 @@ int CommandAutomountEnable(const std::vector<std::string>& args,
     PrintError(valid.error());
     return 1;
   }
+  // Switch the Windows removal policy before the configuration is saved.  The
+  // running service reacts to the saved entry within a second and then holds
+  // the disk exclusively for the read-write session, which would make the
+  // policy change fail for a device that is being enrolled right now.  A
+  // failure here never blocks enrollment; the DEV-1 pins remain the write
+  // authority.
+  // --quick-removal is an explicit choice, so it also undoes an override left
+  // by an earlier enrollment instead of merely skipping the change.
+  bool policy_changed = false;
+  std::string policy_detail;
+  if (read_write && selected &&
+      selected->location.device_class == DeviceClass::kRemovableDisk) {
+    const bool better_performance = !options.quick_removal;
+    const Status policy = SetDiskRemovalPolicy(
+        selected->location.stable_id, better_performance, &policy_detail);
+    policy_changed = policy.ok();
+    if (!policy.ok()) {
+      std::cerr << "warning: the Windows removal policy could not be "
+                   "changed: "
+                << policy.error().Format() << "\n";
+    } else {
+      // Remember that xfswin wrote the override, so that only `automount
+      // disable` restores it and a policy the user set in Device Manager is
+      // never removed.
+      entry.removal_policy_overridden = better_performance;
+    }
+  }
   config.Upsert(entry);
   Status saved = SaveAutomountConfig(paths.config_file, config);
   if (!saved.ok()) {
     PrintError(saved.error());
     return 1;
+  }
+  if (policy_changed) {
+    std::cout << policy_detail << ".\n";
   }
 
   std::string label = selected ? selected->probe.label : std::string();
@@ -4111,11 +4145,37 @@ int CommandAutomountDisable(const std::vector<std::string>& args,
               << " is not configured for automatic mounting.\n";
     return 1;
   }
+  // Remember the pin before the entry is disabled so the Windows removal
+  // policy can go back to its default.  Only an override that xfswin itself
+  // wrote is restored: a policy the user set in Device Manager is left alone.
+  // The service unmounts asynchronously; retry briefly until the disk is no
+  // longer held by a session.
+  const bool restore_policy = entry->removal_policy_overridden &&
+                              !entry->expected_stable_id.empty();
+  const std::string policy_stable_id = entry->expected_stable_id;
   entry->enabled = false;
+  entry->removal_policy_overridden = false;
   Status saved = SaveAutomountConfig(paths.config_file, config);
   if (!saved.ok()) {
     PrintError(saved.error());
     return 1;
+  }
+  if (restore_policy) {
+    std::string policy_detail;
+    Status policy = XFS_ERR(XfsError::kIoError, "the disk is still in use")
+                        .Metadata("removal-policy");
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      policy = SetDiskRemovalPolicy(policy_stable_id, false, &policy_detail);
+      if (policy.ok()) break;
+      Sleep(250);
+    }
+    if (policy.ok()) {
+      std::cout << policy_detail << ".\n";
+    } else {
+      std::cerr << "warning: automatic mounting is disabled, but the Windows "
+                   "removal policy could not be restored: "
+                << policy.error().Format() << "\n";
+    }
   }
   std::cout << "Automatic mounting disabled for " << FormatUuid(uuid) << ".\n";
   const AutomountServiceStatusInfo service = QueryAutomountServiceStatus();
@@ -4389,6 +4449,8 @@ int Run(const std::vector<std::string>& args) {
       options.allow_fixed_disk_write = true;
     } else if (arg == "--allow-removable-disk-write") {
       options.allow_removable_disk_write = true;
+    } else if (arg == "--quick-removal") {
+      options.quick_removal = true;
     } else if (StartsWith(arg, "--device-cache-mode=")) {
       options.device_cache_mode = arg.substr(20);
     } else if (StartsWith(arg, "--expect-serial=")) {
