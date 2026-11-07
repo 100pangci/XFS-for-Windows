@@ -408,6 +408,8 @@ sessions it owns; manually mounted drives (`xfswin mount`) are left alone.
 | Explorer says "You need to format the disk in drive F:" | The RAW volume's letter was not (or not yet) taken over. Check `xfswin status` for `Drive letter: taken over ...` versus `allocated`; a non-exact volume match or multiple drive letters deliberately fall back and leave the RAW letter alone. |
 | RAW `F:` and XFS `G:` both visible | The takeover was refused (multiple letters, non-RAW volume, or an identity mismatch). Run `xfswin status --debug` and the event log; do not assign the RAW letter manually while the service owns the mount. |
 | `A:`/`B:` rejected | Windows conventions reserve them; choose another letter. |
+| USB device absent from Safely Remove Hardware | A read-write automount owns the physical disk. Run `xfswin automount eject <drive>` as Administrator, then eject the device from the taskbar. Reinserting it resumes automount. |
+| `the XFS journal is dirty` after an unplug | The metadata flush was interrupted. Run `xfswin recover` against the exact raw device, as Administrator, after confirming its identity. Automount refuses a dirty journal until recovery is complete. |
 
 ## Automated coverage
 

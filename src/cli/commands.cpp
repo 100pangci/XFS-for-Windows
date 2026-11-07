@@ -162,6 +162,9 @@ void PrintUsage() {
       "      [--allow-removable-disk-write]\n"
       "                                legacy enrollment spelling (deprecated)\n"
       "  automount disable <fs>        stop mounting a configured XFS\n"
+      "  automount eject <drive|fs>     cleanly release an automounted XFS for\n"
+      "                                safe removal, then use Windows\n"
+      "                                Safely Remove Hardware (Administrator)\n"
       "  automount run                 run in console mode (diagnostics/tests)\n"
       "  unmount <X:>                  stop an xfswin mount\n"
       "\n"
@@ -4123,13 +4126,65 @@ int CommandAutomountDisable(const std::vector<std::string>& args,
   return 0;
 }
 
+int CommandAutomountEject(const std::vector<std::string>& args) {
+  if (args.size() != 3) {
+    std::cerr << "usage: xfswin automount eject <drive|uuid>\n";
+    return 1;
+  }
+  Uuid uuid{};
+  if (!ParseUuid(args[2], &uuid)) {
+    // A drive letter is accepted only when the live automount service has
+    // published a session for it.  No drive letter alone authorizes removal.
+    const std::string selector = args[2];
+    std::string drive;
+    if (selector.size() == 1 || (selector.size() == 2 && selector[1] == ':') ||
+        (selector.size() == 3 && selector[1] == ':' && selector[2] == '\\')) {
+      drive = std::string(1, static_cast<char>(
+          std::toupper(static_cast<unsigned char>(selector[0])))) + ":";
+    }
+    if (drive.empty()) {
+      std::cerr << "error: pass a mounted drive letter or a filesystem UUID\n";
+      return 1;
+    }
+    auto loaded = LoadAutomountRuntimeStatus(
+        DefaultAutomountRuntimeStatusPath());
+    if (!loaded.ok()) {
+      PrintError(loaded.error());
+      return 1;
+    }
+    for (const auto& mount : loaded.value().mounts) {
+      if (mount.drive == drive) {
+        uuid = mount.fs_uuid;
+        break;
+      }
+    }
+    if (IsNullUuid(uuid)) {
+      std::cerr << "error: " << drive
+                << " is not an automount-owned XFS session\n";
+      return 1;
+    }
+  }
+  std::string detail;
+  Status result = RequestAutomountEject(uuid, &detail);
+  if (!result.ok()) {
+    if (!detail.empty()) {
+      std::cerr << "error: " << detail << "\n";
+    } else {
+      PrintError(result.error());
+    }
+    return 1;
+  }
+  std::cout << FormatUuid(uuid) << ": " << detail << "\n";
+  return 0;
+}
+
 int CommandAutomount(const std::vector<std::string>& args,
                      const Options& options, bool drive_specified,
                      const std::string& drive_option) {
   if (args.size() < 2) {
     std::cerr
         << "usage: xfswin automount <install|uninstall|start|stop|status|"
-           "enable|disable|run>\n";
+           "enable|disable|eject|run>\n";
     return 1;
   }
   const std::string& action = args[1];
@@ -4167,6 +4222,9 @@ int CommandAutomount(const std::vector<std::string>& args,
   }
   if (action == "disable") {
     return CommandAutomountDisable(args, options);
+  }
+  if (action == "eject") {
+    return CommandAutomountEject(args);
   }
   std::cerr << "error: unknown automount action '" << action << "'\n";
   return 1;

@@ -2454,3 +2454,85 @@ TEST(ux_automount_config_virtual_disk_needs_no_serial) {
               "expected-device-class = removable-disk\n")
             .ok());
 }
+TEST(ux_automount_eject_suspends_until_device_reinsertion) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0xf1);
+  platform.devices.push_back({TestFilesystem(uuid, "USB1", 1, "SN1"), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(platform.start_calls, 1);
+
+  std::string detail;
+  CHECK(engine.Eject(uuid, At(1000), &detail));
+  CHECK(detail.find("safe removal") != std::string::npos);
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.stop_calls, 1);
+  CHECK_EQ(platform.CountLogs("eject", "released"), 1);
+
+  // While Windows still reports the device, even a periodic reconciliation
+  // must not silently take the disk back after the user released it.
+  engine.Tick(At(61000));
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.start_calls, 1);
+  CHECK(engine.status().entries.front().detail.find("safe removal") !=
+        std::string::npos);
+
+  // Safe removal: discovery no longer sees the filesystem.  The suspension is
+  // lifted, but there is still nothing attached to mount.
+  platform.devices[0].present = false;
+  engine.NotifyDeviceChanged(At(62000));
+  engine.Tick(At(62000));
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.CountLogs("eject", "device-removed"), 1);
+
+  // Reinsertion starts a fresh mount cycle.
+  platform.devices[0].present = true;
+  engine.NotifyDeviceChanged(At(63000));
+  engine.Tick(At(63000));
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(platform.start_calls, 2);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kMounted);
+}
+
+TEST(ux_automount_eject_refuses_unenrolled_and_survives_a_failed_stop) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid enrolled = TestUuid(0xf2);
+  const xfs::Uuid other = TestUuid(0xf3);
+  platform.devices.push_back(
+      {TestFilesystem(enrolled, "USB1", 1, "SN1"), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(enrolled)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  std::string detail;
+  CHECK(!engine.Eject(other, At(1000), &detail));
+  CHECK(detail.find("not enrolled") != std::string::npos);
+
+  platform.stop_failures = 1;
+  CHECK(!engine.Eject(enrolled, At(2000), &detail));
+  CHECK(detail.find("did not stop cleanly") != std::string::npos);
+  CHECK_EQ(platform.CountLogs("eject", "failed"), 1);
+
+  // The failed stop is retried by reconciliation.  The release intent is
+  // already recorded, so the retry must not restart the mount the user asked
+  // to release.
+  engine.Tick(At(3000));
+  CHECK(platform.sessions.empty());
+  CHECK_EQ(platform.start_calls, 1);
+
+  // A repeated request reports the release instead of touching the device
+  // again, and the periodic reconciliation keeps it unmounted while the
+  // device stays attached.
+  CHECK(engine.Eject(enrolled, At(5000), &detail));
+  CHECK(detail.find("already released") != std::string::npos);
+  engine.Tick(At(66000));
+  CHECK_EQ(platform.start_calls, 1);
+  CHECK(engine.status().entries.front().detail.find("safe removal") !=
+        std::string::npos);
+}
