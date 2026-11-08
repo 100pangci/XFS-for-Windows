@@ -85,19 +85,27 @@ Pass `--quick-removal` to select Windows' default **Quick removal** policy inste
 & $exe automount enable <fs> --rw --yes-i-really-mean-it --quick-removal
 ```
 
-Quick removal devices never appear in the Safely Remove Hardware list because Windows treats an unplug as safe by design — which does not hold for a mounted XFS filesystem, so always run `automount eject` first. `automount disable` also restores the default policy; an ordinary upgrade or uninstall does not change Windows device settings.
+Quick removal devices may still be absent from the Safely Remove Hardware list because Windows treats an unplug as safe by design — which does not hold for a mounted XFS filesystem. The service answers Windows' own removal request, so a device the tray does list can be ejected there; otherwise run `automount eject` first. `automount disable` also restores the default policy; an ordinary upgrade or uninstall does not change Windows device settings.
 
 ## Remove a USB device safely
 
-A read-write automount owns the physical disk exclusively. Before unplugging it, release the automount session from an elevated PowerShell window:
+The automount service releases the filesystem by itself when Windows starts a device removal, so the ordinary path is the taskbar:
+
+1. Click **Safely Remove Hardware** in the taskbar and choose the device (or its drive letter).
+2. Windows asks the automount service to release the filesystem. The service flushes metadata, closes its exclusive disk handle and restores the Windows volume mount point, then lets Windows finish the removal.
+3. Unplug the device once Windows confirms it can be removed.
+
+Because the service holds the disk exclusively, Windows could otherwise report the device as still in use. While a session is mounted, the service registers for Windows' `DEVICEQUERYREMOVE` notification on that disk, which is what turns the tray click into a clean release. If the release cannot complete (for example another handle owner vetoes the removal, or the release times out), the service answers with a veto, Windows keeps the device attached and the filesystem stays mounted — nothing is left half-unmounted. If the removal is abandoned after a successful release, the filesystem is mounted again automatically.
+
+The command-line path remains available and is the reliable one for devices the tray does not list (Quick removal policy) and for an explicit release in a script:
 
 ```powershell
 & $exe automount eject F:
 ```
 
-Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata and restores the Windows volume mount point; automatic mounting is suspended while that device stays attached. Once it reports that the filesystem was released, unplug the device.
+Replace `F:` with the mounted drive letter, or pass the filesystem UUID. The command stops the session, flushes metadata, restores the Windows volume mount point and then asks Windows to eject the removable device that carries the disk; automatic mounting is suspended while that device stays attached. Once it reports the outcome, unplug the device if Windows did not already remove it.
 
-With the default **Better performance** policy, the disk appears in the taskbar's **Safely Remove Hardware** list after the release; eject it there and unplug once Windows confirms. With `--quick-removal`, unplug directly after `automount eject` confirms the release. Reinsert the device to mount it again automatically.
+Reinsert the device to mount it again automatically.
 
 Do not pull the device out while the XFS drive is mounted: a power loss during a read-write session can leave the XFS journal dirty, and automount will then refuse to mount it until `xfswin recover` has replayed that journal. Recovery writes filesystem metadata and must be run deliberately against the exact device.
 

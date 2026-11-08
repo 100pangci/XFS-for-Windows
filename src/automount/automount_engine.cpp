@@ -284,6 +284,19 @@ bool AutomountEngine::Eject(const Uuid& uuid, AutomountTimePoint now,
   return true;
 }
 
+bool AutomountEngine::CancelEject(const Uuid& uuid, AutomountTimePoint now) {
+  const std::string key = UuidKey(uuid);
+  if (suspended_.erase(key) == 0) return false;
+  // The suspension is the only reason reconciliation skipped this entry while
+  // its device stayed attached; dropping it lets the next pass mount again.
+  retries_.erase(key);
+  exhausted_.erase(key);
+  Log(AutomountLogLevel::kInfo, "eject", key, "", "", "cancelled",
+      "the device removal was abandoned; automatic mounting resumes");
+  pending_reconcile_ = now;
+  return true;
+}
+
 void AutomountEngine::Tick(AutomountTimePoint now) {
   if (!running_) return;
   bool due = settings_changed_;

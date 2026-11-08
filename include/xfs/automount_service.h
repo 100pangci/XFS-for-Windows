@@ -117,6 +117,15 @@ Status StopAutomountService(std::string* message);
 // actually been removed and reinserted.  `detail` receives the result text.
 Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail);
 
+// Asks Windows to eject the removable device that carries `stable_id` (the
+// storage GUID of its physical disk).  Call it after the filesystem has been
+// released: it only completes the hardware removal, it never decides whether a
+// filesystem may be released.  `attempted` reports whether an eject request
+// was actually sent (false for a fixed disk, an unknown identity or a device
+// that is already gone); `detail` receives a human-readable outcome.
+Status EjectRemovableDiskDevice(const std::string& stable_id, bool* attempted,
+                                std::string* detail);
+
 // Adjusts Windows' removal policy for one physical disk identified by its
 // stable id.  `better_performance` selects orderly removal (the device appears
 // in Safely Remove Hardware and Windows may cache writes); false restores the

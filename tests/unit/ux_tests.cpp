@@ -2565,6 +2565,37 @@ TEST(ux_automount_eject_suspends_until_device_reinsertion) {
         xfs::AutomountEntryState::kMounted);
 }
 
+TEST(ux_automount_cancel_eject_resumes_an_abandoned_removal) {
+  FakeAutomountPlatform platform;
+  const xfs::Uuid uuid = TestUuid(0xf4);
+  platform.devices.push_back({TestFilesystem(uuid, "USB1", 1, "SN1"), true});
+
+  xfs::AutomountEngine engine(platform);
+  engine.SetConfig(ConfigWith({EngineEntry(uuid)}));
+  engine.Start(kStart);
+  engine.Tick(kStart);
+  CHECK_EQ(platform.sessions.size(), 1u);
+
+  std::string detail;
+  CHECK(engine.Eject(uuid, At(1000), &detail));
+  CHECK(platform.sessions.empty());
+
+  // The user cancelled Safely Remove Hardware: the device is still attached.
+  // The release must be undone, otherwise the filesystem never comes back
+  // even though Windows never removed the disk.
+  CHECK(engine.CancelEject(uuid, At(2000)));
+  CHECK_EQ(platform.CountLogs("eject", "cancelled"), 1);
+  engine.Tick(At(2100));
+  CHECK_EQ(platform.sessions.size(), 1u);
+  CHECK_EQ(platform.start_calls, 2);
+  CHECK(engine.status().entries.front().state ==
+        xfs::AutomountEntryState::kMounted);
+
+  // A UUID that was never released is not cancelled, so the service never
+  // resumes a mount it did not stop.
+  CHECK(!engine.CancelEject(TestUuid(0xf5), At(3000)));
+}
+
 TEST(ux_automount_eject_refuses_unenrolled_and_survives_a_failed_stop) {
   FakeAutomountPlatform platform;
   const xfs::Uuid enrolled = TestUuid(0xf2);
