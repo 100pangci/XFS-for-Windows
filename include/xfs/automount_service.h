@@ -117,6 +117,15 @@ Status StopAutomountService(std::string* message);
 // actually been removed and reinserted.  `detail` receives the result text.
 Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail);
 
+// Adjusts Windows' removal policy for one physical disk identified by its
+// stable id.  `better_performance` selects orderly removal (the device appears
+// in Safely Remove Hardware and Windows may cache writes); false restores the
+// per-device default, normally Quick removal.  This is a per-device Windows
+// setting only: it never changes xfswin's write qualification or identity
+// policy.  `detail` receives a human-readable outcome.
+Status SetDiskRemovalPolicy(const std::string& stable_id,
+                            bool better_performance, std::string* detail);
+
 // Runs the WinFsp service loop.  When the process was not started by the SCM
 // this falls back to console mode (Ctrl+C stops), which is how the test suite
 // exercises the real event loop.  Returns a process exit code.

@@ -65,6 +65,11 @@ struct Options {
   bool xattr_value_is_hex = false;  // --value-hex input
   std::string xattr_value_file;   // binary value input
   std::string xattr_output;       // binary value output
+  // automount enable --rw: select the Windows Quick removal policy instead of
+  // switching an enrolled removable disk to Better performance.  The default
+  // switch is what makes the device appear in Safely Remove Hardware; the
+  // xfswin write policy is unaffected either way.
+  bool quick_removal = false;
   // DEV-1 device qualification.  A raw device is writable only when the caller
   // explicitly asks for qualification, and each risky device class needs its
   // own opt-in.  The defaults refuse fixed and removable disks.

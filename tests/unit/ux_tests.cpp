@@ -563,6 +563,72 @@ TEST(ux_automount_config_writable_entry_roundtrip) {
   CHECK_EQ(entry->expected_size_bytes, 64160400896ull);
 }
 
+TEST(ux_automount_config_removal_policy_ownership_roundtrip) {
+  // The flag records that xfswin itself wrote the Windows removal policy, so
+  // only `automount disable` restores the default and a policy the user set
+  // in Device Manager survives.
+  const std::string text =
+      "version = 1\n"
+      "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+      "enabled = true\n"
+      "mode = read-write\n"
+      "expected-serial = AA00000000000489\n"
+      "expected-stable-id = {E3BDCF9A-D368-E874-81CB-EC5639EC18E6}\n"
+      "expected-size = 64160400896\n"
+      "expected-device-class = removable-disk\n"
+      "device-qualification = true\n"
+      "allow-removable-disk = true\n"
+      "removal-policy-overridden = true\n";
+  auto parsed = xfs::ParseAutomountConfig(text);
+  CHECK(parsed.ok());
+  const xfs::AutomountEntry* entry = parsed.value().config.Find(
+      WritableEntry().fs_uuid);
+  CHECK(entry != nullptr);
+  if (!entry) return;
+  CHECK(entry->removal_policy_overridden);
+
+  const std::string serialized =
+      xfs::SerializeAutomountConfig(parsed.value().config);
+  CHECK(serialized.find("removal-policy-overridden = true") !=
+        std::string::npos);
+  auto reloaded = xfs::ParseAutomountConfig(serialized);
+  CHECK(reloaded.ok());
+  const xfs::AutomountEntry* again =
+      reloaded.value().config.Find(WritableEntry().fs_uuid);
+  CHECK(again != nullptr);
+  if (!again) return;
+  CHECK(again->removal_policy_overridden);
+
+  // A configuration written before this key existed keeps the default: xfswin
+  // never changed the device, so it never restores one either.
+  const std::string legacy =
+      "version = 1\n"
+      "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+      "enabled = true\n"
+      "mode = read-write\n"
+      "expected-serial = AA00000000000489\n"
+      "expected-stable-id = {E3BDCF9A-D368-E874-81CB-EC5639EC18E6}\n"
+      "expected-size = 64160400896\n"
+      "expected-device-class = removable-disk\n"
+      "device-qualification = true\n"
+      "allow-removable-disk = true\n";
+  auto old = xfs::ParseAutomountConfig(legacy);
+  CHECK(old.ok());
+  const xfs::AutomountEntry* old_entry = old.value().config.Find(
+      WritableEntry().fs_uuid);
+  CHECK(old_entry != nullptr);
+  if (!old_entry) return;
+  CHECK(!old_entry->removal_policy_overridden);
+
+  const std::string bad =
+      "version = 1\n"
+      "[filesystem \"" + std::string(kConfigUuid) + "\"]\n"
+      "removal-policy-overridden = maybe\n";
+  auto refused = xfs::ParseAutomountConfig(bad);
+  CHECK(!refused.ok());
+  CHECK(refused.error().code == xfs::XfsError::kInvalidArgument);
+}
+
 TEST(ux_automount_config_legacy_mode_migrates_on_save) {
   const std::string legacy =
       "version = 1\n"

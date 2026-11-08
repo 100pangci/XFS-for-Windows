@@ -402,6 +402,14 @@ Result<AutomountConfigLoad> ParseAutomountConfig(std::string_view text) {
                                  "allow-fixed-disk must be true or false"))
             .Metadata("automount");
       }
+    } else if (key == "removal-policy-overridden") {
+      if (!ParseBool(value, &current.removal_policy_overridden)) {
+        return XFS_ERR(XfsError::kInvalidArgument,
+                       LineError(line_number,
+                                 "removal-policy-overridden must be true or "
+                                 "false"))
+            .Metadata("automount");
+      }
     } else {
       load.warnings.push_back(LineError(
           line_number, "unknown filesystem key '" + key + "' ignored"));
@@ -485,6 +493,8 @@ std::string SerializeAutomountConfig(const AutomountConfig& config) {
         << (entry->allow_removable_disk ? "true" : "false") << "\n";
     out << "allow-fixed-disk = "
         << (entry->allow_fixed_disk ? "true" : "false") << "\n";
+    out << "removal-policy-overridden = "
+        << (entry->removal_policy_overridden ? "true" : "false") << "\n";
   }
   return out.str();
 }
