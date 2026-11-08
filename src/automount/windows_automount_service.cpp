@@ -34,6 +34,7 @@ typedef NTSTATUS* PNTSTATUS;
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -77,6 +78,17 @@ constexpr wchar_t kEjectRequestName[] = L"eject.request";
 constexpr wchar_t kEjectAcceptedName[] = L"eject.request.accepted";
 constexpr wchar_t kEjectResultName[] = L"eject.result";
 constexpr uint32_t kEjectResultTimeoutMs = 20000;
+// Windows waits for the device-removal answer with its own timeout (a few
+// seconds in the shell, longer from cfgmgr32); a release that takes longer
+// than this is reported as vetoed so the user sees the normal "device in use"
+// message instead of a hung Safely Remove Hardware dialog.
+constexpr DWORD kRemovalReleaseTimeoutMs = 20000;
+// After a release performed for a device removal, Windows may still abandon
+// the removal (another handle owner vetoes it, or the user cancels Safely
+// Remove Hardware).  The notification handle is already closed by then, so the
+// answer arrives as "the device is still attached"; past this grace period the
+// release is undone and the filesystem mounts again.
+constexpr uint32_t kRemovalGraceSeconds = 10;
 constexpr wchar_t kServiceDisplayName[] = L"XFS for Windows automount";
 constexpr wchar_t kServiceDescription[] =
     L"Discovers attached XFS filesystems and mounts configured filesystems "
@@ -574,18 +586,158 @@ class WindowsTakeoverOps final : public TakeoverOps {
   }
 };
 
+// ---------------------------------------------------------------------------
+// PnP removal handshake
+// ---------------------------------------------------------------------------
+
+// One release requested by a device-removal notification.  The notification
+// callback runs on a PnP thread and may not touch the engine (the engine is
+// owned by the service worker thread); it queues this request and waits for
+// the worker to finish the clean unmount.  Windows only accepts
+// ERROR_SUCCESS from the callback once the service has released every handle,
+// so the handshake completes before the callback returns.
+struct RemovalReleaseRequest {
+  Uuid uuid{};
+  // The completion event is kept alive by shared ownership: the worker may
+  // signal it after the callback already gave up on a slow release, so it
+  // must never be closed while the other side can still use it.
+  std::shared_ptr<void> done;
+  bool released = false;
+  std::string detail;
+  // Set when the release was requested by Windows (device removal), not by
+  // the CLI.  Such a release is provisional until the device is really gone.
+  bool for_device_removal = false;
+};
+
+std::shared_ptr<void> CreateSharedEvent() {
+  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!event) return {};
+  return std::shared_ptr<void>(event, [](void* handle) {
+    CloseHandle(static_cast<HANDLE>(handle));
+  });
+}
+
+// Shared state between the service runtime and every per-session removal
+// notification.  A notification callback can still be running while its
+// registration is being unregistered, possibly while the service runtime is
+// being destroyed, so the queue and the shutdown gate live in this
+// reference-counted object instead of in ServiceRuntime.
+struct RemovalCoordinator {
+  // The release queue.  The worker swaps it out; callbacks append and may
+  // withdraw their own request.
+  std::mutex mutex;
+  std::vector<std::shared_ptr<RemovalReleaseRequest>> requests;
+  // Auto-closed with the coordinator: a callback that is still being
+  // unregistered may signal it after the service runtime is gone.
+  std::shared_ptr<void> wake;
+  // Refuses new callbacks during service shutdown and counts the ones
+  // already inside the handshake, so the engine is never destroyed under a
+  // callback that is about to use it.
+  std::mutex callback_mutex;
+  std::condition_variable callback_cv;
+  int active_callbacks = 0;
+  // Atomic so the queue hand-off can re-check it under `mutex` without a race
+  // against ShutdownRemovalCoordinator flipping it.
+  std::atomic<bool> accepting{true};
+
+  HANDLE wake_handle() const {
+    return wake ? static_cast<HANDLE>(wake.get()) : nullptr;
+  }
+};
+
+// Registers (and later retires) the DEVICEHANDLE notification for one mount
+// session.  The handle is opened with zero access and shared read/write so it
+// coexists with the session's own raw-device handle; it exists only to make
+// Windows ask this service before the disk is removed.
+struct RemovalWatch {
+  std::atomic<HANDLE> disk{nullptr};
+  HCMNOTIFICATION notification = nullptr;
+  std::shared_ptr<RemovalCoordinator> coordinator;
+  Uuid uuid{};
+  std::atomic<bool> retired{false};
+};
+
+// Called from the PnP notification thread.  The coordinator reference keeps
+// the shared state alive for the duration of the call.
+bool ReleaseForRemoval(RemovalCoordinator& coordinator, const Uuid& uuid,
+                       std::string* detail);
+
+void CloseRemovalWatchHandle(RemovalWatch* watch) {
+  HANDLE handle = watch->disk.exchange(nullptr);
+  if (handle != nullptr && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+}
+
+DWORD CALLBACK RemovalWatchCallback(HCMNOTIFICATION, PVOID context,
+                                    CM_NOTIFY_ACTION action,
+                                    PCM_NOTIFY_EVENT_DATA, DWORD) {
+  auto* watch = static_cast<RemovalWatch*>(context);
+  if (!watch || !watch->coordinator) return ERROR_SUCCESS;
+  if (action != CM_NOTIFY_ACTION_DEVICEQUERYREMOVE) {
+    // QUERYREMOVEFAILED / REMOVEPENDING / REMOVECOMPLETE need no action: the
+    // session is already gone, or Windows is already proceeding.
+    return ERROR_SUCCESS;
+  }
+  std::string detail;
+  if (!ReleaseForRemoval(*watch->coordinator, watch->uuid, &detail)) {
+    return ERROR_CANCELLED;
+  }
+  // This zero-access handle is itself an open handle on the disk; it must be
+  // closed before ERROR_SUCCESS, otherwise the device stack keeps the
+  // removal vetoed.
+  CloseRemovalWatchHandle(watch);
+  return ERROR_SUCCESS;
+}
+
+// cfgmgr32 waits for pending notification callbacks inside
+// CM_Unregister_Notification, and this service's callback waits for the
+// worker.  Unregistering synchronously here could therefore deadlock (for
+// example during a worker-initiated release); the watch retires on its own
+// thread, after the callback has returned.
+void RetireRemovalWatch(RemovalWatch* watch) {
+  if (!watch) return;
+  if (watch->retired.exchange(true)) return;
+  try {
+    std::thread([watch] {
+      if (watch->notification) {
+        CM_Unregister_Notification(watch->notification);
+        watch->notification = nullptr;
+      }
+      CloseRemovalWatchHandle(watch);
+      delete watch;
+    }).detach();
+  } catch (...) {
+    // Leaving the registration in place leaks one handle; failing the
+    // unmount would be worse, and process exit releases it.
+  }
+}
+
+// A live WinFsp mount plus the removal notification registered for it.  The
+// watch is retired without blocking when the mount stops, so a removal
+// callback that is already waiting for this stop cannot deadlock it.
+struct LiveMount {
+  std::unique_ptr<winfsp::MountSession> session;
+  RemovalWatch* removal_watch = nullptr;
+};
+
 class WindowsAutomountPlatform final : public AutomountPlatform {
  public:
   WindowsAutomountPlatform() = default;
   ~WindowsAutomountPlatform() override {
-    std::map<std::string, std::unique_ptr<winfsp::MountSession>> sessions;
+    std::map<std::string, LiveMount> sessions;
     {
       std::lock_guard<std::mutex> lock(session_mutex_);
       sessions.swap(sessions_);
     }
     for (auto& entry : sessions) {
-      if (entry.second) entry.second->Stop();
+      if (entry.second.session) entry.second.session->Stop();
+      RetireRemovalWatch(entry.second.removal_watch);
     }
+  }
+
+  void SetRemovalCoordinator(
+      std::shared_ptr<RemovalCoordinator> coordinator) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    removal_coordinator_ = std::move(coordinator);
   }
 
   Result<DiscoveryReport> Discover(
@@ -797,24 +949,32 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
     }
 
     const std::string id = session.value()->id();
+    RemovalWatch* removal_watch = CreateRemovalWatch(
+        filesystem.location.disk_path, filesystem.probe.superblock.uuid);
     {
       std::lock_guard<std::mutex> lock(session_mutex_);
-      sessions_[id] = std::move(session.value());
+      LiveMount live;
+      live.session = std::move(session.value());
+      live.removal_watch = removal_watch;
+      sessions_[id] = std::move(live);
     }
     result.session_id = id;
     return result;
   }
 
   Status StopMount(const std::string& session_id) override {
-    std::unique_ptr<winfsp::MountSession> session;
+    LiveMount live;
     {
       std::lock_guard<std::mutex> lock(session_mutex_);
       const auto it = sessions_.find(session_id);
       if (it == sessions_.end()) return OkStatus();  // already stopped
-      session = std::move(it->second);
+      live = std::move(it->second);
       sessions_.erase(it);
     }
-    const Status stopped = session->Stop();
+    const Status stopped = live.session->Stop();
+    // Unregistering on this thread could wait for a removal callback that is
+    // itself waiting for this unmount; the watch retires on its own thread.
+    RetireRemovalWatch(live.removal_watch);
     if (!stopped.ok()) {
       // The mount point is released even when the durable unmount failed;
       // report the durability problem in the service log, not as a pending
@@ -835,7 +995,8 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
   bool IsSessionAlive(const std::string& session_id) override {
     std::lock_guard<std::mutex> lock(session_mutex_);
     const auto it = sessions_.find(session_id);
-    return it != sessions_.end() && it->second && it->second->alive();
+    return it != sessions_.end() && it->second.session &&
+           it->second.session->alive();
   }
 
   void EmitLog(const AutomountLogRecord& record) override {
@@ -855,8 +1016,63 @@ class WindowsAutomountPlatform final : public AutomountPlatform {
   }
 
  private:
+  // Opens a zero-access handle on the mounted disk and asks Windows to send
+  // DEVICEQUERYREMOVE before the disk is removed.  Registration failures are
+  // reported but never fail the mount: the CLI release remains available.
+  RemovalWatch* CreateRemovalWatch(const std::string& disk_path,
+                                   const Uuid& uuid) {
+    if (disk_path.empty() || !removal_coordinator_) return nullptr;
+    // Only raw physical disks have a PnP device that can be removed; an
+    // image file is never ejected from Safely Remove Hardware.
+    if (disk_path.rfind("\\\\.\\", 0) != 0) return nullptr;
+    const std::wstring path = Utf8ToWide(disk_path);
+    HANDLE disk = CreateFileW(path.c_str(), 0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (disk == INVALID_HANDLE_VALUE) {
+      AutomountLogRecord record;
+      record.level = AutomountLogLevel::kWarn;
+      record.event = "device-query-remove";
+      record.result = "unavailable";
+      record.uuid = FormatUuid(uuid);
+      record.detail =
+          "cannot open " + disk_path + " for device-removal notifications: " +
+          WideToUtf8(Win32ErrorText(GetLastError())) +
+          "; Safely Remove Hardware will report the device in use until the "
+          "filesystem is released";
+      EmitLog(record);
+      return nullptr;
+    }
+    auto* watch = new RemovalWatch();
+    watch->disk.store(disk);
+    watch->coordinator = removal_coordinator_;
+    watch->uuid = uuid;
+    CM_NOTIFY_FILTER filter{};
+    filter.cbSize = sizeof(filter);
+    filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE;
+    filter.u.DeviceHandle.hTarget = disk;
+    const CONFIGRET cr = CM_Register_Notification(
+        &filter, watch, RemovalWatchCallback, &watch->notification);
+    if (cr != CR_SUCCESS) {
+      AutomountLogRecord record;
+      record.level = AutomountLogLevel::kWarn;
+      record.event = "device-query-remove";
+      record.result = "unavailable";
+      record.uuid = FormatUuid(uuid);
+      record.detail =
+          "cannot register the device-removal notification (cfgmgr32 error " +
+          std::to_string(static_cast<int>(cr)) + ")";
+      EmitLog(record);
+      CloseRemovalWatchHandle(watch);
+      delete watch;
+      return nullptr;
+    }
+    return watch;
+  }
+
   std::mutex session_mutex_;
-  std::map<std::string, std::unique_ptr<winfsp::MountSession>> sessions_;
+  std::map<std::string, LiveMount> sessions_;
+  std::shared_ptr<RemovalCoordinator> removal_coordinator_;
 };
 
 // ---------------------------------------------------------------------------
@@ -869,6 +1085,17 @@ struct ServiceRuntime {
     if (stop_event && worker.joinable()) {
       SetEvent(stop_event);
       worker.join();
+    }
+    // No removal callback may still touch this runtime: refuse new ones and
+    // wait out the ones already inside the handshake before the members are
+    // destroyed.  The coordinator itself is reference counted, so a callback
+    // that is still being unregistered after the runtime is gone sees only
+    // the coordinator.
+    if (removal) {
+      std::unique_lock<std::mutex> lock(removal->callback_mutex);
+      removal->accepting = false;
+      removal->callback_cv.wait(
+          lock, [this] { return removal->active_callbacks == 0; });
     }
     UnregisterNotifications();
     if (config_notify) {
@@ -941,6 +1168,16 @@ struct ServiceRuntime {
   HANDLE config_notify = nullptr;
   HCMNOTIFICATION disk_notification = nullptr;
   HCMNOTIFICATION volume_notification = nullptr;
+  // Shared with every per-session removal notification; see
+  // RemovalCoordinator.
+  std::shared_ptr<RemovalCoordinator> removal;
+  // Releases performed for a device removal that Windows has not confirmed
+  // yet (see ExpireProvisionalReleases).  Worker-thread only.
+  struct PendingDeviceRemoval {
+    Uuid uuid{};
+    AutomountTimePoint deadline{};
+  };
+  std::vector<PendingDeviceRemoval> pending_device_removals;
   AutomountServicePaths paths;
   std::unique_ptr<WindowsAutomountPlatform> platform;
   std::unique_ptr<AutomountEngine> engine;
@@ -998,6 +1235,12 @@ bool WriteEjectResult(const std::filesystem::path& path,
   return static_cast<bool>(file);
 }
 
+// Asks Windows to eject the physical device that carries |stable_id|.  The
+// disk devnode is usually not ejectable itself (USB bridges report the disk
+// as a fixed device), so the nearest removable ancestor is used: that is the
+// USB device Safely Remove Hardware targets too.
+// Implemented with the rest of the cfgmgr32 device helpers below.
+
 // The service owns this one-slot channel.  A stale .accepted file is finished
 // first, so a service restart never drops a request that was already claimed.
 // Only the engine may decide that a filesystem can be released; this shell
@@ -1041,13 +1284,40 @@ void ProcessEjectRequests(ServiceRuntime& runtime) {
   Uuid uuid{};
   bool ok = ParseUuid(line, &uuid);
   std::string detail;
+  // The mounted session knows which physical disk it uses; the CLI needs that
+  // identity to ask Windows to eject the device once the filesystem is
+  // released.  It is read before the release, because the release removes the
+  // session from the snapshot.
+  std::string stable_id;
+  for (const auto& mount : runtime.engine->status().mounts) {
+    if (UuidEqual(mount.fs_uuid, uuid)) {
+      stable_id = mount.stable_id;
+      break;
+    }
+  }
   if (ok) {
     ok = runtime.engine->Eject(uuid, AutomountClock::now(), &detail);
   } else {
     detail = "the request does not contain a valid filesystem UUID";
   }
+  if (ok) {
+    // An explicit CLI release is durable until the device is reinserted.  Drop
+    // any provisional grace deadline so an earlier tray attempt that Windows
+    // abandoned cannot resume mounting behind the user's back.
+    auto& pending = runtime.pending_device_removals;
+    pending.erase(
+        std::remove_if(pending.begin(), pending.end(),
+                       [&uuid](const ServiceRuntime::PendingDeviceRemoval& p) {
+                         return UuidEqual(p.uuid, uuid);
+                       }),
+        pending.end());
+  }
   std::filesystem::remove(accepted, ec);
-  WriteEjectResult(result, std::string(ok ? "ok\t" : "error\t") + detail);
+  // Third field: the released device identity, so the caller can complete the
+  // hardware eject without re-deriving it.  Empty when the session was an
+  // image or the release failed.
+  WriteEjectResult(result, std::string(ok ? "ok\t" : "error\t") + detail +
+                               (ok ? "\t" + stable_id : ""));
   AutomountLogRecord record;
   record.level = ok ? AutomountLogLevel::kInfo : AutomountLogLevel::kWarn;
   record.event = "eject-request";
@@ -1057,6 +1327,181 @@ void ProcessEjectRequests(ServiceRuntime& runtime) {
   runtime.platform->EmitLog(record);
   runtime.engine->Tick(AutomountClock::now());
   runtime.PublishRuntimeStatus();
+}
+
+// Windows asked this service to release the filesystem because a device
+// removal is starting.  The notification callback runs on a PnP thread, so it
+// only queues the request and waits; the service worker performs the clean
+// unmount through the engine and signals the event the callback is waiting
+// on.  Returns true only when every handle is released, which is what lets
+// the callback answer ERROR_SUCCESS.
+bool ReleaseForRemoval(RemovalCoordinator& coordinator, const Uuid& uuid,
+                       std::string* detail) {
+  std::shared_ptr<RemovalReleaseRequest> request =
+      std::make_shared<RemovalReleaseRequest>();
+  request->uuid = uuid;
+  request->for_device_removal = true;
+  request->done = CreateSharedEvent();
+  if (!request->done) {
+    if (detail) *detail = "cannot create the release completion event";
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> gate(coordinator.callback_mutex);
+    if (!coordinator.accepting) {
+      if (detail) *detail = "the automount service is stopping";
+      return false;
+    }
+    ++coordinator.active_callbacks;
+  }
+  struct CallbackScope {
+    RemovalCoordinator* coordinator;
+    ~CallbackScope() {
+      {
+        std::lock_guard<std::mutex> gate(coordinator->callback_mutex);
+        --coordinator->active_callbacks;
+      }
+      coordinator->callback_cv.notify_all();
+    }
+  } scope{&coordinator};
+
+  {
+    std::lock_guard<std::mutex> lock(coordinator.mutex);
+    // Re-check while holding the queue mutex: ShutdownRemovalCoordinator
+    // stops accepting first and only then swaps the queue under this same
+    // mutex, so a request appended here is guaranteed to be failed by that
+    // swap instead of waiting out the timeout.
+    if (!coordinator.accepting) {
+      if (detail) *detail = "the automount service is stopping";
+      return false;
+    }
+    coordinator.requests.push_back(request);
+  }
+  if (HANDLE wake = coordinator.wake_handle()) SetEvent(wake);
+  const DWORD finished = WaitForSingleObject(
+      static_cast<HANDLE>(request->done.get()), kRemovalReleaseTimeoutMs);
+  if (finished != WAIT_OBJECT_0) {
+    // Withdraw the request so the worker never acts on it after the device
+    // stack has already abandoned the removal; the engine keeps the mount.
+    std::lock_guard<std::mutex> lock(coordinator.mutex);
+    auto& queue = coordinator.requests;
+    queue.erase(std::remove(queue.begin(), queue.end(), request), queue.end());
+    if (detail) {
+      *detail = finished == WAIT_TIMEOUT
+                    ? "the filesystem release did not finish in time"
+                    : "the release handshake was abandoned";
+    }
+    return false;
+  }
+  if (!request->released && detail) *detail = request->detail;
+  return request->released;
+}
+
+// Called on the service worker thread just before it stops the engine.  A
+// removal callback may be waiting for a release that will now never happen;
+// refusing new handshakes and failing the queued ones keeps the service stop
+// from waiting out the callback timeout.
+void ShutdownRemovalCoordinator(RemovalCoordinator* coordinator) {
+  if (!coordinator) return;
+  {
+    std::lock_guard<std::mutex> gate(coordinator->callback_mutex);
+    coordinator->accepting = false;
+  }
+  std::vector<std::shared_ptr<RemovalReleaseRequest>> pending;
+  {
+    std::lock_guard<std::mutex> lock(coordinator->mutex);
+    pending.swap(coordinator->requests);
+  }
+  for (const auto& request : pending) {
+    request->released = false;
+    request->detail = "the automount service is stopping";
+    SetEvent(static_cast<HANDLE>(request->done.get()));
+  }
+}
+
+// Runs on the service worker thread, which owns the engine.
+void ProcessRemovalReleases(ServiceRuntime& runtime) {
+  std::vector<std::shared_ptr<RemovalReleaseRequest>> batch;
+  {
+    std::lock_guard<std::mutex> lock(runtime.removal->mutex);
+    batch.swap(runtime.removal->requests);
+  }
+  for (const auto& request : batch) {
+    // A release that was already in place (CLI eject, or an earlier tray
+    // attempt) is durable on its own terms: only the release this handshake
+    // actually performs is provisional and expires if Windows abandons it.
+    const bool already_suspended = runtime.engine->IsSuspended(request->uuid);
+    std::string detail;
+    const bool released =
+        runtime.engine->Eject(request->uuid, AutomountClock::now(), &detail);
+    AutomountLogRecord record;
+    record.level = released ? AutomountLogLevel::kInfo : AutomountLogLevel::kWarn;
+    record.event = "device-removal";
+    record.uuid = FormatUuid(request->uuid);
+    record.result = released ? "released" : "refused";
+    record.detail = released ? "released for the requested device removal"
+                             : detail;
+    runtime.platform->EmitLog(record);
+    request->released = released;
+    request->detail = detail;
+    if (released && request->for_device_removal && !already_suspended) {
+      // Provisional until Windows proves the device really left.  A user who
+      // cancels Safely Remove Hardware (or another handle owner that vetoes)
+      // would otherwise leave the filesystem unmounted forever.
+      runtime.pending_device_removals.push_back(
+          ServiceRuntime::PendingDeviceRemoval{
+              request->uuid,
+              AutomountClock::now() +
+                  std::chrono::seconds(kRemovalGraceSeconds)});
+    }
+    SetEvent(static_cast<HANDLE>(request->done.get()));
+  }
+  if (!batch.empty()) {
+    runtime.engine->Tick(AutomountClock::now());
+    runtime.PublishRuntimeStatus();
+  }
+}
+
+// True when the engine's latest discovery pass still sees the filesystem.
+// That is exactly the evidence the engine's own suspension rule uses, so the
+// service never resumes a mount the engine would refuse.  An incomplete pass
+// is not evidence of removal and keeps the release in place.
+bool DeviceIdentityStillAttached(ServiceRuntime& runtime, const Uuid& uuid) {
+  const AutomountStatus& status = runtime.engine->status();
+  if (status.discovery_incomplete) return true;
+  for (const auto& filesystem : status.discovered) {
+    if (UuidEqual(filesystem.probe.superblock.uuid, uuid)) return true;
+  }
+  return false;
+}
+
+// Gives back a release that Windows never completed: the device is still
+// attached after the grace period, so the removal was abandoned.
+void ExpireProvisionalReleases(ServiceRuntime& runtime) {
+  if (runtime.pending_device_removals.empty()) return;
+  const AutomountTimePoint now = AutomountClock::now();
+  for (auto it = runtime.pending_device_removals.begin();
+       it != runtime.pending_device_removals.end();) {
+    if (now < it->deadline) {
+      ++it;
+      continue;
+    }
+    const Uuid uuid = it->uuid;
+    it = runtime.pending_device_removals.erase(it);
+    const bool still_attached = DeviceIdentityStillAttached(
+        runtime, uuid);
+    if (!still_attached) continue;
+    if (runtime.engine->CancelEject(uuid, now)) {
+      AutomountLogRecord record;
+      record.level = AutomountLogLevel::kInfo;
+      record.event = "device-removal";
+      record.uuid = FormatUuid(uuid);
+      record.result = "cancelled";
+      record.detail =
+          "the device is still attached; the filesystem is mounted again";
+      runtime.platform->EmitLog(record);
+    }
+  }
 }
 
 DWORD WaitTimeoutFor(std::optional<AutomountTimePoint> next,
@@ -1072,9 +1517,11 @@ DWORD WaitTimeoutFor(std::optional<AutomountTimePoint> next,
 }
 
 void WorkerMain(ServiceRuntime& runtime) {
-  enum class WakeKind : uint8_t { kStop, kDevice, kConfig };
+  enum class WakeKind : uint8_t { kStop, kDevice, kConfig, kRemoval };
   while (true) {
     ProcessEjectRequests(runtime);
+    ProcessRemovalReleases(runtime);
+    ExpireProvisionalReleases(runtime);
     runtime.engine->Tick(AutomountClock::now());
     runtime.PublishRuntimeStatus();
     const AutomountTimePoint now = AutomountClock::now();
@@ -1087,9 +1534,13 @@ void WorkerMain(ServiceRuntime& runtime) {
                                 request_error)) {
       timeout = std::min<DWORD>(timeout, 250);
     }
+    for (const auto& pending : runtime.pending_device_removals) {
+      timeout = std::min<DWORD>(
+          timeout, WaitTimeoutFor(pending.deadline, AutomountClock::now()));
+    }
 
-    HANDLE handles[3] = {};
-    WakeKind kinds[3] = {};
+    HANDLE handles[4] = {};
+    WakeKind kinds[4] = {};
     DWORD count = 0;
     handles[count] = runtime.stop_event;
     kinds[count++] = WakeKind::kStop;
@@ -1100,6 +1551,10 @@ void WorkerMain(ServiceRuntime& runtime) {
     if (runtime.config_notify) {
       handles[count] = runtime.config_notify;
       kinds[count++] = WakeKind::kConfig;
+    }
+    if (runtime.removal && runtime.removal->wake_handle()) {
+      handles[count] = runtime.removal->wake_handle();
+      kinds[count++] = WakeKind::kRemoval;
     }
 
     const DWORD wake =
@@ -1138,8 +1593,14 @@ void WorkerMain(ServiceRuntime& runtime) {
         runtime.platform->EmitLog(record);
       }
       runtime.engine->NotifySettingsChanged(event_time);
+    } else if (kind == WakeKind::kRemoval) {
+      // The release queue is consumed at the top of the loop; the device
+      // removal itself is not a mount change the engine has to reconcile,
+      // because the ejection suspends the entry.
+      ResetEvent(runtime.removal->wake_handle());
     }
   }
+  ShutdownRemovalCoordinator(runtime.removal.get());
   runtime.stop_report = runtime.engine->Stop(AutomountClock::now());
   runtime.PublishRuntimeStatus();
 }
@@ -1165,6 +1626,18 @@ NTSTATUS OnServiceStart(FSP_SERVICE* service, ULONG, PWSTR*) {
   }
 
   runtime->platform = std::make_unique<WindowsAutomountPlatform>();
+  runtime->removal = std::make_shared<RemovalCoordinator>();
+  runtime->removal->wake = CreateSharedEvent();
+  runtime->platform->SetRemovalCoordinator(runtime->removal);
+  if (!runtime->removal->wake) {
+    // Without the wake event a queued release would only be picked up at the
+    // next timed wake.  Refuse to start rather than hand Windows a veto it
+    // cannot recover from.
+    ServiceLog(EVENTLOG_ERROR_TYPE,
+               L"XFS automount: cannot create the device-removal wake event: " +
+                   Win32ErrorText(GetLastError()));
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
   AutomountSettings settings;
   runtime->engine = std::make_unique<AutomountEngine>(*runtime->platform,
                                                      settings);
@@ -1791,11 +2264,36 @@ Status RequestAutomountEject(const Uuid& fs_uuid, std::string* detail) {
   }
   const size_t tab = text.find('\t');
   const bool ok = text.rfind("ok\t", 0) == 0;
-  const std::string message =
+  std::string message =
       tab == std::string::npos ? text : text.substr(tab + 1);
+  // The service appends the released device identity after the message so the
+  // caller can finish the eject; strip it before reporting to the user.
+  std::string stable_id;
+  const size_t second = message.find('\t');
+  if (second != std::string::npos) {
+    stable_id = message.substr(second + 1);
+    message = message.substr(0, second);
+  }
   if (detail) *detail = message;
   if (!ok) {
     return XFS_ERR(XfsError::kIoError, message).Metadata("automount-eject");
+  }
+  if (stable_id.empty()) return OkStatus();
+  // Complete the hardware removal.  The filesystem is released and every
+  // handle is closed, so Windows has nothing left to veto.  A missing or
+  // non-removable device is not a release failure: report it in the message
+  // and keep the release result.
+  bool attempted = false;
+  std::string eject_detail;
+  const Status ejected =
+      EjectRemovableDiskDevice(stable_id, &attempted, &eject_detail);
+  if (detail) {
+    *detail = message;
+    if (attempted) {
+      *detail += ejected.ok() ? "; " + eject_detail
+                              : "; the device could not be ejected: " +
+                                    eject_detail;
+    }
   }
   return OkStatus();
 }
@@ -1875,15 +2373,17 @@ bool DiskHandleMatchesStableId(HANDLE disk, const GUID& expected) {
 #endif
 }
 
-}  // namespace
-
-Status SetDiskRemovalPolicy(const std::string& stable_id,
-                            bool better_performance, std::string* detail) {
+// Binds a DEV-1 stable id (the storage GUID text form) to exactly one attached
+// disk device node.  The disk itself is opened with zero access and shared,
+// which is the same authority discovery uses; guessing from serial numbers or
+// disk numbers would bind the wrong device.
+Status FindDiskDevNode(const std::string& stable_id, DEVINST* devnode,
+                       const char* metadata) {
   GUID expected{};
   if (!ParseStableGuid(stable_id, &expected)) {
     return XFS_ERR(XfsError::kInvalidArgument,
                    "the device identity is not a storage GUID")
-        .Metadata("removal-policy");
+        .Metadata(metadata);
   }
   ULONG list_size = 0;
   CONFIGRET cr = CM_Get_Device_Interface_List_SizeW(
@@ -1892,7 +2392,7 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
   if (cr != CR_SUCCESS || list_size == 0) {
     return XFS_ERR(XfsError::kNotFound,
                    "no disk devices are currently attached")
-        .Metadata("removal-policy");
+        .Metadata(metadata);
   }
   std::wstring symlinks(list_size, L'\0');
   cr = CM_Get_Device_Interface_ListW(
@@ -1902,12 +2402,8 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
     return XFS_ERR(XfsError::kIoError,
                    "cannot enumerate disk devices (cfgmgr32 error " +
                        std::to_string(static_cast<int>(cr)) + ")")
-        .Metadata("removal-policy");
+        .Metadata(metadata);
   }
-  // Bind the stable-id GUID to exactly one live disk devnode.  Opening the
-  // disk itself (zero access, shared) is the same authority discovery uses and
-  // avoids guessing from serial numbers or disk numbers.  An ambiguous match
-  // is refused rather than changing another disk's policy.
   std::wstring target_symlink;
   int matches = 0;
   for (const wchar_t* p = symlinks.data(); *p != L'\0';
@@ -1925,41 +2421,72 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
       return XFS_ERR(XfsError::kAlreadyExists,
                      "several attached disks match the device identity " +
                          stable_id)
-          .Metadata("removal-policy");
+          .Metadata(metadata);
     }
     target_symlink = symlink;
   }
   if (target_symlink.empty()) {
     return XFS_ERR(XfsError::kNotFound,
                    "no attached disk matches the device identity " + stable_id)
-        .Metadata("removal-policy");
+        .Metadata(metadata);
   }
-  const std::string target_instance =
-      DeviceInstanceIdOfDiskInterface(target_symlink);
-  if (target_instance.empty()) {
+  const std::string instance = DeviceInstanceIdOfDiskInterface(target_symlink);
+  if (instance.empty()) {
     return XFS_ERR(XfsError::kIoError,
                    "the matching disk has no PnP device instance")
-        .Metadata("removal-policy");
+        .Metadata(metadata);
   }
-  const std::wstring target_instance_wide = Utf8ToWide(target_instance);
-  DEVINST devnode = 0;
-  cr = CM_Locate_DevNodeW(&devnode,
-                          const_cast<DEVINSTID_W>(target_instance_wide.c_str()),
+  const std::wstring instance_wide = Utf8ToWide(instance);
+  cr = CM_Locate_DevNodeW(devnode,
+                          const_cast<DEVINSTID_W>(instance_wide.c_str()),
                           CM_LOCATE_DEVNODE_NORMAL);
   if (cr != CR_SUCCESS) {
     return XFS_ERR(XfsError::kIoError,
-                   "cannot locate the device node for " + target_instance)
-        .Metadata("removal-policy");
+                   "cannot locate the device node for " + instance)
+        .Metadata(metadata);
   }
+  return OkStatus();
+}
+
+// The nearest ancestor (including `devnode`) that Windows may eject.  A USB
+// bridge commonly reports the disk node as a fixed device, in which case only
+// the USB device node above it is removable — and that is the node Safely
+// Remove Hardware removes.
+Status FindEjectableDevNode(DEVINST devnode, DEVINST* ejectable) {
+  for (DEVINST current = devnode; current != 0;) {
+    ULONG capabilities = 0;
+    ULONG size = sizeof(capabilities);
+    const CONFIGRET caps = CM_Get_DevNode_Registry_PropertyW(
+        current, CM_DRP_CAPABILITIES, nullptr,
+        reinterpret_cast<PBYTE>(&capabilities), &size, 0);
+    if (caps == CR_SUCCESS && (capabilities & CM_DEVCAP_REMOVABLE) != 0) {
+      *ejectable = current;
+      return OkStatus();
+    }
+    DEVINST parent = 0;
+    if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS || parent == 0) break;
+    current = parent;
+  }
+  // Not removable: a fixed disk has nothing to eject, and saying so is not an
+  // error the caller should report as a failure.
+  return XFS_ERR(XfsError::kNotFound,
+                 "the device is not removable and cannot be ejected")
+      .Metadata("device-eject");
+}
+
+// Applies the removal-policy override to one devnode.  `compare` is what the
+// tray shows and what the service's own eject request targets, so the setting
+// goes on both the disk node and its removable ancestor.
+CONFIGRET ApplyRemovalPolicy(DEVINST devnode, bool better_performance) {
   const DEVPROPKEY* key = &DEVPKEY_Device_RemovalPolicyOverride;
+  CONFIGRET cr = CR_SUCCESS;
   if (better_performance) {
     // CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL: write caching is enabled and
     // the device shows up in Safely Remove Hardware.
-    const UINT32 orderly = CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL;
-    cr = CM_Set_DevNode_PropertyW(
-        devnode, key, DEVPROP_TYPE_UINT32,
-        reinterpret_cast<PBYTE>(const_cast<UINT32*>(&orderly)), sizeof(orderly),
-        0);
+    UINT32 orderly = CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL;
+    cr = CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_UINT32,
+                                  reinterpret_cast<PBYTE>(&orderly),
+                                  sizeof(orderly), 0);
   } else {
     // A null buffer with DEVPROP_TYPE_EMPTY deletes the property; passing the
     // value type with a zero-length buffer is rejected with CR_INVALID_DATA.
@@ -1968,6 +2495,64 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
     if (cr == CR_NO_SUCH_VALUE || cr == CR_INVALID_PROPERTY ||
         cr == CR_NO_SUCH_DEVICE_INTERFACE) {
       cr = CR_SUCCESS;
+    }
+  }
+  return cr;
+}
+
+// The removal policy alone does not put a device into the taskbar's Safely
+// Remove Hardware list: Windows' default Quick removal marks the device
+// instance CM_DEVCAP_SURPRISEREMOVALOK, and PnP then reports
+// DEVPKEY_Device_SafeRemovalRequired as FALSE, so the tray offers nothing.
+// DEVPKEY_Device_SafeRemovalRequiredOverride is the documented switch that
+// makes PnP skip that heuristic for a removable instance.  xfswin needs the
+// tray entry because the filesystem behind the disk must still be released
+// through the service's DEVICEQUERYREMOVE handshake before the removal.
+CONFIGRET ApplySafeRemovalOverride(DEVINST devnode, bool required) {
+  const DEVPROPKEY* key = &DEVPKEY_Device_SafeRemovalRequiredOverride;
+  if (required) {
+    DEVPROP_BOOLEAN value = DEVPROP_TRUE;
+    return CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_BOOLEAN,
+                                    reinterpret_cast<PBYTE>(&value),
+                                    sizeof(value), 0);
+  }
+  CONFIGRET cr =
+      CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_EMPTY, nullptr, 0, 0);
+  if (cr == CR_NO_SUCH_VALUE || cr == CR_INVALID_PROPERTY ||
+      cr == CR_NO_SUCH_DEVICE_INTERFACE) {
+    cr = CR_SUCCESS;
+  }
+  return cr;
+}
+
+}  // namespace
+
+Status SetDiskRemovalPolicy(const std::string& stable_id,
+                            bool better_performance, std::string* detail) {
+  DEVINST devnode = 0;
+  const Status found =
+      FindDiskDevNode(stable_id, &devnode, "removal-policy");
+  if (!found.ok()) return found;
+  CONFIGRET cr = ApplyRemovalPolicy(devnode, better_performance);
+  CONFIGRET override_cr = CR_SUCCESS;
+  if (cr == CR_SUCCESS) {
+    override_cr = ApplySafeRemovalOverride(devnode, better_performance);
+  }
+  CONFIGRET ancestor_cr = CR_SUCCESS;
+  CONFIGRET ancestor_override_cr = CR_SUCCESS;
+  bool has_ancestor = false;
+  if (cr == CR_SUCCESS) {
+    // The disk node of a USB bridge is reported as a fixed device, which
+    // Safely Remove Hardware does not list.  The removable node above it is
+    // what the tray offers (and what this service ejects), so it carries the
+    // same setting.  Failing to set it never fails the disk's own policy: a
+    // non-removable disk simply has no ancestor to update.
+    DEVINST ejectable = 0;
+    if (FindEjectableDevNode(devnode, &ejectable).ok() && ejectable != devnode) {
+      has_ancestor = true;
+      ancestor_cr = ApplyRemovalPolicy(ejectable, better_performance);
+      ancestor_override_cr =
+          ApplySafeRemovalOverride(ejectable, better_performance);
     }
   }
   if (cr != CR_SUCCESS) {
@@ -1986,8 +2571,88 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
                     "for the setting to take effect"
                   : "the disk now uses the default (Quick removal) policy; "
                     "reinsert the device for the setting to take effect";
+    // The tray entry is the point of the override: report when a write that
+    // makes the device appear there did not take effect, instead of promising
+    // a tray entry that Windows will not show.
+    std::vector<std::pair<const char*, CONFIGRET>> failures;
+    if (override_cr != CR_SUCCESS) {
+      failures.emplace_back("the disk device", override_cr);
+    }
+    if (has_ancestor && ancestor_cr != CR_SUCCESS) {
+      failures.emplace_back("the removable device", ancestor_cr);
+    }
+    if (has_ancestor && ancestor_override_cr != CR_SUCCESS) {
+      failures.emplace_back("the removable device", ancestor_override_cr);
+    }
+    if (!failures.empty()) {
+      *detail += "; ";
+      bool first = true;
+      for (const auto& failure : failures) {
+        if (!first) *detail += ", ";
+        first = false;
+        *detail += std::string(failure.first) +
+                   " could not be updated (cfgmgr32 error " +
+                   std::to_string(static_cast<int>(failure.second)) + ")";
+      }
+      *detail +=
+          ", so the device may still be absent from Safely Remove Hardware";
+    }
   }
   return OkStatus();
+}
+
+// Ejects the removable device that carries |stable_id| through cfgmgr32.  The
+// service has already released the filesystem when this runs, so Windows only
+// has to take the device off the bus.  A fixed disk, an unknown identity or a
+// device that is already gone is reported through `attempted` instead of as a
+// failure: there is nothing to eject.
+Status EjectRemovableDiskDevice(const std::string& stable_id, bool* attempted,
+                                std::string* detail) {
+  if (attempted) *attempted = false;
+  DEVINST devnode = 0;
+  const Status found = FindDiskDevNode(stable_id, &devnode, "device-eject");
+  if (!found.ok()) {
+    if (found.error().code == XfsError::kNotFound) return OkStatus();
+    return found;
+  }
+  DEVINST ejectable = 0;
+  const Status removable = FindEjectableDevNode(devnode, &ejectable);
+  if (!removable.ok()) {
+    if (removable.error().code == XfsError::kNotFound) {
+      if (detail) {
+        *detail = "the device is not removable; no eject request was sent";
+      }
+      return OkStatus();
+    }
+    return removable;
+  }
+  PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
+  wchar_t veto_name[MAX_PATH + 1] = {};
+  // CM_Request_Device_Eject asks every registered handle owner (this service
+  // included) with DEVICEQUERYREMOVE first.  The service's removal
+  // notification answers it, but the filesystem is already released here, so
+  // the answer is immediate.
+  const CONFIGRET cr = CM_Request_Device_EjectW(
+      ejectable, &veto, veto_name, static_cast<ULONG>(std::size(veto_name)),
+      0);
+  if (attempted) *attempted = true;
+  if (cr == CR_SUCCESS) {
+    if (detail) *detail = "the device was ejected";
+    return OkStatus();
+  }
+  std::string reason =
+      "Windows refused the eject request (cfgmgr32 error " +
+      std::to_string(static_cast<int>(cr));
+  if (veto != PNP_VetoTypeUnknown) {
+    reason += ", veto " + std::to_string(static_cast<int>(veto));
+    if (veto_name[0] != L'\0') reason += " " + WideToUtf8(veto_name);
+  }
+  reason += ")";
+  if (detail) *detail = reason;
+  return XFS_ERR(cr == CR_ACCESS_DENIED ? XfsError::kPermissionDenied
+                                        : XfsError::kIoError,
+                 reason)
+      .Metadata("device-eject");
 }
 
 int RunAutomountService() {

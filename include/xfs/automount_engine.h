@@ -231,6 +231,11 @@ class AutomountEngine {
   // device has been removed and inserted again.  Returns false when the UUID
   // is not an enabled automount entry; `detail` receives the reason.
   bool Eject(const Uuid& uuid, AutomountTimePoint now, std::string* detail);
+  // Undoes a release whose device removal was abandoned (Windows answered
+  // QUERYREMOVEFAILED, or the user cancelled Safely Remove Hardware): forgets
+  // the suspension so the entry mounts again at the next reconciliation.
+  // Returns false when the UUID was not suspended.
+  bool CancelEject(const Uuid& uuid, AutomountTimePoint now);
 
   // Runs all work that is due at `now` (debounced device pass, periodic
   // reconciliation, retry).  Safe to call as often as the service loop wakes.
