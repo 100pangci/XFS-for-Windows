@@ -752,8 +752,8 @@ class TreeEditor {
           .Ino(ino_)
           .Metadata("attr leaf");
     }
-    WorkingLeaf& leaf = leaves_.at(logical);
-    const std::vector<XattrEntry> all = leaf.entries;
+    const WorkingLeaf old = leaves_.at(logical);
+    const std::vector<XattrEntry>& all = old.entries;
     size_t best = 0;
     size_t best_imbalance = SIZE_MAX;
     bool found = false;
@@ -774,57 +774,103 @@ class TreeEditor {
         best_imbalance = imbalance;
       }
     }
-    if (!found) {
+    // A large local attribute can make every two-way split invalid when it
+    // sits between enough entries on both sides. Linux handles this by
+    // splitting the new leaf again, producing three consecutive leaves.
+    std::vector<size_t> cuts{0};
+    if (found) {
+      cuts.push_back(best);
+      cuts.push_back(all.size());
+    } else {
+      size_t bytes = kLeafHeader;
+      for (size_t i = 0; i < all.size(); ++i) {
+        const size_t entry_bytes =
+            EntrySize(all[i]) + kAttrLeafEntrySize;
+        if (bytes + entry_bytes > geo_.block_size) {
+          if (i == cuts.back()) {
+            return XFS_ERR(XfsError::kNoSpace,
+                           "attr leaf cannot be split into two valid leaves")
+                .Ino(ino_)
+                .Metadata("attr leaf");
+          }
+          cuts.push_back(i);
+          bytes = kLeafHeader;
+        }
+        bytes += entry_bytes;
+      }
+      cuts.push_back(all.size());
+      if (cuts.size() > 4) {
+        return XFS_ERR(XfsError::kNoSpace,
+                       "attr leaf cannot be split into two valid leaves")
+            .Ino(ino_)
+            .Metadata("attr leaf");
+      }
+    }
+    const size_t leaf_count = cuts.size() - 1;
+    if (leaf_count < 2) {
       return XFS_ERR(XfsError::kNoSpace,
                      "attr leaf cannot be split into two valid leaves")
           .Ino(ino_)
           .Metadata("attr leaf");
     }
-    WorkingLeaf& old = leaves_.at(logical);
-    std::vector<XattrEntry> lower(all.begin(), all.begin() + best);
-    std::vector<XattrEntry> upper(all.begin() + best, all.end());
+    std::vector<uint32_t> logicals(leaf_count);
+    logicals[0] = logical;
+    for (size_t i = 1; i < leaf_count; ++i) {
+      uint64_t fsb = 0;
+      Status s = blocks_->AllocateRun(1, &logicals[i], &fsb);
+      if (!s.ok()) return s;
+    }
 
-    uint32_t new_logical = 0;
-    uint64_t new_fsb = 0;
-    Status s = blocks_->AllocateRun(1, &new_logical, &new_fsb);
-    if (!s.ok()) return s;
-    (void)new_fsb;
-    WorkingLeaf new_leaf;
-    new_leaf.logical = new_logical;
-    new_leaf.forw = old.forw;
-    new_leaf.back = old.logical;
-    new_leaf.entries = std::move(upper);
-    new_leaf.dirty = true;
-    const uint32_t old_forw = old.forw;
-    old.entries = std::move(lower);
-    old.forw = new_logical;
-    old.dirty = true;
-    if (old_forw != 0) {
-      auto next = leaves_.find(old_forw);
+    std::vector<WorkingLeaf> split_leaves;
+    split_leaves.reserve(leaf_count);
+    for (size_t i = 0; i < leaf_count; ++i) {
+      WorkingLeaf split;
+      split.logical = logicals[i];
+      split.back = i == 0 ? old.back : logicals[i - 1];
+      split.forw = i + 1 == leaf_count ? old.forw : logicals[i + 1];
+      split.entries.assign(
+          all.begin() + static_cast<ptrdiff_t>(cuts[i]),
+          all.begin() + static_cast<ptrdiff_t>(cuts[i + 1]));
+      split.dirty = true;
+      split_leaves.push_back(std::move(split));
+    }
+
+    if (old.forw != 0) {
+      auto next = leaves_.find(old.forw);
       if (next == leaves_.end()) {
         return XFS_ERR(XfsError::kCorruptBtree,
                        "attr leaf forward link is invalid")
             .Ino(ino_)
             .Metadata("attr leaf")
-            .Actual(old_forw);
+            .Actual(old.forw);
       }
-      next->second.back = new_logical;
+      next->second.back = logicals.back();
       next->second.dirty = true;
     }
-    const uint32_t upper_hash = LastHash(new_leaf.entries);
-    leaves_.emplace(new_logical, std::move(new_leaf));
+    leaves_.at(logical) = std::move(split_leaves[0]);
+    for (size_t i = 1; i < leaf_count; ++i) {
+      leaves_.emplace(logicals[i], std::move(split_leaves[i]));
+    }
 
+    std::vector<NodeEditEntry> inserted;
+    inserted.reserve(leaf_count - 1);
+    for (size_t i = 1; i < leaf_count; ++i) {
+      inserted.push_back(
+          {LastHash(leaves_.at(logicals[i]).entries), logicals[i]});
+    }
     WorkingNode& pnode = nodes_.at(parent);
-    NodeEditEntry inserted{upper_hash, new_logical};
-    pnode.entries.insert(pnode.entries.begin() +
-                             static_cast<ptrdiff_t>(parent_index + 1),
-                         inserted);
+    pnode.entries.insert(
+        pnode.entries.begin() + static_cast<ptrdiff_t>(parent_index + 1),
+        inserted.begin(), inserted.end());
     pnode.dirty = true;
-    s = UpdateKeys(old.logical);
+
+    Status s = UpdateKeys(logical);
     if (!s.ok()) return s;
-    s = UpdateKeys(new_logical);
-    if (!s.ok()) return s;
-    if (pnode.entries.size() > NodeMaxRecs(geo_.block_size)) {
+    for (size_t i = 1; i < leaf_count; ++i) {
+      s = UpdateKeys(logicals[i]);
+      if (!s.ok()) return s;
+    }
+    if (nodes_.at(parent).entries.size() > NodeMaxRecs(geo_.block_size)) {
       return SplitNode(parent);
     }
     return OkStatus();
