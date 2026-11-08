@@ -2500,6 +2500,31 @@ CONFIGRET ApplyRemovalPolicy(DEVINST devnode, bool better_performance) {
   return cr;
 }
 
+// The removal policy alone does not put a device into the taskbar's Safely
+// Remove Hardware list: Windows' default Quick removal marks the device
+// instance CM_DEVCAP_SURPRISEREMOVALOK, and PnP then reports
+// DEVPKEY_Device_SafeRemovalRequired as FALSE, so the tray offers nothing.
+// DEVPKEY_Device_SafeRemovalRequiredOverride is the documented switch that
+// makes PnP skip that heuristic for a removable instance.  xfswin needs the
+// tray entry because the filesystem behind the disk must still be released
+// through the service's DEVICEQUERYREMOVE handshake before the removal.
+CONFIGRET ApplySafeRemovalOverride(DEVINST devnode, bool required) {
+  const DEVPROPKEY* key = &DEVPKEY_Device_SafeRemovalRequiredOverride;
+  if (required) {
+    DEVPROP_BOOLEAN value = DEVPROP_TRUE;
+    return CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_BOOLEAN,
+                                    reinterpret_cast<PBYTE>(&value),
+                                    sizeof(value), 0);
+  }
+  CONFIGRET cr =
+      CM_Set_DevNode_PropertyW(devnode, key, DEVPROP_TYPE_EMPTY, nullptr, 0, 0);
+  if (cr == CR_NO_SUCH_VALUE || cr == CR_INVALID_PROPERTY ||
+      cr == CR_NO_SUCH_DEVICE_INTERFACE) {
+    cr = CR_SUCCESS;
+  }
+  return cr;
+}
+
 }  // namespace
 
 Status SetDiskRemovalPolicy(const std::string& stable_id,
@@ -2509,7 +2534,12 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
       FindDiskDevNode(stable_id, &devnode, "removal-policy");
   if (!found.ok()) return found;
   CONFIGRET cr = ApplyRemovalPolicy(devnode, better_performance);
+  CONFIGRET override_cr = CR_SUCCESS;
+  if (cr == CR_SUCCESS) {
+    override_cr = ApplySafeRemovalOverride(devnode, better_performance);
+  }
   CONFIGRET ancestor_cr = CR_SUCCESS;
+  CONFIGRET ancestor_override_cr = CR_SUCCESS;
   bool has_ancestor = false;
   if (cr == CR_SUCCESS) {
     // The disk node of a USB bridge is reported as a fixed device, which
@@ -2521,6 +2551,8 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
     if (FindEjectableDevNode(devnode, &ejectable).ok() && ejectable != devnode) {
       has_ancestor = true;
       ancestor_cr = ApplyRemovalPolicy(ejectable, better_performance);
+      ancestor_override_cr =
+          ApplySafeRemovalOverride(ejectable, better_performance);
     }
   }
   if (cr != CR_SUCCESS) {
@@ -2539,14 +2571,31 @@ Status SetDiskRemovalPolicy(const std::string& stable_id,
                     "for the setting to take effect"
                   : "the disk now uses the default (Quick removal) policy; "
                     "reinsert the device for the setting to take effect";
+    // The tray entry is the point of the override: report when a write that
+    // makes the device appear there did not take effect, instead of promising
+    // a tray entry that Windows will not show.
+    std::vector<std::pair<const char*, CONFIGRET>> failures;
+    if (override_cr != CR_SUCCESS) {
+      failures.emplace_back("the disk device", override_cr);
+    }
     if (has_ancestor && ancestor_cr != CR_SUCCESS) {
-      // The tray lists the removable ancestor, not the disk node.  Say so
-      // instead of promising a tray entry that was not updated.
-      *detail += "; the removable device node could not be updated (cfgmgr32 "
-                 "error " +
-                 std::to_string(static_cast<int>(ancestor_cr)) +
-                 "), so the device may still be absent from Safely Remove "
-                 "Hardware";
+      failures.emplace_back("the removable device", ancestor_cr);
+    }
+    if (has_ancestor && ancestor_override_cr != CR_SUCCESS) {
+      failures.emplace_back("the removable device", ancestor_override_cr);
+    }
+    if (!failures.empty()) {
+      *detail += "; ";
+      bool first = true;
+      for (const auto& failure : failures) {
+        if (!first) *detail += ", ";
+        first = false;
+        *detail += std::string(failure.first) +
+                   " could not be updated (cfgmgr32 error " +
+                   std::to_string(static_cast<int>(failure.second)) + ")";
+      }
+      *detail +=
+          ", so the device may still be absent from Safely Remove Hardware";
     }
   }
   return OkStatus();
