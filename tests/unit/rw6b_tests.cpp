@@ -559,6 +559,94 @@ TEST(rw6b_rmap_editor_merges_across_interleaved_owner) {
   CHECK(tree.value().LookupEq(RmapKey{42, shared, 0, 0}).ok());
 }
 
+TEST(rw6b_rmap_editor_unmap_and_convert_across_interleaved_owner) {
+  WritableRmap image = BuildWritableRmap();
+  auto editor = LoadEditor(&image);
+  const uint64_t ino = image.rootino;
+  const uint64_t shared = ino + 1;
+
+  CHECK(editor->MapExtent(0, DataRec(ino, 28, 35, 0)).ok());
+  CHECK(editor->MapExtent(0, DataRec(shared, 42, 3, 0)).ok());
+
+  // Trim the long record after the shorter shared record in reverse key order.
+  CHECK(editor->UnmapExtent(0, RmapKey{56, ino, 28, 0}, 7).ok());
+  auto trimmed = editor->LookupEq(0, RmapKey{28, ino, 0, 0});
+  auto shared_rec = editor->LookupEq(0, RmapKey{42, shared, 0, 0});
+  CHECK(trimmed.ok() && shared_rec.ok());
+  CHECK_EQ(trimmed.value().blockcount, 28u);
+  CHECK_EQ(shared_rec.value().blockcount, 3u);
+  CHECK(!editor->LookupEq(0, RmapKey{56, ino, 28, 0}).ok());
+
+  // Convert a written range beyond the short record, then verify both sides
+  // of the split and that the overlapping written owner remains untouched.
+  CHECK(editor->ConvertExtent(0, RmapKey{50, ino, 22, 0}, 4, false).ok());
+  auto left = editor->LookupEq(0, RmapKey{28, ino, 0, 0});
+  auto middle = editor->LookupEq(0, RmapKey{50, ino, 22, kRmapUnwritten});
+  auto right = editor->LookupEq(0, RmapKey{54, ino, 26, 0});
+  shared_rec = editor->LookupEq(0, RmapKey{42, shared, 0, 0});
+  CHECK(left.ok() && middle.ok() && right.ok() && shared_rec.ok());
+  CHECK_EQ(left.value().blockcount, 22u);
+  CHECK_EQ(middle.value().blockcount, 4u);
+  CHECK_EQ(right.value().blockcount, 2u);
+  CHECK(!left.value().unwritten());
+  CHECK(middle.value().unwritten());
+  CHECK(!right.value().unwritten());
+  CHECK_EQ(shared_rec.value().blockcount, 3u);
+
+  Republish(&image, editor.get());
+  auto converted_tree = LoadRmapTree(*image.device, image.geo, 0);
+  CHECK(converted_tree.ok());
+  auto persisted_middle =
+      converted_tree.value().LookupEq(RmapKey{50, ino, 22, kRmapUnwritten});
+  auto persisted_shared =
+      converted_tree.value().LookupEq(RmapKey{42, shared, 0, 0});
+  CHECK(persisted_middle.ok() && persisted_shared.ok());
+  CHECK_EQ(persisted_middle.value().blockcount, 4u);
+  CHECK_EQ(persisted_shared.value().blockcount, 3u);
+
+  // Converting back merges the original owner's fragments across the shared
+  // record without changing that record.
+  CHECK(editor->ConvertExtent(0, RmapKey{50, ino, 22, 0}, 4, true).ok());
+  auto merged = editor->LookupEq(0, RmapKey{28, ino, 0, 0});
+  shared_rec = editor->LookupEq(0, RmapKey{42, shared, 0, 0});
+  CHECK(merged.ok() && shared_rec.ok());
+  CHECK_EQ(merged.value().blockcount, 28u);
+  CHECK(!merged.value().unwritten());
+  CHECK_EQ(shared_rec.value().blockcount, 3u);
+  CHECK(!editor->LookupEq(0, RmapKey{50, ino, 22, kRmapUnwritten}).ok());
+  CHECK(!editor->LookupEq(0, RmapKey{54, ino, 26, 0}).ok());
+
+  Republish(&image, editor.get());
+  auto tree = LoadRmapTree(*image.device, image.geo, 0);
+  CHECK(tree.ok());
+  auto persisted_long = tree.value().LookupEq(RmapKey{28, ino, 0, 0});
+  auto persisted_short = tree.value().LookupEq(RmapKey{42, shared, 0, 0});
+  CHECK(persisted_long.ok() && persisted_short.ok());
+  CHECK_EQ(persisted_long.value().blockcount, 28u);
+  CHECK_EQ(persisted_short.value().blockcount, 3u);
+}
+
+TEST(rw6b_rmap_editor_unknown_unmap_across_interleaved_owner) {
+  WritableRmap image = BuildWritableRmap();
+  auto editor = LoadEditor(&image);
+  const uint64_t ino = image.rootino;
+  const uint64_t shared = ino + 1;
+
+  CHECK(editor->MapExtent(0, DataRec(ino, 28, 35, 0)).ok());
+  CHECK(editor->MapExtent(0, DataRec(shared, 42, 3, 0)).ok());
+  CHECK(editor->UnmapExtent(0, RmapKey{50, kRmapOwnerUnknown, 0, 0}, 4,
+                            true, false)
+            .ok());
+
+  auto left = editor->LookupEq(0, RmapKey{28, ino, 0, 0});
+  auto right = editor->LookupEq(0, RmapKey{54, ino, 26, 0});
+  auto shared_rec = editor->LookupEq(0, RmapKey{42, shared, 0, 0});
+  CHECK(left.ok() && right.ok() && shared_rec.ok());
+  CHECK_EQ(left.value().blockcount, 22u);
+  CHECK_EQ(right.value().blockcount, 9u);
+  CHECK_EQ(shared_rec.value().blockcount, 3u);
+}
+
 TEST(rw6b_rmap_editor_unmap_and_convert_matrix) {
   WritableRmap image = BuildWritableRmap();
   auto editor = LoadEditor(&image);

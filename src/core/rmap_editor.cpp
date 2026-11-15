@@ -513,7 +513,8 @@ class RmapEditor::Impl {
     const RmapRecord* found = nullptr;
     for (auto it = ag->records.rbegin(); it != ag->records.rend(); ++it) {
       if (it->key.startblock > key.startblock) continue;
-      if (it->EndBlock() <= key.startblock) break;
+      // Shared extents overlap: an earlier record can extend past this one.
+      if (it->EndBlock() <= key.startblock) continue;
       if (!unknown_owner) {
         if (it->key.owner != key.owner) continue;
         if ((it->key.flags & kRmapUnwritten) !=
@@ -624,7 +625,8 @@ class RmapEditor::Impl {
     const RmapRecord* found = nullptr;
     for (auto it = ag->records.rbegin(); it != ag->records.rend(); ++it) {
       if (it->key.startblock > key.startblock) continue;
-      if (it->EndBlock() <= key.startblock) break;
+      // Shared extents overlap: an earlier record can extend past this one.
+      if (it->EndBlock() <= key.startblock) continue;
       if (it->key.owner != key.owner) continue;
       if ((it->key.flags & kRmapKeyFlags) != 0) continue;
       if (it->unwritten() != old_unwritten) continue;
