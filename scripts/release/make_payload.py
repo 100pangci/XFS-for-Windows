@@ -28,10 +28,21 @@ from pathlib import Path
 
 REQUIRED_APP_FILES = {
     "xfswin.exe",
+    "xfswin-gui.exe",
     "LICENSE",
     "README.md",
     "version.json",
     "docs/INSTALL.md",
+    "THIRD-PARTY-NOTICES/WinFsp-NOTICE.md",
+    "THIRD-PARTY-NOTICES/WinFsp-LICENSE.txt",
+    "THIRD-PARTY-NOTICES/README.md",
+}
+ALLOWED_APP_FILES = REQUIRED_APP_FILES | {
+    "docs/INSTALLER.md",
+    "docs/RELEASE.md",
+    "docs/RW_STABILITY.md",
+    "docs/UX.md",
+    "docs/WINDOWS_BLOCK_DEVICE.md",
 }
 ARCHITECTURES = {"x64": 0x8664, "arm64": 0xAA64}
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
@@ -79,6 +90,9 @@ def collect_app_files(app_dir: Path) -> list[tuple[str, Path]]:
     missing = sorted(REQUIRED_APP_FILES - names)
     if missing:
         raise PayloadError(f"app payload is missing: {', '.join(missing)}")
+    unexpected = sorted(names - ALLOWED_APP_FILES)
+    if unexpected:
+        raise PayloadError(f"app payload contains unapproved files: {', '.join(unexpected)}")
     return files
 
 
@@ -127,12 +141,13 @@ def build_payload(args: argparse.Namespace) -> None:
             f"winfsp-{args.winfsp_version}.msi"
         )
     expected_machine = ARCHITECTURES[args.architecture]
-    actual_machine = pe_machine(app_dir / "xfswin.exe")
-    if actual_machine != expected_machine:
-        raise PayloadError(
-            f"xfswin.exe machine 0x{actual_machine:04x} does not match "
-            f"{args.architecture} (0x{expected_machine:04x})"
-        )
+    for executable_name in ("xfswin.exe", "xfswin-gui.exe"):
+        actual_machine = pe_machine(app_dir / executable_name)
+        if actual_machine != expected_machine:
+            raise PayloadError(
+                f"{executable_name} machine 0x{actual_machine:04x} does not match "
+                f"{args.architecture} (0x{expected_machine:04x})"
+            )
     validate_version_json(app_dir, args.version, args.git_sha, args.architecture)
     winfsp_hash = sha256_file(winfsp_msi)
     if args.winfsp_sha256 and winfsp_hash.lower() != args.winfsp_sha256.lower():

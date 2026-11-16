@@ -21,7 +21,7 @@ function Get-ReleaseFailureMessage {
 # The release manifest's shared acceptance contract.  The install and failure
 # scripts together produce exactly these cases; neither may invent a skip.
 $script:ReleaseInstallCases = @(
-    'clean-install', 'version', 'path', 'service', 'ro-mount', 'rw-smoke',
+    'clean-install', 'version', 'path', 'service', 'gui-operations', 'ro-mount', 'rw-smoke',
     'active-upgrade-refusal', 'active-service-upgrade-refusal',
     'upgrade', 'legacy-config', 'uninstall',
     'config-preservation', 'reinstall'
@@ -220,6 +220,8 @@ function Assert-ReleasePortableArchive {
         'portable ZIP is not a clean production Release build'
     Assert-Release ((Get-ReleaseZipEntrySha256 $fullPath 'xfswin.exe') -eq $Package.payload_xfswin_sha256) `
         'portable ZIP xfswin.exe does not match the package payload SHA-256'
+    Assert-Release ((Get-ReleaseZipEntrySha256 $fullPath 'xfswin-gui.exe') -eq $Package.payload_gui_sha256) `
+        'portable ZIP xfswin-gui.exe does not match the package payload SHA-256'
     return $fullPath
 }
 
@@ -263,11 +265,14 @@ function Get-ReleasePackage {
         'payload_exe_sha256', 'payload_xfswin_sha256', 'xfswin_sha256',
         'payload.xfswin.sha256', 'assets.payload_exe.sha256',
         'artifacts.xfswin.sha256', 'artifacts.payload.xfswin.sha256') 'payload xfswin.exe SHA-256').ToLowerInvariant()
+    $payloadGuiSha = (Get-ReleaseMetadataValue $metadata @(
+        'payload_gui_sha256', 'assets.payload_gui.sha256', 'payload.xfswin_gui.sha256')
+        'payload xfswin-gui.exe SHA-256').ToLowerInvariant()
     Assert-Release ($archValue -eq $Architecture) `
         "package metadata architecture '$archValue' does not match $Architecture"
     Assert-Release ($version -match '^0\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') `
         "first release metadata must identify a 0.x version, got '$version'"
-    foreach ($pair in @(@('setup', $setupSha), @('portable ZIP', $zipSha), @('payload xfswin.exe', $payloadSha))) {
+    foreach ($pair in @(@('setup', $setupSha), @('portable ZIP', $zipSha), @('payload xfswin.exe', $payloadSha), @('payload xfswin-gui.exe', $payloadGuiSha))) {
         Assert-Release ($pair[1] -match '^[0-9a-f]{64}$') `
             "package metadata has an invalid $($pair[0]) SHA-256"
     }
@@ -301,6 +306,7 @@ function Get-ReleasePackage {
         git_sha = $gitSha
         architecture = $Architecture
         payload_xfswin_sha256 = $payloadSha
+        payload_gui_sha256 = $payloadGuiSha
         portable_zip_sha256 = $zipSha
         portable_path = if ($hasPortable) { $portablePath } else { '' }
         has_portable = $hasPortable
@@ -668,6 +674,8 @@ function Get-ReleaseInstalledState {
         directory = $directory
         exe = $exePath
         exe_sha256 = Get-ReleaseSha256 $exePath
+        gui = Join-Path $directory 'xfswin-gui.exe'
+        gui_sha256 = Get-ReleaseSha256 (Join-Path $directory 'xfswin-gui.exe')
         version_path = $versionPath
         version_json = $versionInfo
         version_json_sha256 = Get-ReleaseSha256 $versionPath
@@ -1351,6 +1359,9 @@ function Read-ReleaseQualification {
     $installedExe = [string](Get-ReleaseProperty $evidence 'installed_exe_sha256')
     Assert-Release ($installedExe -eq $Package.payload_xfswin_sha256) `
         'acceptance evidence binds a different installed executable'
+    $installedGui = [string](Get-ReleaseProperty $evidence 'installed_gui_sha256')
+    Assert-Release ($installedGui -eq $Package.payload_gui_sha256) `
+        'acceptance evidence binds a different installed GUI executable'
     $metadata = Get-ReleaseProperty $evidence 'installed_metadata'
     Assert-Release ($null -ne $metadata) 'acceptance evidence has no installed_metadata'
     Assert-ReleaseInstalledMetadata $metadata $Package
@@ -1374,6 +1385,7 @@ function Write-ReleaseEvidence {
     $details = [ordered]@{}
     $installedMetadata = $null
     $installedJsonHash = ''
+    $installedGuiHash = ''
     if ($MergeExisting) {
         $existing = Read-ReleaseQualification -Path $Path -Package $Package -GitIdentity $GitIdentity
         $existingCases = Get-ReleaseProperty $existing 'cases'
@@ -1400,13 +1412,17 @@ function Write-ReleaseEvidence {
         }
         $installedMetadata = Get-ReleaseProperty $existing 'installed_metadata'
         $installedJsonHash = [string](Get-ReleaseProperty $existing 'installed_version_json_sha256')
+        $installedGuiHash = [string](Get-ReleaseProperty $existing 'installed_gui_sha256')
     } else {
         Assert-Release ($null -ne $InstalledState) `
             'new acceptance evidence requires the actual installed state'
         $installedMetadata = $InstalledState.version_json
         $installedJsonHash = $InstalledState.version_json_sha256
+        $installedGuiHash = $InstalledState.gui_sha256
         Assert-Release ($InstalledState.exe_sha256 -eq $Package.payload_xfswin_sha256) `
             'installed xfswin.exe is not the package payload'
+        Assert-Release ($installedGuiHash -eq $Package.payload_gui_sha256) `
+            'installed xfswin-gui.exe is not the package payload'
     }
     Assert-ReleaseInstalledMetadata $installedMetadata $Package
     foreach ($name in $Cases.Keys) {
@@ -1419,6 +1435,7 @@ function Write-ReleaseEvidence {
         architecture = $Package.architecture
         installer_sha256 = $Package.installer_sha256
         installed_exe_sha256 = $Package.payload_xfswin_sha256
+        installed_gui_sha256 = $installedGuiHash
         installed_metadata = $installedMetadata
         installed_version_json_sha256 = $installedJsonHash
         run_id = $GitIdentity.run_id

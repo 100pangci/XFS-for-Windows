@@ -84,6 +84,7 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
 
   RenameOutcome outcome;
   bool replaced_zero_link = false;
+  bool namespace_changed = false;
   Status status = RunTransaction([&](XfsTransaction& txn) -> Status {
     // --- resolve and validate everything before modifying anything ---
     auto src_dp = OpenInode(src_parent);
@@ -458,14 +459,23 @@ Result<XfsFilesystem::RenameOutcome> XfsFilesystem::Rename(
     if (!s.ok()) return s;
     outcome.moved_ino = moved.value().ino;
     outcome.replaced_zero_link = replaced_zero_link;
+    namespace_changed = true;
     return OkStatus();
   });
   if (!status.ok()) return status.error();
+  if (!namespace_changed) return outcome;
 
-  InvalidateCaches(CacheInvalidation::Directory(src_parent));
+  const bool kept_parent_cache =
+      dst_parent == src_parent && outcome.replaced_ino == 0 &&
+      CacheDirectoryRename(src_parent, src_name, dst_name);
+  if (!kept_parent_cache) {
+    InvalidateCaches(CacheInvalidation::Directory(src_parent));
+    if (dst_parent != src_parent) {
+      InvalidateCaches(CacheInvalidation::Directory(dst_parent));
+    }
+  }
   InvalidateCaches(CacheInvalidation::Inode(src_parent));
   if (dst_parent != src_parent) {
-    InvalidateCaches(CacheInvalidation::Directory(dst_parent));
     InvalidateCaches(CacheInvalidation::Inode(dst_parent));
   }
   if (outcome.moved_ino != 0) {

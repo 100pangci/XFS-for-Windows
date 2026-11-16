@@ -27,6 +27,9 @@ void Usage() {
       "  --steps <n>             number of operations (default 200)\n"
       "  --image <path>          image to create or recover\n"
       "  --trace <path>          human-readable operation trace\n"
+      "  --concurrent-observer read|flush run a concurrent observer (hooks build)\n"
+      "  --schedule-out <path>   record each scheduler choice before stepping\n"
+      "  --schedule-file <path>  strictly replay a recorded schedule\n"
       "  --manifest <path>       JSON semantic manifest for independent checks\n"
       "  --profile default|modern (default: modern)\n"
       "  --workload mixed|dir|xattr|alloc|enospc (default: mixed)\n"
@@ -105,6 +108,15 @@ std::string Reproducer(const char* argv0, const FuzzOptions& options,
                         Quote(options.manifest);
   if (!options.ops_file.empty()) {
     command += " --ops-file " + Quote(options.ops_file);
+  }
+  if (!options.concurrent_observer.empty()) {
+    command += " --concurrent-observer " + options.concurrent_observer;
+  }
+  if (!options.schedule_out.empty()) {
+    command += " --schedule-out " + Quote(options.schedule_out);
+  }
+  if (!options.schedule_file.empty()) {
+    command += " --schedule-file " + Quote(options.schedule_file);
   }
   if (options.crash_op) {
     command += " --crash-op " + std::to_string(options.crash_op) +
@@ -242,6 +254,12 @@ int main(int argc, char** argv) {
       ops_out = value("--ops-out");
     } else if (arg == "--ops-file") {
       options.ops_file = value("--ops-file");
+    } else if (arg == "--concurrent-observer") {
+      options.concurrent_observer = value("--concurrent-observer");
+    } else if (arg == "--schedule-out") {
+      options.schedule_out = value("--schedule-out");
+    } else if (arg == "--schedule-file") {
+      options.schedule_file = value("--schedule-file");
     } else if (arg == "--recover") {
       options.recover = true;
     } else if (arg == "--require-enospc") {
@@ -263,6 +281,30 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+#ifndef XFSWIN_CONCURRENCY_HOOKS
+  if (!options.concurrent_observer.empty() || !options.schedule_out.empty() ||
+      !options.schedule_file.empty()) {
+    std::fprintf(stderr,
+                 "--concurrent-observer and schedule options require "
+                 "XFSWIN_CONCURRENCY_HOOKS\n");
+    return 2;
+  }
+#endif
+  if (!options.concurrent_observer.empty() &&
+      options.concurrent_observer != "read" &&
+      options.concurrent_observer != "flush") {
+    std::fprintf(stderr, "--concurrent-observer must be read or flush\n");
+    return 2;
+  }
+  if (!options.schedule_out.empty() && !options.schedule_file.empty()) {
+    std::fprintf(stderr, "--schedule-out and --schedule-file are mutually exclusive\n");
+    return 2;
+  }
+  if ((!options.schedule_out.empty() || !options.schedule_file.empty()) &&
+      options.concurrent_observer.empty()) {
+    std::fprintf(stderr, "schedule options require --concurrent-observer\n");
+    return 2;
+  }
   if (options.image.empty()) {
     std::fprintf(stderr, "--image is required\n");
     return 2;

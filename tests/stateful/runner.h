@@ -24,6 +24,9 @@ struct FuzzOptions {
   std::string trace;
   std::string manifest;
   std::string ops_file;  // replay an explicit operation list instead of seed
+  std::string concurrent_observer;  // read or flush; requires concurrency hooks
+  std::string schedule_out;
+  std::string schedule_file;
   ImageProfile profile = ImageProfile::kModern;
   Workload workload = Workload::kMixed;
   uint64_t size_bytes = 0;  // 0 = profile default

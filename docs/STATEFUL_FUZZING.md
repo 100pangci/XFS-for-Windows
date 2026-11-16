@@ -172,10 +172,16 @@ tab-separated replay format; `--ops-file` replays that exact list and is what
 the reducer uses.  A minimized failure is a small textual operation file, not a
 large image.
 
-`reduce_stateful_trace.py` parses an operation file, removes chunks while the
-original failure signature still reproduces, and prints the reduced file and
-command.  This is a plain delta debugger over the operation list; it does not
-change the generator or the filesystem contract.
+`reduce_stateful_trace.py` parses a sequential FUZZ-2 operation file, removes
+chunks while the original failure signature still reproduces, and prints the
+reduced file and command. This is a plain delta debugger over that operation
+list; it does not change the generator or filesystem contract. It does not
+reduce cooperative concurrency schedules. Those are recorded and strictly
+replayed by `tests/scripts/concurrency_stateful_matrix.py`; keep the original
+`.ops.txt`, `.schedule`, and `.events.txt` artifacts together when reporting a
+concurrency failure. The operation catalog records the fixed worker programs,
+while the schedule records every Controller choice. Incomplete or invalid
+schedules are rejected by the scheduler.
 
 ## 6. Crash model and contract
 
@@ -261,6 +267,34 @@ PR smoke:
 Longer manual/stress runs use the same binary with more steps/seeds, for
 example 1000–10000 operations with a higher crash density; `fuzz2_soak.sh`
 below is the supported driver. They are not forced into every PR.
+
+### Concurrent crash matrix
+
+Build with both test hooks and concurrency hooks, then run the image-only smoke
+without root:
+
+```bash
+cmake -S . -B build-concurrent-crash \
+  -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF \
+  -DXFSWIN_CONCURRENCY_HOOKS=ON -DXFSWIN_TEST_HOOKS=ON
+cmake --build build-concurrent-crash --target stateful_fuzz
+python3 -I tests/scripts/concurrent_stateful_crash.py \
+  --exe build-concurrent-crash/tests/stateful_fuzz \
+  --work-dir out/concurrent-crash --mode smoke
+```
+
+The smoke records and replays each schedule, runs project recovery, checks the
+raw semantic oracle and `xfs_repair -n`, and verifies negative file, hard-link
+and xattr manifest mutations are rejected. `tests/tools/test_stateful_range.py`
+also checks that corruption inside an allowed old/new data range is rejected.
+The soak mode repeats the four representative operation/crash/observer
+combinations over two fixed seeds.
+
+Linux CI can add `--kernel-replay --kernel-recovered`. The first flag preserves
+a dirty image copy before project recovery and verifies kernel journal replay;
+the second checks the project-recovered image through the raw oracle and kernel
+mount. Both require root and loop devices. Local image-only runs do not invoke
+sudo. Failed cases keep their logs and image under the work directory.
 
 ### Running the crash matrix
 

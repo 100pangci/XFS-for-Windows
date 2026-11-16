@@ -128,6 +128,7 @@ configure_file(cmake/xfswin_version.h.in generated/xfswin_version.h @ONLY)
 configure_file(cmake/version.json.in generated/version.json @ONLY)
 if(WIN32)
   configure_file(cmake/xfswin.rc.in generated/xfswin.rc @ONLY)
+  configure_file(cmake/xfswin-gui.rc.in generated/xfswin-gui.rc @ONLY)
 endif()
 
 # The canonical CI builds turn warnings into errors. MSVC applies /WX to

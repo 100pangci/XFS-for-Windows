@@ -321,6 +321,17 @@ try {
             [void](Wait-ServiceFromPath $restored.exe 120)
             [void](Assert-ReleaseProductRegistration -Package $package `
                 -ExpectedVersion ([string]$before.version_json.version))
+            $restoredDirectory = Split-Path -Parent $restored.exe
+            $restoredGui = Join-Path $restoredDirectory 'xfswin-gui.exe'
+            Assert-Release (Test-Path -LiteralPath $restoredGui -PathType Leaf) `
+                "the $stage rollback did not restore the previous GUI executable"
+            $guiLinks = @(Get-ReleaseShortcuts $restoredDirectory | Where-Object { [IO.Path]::GetFileName($_) -eq 'XFS for Windows.lnk' })
+            Assert-Release ($guiLinks.Count -eq 1) `
+                "the $stage rollback did not restore exactly one GUI Start Menu shortcut"
+            $shell = New-Object -ComObject WScript.Shell
+            $guiLink = $shell.CreateShortcut($guiLinks[0])
+            Assert-Release ([IO.Path]::GetFullPath($guiLink.TargetPath).Equals($restoredGui, [StringComparison]::OrdinalIgnoreCase)) `
+                "the $stage rollback GUI shortcut does not target the restored executable"
             Assert-Release (-not (Test-Path -LiteralPath (Join-Path $env:ProgramData 'xfswin\maintenance.fence'))) `
                 "the $stage rollback left the maintenance fence behind"
             $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `

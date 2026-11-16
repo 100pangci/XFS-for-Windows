@@ -18,6 +18,10 @@
 #include "stateful/verifier.h"
 #include "xfs/crash.h"
 #include "xfs/filesystem.h"
+#ifdef XFSWIN_CONCURRENCY_HOOKS
+#include "xfs/concurrency_test.h"
+#include <random>
+#endif
 #include "xfs/formatter.h"
 #include "xfs/image_device.h"
 
@@ -381,6 +385,162 @@ ExecResult ExecuteOperation(xfs::XfsFilesystem& fs, const ModelFs& model,
   return ExecResult{false, false, {}};
 }
 
+struct ScheduleState {
+  std::vector<uint32_t> replay;
+  size_t cursor = 0;
+  bool recording = false;
+  std::ofstream output;
+};
+
+void LoadSchedule(const FuzzOptions& options, ScheduleState* state) {
+  if (options.schedule_file.empty()) return;
+  std::ifstream input(options.schedule_file, std::ios::binary);
+  if (!input) throw FuzzFailure{"cannot open schedule file", 0};
+  std::string text((std::istreambuf_iterator<char>(input)), {});
+  if (text.empty() || text.back() != '\n') {
+    throw FuzzFailure{"schedule is empty or truncated", 0};
+  }
+  text.pop_back();
+  std::istringstream lines(text);
+  std::string token;
+  while (std::getline(lines, token)) {
+    if (token.empty()) throw FuzzFailure{"invalid empty schedule choice", 0};
+    uint64_t value = 0;
+    for (char c : token) {
+      if (c < '0' || c > '9' || value > (UINT32_MAX - (c - '0')) / 10) {
+        throw FuzzFailure{"invalid schedule choice", 0};
+      }
+      value = value * 10 + (c - '0');
+    }
+    state->replay.push_back(static_cast<uint32_t>(value));
+  }
+  if (state->replay.empty()) throw FuzzFailure{"schedule is empty", 0};
+}
+
+#ifdef XFSWIN_CONCURRENCY_HOOKS
+void RecordChoice(ScheduleState* schedule, uint32_t choice) {
+  if (!schedule->recording) return;
+  schedule->output << choice << '\n' << std::flush;
+  if (!schedule->output) throw FuzzFailure{"cannot persist schedule choice", 0};
+  ++schedule->cursor;
+}
+#endif
+
+ExecResult ExecuteConcurrent(xfs::XfsFilesystem& fs, const ModelFs& model,
+                             const Operation& op, uint64_t* new_ino,
+                             const FuzzOptions& options,
+                             ScheduleState* schedule, uint64_t step) {
+#ifndef XFSWIN_CONCURRENCY_HOOKS
+  (void)fs; (void)model; (void)op; (void)new_ino; (void)options;
+  (void)schedule; (void)step;
+  throw FuzzFailure{"--concurrent-observer requires XFSWIN_CONCURRENCY_HOOKS", 0};
+#else
+  auto& controller = xfs::conc::Controller::Get();
+  controller.Enable();
+  struct JoinGuard {
+    xfs::conc::Controller& controller;
+    ~JoinGuard() noexcept { try { controller.JoinAll(); } catch (...) {} }
+  } join_guard{controller};
+  ExecResult result;
+  std::string observer_error;
+  bool observer_ran = false;
+  const uint64_t root = model.Find(model.root())->actual_ino;
+  const uint64_t mutator = controller.Spawn("stateful-mutator", [&] {
+    result = ExecuteOperation(fs, model, op, new_ino);
+  });
+  const uint64_t observer = controller.Spawn("stateful-observer", [&] {
+    observer_ran = true;
+    if (options.concurrent_observer == "flush") {
+      auto status = fs.Flush();
+      if (!status.ok()) observer_error = status.error().Format();
+    } else {
+      auto lookup = fs.LookupName(root, "..");
+      if (!lookup.ok()) {
+        observer_error = lookup.error().Format();
+      } else if (lookup.value().ino != root) {
+        observer_error = "root parent lookup did not resolve to the root inode";
+      }
+    }
+  });
+  const uint64_t ids[] = {mutator, observer};
+  for (uint32_t index = 0; index < 2; ++index) {
+    if (!schedule->replay.empty()) {
+      if (schedule->cursor >= schedule->replay.size() ||
+          schedule->replay[schedule->cursor] != index) {
+        controller.JoinAll();
+        throw FuzzFailure{"schedule has an invalid worker startup choice", step};
+      }
+      ++schedule->cursor;
+    } else if (schedule->recording) {
+      RecordChoice(schedule, index);
+    }
+    if (!controller.Step(ids[index])) {
+      controller.JoinAll();
+      throw FuzzFailure{"concurrent workers failed to start\n" + controller.Dump(), step};
+    }
+  }
+  while (!controller.WaitAllDone(1)) {
+    const auto runnable = controller.RunnableOps();
+    if (runnable.empty()) {
+      if (!controller.WaitAllDone(30000)) {
+        controller.JoinAll();
+        throw FuzzFailure{"concurrent workers stalled\n" + controller.Dump(), step};
+      }
+      break;
+    }
+    uint32_t index = 0;
+    uint64_t selected = runnable.front();
+    if (!schedule->replay.empty()) {
+      if (schedule->cursor >= schedule->replay.size()) {
+        controller.JoinAll();
+        throw FuzzFailure{"schedule ended before workers completed", step};
+      }
+      index = schedule->replay[schedule->cursor];
+      if (index >= 2) {
+        controller.JoinAll();
+        throw FuzzFailure{"schedule choice is out of range", step};
+      }
+      selected = ids[index];
+      if (std::find(runnable.begin(), runnable.end(), selected) == runnable.end()) {
+        controller.JoinAll();
+        throw FuzzFailure{"schedule selected a non-runnable worker", step};
+      }
+    } else {
+      const uint32_t preferred = static_cast<uint32_t>((schedule->cursor + options.seed) % 2);
+      if (std::find(runnable.begin(), runnable.end(), ids[preferred]) != runnable.end()) {
+        index = preferred;
+        selected = ids[index];
+      } else {
+        for (uint32_t i = 0; i < 2; ++i) {
+          if (ids[i] == selected) index = i;
+        }
+      }
+    }
+    if (schedule->recording) RecordChoice(schedule, index);
+    else if (!schedule->replay.empty()) ++schedule->cursor;
+    else ++schedule->cursor;
+    if (!controller.Step(selected)) {
+      controller.JoinAll();
+      throw FuzzFailure{"concurrent worker step stalled\n" + controller.Dump(), step};
+    }
+  }
+  if (!controller.WaitAllDone(30000)) {
+    controller.JoinAll();
+    throw FuzzFailure{"concurrent workers did not finish", step};
+  }
+  controller.JoinAll();
+  if (!observer_ran) throw FuzzFailure{"observer did not execute", step};
+  for (const auto& event : controller.Events()) {
+    if (event.op_label == "stateful-observer") {
+      AppendTrace(options, "observer-event " + std::string(xfs::conc::ToString(event.kind)) +
+                              " " + event.point);
+    }
+  }
+  if (!observer_error.empty()) throw FuzzFailure{"observer failed: " + observer_error, step};
+  return result;
+#endif
+}
+
 // The ENOSPC workload must prove more than "one operation returned kNoSpace":
 // the failed transaction has to leave the image unchanged, and space must be
 // allocatable again after a real release.  Run one deterministic probe at the
@@ -669,6 +829,30 @@ int RunFresh(const FuzzOptions& options) {
   if (options.workload == Workload::kEnospc && options.crash_op != 0) {
     throw FuzzFailure{"ENOSPC workload does not support crash injection", 0};
   }
+#ifndef XFSWIN_CONCURRENCY_HOOKS
+  if (!options.concurrent_observer.empty()) {
+    throw FuzzFailure{"--concurrent-observer requires XFSWIN_CONCURRENCY_HOOKS", 0};
+  }
+#endif
+  if (!options.concurrent_observer.empty() &&
+      options.concurrent_observer != "read" && options.concurrent_observer != "flush") {
+    throw FuzzFailure{"--concurrent-observer must be read or flush", 0};
+  }
+  if (!options.schedule_out.empty() && !options.schedule_file.empty()) {
+    throw FuzzFailure{"--schedule-out and --schedule-file are mutually exclusive", 0};
+  }
+  if ((!options.schedule_out.empty() || !options.schedule_file.empty()) &&
+      options.concurrent_observer.empty()) {
+    throw FuzzFailure{"schedule options require --concurrent-observer", 0};
+  }
+  ScheduleState schedule;
+  LoadSchedule(options, &schedule);
+  if (!options.schedule_out.empty()) {
+    EnsureParent(options.schedule_out);
+    schedule.output.open(options.schedule_out, std::ios::binary | std::ios::trunc);
+    if (!schedule.output) throw FuzzFailure{"cannot create schedule output", 0};
+    schedule.recording = true;
+  }
 
   WriteTraceHeader(options);
 
@@ -732,10 +916,17 @@ int RunFresh(const FuzzOptions& options) {
       if (target) {
         AppendTrace(options, "begin " + std::to_string(i + 1) + " " +
                                  op.Describe());
+        if (!options.concurrent_observer.empty()) {
+          auto barrier = fs.Flush();
+          if (!barrier.ok()) throw FuzzFailure{"pre-target flush failed: " + barrier.error().Format(), i + 1};
+        }
         ArmCrash(options.crash_point, options.crash_hit);
       }
       uint64_t new_ino = 0;
-      ExecResult result = ExecuteOperation(fs, model, op, &new_ino);
+      ExecResult result = options.concurrent_observer.empty()
+                              ? ExecuteOperation(fs, model, op, &new_ino)
+                              : ExecuteConcurrent(fs, model, op, &new_ino, options,
+                                                  &schedule, i + 1);
       if (!result.ok) {
         throw FuzzFailure{"operation " + std::to_string(i + 1) + " (" +
                               op.Describe() + ") failed: " +
@@ -839,7 +1030,10 @@ int RunFresh(const FuzzOptions& options) {
     for (uint64_t i = 0; i < plan.ops.size(); ++i) {
       const Operation& op = plan.ops[i];
       uint64_t new_ino = 0;
-      ExecResult result = ExecuteOperation(fs, model, op, &new_ino);
+      ExecResult result = options.concurrent_observer.empty()
+                              ? ExecuteOperation(fs, model, op, &new_ino)
+                              : ExecuteConcurrent(fs, model, op, &new_ino, options,
+                                                  &schedule, i + 1);
       if (!result.ok) {
         throw FuzzFailure{"operation " + std::to_string(i + 1) + " (" +
                               op.Describe() + ") failed: " +
@@ -868,6 +1062,9 @@ int RunFresh(const FuzzOptions& options) {
     }
   }
 
+  if (!schedule.replay.empty() && schedule.cursor != schedule.replay.size()) {
+    throw FuzzFailure{"schedule contains unused trailing choices", executed};
+  }
   VerifyResult final_verify = VerifyModel(fs, model);
   if (!final_verify.ok) throw FuzzFailure{final_verify.error, executed};
   FinishClean(fs, &error);

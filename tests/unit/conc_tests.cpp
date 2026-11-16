@@ -8,6 +8,7 @@
 // exactly one operation thread is runnable at a time, so a WaitFor/Resume
 // script is a reproducible interleaving, not a timing guess.
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -2642,18 +2643,85 @@ std::vector<uint32_t> EnvSchedule() {
   std::vector<uint32_t> out;
   const char* value = std::getenv("XFSWIN_CONC_REPLAY");
   if (value == nullptr || *value == '\0') return out;
-  std::string text(value);
+  const std::string text(value);
   size_t pos = 0;
   while (pos < text.size()) {
     size_t comma = text.find(',', pos);
     if (comma == std::string::npos) comma = text.size();
-    if (comma > pos) {
-      out.push_back(static_cast<uint32_t>(
-          std::strtoul(text.substr(pos, comma - pos).c_str(), nullptr, 10)));
+    if (comma == pos || (comma < text.size() && comma + 1 == text.size())) {
+      throw xfstest::TestFailure("XFSWIN_CONC_REPLAY contains an empty choice");
     }
+    const std::string token = text.substr(pos, comma - pos);
+    if (!std::all_of(token.begin(), token.end(),
+                     [](char digit) { return digit >= '0' && digit <= '9'; })) {
+      throw xfstest::TestFailure("XFSWIN_CONC_REPLAY contains an invalid choice: " + token);
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(token.c_str(), &end, 10);
+    if (errno == ERANGE || end == token.c_str() || *end != '\0' ||
+        parsed > 0xfffffffful) {
+      throw xfstest::TestFailure("XFSWIN_CONC_REPLAY contains an invalid choice: " + token);
+    }
+    out.push_back(static_cast<uint32_t>(parsed));
     pos = comma + 1;
   }
   return out;
+}
+
+std::string ScheduleText(const std::vector<uint32_t>& schedule);
+
+std::string ArtifactStem(const char* what) {
+  const char* prefix = std::getenv("XFSWIN_CONC_ARTIFACT_PREFIX");
+  if (prefix == nullptr || *prefix == '\0') return {};
+  std::string stem = std::string(prefix) + ".";
+  for (const char* p = what; *p != '\0'; ++p) {
+    stem.push_back((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                           (*p >= '0' && *p <= '9')
+                       ? *p
+                       : '_');
+  }
+  return stem;
+}
+
+void WriteScheduleArtifacts(const char* what,
+                            const std::vector<std::string>& labels,
+                            const std::vector<uint32_t>& schedule) {
+  const std::string stem = ArtifactStem(what);
+  if (stem.empty()) return;
+  std::ofstream ops(stem + ".ops.txt", std::ios::trunc);
+  std::ofstream choices(stem + ".schedule", std::ios::trunc);
+  std::ofstream events(stem + ".events.txt", std::ios::trunc);
+  if (!ops || !choices || !events) {
+    throw xfstest::TestFailure("cannot write concurrency replay artifacts at " + stem);
+  }
+  ops << "scenario=" << what << "\nworkers=" << labels.size() << "\n";
+  for (size_t i = 0; i < labels.size(); ++i) {
+    ops << i << "\t" << labels[i] << "\n";
+  }
+  choices << ScheduleText(schedule) << "\n";
+  for (const auto& event : C().Events()) {
+    if (event.kind == EventKind::kOpEnter) continue;
+    events << xfs::conc::ToString(event.kind) << '\t' << event.point << '\t'
+           << event.op_label << '\t' << event.ino << '\n';
+  }
+  ops.flush();
+  choices.flush();
+  events.flush();
+  if (!ops || !choices || !events) {
+    throw xfstest::TestFailure("failed to persist concurrency replay artifacts at " + stem);
+  }
+}
+
+void PersistScheduleChoice(const char* what, uint32_t choice, bool first) {
+  const std::string stem = ArtifactStem(what);
+  if (stem.empty()) return;
+  std::ofstream output(stem + ".schedule", std::ios::binary |
+                       (first ? std::ios::trunc : std::ios::app));
+  if (!output) throw xfstest::TestFailure("cannot persist scheduler choice at " + stem);
+  if (!first) output << ',';
+  output << choice << std::flush;
+  if (!output) throw xfstest::TestFailure("failed to persist scheduler choice at " + stem);
 }
 
 // Spawns `bodies`, starts each one deterministically, then drives the
@@ -2663,6 +2731,7 @@ std::vector<uint32_t> RunScheduled(
     uint64_t seed, const std::vector<std::function<void()>>& bodies,
     const std::vector<std::string>& labels, const char* what,
     const std::vector<uint32_t>& replay_override = {}) {
+  WriteScheduleArtifacts(what, labels, {});
   std::vector<uint64_t> ids;
   ids.reserve(bodies.size());
   for (size_t i = 0; i < bodies.size(); ++i) {
@@ -2683,6 +2752,7 @@ std::vector<uint32_t> RunScheduled(
   std::mt19937_64 rng(seed);
   std::vector<uint32_t> schedule;
   uint64_t steps = 0;
+  try {
   for (;;) {
     const std::vector<uint64_t> runnable = C().RunnableOps();
     if (runnable.empty()) {
@@ -2723,6 +2793,7 @@ std::vector<uint32_t> RunScheduled(
       pick = chosen;
     }
     schedule.push_back(static_cast<uint32_t>(index));
+    PersistScheduleChoice(what, static_cast<uint32_t>(index), steps == 0);
     if (!C().Step(pick)) {
       throw xfstest::TestFailure(
           std::string(what) + ": scheduler step " + std::to_string(steps) +
@@ -2735,10 +2806,26 @@ std::vector<uint32_t> RunScheduled(
                                  ": step limit exceeded\n" + C().Dump());
     }
   }
+  if (strict_replay && steps != replay.size()) {
+    throw xfstest::TestFailure(std::string(what) +
+                               ": replay schedule has unused trailing choices");
+  }
   if (!C().WaitAllDone(60000)) {
     throw xfstest::TestFailure(std::string(what) +
                                ": operations did not finish\n" + C().Dump());
   }
+  } catch (const std::exception& failure) {
+    C().JoinAll();
+    try {
+      WriteScheduleArtifacts(what, labels, schedule);
+    } catch (const std::exception& artifact_error) {
+      throw xfstest::TestFailure(std::string(failure.what()) +
+                                 "\nfailed to save replay evidence: " +
+                                 artifact_error.what());
+    }
+    throw;
+  }
+  WriteScheduleArtifacts(what, labels, schedule);
   return schedule;
 }
 
@@ -3133,6 +3220,16 @@ TEST(conc_seeded_schedule_is_reproducible_and_replayable) {
     std::vector<uint32_t> ignored_schedule;
     std::vector<std::string> ignored_events;
     RunReplayWorkload(0, &ignored_schedule, &ignored_events, truncated);
+  } catch (const xfstest::TestFailure&) {
+    rejected = true;
+  }
+  CHECK(rejected);
+
+  rejected = false;
+  try {
+    std::vector<uint32_t> ignored_schedule;
+    std::vector<std::string> ignored_events;
+    RunReplayWorkload(0, &ignored_schedule, &ignored_events, {99});
   } catch (const xfstest::TestFailure&) {
     rejected = true;
   }

@@ -359,7 +359,7 @@ jobs:
           $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
           $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           foreach ($required in @('installer_name', 'installer_sha256', 'portable_name',
-              'portable_sha256', 'payload_exe_sha256', 'toolchain', 'build_timestamp',
+              'portable_sha256', 'payload_exe_sha256', 'payload_gui_sha256', 'toolchain', 'build_timestamp',
               'signing', 'rust', 'cmake', 'testing')) {
             if ($null -eq $metadata.PSObject.Properties[$required]) {
               throw "package metadata is missing the REL1 top-level field '$required'"
@@ -885,7 +885,7 @@ jobs:
                   sys.exit(f"package-metadata-{arch}.json: git_sha mismatch")
               if metadata.get("architecture") != arch:
                   sys.exit(f"package-metadata-{arch}.json: architecture mismatch")
-              for key in ("toolchain", "build_timestamp"):
+              for key in ("toolchain", "build_timestamp", "payload_gui_sha256"):
                   if not metadata.get(key):
                       sys.exit(f"package-metadata-{arch}.json: missing {key}")
               if metadata.get("winfsp", {}).get("sha256", "").lower() != winfsp_sha:
@@ -905,11 +905,17 @@ jobs:
                   sys.exit(f"package-metadata-{arch}.json: assets.portable_zip SHA-256 mismatch")
               with zipfile.ZipFile(portable) as archive:
                   payload = archive.read("xfswin.exe")
+                  gui_payload = archive.read("xfswin-gui.exe")
               payload_sha = hashlib.sha256(payload).hexdigest()
+              gui_payload_sha = hashlib.sha256(gui_payload).hexdigest()
               if metadata.get("payload_exe_sha256") != payload_sha:
                   sys.exit(f"package-metadata-{arch}.json: payload SHA-256 mismatch")
               if metadata.get("assets", {}).get("payload_exe", {}).get("sha256") != payload_sha:
                   sys.exit(f"package-metadata-{arch}.json: assets.payload_exe SHA-256 mismatch")
+              if metadata.get("payload_gui_sha256") != gui_payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: GUI payload SHA-256 mismatch")
+              if metadata.get("assets", {}).get("payload_gui", {}).get("sha256") != gui_payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: assets.payload_gui SHA-256 mismatch")
           print("package metadata matches the four public assets")
           PY
 

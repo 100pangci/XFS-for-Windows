@@ -723,8 +723,17 @@ pub fn create_shortcuts(install_root: &Path) -> io::Result<()> {
     fs::create_dir_all(&menu)?;
     let system = system_directory()?;
     let cmd = system.join("cmd.exe");
-    let uninstaller = install_root.join("xfswin.exe");
+    let gui = install_root.join("xfswin-gui.exe");
+    let command_line = install_root.join("xfswin.exe");
     let install_text = install_root.to_string_lossy().to_string();
+    create_shortcut(
+        &menu.join("XFS for Windows.lnk"),
+        &gui,
+        "",
+        &install_text,
+        "Manage XFS volumes and automount settings",
+        &gui,
+    )?;
     create_shortcut(
         &menu.join("XFS for Windows Command Prompt.lnk"),
         &cmd,
@@ -739,7 +748,7 @@ pub fn create_shortcuts(install_root: &Path) -> io::Result<()> {
         "",
         &install_text,
         "Install, upgrade and automount guide",
-        &uninstaller,
+        &command_line,
     )?;
     Ok(())
 }
@@ -788,6 +797,7 @@ fn create_shortcut(
 pub fn remove_shortcuts() -> io::Result<()> {
     let menu = start_menu_directory()?;
     for name in [
+        "XFS for Windows.lnk",
         "XFS for Windows Command Prompt.lnk",
         "XFS for Windows Documentation.lnk",
     ] {

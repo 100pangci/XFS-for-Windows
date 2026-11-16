@@ -22,7 +22,7 @@ The setup places `xfswin.exe`, `uninstall.exe`, documentation and the WinFsp not
 
 Files in `%ProgramData%\xfswin` are never owned by setup: `automount.ini`, UUID enrollments, read-write identity pins and other user configuration survive upgrades and ordinary uninstall. Setup writes product/ARP registration under `HKLM\SOFTWARE\XFS-for-Windows` and `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7C4E2D19-6B8A-4F53-A1D0-3E9B5C7A2F64}`.
 
-The service is installed and started, but a clean installation has no configured XFS entries and therefore mounts nothing. Installing or verifying the product does not enumerate disks, probe filesystems or write to XFS media. There is no GUI, tray application or updater.
+The service is installed and started, but a clean installation has no configured XFS entries and therefore mounts nothing. Installing or verifying the product does not enumerate disks, probe filesystems or write to XFS media. The payload also includes the native `xfswin-gui.exe` manager; its normal desktop entry point does not request elevation at startup. The manager delegates filesystem operations to the existing CLI and service. No updater or additional tray removal mechanism is installed.
 
 ## WinFsp dependency
 

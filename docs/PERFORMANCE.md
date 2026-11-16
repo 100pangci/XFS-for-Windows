@@ -297,6 +297,65 @@ rmap/refcount/parent oracles remain the correctness gate.
     in `run_mounted_perf.ps1`, but DiskSpd was not installed on this machine.
     The A/B medians and deterministic counters above are unaffected.
 
+## Linux core workload and rename-cache measurement
+
+The Linux core runner also measures small-file create/read/delete with 1 and 4
+threads, a 128-file source-tree copy with 1 and 4 threads, a 1000-entry
+large-directory enumeration, and 100 same-directory renames. JSON includes
+filesystem/device read, write and flush calls, journal commits/flushes, cache
+counters, concurrency and process peak RSS where `getrusage` is available.
+RSS is a process high-water mark sampled after each workload, not a per-workload
+allocation counter; unsupported platforms report zero.
+
+The large-directory `core_cold` row invalidates the XFS core directory cache
+before listing and requires exactly one core cache miss. It does not clear or
+claim to measure a cold host page cache. The immediately following `core_warm`
+row measures the core-cache hit.
+
+Measured 2026-11-16 in this Linux workspace, RelWithDebInfo with strict warnings,
+16 reported hardware threads, a 512 MiB modern XFS image, 4 KiB blocks and four
+AGs. Each side used a freshly formatted image. The original `xfswin_perf` binary
+and JSON are in `out/management-validation/perf-measured/`; the original
+baseline-compatible A/B result is retained separately as
+`out/management-validation/perf-baseline/existing-ab.json`.
+
+| 100 same-directory, non-replacing renames | Before | After |
+|---|---:|---:|
+| Wall time | 44.02 ms | 47.54 ms |
+| Core directory-cache misses | 198 | 0 |
+| Device reads | 1,485 | 1,188 |
+| Device read bytes | 6,959,104 | 5,742,592 |
+| Journal commits / flushes | 100 / 100 | 100 / 100 |
+
+Additional optimized-run observations (single run):
+
+| Workload | Wall time | Device I/O / flushes |
+|---|---:|---:|
+| 1000 small files, create/read/delete, 1 thread | 3.21 s | 171,000 reads / 45,000 writes / 7,000 device flushes |
+| Same, 4 threads | 3.56 s | 171,003 reads / 45,000 writes / 7,000 device flushes |
+| 128-file source-tree copy, 1 thread | 250 ms | 14,856 reads / 3,175 writes |
+| Same, 4 threads | 265 ms | 16,503 reads / 3,175 writes |
+| 1000-entry directory, core-cache cold / warm | 134 / 3.6 ms | 32 / 0 device reads |
+
+The measured 4-thread namespace and copy workloads did not outperform the
+single-thread runs; their writes reached a maximum concurrency of one. Peak
+process RSS reached about 45.7 MiB (47.9 MB). These values are diagnostic
+single-run observations, while the counter and cache assertions are deterministic
+gates.
+
+The cache update removes 20% of device read calls in the rename workload and all
+parent-directory cache misses. This single-run wall time does not show a speedup;
+rename remains dominated by its unchanged durable transaction flush. No WAL,
+flush, or success boundary was changed. The incremental path applies only to a
+same-directory rename with no replaced target. Other rename shapes retain the
+existing full invalidation behavior. A deterministic unit test verifies the
+renamed name is visible and the warm parent cache has no miss; the runner has the
+same miss-count gate.
+
+Reproduce with the normal strict build and a freshly formatted image, then run
+`xfswin_perf --image <image> --json <result.json> --label <label>`. For this
+Linux configuration, `mkfs.xfs -f -m crc=1,finobt=1,rmapbt=1,reflink=1,bigtime=1,inobtcount=1 -i sparse=1,nrext64=1,exchange=1 -n parent=1 <image>` creates the matching feature profile. Do not compare warm host-cache results with cold-device claims.
+
 ## Reproducing
 
 ```powershell

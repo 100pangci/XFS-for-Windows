@@ -90,6 +90,27 @@ void XfsFilesystem::CacheDirectoryAdd(uint64_t ino, std::string_view name,
   ++dir_cache_entries_;
 }
 
+bool XfsFilesystem::CacheDirectoryRename(uint64_t ino,
+                                         std::string_view old_name,
+                                         std::string_view new_name) const {
+  std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);
+  auto it = dir_cache_.find(ino);
+  if (it == dir_cache_.end()) return false;
+  auto source = it->second.index.find(std::string(old_name));
+  auto target = it->second.index.find(std::string(new_name));
+  if (source == it->second.index.end() || target != it->second.index.end()) {
+    dir_cache_entries_ -= it->second.entries.size();
+    dir_cache_.erase(it);
+    return false;
+  }
+  const size_t position = source->second;
+  it->second.index.erase(source);
+  it->second.entries[position].name.assign(new_name);
+  it->second.index.emplace(it->second.entries[position].name, position);
+  it->second.last_used = ++dir_cache_clock_;
+  return true;
+}
+
 void XfsFilesystem::CacheDirectoryRemove(uint64_t ino,
                                          std::string_view name) const {
   std::lock_guard<xfs::conc::Mutex> lock(cache_mutex_);

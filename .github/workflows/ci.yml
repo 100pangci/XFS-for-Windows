@@ -151,6 +151,11 @@ jobs:
       - name: Full suite with the scheduler compiled in
         run: ctest --test-dir build --output-on-failure
 
+      - name: Record and replay bounded concurrency schedules
+        run: >
+          python3 -I tests/scripts/concurrency_stateful_matrix.py
+          --exe build/tests/xfs_tests --work-dir conc-work/replay --mode smoke
+
       - name: Export the seeded stress images
         run: |
           set -euo pipefail
@@ -277,6 +282,11 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
+      - name: Record and replay extended concurrency schedules
+        run: >
+          python3 -I tests/scripts/concurrency_stateful_matrix.py
+          --exe build/tests/xfs_tests --work-dir conc-soak/replay --mode soak
+
       - name: Long seeded stress (8 threads, three seeds)
         run: |
           set -euo pipefail
@@ -394,6 +404,21 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
+      - name: Enable deterministic scheduling for combined crash validation
+        run: >
+          cmake -S . -B build -DXFSWIN_CONCURRENCY_HOOKS=ON
+          -DXFSWIN_BUILD_TESTS=ON -DXFSWIN_BUILD_WINFSP=OFF
+          -DXFSWIN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build combined stateful runner
+        run: cmake --build build --target stateful_fuzz -j "$(nproc)"
+
+      - name: Concurrent crash recovery and independent kernel replay
+        run: >
+          sudo python3 -I tests/scripts/concurrent_stateful_crash.py
+          --exe build/tests/stateful_fuzz --work-dir fuzz2/concurrent-crash
+          --mode smoke --kernel-replay --kernel-recovered
+
       - name: Stateful sequences (mixed, directory, xattr, allocator, ENOSPC)
         run: |
           set -euo pipefail
@@ -431,6 +456,16 @@ jobs:
           set -euo pipefail
           sudo EXE="$PWD/build/tests/stateful_fuzz" WORK="$PWD/fuzz2/crash" \
             SIZE_MB=300 bash tests/scripts/fuzz2_crash_matrix.sh
+
+      - name: Upload concurrent crash schedules and verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-concurrent-crash
+          path: |
+            fuzz2/concurrent-crash/
+            !fuzz2/concurrent-crash/**/*.img
+          if-no-files-found: ignore
 
       - name: Upload FUZZ-2 artifacts
         if: failure()
@@ -3034,6 +3069,7 @@ jobs:
             -Image "rw\rw.img" -Drive Y: -Threads 4 -Iterations 20
 
       - name: Upload the concurrent WinFsp image and manifest
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rw-conc
@@ -5673,6 +5709,18 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
+      - name: Enable deterministic scheduling for the crash soak
+        run: cmake -S . -B build -DXFSWIN_CONCURRENCY_HOOKS=ON
+
+      - name: Build combined crash runner
+        run: cmake --build build --target stateful_fuzz -j "$(nproc)"
+
+      - name: Extended concurrent crash and kernel replay matrix
+        run: >
+          sudo python3 -I tests/scripts/concurrent_stateful_crash.py
+          --exe build/tests/stateful_fuzz --work-dir fuzz2-soak/concurrent-crash
+          --mode soak --kernel-replay --kernel-recovered
+
       - name: Long stateful soak (kernel verification)
         env:
           SOAK_STEPS: ${{ github.event.inputs.soak_steps || '2000' }}
@@ -5684,6 +5732,16 @@ jobs:
             STEPS="$SOAK_STEPS" SEEDS="$SOAK_SEEDS" \
             WORKLOADS="$SOAK_WORKLOADS" \
             bash tests/scripts/fuzz2_soak.sh
+
+      - name: Upload concurrent crash soak schedules and verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz2-concurrent-crash-soak
+          path: |
+            fuzz2-soak/concurrent-crash/
+            !fuzz2-soak/concurrent-crash/**/*.img
+          if-no-files-found: ignore
 
       - name: Upload soak failure artifacts
         if: failure()
