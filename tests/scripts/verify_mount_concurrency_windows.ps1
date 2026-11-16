@@ -223,9 +223,20 @@ public static class XfsOpenLifetime {
                                 if (!turn.WaitOne(30000)) throw new TimeoutException("handle turn");
                                 if (command == 3) break;
                                 if (command == 2) {
-                                    uint flags = 3; // DELETE | POSIX_SEMANTICS
-                                    if (!SetFileInformationByHandle(handle, 21, ref flags, 4))
-                                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                                    // POSIX disposition removes the name when
+                                    // this handle closes. Keep the original
+                                    // handle alive to verify the open inode
+                                    // survives that namespace removal.
+                                    using (var deleteHandle = CreateFileW(renamed,
+                                            0x00010000, 7, IntPtr.Zero, 3, 0,
+                                            IntPtr.Zero)) {
+                                        if (deleteHandle.IsInvalid)
+                                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                                        uint flags = 3; // DELETE | POSIX_SEMANTICS
+                                        if (!SetFileInformationByHandle(deleteHandle, 21,
+                                                ref flags, 4))
+                                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                                    }
                                 } else {
                                     stream.Position = 0;
                                     if (stream.ReadByte() != 0x31)
