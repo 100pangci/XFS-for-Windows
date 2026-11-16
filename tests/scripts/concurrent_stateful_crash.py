@@ -35,15 +35,34 @@ def remove_if_exists(path):
         path.unlink()
 
 
+def diagnostic_tail(log):
+    try:
+        with open(log, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 8192))
+            text = stream.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-30:])
+
+
 def invoke(command, log, expected=None):
     with open(log, "wb") as stream:
         result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
-    if expected is not None and result.returncode != expected:
-        raise SystemExit("concurrent crash: expected exit %s, got %s (see %s)" %
-                         (expected, result.returncode, log))
-    if expected is None and result.returncode:
-        raise SystemExit("concurrent crash: command failed (%s), see %s" %
-                         (result.returncode, log))
+    mismatch = expected is not None and result.returncode != expected
+    failed = expected is None and result.returncode != 0
+    if mismatch or failed:
+        if expected is not None:
+            message = "concurrent crash: expected exit %s, got %s (see %s)" % (
+                expected, result.returncode, log)
+        else:
+            message = "concurrent crash: command failed (%s), see %s" % (
+                result.returncode, log)
+        details = diagnostic_tail(log)
+        if details:
+            message += "\nlast command output:\n" + details
+        raise SystemExit(message)
     return result.returncode
 
 

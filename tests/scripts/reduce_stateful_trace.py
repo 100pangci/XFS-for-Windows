@@ -75,7 +75,7 @@ def read_schedule(path):
 
 
 def write_schedule(path, choices):
-    with open(path, "w", encoding="utf-8") as output:
+    with open(path, "w", encoding="utf-8", newline="\n") as output:
         output.write(",".join(str(choice) for choice in choices) + "\n")
 
 

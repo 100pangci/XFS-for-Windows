@@ -133,8 +133,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install xfsprogs
-        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
+      - name: Install the reference xfsprogs 7.2.0
+        run: |
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 \
+            build-essential curl libinih-dev uuid-dev liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
 
       - name: Configure (concurrency hooks on)
         run: >
@@ -149,7 +155,9 @@ jobs:
         run: cmake --build build -j "$(nproc)"
 
       - name: Full suite with the scheduler compiled in
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          mkdir -p conc-work/tmp
+          TMPDIR="$PWD/conc-work/tmp" ctest --test-dir build --output-on-failure
 
       - name: Record and replay bounded concurrency schedules
         run: >
@@ -267,8 +275,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install xfsprogs
-        run: sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 && sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 xfsprogs
+      - name: Install the reference xfsprogs
+        run: |
+          sudo timeout 300 apt-get update -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3
+          sudo timeout 600 apt-get install -y -o DPkg::Lock::Timeout=120 build-essential curl libinih-dev uuid-dev \
+            liburcu-dev libblkid-dev libicu-dev
+          sudo bash tests/scripts/install_xfsprogs_7_2_0.sh
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
 
       - name: Configure (concurrency hooks on)
         run: >
@@ -414,10 +428,11 @@ jobs:
         run: cmake --build build --target stateful_fuzz -j "$(nproc)"
 
       - name: Concurrent crash recovery and independent kernel replay
-        run: >
-          sudo python3 -I tests/scripts/concurrent_stateful_crash.py
-          --exe build/tests/stateful_fuzz --work-dir fuzz2/concurrent-crash
-          --mode smoke --kernel-replay --kernel-recovered
+        run: |
+          mkdir -p fuzz2
+          sudo python3 -I tests/scripts/concurrent_stateful_crash.py \
+            --exe build/tests/stateful_fuzz --work-dir fuzz2/concurrent-crash \
+            --mode smoke --kernel-replay --kernel-recovered
 
       - name: Stateful sequences (mixed, directory, xattr, allocator, ENOSPC)
         run: |
@@ -5716,10 +5731,11 @@ jobs:
         run: cmake --build build --target stateful_fuzz -j "$(nproc)"
 
       - name: Extended concurrent crash and kernel replay matrix
-        run: >
-          sudo python3 -I tests/scripts/concurrent_stateful_crash.py
-          --exe build/tests/stateful_fuzz --work-dir fuzz2-soak/concurrent-crash
-          --mode soak --kernel-replay --kernel-recovered
+        run: |
+          mkdir -p fuzz2-soak
+          sudo python3 -I tests/scripts/concurrent_stateful_crash.py \
+            --exe build/tests/stateful_fuzz --work-dir fuzz2-soak/concurrent-crash \
+            --mode soak --kernel-replay --kernel-recovered
 
       - name: Long stateful soak (kernel verification)
         env:
