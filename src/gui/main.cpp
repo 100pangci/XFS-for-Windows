@@ -351,8 +351,8 @@ void Action(HWND window, int id) {
     output_path = SavePath(window);
     if (output_path.empty()) return;
   }
-  if (id == kUnmount && !device.effective_mode.empty() && device.automount_mode != L"not enrolled") {
-    SetDetails(L"This mount is owned by the automount service. Use Eject for a safe release that suspends remounting until the device is removed, or disable enrollment first. Filesystem unmount is not device eject.");
+  if (id == kUnmount && device.automount_enabled) {
+    SetDetails(L"Automatic mounting is enabled for this filesystem and may remount it after unmount. Use Eject for a safe release, or disable enrollment and refresh first. Filesystem unmount is not device eject.");
     return;
   }
   if (id == kOpen) {
@@ -387,8 +387,11 @@ void Action(HWND window, int id) {
       const bool json = request->id == kExportJson;
       output = RunCli(json ? std::vector<std::wstring>{L"diagnostics", L"--json"}
                            : std::vector<std::wstring>{L"diagnostics"}, &code);
-      if (code == 0 && WriteUtf8(request->output_path, output))
-        output = L"Redacted diagnostics saved to " + request->output_path;
+      const bool report_available = json
+          ? output.find(L"{\"schema_version\":") == 0 && output.find(L"\"partial_failures\":") != std::wstring::npos
+          : output.find(L"XFS for Windows diagnostics (schema ") == 0;
+      if (report_available && WriteUtf8(request->output_path, output))
+        output = (code == 0 ? L"Redacted diagnostics saved to " : L"Partial redacted diagnostics saved to ") + request->output_path;
       else output = L"Diagnostics could not be exported. Check the selected path and permissions.";
     }
     else if (request->id == kMount || request->id == kMountRw) {

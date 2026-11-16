@@ -332,6 +332,7 @@ Workload TreeCopy(xfs::XfsFilesystem& filesystem, int thread_count,
     Gate(failed, false, "could not create destination directory");
     return failed;
   }
+  std::vector<uint64_t> target_dirs(kSubdirs);
   ResetCounters(stats);
   const auto start = Clock::now();
   std::atomic<int> failures{0};
@@ -345,6 +346,7 @@ Workload TreeCopy(xfs::XfsFilesystem& filesystem, int thread_count,
           failures.fetch_add(1);
           return;
         }
+        target_dirs[static_cast<size_t>(d)] = target_dir;
         auto entries = filesystem.ListDirectory(source_dirs[static_cast<size_t>(d)]);
         if (!entries.ok()) {
           failures.fetch_add(1);
@@ -377,6 +379,27 @@ Workload TreeCopy(xfs::XfsFilesystem& filesystem, int thread_count,
       static_cast<uint64_t>(kSubdirs * kFilesPerDir * 4096),
       static_cast<uint64_t>(kSubdirs * kFilesPerDir * 3), stats);
   Gate(result, failures.load() == 0, "tree copy operation failed");
+  // Verify outside the measured interval so validation I/O is not benchmark I/O.
+  if (result.gate_ok) {
+    for (int d = 0; d < kSubdirs; ++d) {
+      for (int f = 0; f < kFilesPerDir; ++f) {
+        auto file = filesystem.LookupName(target_dirs[static_cast<size_t>(d)],
+                                          "f" + std::to_string(f));
+        if (!file.ok()) {
+          Gate(result, false, "tree copy destination file missing");
+          return result;
+        }
+        std::vector<uint8_t> actual(4096);
+        const std::vector<uint8_t> expected(4096,
+            static_cast<uint8_t>((d * 37 + f) & 0xff));
+        auto read = filesystem.ReadFile(file.value().ino, 0, actual.data(), actual.size());
+        if (!read.ok() || read.value() != actual.size() || actual != expected) {
+          Gate(result, false, "tree copy destination content mismatch");
+          return result;
+        }
+      }
+    }
+  }
   return result;
 }
 
