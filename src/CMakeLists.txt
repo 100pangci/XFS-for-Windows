@@ -130,7 +130,7 @@ if(WIN32)
     gui/main.cpp
     "${PROJECT_BINARY_DIR}/generated/xfswin-gui.rc"
   )
-  target_link_libraries(xfswin-gui PRIVATE shell32 comdlg32)
+  target_link_libraries(xfswin-gui PRIVATE shell32 comdlg32 advapi32)
   if(XFSWIN_RELEASE_BUILD)
     add_dependencies(xfswin-gui xfswin_release_source_check)
   endif()

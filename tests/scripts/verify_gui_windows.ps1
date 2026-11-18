@@ -116,7 +116,25 @@ function Wait-GuiDetails([IntPtr]$Window, [scriptblock]$Predicate, [string]$Desc
         if (& $Predicate $text) { return $text }
         Start-Sleep -Milliseconds 500
     }
-    throw "Timed out waiting for GUI response: $Description"
+    # The window may be covered by another process on hosted runners. Keep
+    # the actual control text as CI evidence independently of the screenshot.
+    $text | Set-Content -LiteralPath (Join-Path $OutputDirectory 'gui-last-details.txt') -Encoding utf8
+    throw "Timed out waiting for GUI response: $Description (see gui-last-details.txt)"
+}
+function Test-GuiDiscovery([string]$Text, [string]$Uuid, [switch]$AllowPartial) {
+    try { $report = ConvertFrom-Json -InputObject $Text -ErrorAction Stop }
+    catch { return $false }
+    if ($report -isnot [pscustomobject] -or $report.schema_version -lt 1 -or
+        $report.devices -isnot [array] -or $report.partial_failures -isnot [array]) {
+        return $false
+    }
+    $matches = @($report.devices | Where-Object { $_.uuid -eq $Uuid })
+    if ($matches.Count -eq 1 -and $matches[0].discovered -eq $true) { return $true }
+    # A standard user can be denied raw disk access. Accept a structured CLI
+    # report of that condition, never a failure to start or capture the CLI.
+    return ($AllowPartial -and $matches.Count -le 1 -and
+        $report.discovery.state -in @('permission-denied', 'partial') -and
+        $report.partial_failures.Count -gt 0)
 }
 function Click-Gui([IntPtr]$Window, [int]$Id) {
     $control = [XfsGuiNative]::GetDlgItem($Window, $Id)
@@ -272,7 +290,7 @@ try {
     $limitedProcess = Start-GuiWithLimitedToken $Gui
     $process = $limitedProcess
     $window = Get-GuiWindow ([uint32]$limitedProcess.Id)
-    $details = Wait-GuiDetails $window { param($text) $text.Contains($uuid) -or $text -match '(?i)access denied|permission' } 'unprivileged diagnostics discovery'
+    $details = Wait-GuiDetails $window { param($text) Test-GuiDiscovery $text $uuid -AllowPartial } 'unprivileged diagnostics discovery'
     $operations.unprivileged_start = @{ status = 'passed'; process_id = $limitedProcess.Id; response = $details }
     # Privileged storage operations are reached through the GUI's own explicit
     # Run elevated action, never by starting the ordinary GUI with an admin token.
@@ -296,7 +314,7 @@ try {
     Wait-Process -Id $limitedProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
     $process = $elevatedProcess
     $window = Get-GuiWindow ([uint32]$elevatedProcess.Id)
-    $details = Wait-GuiDetails $window { param($text) $text.Contains($uuid) } 'elevated GUI diagnostics discovery'
+    $details = Wait-GuiDetails $window { param($text) Test-GuiDiscovery $text $uuid } 'elevated GUI diagnostics discovery'
     $operations.discovery = @{ status = 'passed'; uuid = $uuid }
     $detailsBeforeNotifications = Get-GuiDetails $window
     $list = [XfsGuiNative]::GetDlgItem($window, 1009)

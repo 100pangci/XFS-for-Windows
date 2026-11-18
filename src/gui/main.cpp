@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -75,15 +76,67 @@ std::wstring CliPath() {
   return path;
 }
 
-std::wstring RunCli(const std::vector<std::wstring>& args, DWORD* exit_code = nullptr, DWORD timeout_ms = 60000) {
-  const auto exe = CliPath();
-  if (exe.empty() || GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    return L"xfswin.exe was not found beside xfswin-gui.exe.";
+DWORD CreateCliOutputPipe(HANDLE* read_pipe, HANDLE* write_pipe) {
+  // A filtered administrator's default DACL can grant access only to SYSTEM
+  // and the now deny-only Administrators SID. CreatePipe must open both ends.
+  // Grant access to the actual caller, not to other users on the machine.
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    return GetLastError();
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  if (size == 0) {
+    const DWORD error = GetLastError();
+    CloseHandle(token);
+    return error;
   }
+  std::vector<BYTE> user(size);
+  const BOOL queried = GetTokenInformation(token, TokenUser, user.data(), size, &size);
+  const DWORD query_error = queried ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(token);
+  if (!queried) return query_error;
+
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid, &sid))
+    return GetLastError();
+  const std::wstring sddl = std::wstring(L"D:P(A;;GA;;;SY)(A;;GA;;;") + sid + L")";
+  LocalFree(sid);
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
+    return GetLastError();
+  SECURITY_ATTRIBUTES sa{sizeof(sa), descriptor, TRUE};
+  const BOOL created = CreatePipe(read_pipe, write_pipe, &sa, 0);
+  const DWORD pipe_error = created ? ERROR_SUCCESS : GetLastError();
+  LocalFree(descriptor);
+  if (!created) return pipe_error;
+  if (!SetHandleInformation(*read_pipe, HANDLE_FLAG_INHERIT, 0)) {
+    const DWORD error = GetLastError();
+    CloseHandle(*read_pipe);
+    CloseHandle(*write_pipe);
+    return error;
+  }
+  return ERROR_SUCCESS;
+}
+
+std::wstring StartCapturedCli(const std::vector<std::wstring>& args,
+                              PROCESS_INFORMATION* process, HANDLE* read_pipe) {
+  const auto exe = CliPath();
+  if (exe.empty() || GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return L"xfswin.exe was not found beside xfswin-gui.exe.";
+  HANDLE write_pipe = nullptr;
+  const DWORD pipe_error = CreateCliOutputPipe(read_pipe, &write_pipe);
+  if (pipe_error != ERROR_SUCCESS)
+    return L"Cannot create a command output pipe (Windows error " + std::to_wstring(pipe_error) + L").";
   SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-  HANDLE read_pipe = nullptr, write_pipe = nullptr;
-  if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) return L"Cannot create a command output pipe.";
-  SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+  const HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (null_input == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    CloseHandle(*read_pipe);
+    CloseHandle(write_pipe);
+    return L"Cannot open command input (Windows error " + std::to_wstring(error) + L").";
+  }
   std::wstring command = Quote(exe);
   for (const auto& arg : args) command += L" " + Quote(arg);
   STARTUPINFOW startup{};
@@ -92,18 +145,28 @@ std::wstring RunCli(const std::vector<std::wstring>& args, DWORD* exit_code = nu
   startup.wShowWindow = SW_HIDE;
   startup.hStdOutput = write_pipe;
   startup.hStdError = write_pipe;
-  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-  PROCESS_INFORMATION process{};
+  startup.hStdInput = null_input;
   const BOOL started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr,
                                       TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
-                                      &startup, &process);
+                                      &startup, process);
+  const DWORD error = started ? ERROR_SUCCESS : GetLastError();
   CloseHandle(write_pipe);
+  CloseHandle(null_input);
   if (!started) {
-    CloseHandle(read_pipe);
-    return GetLastError() == ERROR_ACCESS_DENIED
+    CloseHandle(*read_pipe);
+    return error == ERROR_ACCESS_DENIED || error == ERROR_ELEVATION_REQUIRED
       ? L"Access denied. Reopen the application with the required Windows permissions."
-      : L"Could not start xfswin.exe. Check that the adjacent CLI is available.";
+      : L"Could not start xfswin.exe (Windows error " + std::to_wstring(error) + L").";
   }
+  return {};
+}
+
+std::wstring RunCli(const std::vector<std::wstring>& args, DWORD* exit_code = nullptr, DWORD timeout_ms = 60000) {
+  if (exit_code) *exit_code = ERROR_GEN_FAILURE;
+  PROCESS_INFORMATION process{};
+  HANDLE read_pipe = nullptr;
+  auto error = StartCapturedCli(args, &process, &read_pipe);
+  if (!error.empty()) return error;
   std::string bytes;
   char buffer[4096];
   DWORD count = 0;
@@ -679,89 +742,70 @@ void Action(HWND window, int id) {
       else output = L"Diagnostics could not be exported. Check the selected path and permissions.";
     }
     else if (request->id == kMount || request->id == kMountRw) {
-      const auto exe = CliPath();
-      const bool writable = request->id == kMountRw;
-      std::wstring command = Quote(exe) + L" " + Quote(L"mount") + L" " + Quote(d.uuid) + L" " + Quote(L"--drive") + L" " + Quote(request->drive_selection);
-      if (writable) {
-        command += L" " + Quote(L"--rw") + L" " + Quote(L"--device-write-qualification");
-        if (!d.serial.empty()) command += L" " + Quote(L"--expect-serial=" + d.serial);
-        command += L" " + Quote(L"--expect-stable-id=" + d.stable_id);
-        command += L" " + Quote(L"--expect-size=" + d.device_size);
-        if (d.device_class == L"removable-disk") command += L" " + Quote(L"--allow-removable-disk-write");
-        if (d.device_class == L"fixed-disk") command += L" " + Quote(L"--allow-fixed-disk-write");
+      std::vector<std::wstring> args{L"mount", d.uuid, L"--drive", request->drive_selection};
+      if (request->id == kMountRw) {
+        args.emplace_back(L"--rw");
+        args.emplace_back(L"--device-write-qualification");
+        if (!d.serial.empty()) args.push_back(L"--expect-serial=" + d.serial);
+        args.push_back(L"--expect-stable-id=" + d.stable_id);
+        args.push_back(L"--expect-size=" + d.device_size);
+        if (d.device_class == L"removable-disk") args.emplace_back(L"--allow-removable-disk-write");
+        if (d.device_class == L"fixed-disk") args.emplace_back(L"--allow-fixed-disk-write");
       }
-      SECURITY_ATTRIBUTES pipe_sa{sizeof(pipe_sa), nullptr, TRUE};
-      HANDLE output_read = nullptr, output_write = nullptr;
-      if (!CreatePipe(&output_read, &output_write, &pipe_sa, 0)) {
-        output = L"Cannot capture mount output.";
-      } else {
-        SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0);
-        HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        &pipe_sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        STARTUPINFOW startup{}; startup.cb = sizeof(startup);
-        startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-        startup.wShowWindow = SW_HIDE; startup.hStdOutput = output_write;
-        startup.hStdError = output_write; startup.hStdInput = null_input;
-        PROCESS_INFORMATION process{};
-        const BOOL started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
-        CloseHandle(output_write);
-        if (null_input != INVALID_HANDLE_VALUE) CloseHandle(null_input);
-        if (!started) {
-          CloseHandle(output_read);
-          output = GetLastError() == ERROR_ACCESS_DENIED ? L"Access denied. Reopen with the required Windows permissions." : L"Could not start the mount process; check WinFsp and drive-letter availability.";
-        } else {
-          CloseHandle(process.hThread);
-          std::string mount_output;
-          char buffer[2048]; DWORD count = 0, available = 0;
-          output = L"Mount startup is still pending; the mount process will be left running. Refresh after this operation and use Unmount if it appears.";
-          bool mounted = false, process_exited = false;
-          const ULONGLONG mount_deadline = GetTickCount64() + 30000;
-          for (int attempt = 0; attempt < 30 && GetTickCount64() < mount_deadline; ++attempt) {
-            if (PeekNamedPipe(output_read, nullptr, 0, nullptr, &available, nullptr) && available) {
-              const DWORD want = (std::min)(available, static_cast<DWORD>(sizeof(buffer)));
-              if (ReadFile(output_read, buffer, want, &count, nullptr) && count) mount_output.append(buffer, count);
-            }
-            if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) { process_exited = true; break; }
-            const ULONGLONG remaining = mount_deadline - GetTickCount64();
-            if (remaining == 0) break;
-            const DWORD probe_timeout = static_cast<DWORD>((std::min)(remaining, ULONGLONG{5000}));
-            const std::wstring status = RunCli({L"diagnostics", L"--json", L"--include-identifiers"}, nullptr, probe_timeout);
-            if (IsDiagnosticsJsonReport(status)) {
-              const auto device_status = FindDeviceJsonObject(status, d.uuid);
-              if (!device_status.empty()) {
-                const std::wstring drive = JsonField(device_status, L"drive");
-                const std::wstring announced_drive = MountAnnouncementDrive(mount_output);
-                if (!drive.empty() && !announced_drive.empty() &&
-                    JsonField(device_status, L"mounted") == L"true" &&
-                    CompareStringOrdinal(drive.c_str(), -1, announced_drive.c_str(), -1, TRUE) == CSTR_EQUAL) {
-                  output = L"Mount is ready at " + drive + L"\\. The mount process continues independently.";
-                  mounted = true;
-                  break;
-                }
+      HANDLE output_read = nullptr;
+      PROCESS_INFORMATION process{};
+      output = StartCapturedCli(args, &process, &output_read);
+      if (output.empty()) {
+        CloseHandle(process.hThread);
+        std::string mount_output;
+        char buffer[2048]; DWORD count = 0, available = 0;
+        output = L"Mount startup is still pending; the mount process will be left running. Refresh after this operation and use Unmount if it appears.";
+        bool mounted = false, process_exited = false;
+        const ULONGLONG mount_deadline = GetTickCount64() + 30000;
+        for (int attempt = 0; attempt < 30 && GetTickCount64() < mount_deadline; ++attempt) {
+          if (PeekNamedPipe(output_read, nullptr, 0, nullptr, &available, nullptr) && available) {
+            const DWORD want = (std::min)(available, static_cast<DWORD>(sizeof(buffer)));
+            if (ReadFile(output_read, buffer, want, &count, nullptr) && count) mount_output.append(buffer, count);
+          }
+          if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) { process_exited = true; break; }
+          const ULONGLONG now = GetTickCount64();
+          if (now >= mount_deadline) break;
+          const DWORD probe_timeout = static_cast<DWORD>((std::min)(mount_deadline - now, ULONGLONG{5000}));
+          const std::wstring status = RunCli({L"diagnostics", L"--json", L"--include-identifiers"}, nullptr, probe_timeout);
+          if (IsDiagnosticsJsonReport(status)) {
+            const auto device_status = FindDeviceJsonObject(status, d.uuid);
+            if (!device_status.empty()) {
+              const std::wstring drive = JsonField(device_status, L"drive");
+              const std::wstring announced_drive = MountAnnouncementDrive(mount_output);
+              if (!drive.empty() && !announced_drive.empty() &&
+                  JsonField(device_status, L"mounted") == L"true" &&
+                  CompareStringOrdinal(drive.c_str(), -1, announced_drive.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                output = L"Mount is ready at " + drive + L"\\. The mount process continues independently.";
+                mounted = true;
+                break;
               }
             }
-            Sleep(1000);
           }
-          if (!mounted && !process_exited && WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0)
-            process_exited = true;
-          while (PeekNamedPipe(output_read, nullptr, 0, nullptr, &available, nullptr) && available) {
-            const DWORD want = (std::min)(available, static_cast<DWORD>(sizeof(buffer)));
-            if (!ReadFile(output_read, buffer, want, &count, nullptr) || !count) break;
-            mount_output.append(buffer, count);
-          }
-          if (!mounted && !mount_output.empty()) {
-            const int chars = MultiByteToWideChar(CP_UTF8, 0, mount_output.data(), static_cast<int>(mount_output.size()), nullptr, 0);
-            std::wstring captured(chars > 0 ? chars : 0, L'\0');
-            if (chars) MultiByteToWideChar(CP_UTF8, 0, mount_output.data(), static_cast<int>(mount_output.size()), captured.data(), chars);
-            output = process_exited ? L"Mount process exited before readiness. CLI output: " + captured
-                                    : L"Mount remains pending and its process was left running. Refresh to check its state. CLI output: " + captured;
-          } else if (process_exited && !mounted) {
-            output = L"Mount process exited before the filesystem became ready.";
-          }
-          CloseHandle(output_read);
-          CloseHandle(process.hProcess);
+          Sleep(1000);
         }
+        if (!mounted && !process_exited && WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0)
+          process_exited = true;
+        while (PeekNamedPipe(output_read, nullptr, 0, nullptr, &available, nullptr) && available) {
+          const DWORD want = (std::min)(available, static_cast<DWORD>(sizeof(buffer)));
+          if (!ReadFile(output_read, buffer, want, &count, nullptr) || !count) break;
+          mount_output.append(buffer, count);
+        }
+        if (!mounted && !mount_output.empty()) {
+          const int chars = MultiByteToWideChar(CP_UTF8, 0, mount_output.data(), static_cast<int>(mount_output.size()), nullptr, 0);
+          std::wstring captured(chars > 0 ? chars : 0, L'\0');
+          if (chars) MultiByteToWideChar(CP_UTF8, 0, mount_output.data(), static_cast<int>(mount_output.size()), captured.data(), chars);
+          output = process_exited ? L"Mount process exited before readiness. CLI output: " + captured
+                                  : L"Mount remains pending and its process was left running. Refresh to check its state. CLI output: " + captured;
+        } else if (process_exited && !mounted) {
+          output = L"Mount process exited before the filesystem became ready.";
+        }
+        CloseHandle(output_read);
+        CloseHandle(process.hProcess);
       }
     }
     auto* result = new std::wstring(std::move(output));
