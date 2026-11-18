@@ -17,8 +17,10 @@
 #include <shellapi.h>
 #include <commdlg.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -218,14 +220,226 @@ std::wstring JsonField(const std::wstring& object, const wchar_t* name) {
   return {};
 }
 
+void SkipJsonWhitespace(const std::wstring& json, size_t* position) {
+  while (*position < json.size() &&
+         (json[*position] == L' ' || json[*position] == L'\t' ||
+          json[*position] == L'\r' || json[*position] == L'\n')) {
+    ++*position;
+  }
+}
+
+bool ParseJsonString(const std::wstring& json, size_t* position) {
+  if (*position >= json.size() || json[(*position)++] != L'"') return false;
+  while (*position < json.size()) {
+    const wchar_t c = json[(*position)++];
+    if (c == L'"') return true;
+    if (c < 0x20) return false;
+    if (c != L'\\') continue;
+    if (*position >= json.size()) return false;
+    const wchar_t escaped = json[(*position)++];
+    if (escaped == L'"' || escaped == L'\\' || escaped == L'/' ||
+        escaped == L'b' || escaped == L'f' || escaped == L'n' ||
+        escaped == L'r' || escaped == L't') {
+      continue;
+    }
+    if (escaped != L'u' || *position + 4 > json.size()) return false;
+    for (int i = 0; i < 4; ++i) {
+      const wchar_t h = json[(*position)++];
+      if (!((h >= L'0' && h <= L'9') || (h >= L'a' && h <= L'f') ||
+            (h >= L'A' && h <= L'F'))) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+bool ParseJsonNumber(const std::wstring& json, size_t* position) {
+  const size_t start = *position;
+  if (*position < json.size() && json[*position] == L'-') ++*position;
+  if (*position >= json.size()) return false;
+  if (json[*position] == L'0') {
+    ++*position;
+  } else if (json[*position] >= L'1' && json[*position] <= L'9') {
+    while (*position < json.size() && json[*position] >= L'0' &&
+           json[*position] <= L'9') {
+      ++*position;
+    }
+  } else {
+    return false;
+  }
+  if (*position < json.size() && json[*position] == L'.') {
+    ++*position;
+    const size_t fraction = *position;
+    while (*position < json.size() && json[*position] >= L'0' &&
+           json[*position] <= L'9') {
+      ++*position;
+    }
+    if (*position == fraction) return false;
+  }
+  if (*position < json.size() &&
+      (json[*position] == L'e' || json[*position] == L'E')) {
+    ++*position;
+    if (*position < json.size() &&
+        (json[*position] == L'+' || json[*position] == L'-')) {
+      ++*position;
+    }
+    const size_t exponent = *position;
+    while (*position < json.size() && json[*position] >= L'0' &&
+           json[*position] <= L'9') {
+      ++*position;
+    }
+    if (*position == exponent) return false;
+  }
+  return *position > start;
+}
+
+bool ParseJsonValue(const std::wstring& json, size_t* position,
+                    unsigned depth) {
+  if (depth > 128) return false;
+  SkipJsonWhitespace(json, position);
+  if (*position >= json.size()) return false;
+  if (json[*position] == L'"') return ParseJsonString(json, position);
+  if (json[*position] == L'-' ||
+      (json[*position] >= L'0' && json[*position] <= L'9')) {
+    return ParseJsonNumber(json, position);
+  }
+  if (json.compare(*position, 4, L"true") == 0) {
+    *position += 4;
+    return true;
+  }
+  if (json.compare(*position, 5, L"false") == 0) {
+    *position += 5;
+    return true;
+  }
+  if (json.compare(*position, 4, L"null") == 0) {
+    *position += 4;
+    return true;
+  }
+  if (json[*position] == L'[') {
+    ++*position;
+    SkipJsonWhitespace(json, position);
+    if (*position < json.size() && json[*position] == L']') {
+      ++*position;
+      return true;
+    }
+    for (;;) {
+      if (!ParseJsonValue(json, position, depth + 1)) return false;
+      SkipJsonWhitespace(json, position);
+      if (*position >= json.size()) return false;
+      if (json[(*position)++] == L']') return true;
+      if (json[*position - 1] != L',') return false;
+    }
+  }
+  if (json[*position] == L'{') {
+    ++*position;
+    SkipJsonWhitespace(json, position);
+    if (*position < json.size() && json[*position] == L'}') {
+      ++*position;
+      return true;
+    }
+    for (;;) {
+      SkipJsonWhitespace(json, position);
+      if (!ParseJsonString(json, position)) return false;
+      SkipJsonWhitespace(json, position);
+      if (*position >= json.size() || json[(*position)++] != L':') return false;
+      if (!ParseJsonValue(json, position, depth + 1)) return false;
+      SkipJsonWhitespace(json, position);
+      if (*position >= json.size()) return false;
+      if (json[(*position)++] == L'}') return true;
+      if (json[*position - 1] != L',') return false;
+    }
+  }
+  return false;
+}
+
+bool IsValidJsonDocument(const std::wstring& json) {
+  size_t position = 0;
+  if (!ParseJsonValue(json, &position, 0)) return false;
+  SkipJsonWhitespace(json, &position);
+  return position == json.size();
+}
+
+bool IsJsonArray(const std::wstring& value) {
+  size_t position = 0;
+  SkipJsonWhitespace(value, &position);
+  if (position >= value.size() || value[position++] != L'[') return false;
+  size_t end = value.size();
+  while (end > position &&
+         (value[end - 1] == L' ' || value[end - 1] == L'\t' ||
+          value[end - 1] == L'\r' || value[end - 1] == L'\n')) {
+    --end;
+  }
+  return end > position && value[end - 1] == L']';
+}
+
+bool JsonArrayHasElements(const std::wstring& value) {
+  size_t position = 0;
+  SkipJsonWhitespace(value, &position);
+  if (position >= value.size() || value[position++] != L'[') return false;
+  SkipJsonWhitespace(value, &position);
+  return position < value.size() && value[position] != L']';
+}
+
+bool IsDiagnosticsJsonReport(const std::wstring& report) {
+  if (!IsValidJsonDocument(report)) return false;
+  size_t position = 0;
+  SkipJsonWhitespace(report, &position);
+  if (position >= report.size() || report[position] != L'{') return false;
+  const auto schema = JsonField(report, L"schema_version");
+  if (schema.empty() ||
+      !std::all_of(schema.begin(), schema.end(), [](wchar_t c) {
+        return c >= L'0' && c <= L'9';
+      })) {
+    return false;
+  }
+  return IsJsonArray(JsonField(report, L"devices")) &&
+         IsJsonArray(JsonField(report, L"partial_failures"));
+}
+
+bool DiagnosticsJsonHasPartialFailures(const std::wstring& report) {
+  return JsonArrayHasElements(JsonField(report, L"partial_failures"));
+}
+
+bool IsDiagnosticsTextReport(const std::wstring& report) {
+  constexpr wchar_t header[] = L"XFS for Windows diagnostics (schema ";
+  return report.rfind(header, 0) == 0 &&
+         report.find(L"\nVersion: ") != std::wstring::npos &&
+         report.find(L"\nWinFsp: ") != std::wstring::npos &&
+         report.find(L"\nAutomount service: ") != std::wstring::npos &&
+         report.find(L"\nDiscovery: ") != std::wstring::npos &&
+         report.find(L"\nDevices: ") != std::wstring::npos;
+}
+
+bool DiagnosticsTextHasPartialFailures(const std::wstring& report) {
+  constexpr wchar_t prefix[] = L"Partial failures: ";
+  size_t line_start = 0;
+  while (line_start < report.size()) {
+    const size_t line_end = report.find(L'\n', line_start);
+    const size_t end = line_end == std::wstring::npos ? report.size() : line_end;
+    if (report.compare(line_start, std::size(prefix) - 1, prefix) == 0) {
+      size_t digit = line_start + sizeof(prefix) / sizeof(prefix[0]) - 1;
+      while (digit < end && report[digit] >= L'0' && report[digit] <= L'9') {
+        if (report[digit] != L'0') return true;
+        ++digit;
+      }
+    }
+    if (line_end == std::wstring::npos) break;
+    line_start = line_end + 1;
+  }
+  return false;
+}
+
 void SetDetails(const std::wstring& text) { if (g_state && g_state->details) SetWindowTextW(g_state->details, text.c_str()); }
 
 void SetBusy(HWND window, bool busy) {
   if (!g_state || g_state->closing) return;
   g_state->busy = busy;
   const int ids[] = {kRefresh, kStart, kEnable, kEnableRw, kDisable, kMount,
-                     kUnmount, kEject, kExport, kExportJson, kMountRw};
+                     kUnmount, kEject, kOpen, kExport, kExportJson, kMountRw,
+                     kElevate};
   for (int id : ids) EnableWindow(GetDlgItem(window, id), busy ? FALSE : TRUE);
+  if (g_state->list) EnableWindow(g_state->list, busy ? FALSE : TRUE);
   if (g_state->drive_choice) EnableWindow(g_state->drive_choice, busy ? FALSE : TRUE);
 }
 
@@ -256,6 +470,65 @@ size_t FindJsonObjectEnd(const std::wstring& json, size_t begin) {
     else if (c == L'}' && --depth == 0) return i;
   }
   return std::wstring::npos;
+}
+
+std::wstring FindDeviceJsonObject(const std::wstring& json,
+                                  const std::wstring& uuid) {
+  const auto devices = JsonField(json, L"devices");
+  if (!IsJsonArray(devices)) return {};
+  size_t position = 0;
+  SkipJsonWhitespace(devices, &position);
+  ++position;
+  std::wstring match;
+  for (;;) {
+    SkipJsonWhitespace(devices, &position);
+    if (position >= devices.size() || devices[position] == L']') return match;
+    if (devices[position] != L'{') return {};
+    const size_t end = FindJsonObjectEnd(devices, position);
+    if (end == std::wstring::npos) return {};
+    const auto object = devices.substr(position, end - position + 1);
+    if (JsonField(object, L"uuid") == uuid) {
+      if (!match.empty()) return {};
+      match = object;
+    }
+    position = end + 1;
+    SkipJsonWhitespace(devices, &position);
+    if (position >= devices.size()) return {};
+    if (devices[position] == L',') ++position;
+    else if (devices[position] != L']') return {};
+  }
+}
+
+std::wstring MountAnnouncementDrive(const std::string& output) {
+  constexpr char prefix[] = "Mounting ";
+  constexpr char read_only[] = " (read-only)";
+  constexpr char read_write[] = " (read-write)";
+  size_t line_start = 0;
+  while (line_start < output.size()) {
+    const size_t line_end = output.find('\n', line_start);
+    const size_t end = line_end == std::string::npos ? output.size() : line_end;
+    if (output.compare(line_start, sizeof(prefix) - 1, prefix) == 0) {
+      size_t mode = output.find(read_only, line_start);
+      if (mode == std::string::npos || mode >= end) {
+        mode = output.find(read_write, line_start);
+      }
+      if (mode != std::string::npos && mode < end && mode >= line_start + 6) {
+        const size_t drive_start = mode - 2;
+        if (drive_start >= line_start + sizeof(prefix) - 1 &&
+            (output[drive_start] >= 'A' && output[drive_start] <= 'Z' ||
+             output[drive_start] >= 'a' && output[drive_start] <= 'z') &&
+            output[drive_start + 1] == ':' && drive_start >= 4 &&
+            output.compare(drive_start - 4, 4, " at ") == 0) {
+          wchar_t drive[] = {static_cast<wchar_t>(output[drive_start]), L':', L'\0'};
+          if (drive[0] >= L'a' && drive[0] <= L'z') drive[0] -= L'a' - L'A';
+          return drive;
+        }
+      }
+    }
+    if (line_end == std::string::npos) break;
+    line_start = line_end + 1;
+  }
+  return {};
 }
 
 void Populate(const std::wstring& json) {
@@ -297,20 +570,21 @@ void Populate(const std::wstring& json) {
     pos = end + 1;
     if (pos < json.size() && json[pos] == L']') break;
   }
-  if (g_state && GetWindowTextLengthW(g_state->details) == 0) SetDetails(json);
+  SetDetails(json);
 }
 
 struct ActionRequest { HWND window; int id; DeviceRow device; std::wstring output_path; std::wstring drive_selection = L"auto"; bool json = false; };
 
-std::wstring SavePath(HWND window) {
+std::wstring SavePath(HWND window, bool json) {
   std::wstring path(32768, L'\0');
   OPENFILENAMEW dialog{};
   dialog.lStructSize = sizeof(dialog);
   dialog.hwndOwner = window;
   dialog.lpstrFilter = L"Text diagnostics (*.txt)\0*.txt\0JSON diagnostics (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+  dialog.nFilterIndex = json ? 2 : 1;
   dialog.lpstrFile = path.data();
   dialog.nMaxFile = static_cast<DWORD>(path.size());
-  dialog.lpstrDefExt = L"txt";
+  dialog.lpstrDefExt = json ? L"json" : L"txt";
   dialog.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
   if (!GetSaveFileNameW(&dialog)) return {};
   path.resize(wcslen(path.c_str()));
@@ -325,6 +599,7 @@ bool WriteUtf8(const std::wstring& path, const std::wstring& text) {
   std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
   if (!file) return false;
   file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+  file.close();
   return static_cast<bool>(file);
 }
 
@@ -338,8 +613,11 @@ void Action(HWND window, int id) {
   }
   DeviceRow device;
   if (needs_device) device = g_state->devices[static_cast<size_t>(selected)];
-  if (id == kMountRw && (!device.discovered || device.serial.empty() || device.stable_id.empty() || device.device_size.empty())) {
-    SetDetails(L"Read-write mount requires a discovered device with serial, stable ID, and device size available for CLI identity pins.");
+  if (id == kMountRw &&
+      (!device.discovered ||
+       (device.device_class != L"virtual-disk" && device.serial.empty()) ||
+       device.stable_id.empty() || device.device_size.empty())) {
+    SetDetails(L"Read-write mount requires a discovered device with stable ID and device size; physical devices also need a serial number.");
     return;
   }
   if (id == kEnableRw || id == kMountRw) {
@@ -348,15 +626,18 @@ void Action(HWND window, int id) {
   }
   std::wstring output_path;
   if (id == kExport || id == kExportJson) {
-    output_path = SavePath(window);
+    output_path = SavePath(window, id == kExportJson);
     if (output_path.empty()) return;
+  }
+  if ((id == kOpen || id == kUnmount) && (!device.mounted || device.drive.empty())) {
+    SetDetails(L"This filesystem has no active drive letter. Refresh to check its mount state.");
+    return;
   }
   if (id == kUnmount && device.automount_enabled) {
     SetDetails(L"Automatic mounting is enabled for this filesystem and may remount it after unmount. Use Eject for a safe release, or disable enrollment and refresh first. Filesystem unmount is not device eject.");
     return;
   }
   if (id == kOpen) {
-    if (device.drive.empty()) { SetDetails(L"This filesystem has no active drive letter."); return; }
     ShellExecuteW(window, L"open", (device.drive + L"\\").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     return;
   }
@@ -382,16 +663,19 @@ void Action(HWND window, int id) {
     else if (request->id == kEnableRw) output = RunCli({L"automount", L"enable", d.uuid, L"--rw", L"--yes-i-really-mean-it"}, &code);
     else if (request->id == kEject) output = RunCli({L"automount", L"eject", d.uuid}, &code);
     else if (request->id == kDisable) output = RunCli({L"automount", L"disable", d.uuid}, &code);
-    else if (request->id == kUnmount) output = d.drive.empty() ? L"This filesystem has no active drive letter." : RunCli({L"unmount", d.drive}, &code);
+    else if (request->id == kUnmount) output = RunCli({L"unmount", d.drive}, &code);
     else if (request->id == kExport || request->id == kExportJson) {
       const bool json = request->id == kExportJson;
       output = RunCli(json ? std::vector<std::wstring>{L"diagnostics", L"--json"}
                            : std::vector<std::wstring>{L"diagnostics"}, &code);
-      const bool report_available = json
-          ? output.find(L"{\"schema_version\":") == 0 && output.find(L"\"partial_failures\":") != std::wstring::npos
-          : output.find(L"XFS for Windows diagnostics (schema ") == 0;
+      const bool report_available = json ? IsDiagnosticsJsonReport(output)
+                                         : IsDiagnosticsTextReport(output);
+      const bool partial_report = code != 0 ||
+          (json ? DiagnosticsJsonHasPartialFailures(output)
+                : DiagnosticsTextHasPartialFailures(output));
       if (report_available && WriteUtf8(request->output_path, output))
-        output = (code == 0 ? L"Redacted diagnostics saved to " : L"Partial redacted diagnostics saved to ") + request->output_path;
+        output = (partial_report ? L"Partial redacted diagnostics saved to "
+                                 : L"Redacted diagnostics saved to ") + request->output_path;
       else output = L"Diagnostics could not be exported. Check the selected path and permissions.";
     }
     else if (request->id == kMount || request->id == kMountRw) {
@@ -400,7 +684,7 @@ void Action(HWND window, int id) {
       std::wstring command = Quote(exe) + L" " + Quote(L"mount") + L" " + Quote(d.uuid) + L" " + Quote(L"--drive") + L" " + Quote(request->drive_selection);
       if (writable) {
         command += L" " + Quote(L"--rw") + L" " + Quote(L"--device-write-qualification");
-        command += L" " + Quote(L"--expect-serial=" + d.serial);
+        if (!d.serial.empty()) command += L" " + Quote(L"--expect-serial=" + d.serial);
         command += L" " + Quote(L"--expect-stable-id=" + d.stable_id);
         command += L" " + Quote(L"--expect-size=" + d.device_size);
         if (d.device_class == L"removable-disk") command += L" " + Quote(L"--allow-removable-disk-write");
@@ -443,13 +727,18 @@ void Action(HWND window, int id) {
             if (remaining == 0) break;
             const DWORD probe_timeout = static_cast<DWORD>((std::min)(remaining, ULONGLONG{5000}));
             const std::wstring status = RunCli({L"diagnostics", L"--json", L"--include-identifiers"}, nullptr, probe_timeout);
-            const size_t uuid_at = status.find(d.uuid);
-            if (uuid_at != std::wstring::npos) {
-              const size_t object_begin = status.rfind(L'{', uuid_at);
-              const size_t object_end = FindJsonObjectEnd(status, object_begin);
-              if (object_begin != std::wstring::npos && object_end != std::wstring::npos) {
-                const std::wstring drive = JsonField(status.substr(object_begin, object_end - object_begin + 1), L"drive");
-                if (!drive.empty()) { output = L"Mount is ready at " + drive + L"\\. The mount process continues independently."; mounted = true; break; }
+            if (IsDiagnosticsJsonReport(status)) {
+              const auto device_status = FindDeviceJsonObject(status, d.uuid);
+              if (!device_status.empty()) {
+                const std::wstring drive = JsonField(device_status, L"drive");
+                const std::wstring announced_drive = MountAnnouncementDrive(mount_output);
+                if (!drive.empty() && !announced_drive.empty() &&
+                    JsonField(device_status, L"mounted") == L"true" &&
+                    CompareStringOrdinal(drive.c_str(), -1, announced_drive.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                  output = L"Mount is ready at " + drive + L"\\. The mount process continues independently.";
+                  mounted = true;
+                  break;
+                }
               }
             }
             Sleep(1000);
@@ -480,7 +769,7 @@ void Action(HWND window, int id) {
     return 0;
   }, request, 0, nullptr);
   if (thread) CloseHandle(thread);
-  else { delete request; SetDetails(L"Could not start a background operation."); }
+  else { delete request; SetBusy(window, false); SetDetails(L"Could not start a background operation."); }
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -516,6 +805,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
   }
   if (message == WM_COMMAND) {
     const int id = LOWORD(wparam);
+    if (HIWORD(wparam) != BN_CLICKED || !lparam ||
+        reinterpret_cast<HWND>(lparam) != GetDlgItem(window, id)) {
+      return 0;
+    }
     if (id == kRefresh) Refresh(window);
     else if (id == kElevate) {
       const auto exe = CliPath();
@@ -525,7 +818,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
       info.cbSize = sizeof(info);
       info.lpVerb = L"runas"; info.lpFile = gui.c_str(); info.nShow = SW_SHOWNORMAL;
       if (!ShellExecuteExW(&info)) SetDetails(L"Elevation was cancelled or failed. You can still use read-only scans.");
-    } else Action(window, id);
+    } else if (id == kStart || id == kEnable || id == kEnableRw ||
+               id == kEject || id == kDisable || id == kMount ||
+               id == kMountRw || id == kUnmount || id == kOpen ||
+               id == kExport || id == kExportJson) {
+      Action(window, id);
+    }
     return 0;
   }
   if (message == kRefreshDone) {

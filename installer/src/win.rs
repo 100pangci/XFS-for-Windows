@@ -726,14 +726,16 @@ pub fn create_shortcuts(install_root: &Path) -> io::Result<()> {
     let gui = install_root.join("xfswin-gui.exe");
     let command_line = install_root.join("xfswin.exe");
     let install_text = install_root.to_string_lossy().to_string();
-    create_shortcut(
-        &menu.join("XFS for Windows.lnk"),
-        &gui,
-        "",
-        &install_text,
-        "Manage XFS volumes and automount settings",
-        &gui,
-    )?;
+    if gui.is_file() {
+        create_shortcut(
+            &menu.join("XFS for Windows.lnk"),
+            &gui,
+            "",
+            &install_text,
+            "Manage XFS volumes and automount settings",
+            &gui,
+        )?;
+    }
     create_shortcut(
         &menu.join("XFS for Windows Command Prompt.lnk"),
         &cmd,
@@ -794,19 +796,49 @@ fn create_shortcut(
     result
 }
 
-pub fn remove_shortcuts() -> io::Result<()> {
+const OWNED_SHORTCUTS: [&str; 3] = [
+    "XFS for Windows.lnk",
+    "XFS for Windows Command Prompt.lnk",
+    "XFS for Windows Documentation.lnk",
+];
+
+pub fn owned_shortcuts_present() -> io::Result<Vec<String>> {
     let menu = start_menu_directory()?;
-    for name in [
-        "XFS for Windows.lnk",
-        "XFS for Windows Command Prompt.lnk",
-        "XFS for Windows Documentation.lnk",
-    ] {
+    Ok(OWNED_SHORTCUTS
+        .iter()
+        .filter(|name| menu.join(name).is_file())
+        .map(|name| (*name).to_string())
+        .collect())
+}
+
+pub fn remove_shortcuts_not_present(previously_present: &[String]) -> io::Result<()> {
+    let menu = start_menu_directory()?;
+    remove_owned_shortcuts_not_present(&menu, previously_present)
+}
+
+fn remove_owned_shortcuts_not_present(
+    menu: &Path,
+    previously_present: &[String],
+) -> io::Result<()> {
+    for name in OWNED_SHORTCUTS {
+        if previously_present
+            .iter()
+            .any(|present| present.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
         match fs::remove_file(menu.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+pub fn remove_shortcuts() -> io::Result<()> {
+    let menu = start_menu_directory()?;
+    remove_owned_shortcuts_not_present(&menu, &[])?;
     match fs::remove_dir(&menu) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1098,11 +1130,50 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn win32_error_marks_missing_keys_as_not_found() {
         assert_eq!(win32_error("open", 2).kind(), io::ErrorKind::NotFound);
         assert_eq!(win32_error("open", 3).kind(), io::ErrorKind::NotFound);
         assert_eq!(win32_error("open", 5).kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn rollback_removes_only_shortcuts_added_by_the_upgrade() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX epoch")
+            .as_nanos();
+        let menu = std::env::temp_dir().join(format!(
+            "xfswin-setup-shortcut-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&menu).expect("create synthetic Start Menu directory");
+        let gui = menu.join(OWNED_SHORTCUTS[0]);
+        let command = menu.join(OWNED_SHORTCUTS[1]);
+        let documentation = menu.join(OWNED_SHORTCUTS[2]);
+        let unrelated = menu.join("User-created shortcut.lnk");
+        for path in [&gui, &command, &documentation, &unrelated] {
+            fs::write(path, b"synthetic shortcut").expect("write synthetic shortcut");
+        }
+
+        remove_owned_shortcuts_not_present(
+            &menu,
+            &[
+                OWNED_SHORTCUTS[1].to_string(),
+                OWNED_SHORTCUTS[2].to_string(),
+            ],
+        )
+        .expect("restore legacy shortcut set");
+
+        assert!(!gui.exists(), "the newly introduced GUI shortcut remains");
+        assert!(command.exists(), "the legacy command shortcut was removed");
+        assert!(
+            documentation.exists(),
+            "the legacy documentation shortcut was removed"
+        );
+        assert!(unrelated.exists(), "an unrelated shortcut was removed");
+        fs::remove_dir_all(&menu).expect("remove synthetic Start Menu directory");
     }
 }

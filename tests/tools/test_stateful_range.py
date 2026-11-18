@@ -5,6 +5,7 @@
 import unittest
 
 import stateful_range
+from test_stateful_crash_contract import StatefulCrashContractTests
 
 
 class StatefulRangeTests(unittest.TestCase):

@@ -41,9 +41,43 @@ public static class XfsGuiNative {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int count);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool SetWindowText(IntPtr hwnd, string text);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr extra);
+  [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr extra);
+  [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
   public delegate bool EnumProc(IntPtr hwnd, IntPtr extra);
+  public static IntPtr FindWindowForProcess(uint processId) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((hwnd, extra) => {
+      uint owner = 0;
+      GetWindowThreadProcessId(hwnd, out owner);
+      if (owner != processId) return true;
+      var cls = new StringBuilder(64);
+      var title = new StringBuilder(128);
+      GetClassName(hwnd, cls, cls.Capacity);
+      GetWindowText(hwnd, title, title.Capacity);
+      if (cls.ToString() == "XfswinManagementWindow" && title.ToString() == "XFS for Windows") {
+        found = hwnd;
+        return false;
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+  public static IntPtr FindSaveFileNameEdit(IntPtr dialog) {
+    IntPtr edit = GetDlgItem(dialog, 1152); // edt1 in the classic dialog
+    if (edit != IntPtr.Zero) return edit;
+    IntPtr combo = GetDlgItem(dialog, 1148); // cmb13 in the Explorer-style dialog
+    EnumChildWindows(combo == IntPtr.Zero ? dialog : combo, (child, extra) => {
+      // The modern dialog nests the file name edit (1001) below its combo box.
+      if (combo == IntPtr.Zero && GetDlgCtrlID(child) != 1001) return true;
+      var name = new StringBuilder(32);
+      GetClassName(child, name, name.Capacity);
+      if (name.ToString() != "Edit") return true;
+      edit = child;
+      return false;
+    }, IntPtr.Zero);
+    return edit;
+  }
   [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
   [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
   [DllImport("advapi32.dll", SetLastError=true)] public static extern bool CreateRestrictedToken(IntPtr existing, uint flags, uint disableCount, IntPtr sidsToDisable, uint deleteCount, IntPtr privilegesToDelete, uint restrictCount, IntPtr sidsToRestrict, out IntPtr token);
@@ -54,19 +88,18 @@ public static class XfsGuiNative {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-  public const uint BM_CLICK=0x00F5, LB_GETCOUNT=0x018B, LB_GETTEXT=0x0189, LB_SETCURSEL=0x0186, WM_GETTEXT=0x000D;
+  public const uint BM_CLICK=0x00F5, LB_GETCOUNT=0x018B, LB_GETTEXT=0x0189, LB_SETCURSEL=0x0186, WM_SETTEXT=0x000C, WM_GETTEXT=0x000D, WM_COMMAND=0x0111;
 }
 '@
 
 function Get-GuiWindow([uint32]$ExpectedProcessId = 0) {
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
-        $window = [XfsGuiNative]::FindWindow('XfswinManagementWindow', 'XFS for Windows')
-        if ($window -ne [IntPtr]::Zero) {
-            if ($ExpectedProcessId -eq 0) { return $window }
-            $owner = [uint32]0
-            [void][XfsGuiNative]::GetWindowThreadProcessId($window, [ref]$owner)
-            if ($owner -eq $ExpectedProcessId) { return $window }
+        if ($ExpectedProcessId -eq 0) {
+            $window = [XfsGuiNative]::FindWindow('XfswinManagementWindow', 'XFS for Windows')
+        } else {
+            $window = [XfsGuiNative]::FindWindowForProcess($ExpectedProcessId)
         }
+        if ($window -ne [IntPtr]::Zero) { return $window }
         Start-Sleep -Milliseconds 500
     }
     throw 'The expected XFS for Windows GUI window did not appear.'
@@ -107,34 +140,56 @@ function Select-GuiDevice([IntPtr]$Window, [string]$Identifier) {
     throw "The GUI device list does not contain fixture UUID $Identifier."
 }
 function Invoke-GuiExport([IntPtr]$Window, [int]$ControlId, [string]$Path) {
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
-    $script:guiSaveDialog = [IntPtr]::Zero
+    $extension = if ($ControlId -eq 1013) { '.json' } else { '.txt' }
+    $expectedPath = $Path
+    if ([string]::IsNullOrEmpty([IO.Path]::GetExtension($expectedPath))) { $expectedPath += $extension }
+    if (Test-Path -LiteralPath $expectedPath) { Remove-Item -LiteralPath $expectedPath -Force }
+    $dialog = [IntPtr]::Zero
+    $dialogResult = [ref]$dialog
+    $findDialog = { param($hwnd, $extra)
+        $owner = [uint32]0
+        [void][XfsGuiNative]::GetWindowThreadProcessId($hwnd, [ref]$owner)
+        $class = [Text.StringBuilder]::new(64)
+        [void][XfsGuiNative]::GetClassName($hwnd, $class, $class.Capacity)
+        if ($owner -eq $process.Id -and $class.ToString() -eq '#32770') {
+            $dialogResult.Value = $hwnd
+            return $false
+        }
+        return $true
+    }.GetNewClosure()
+    $fileName = [IntPtr]::Zero
+    $saveButton = [IntPtr]::Zero
     Click-Gui $Window $ControlId
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
-        $dialog = [IntPtr]::Zero
-        [void][XfsGuiNative]::EnumWindows({ param($hwnd, $extra)
-            $owner = [uint32]0
-            [void][XfsGuiNative]::GetWindowThreadProcessId($hwnd, [ref]$owner)
-            $class = [Text.StringBuilder]::new(64)
-            [void][XfsGuiNative]::GetClassName($hwnd, $class, $class.Capacity)
-            if ($owner -eq $process.Id -and $class.ToString() -eq '#32770') {
-                $script:guiSaveDialog = $hwnd
-                return $false
-            }
-            return $true
-        }.GetNewClosure(), [IntPtr]::Zero)
-        $dialog = $script:guiSaveDialog
-        if ($dialog -ne [IntPtr]::Zero) { break }
+        [void][XfsGuiNative]::EnumWindows($findDialog, [IntPtr]::Zero)
+        if ($dialog -ne [IntPtr]::Zero) {
+            $fileName = [XfsGuiNative]::FindSaveFileNameEdit($dialog)
+            $saveButton = [XfsGuiNative]::GetDlgItem($dialog, 1)
+            if ($fileName -ne [IntPtr]::Zero -and $saveButton -ne [IntPtr]::Zero) { break }
+        }
         Start-Sleep -Milliseconds 250
     }
-    if ($dialog -eq [IntPtr]::Zero) { throw 'The diagnostics Save As dialog did not open.' }
-    [void][XfsGuiNative]::SetWindowText([XfsGuiNative]::GetDlgItem($dialog, 1148), $Path)
-    $saveButton = [XfsGuiNative]::GetDlgItem($dialog, 1)
-    if ($saveButton -eq [IntPtr]::Zero -or -not [XfsGuiNative]::PostMessage($saveButton, [XfsGuiNative]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)) {
+    if ($fileName -eq [IntPtr]::Zero -or $saveButton -eq [IntPtr]::Zero) {
+        throw 'The diagnostics Save As dialog did not initialize.'
+    }
+    $fileNameText = [Text.StringBuilder]::new($Path)
+    if ([XfsGuiNative]::SendMessageString($fileName, [XfsGuiNative]::WM_SETTEXT, [IntPtr]::Zero, $fileNameText) -eq [IntPtr]::Zero) {
+        throw 'Could not set the diagnostics export file name.'
+    }
+    if (-not [XfsGuiNative]::PostMessage($saveButton, [XfsGuiNative]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)) {
         throw 'Could not submit the diagnostics Save As dialog.'
     }
-    for ($attempt = 0; $attempt -lt 60 -and -not (Test-Path -LiteralPath $Path -PathType Leaf); $attempt++) { Start-Sleep -Milliseconds 250 }
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "GUI did not export diagnostics to $Path." }
+    $exportResponse = Wait-GuiDetails $Window {
+        param($text)
+        $text -eq "Redacted diagnostics saved to $expectedPath" -or
+            $text -eq "Partial redacted diagnostics saved to $expectedPath" -or
+            $text.StartsWith('Diagnostics could not be exported.')
+    } 'diagnostics export completion'
+    if ($exportResponse.StartsWith('Diagnostics could not be exported.') -or
+        -not (Test-Path -LiteralPath $expectedPath -PathType Leaf)) {
+        throw "GUI did not export diagnostics to ${expectedPath}: $exportResponse"
+    }
+    return $expectedPath
 }
 function Start-GuiWithLimitedToken([string]$Executable) {
     $processToken = [IntPtr]::Zero
@@ -211,7 +266,7 @@ try {
     $location = "PhysicalDrive$expectedDisk partition $expectedPartition"
     $deviceLine = @($devices.output -split "`r?`n" | Where-Object { $_.IndexOf($uuid, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
     if ($deviceLine.Count -ne 1 -or $deviceLine[0] -notmatch [regex]::Escape($location)) {
-        throw "Discovered UUID $uuid does not match the attached VHD location $location: $($devices.output)"
+        throw "Discovered UUID $uuid does not match the attached VHD location ${location}: $($devices.output)"
     }
 
     $limitedProcess = Start-GuiWithLimitedToken $Gui
@@ -221,20 +276,37 @@ try {
     $operations.unprivileged_start = @{ status = 'passed'; process_id = $limitedProcess.Id; response = $details }
     # Privileged storage operations are reached through the GUI's own explicit
     # Run elevated action, never by starting the ordinary GUI with an admin token.
+    $guiPath = [IO.Path]::GetFullPath($Gui)
+    $existingGuiPids = @((Get-Process -Name 'xfswin-gui' -ErrorAction SilentlyContinue).Id)
     Click-Gui $window 1012
     $elevatedProcess = $null
-    for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        $elevatedProcess = @(Get-Process -Name 'xfswin-gui' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $limitedProcess.Id } | Select-Object -First 1)
-        if ($elevatedProcess.Count -gt 0) { $elevatedProcess = $elevatedProcess[0]; break }
-        Start-Sleep -Milliseconds 500
+    for ($attempt = 0; $attempt -lt 120 -and $null -eq $elevatedProcess; $attempt++) {
+        foreach ($candidate in @(Get-Process -Name 'xfswin-gui' -ErrorAction SilentlyContinue)) {
+            if ($candidate.Id -eq $limitedProcess.Id -or $candidate.Id -in $existingGuiPids) { continue }
+            try { $candidatePath = [IO.Path]::GetFullPath($candidate.Path) } catch { continue }
+            if ($candidatePath.Equals($guiPath, [StringComparison]::OrdinalIgnoreCase)) {
+                $elevatedProcess = $candidate
+                break
+            }
+        }
+        if ($null -eq $elevatedProcess) { Start-Sleep -Milliseconds 500 }
     }
-    if ($null -eq $elevatedProcess) { throw 'The GUI Run elevated control did not start a privileged GUI process.' }
+    if ($null -eq $elevatedProcess) { throw 'The GUI Run elevated control did not start a new GUI process from the expected executable.' }
     Stop-Process -Id $limitedProcess.Id -Force -ErrorAction SilentlyContinue
     Wait-Process -Id $limitedProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
     $process = $elevatedProcess
     $window = Get-GuiWindow ([uint32]$elevatedProcess.Id)
     $details = Wait-GuiDetails $window { param($text) $text.Contains($uuid) } 'elevated GUI diagnostics discovery'
     $operations.discovery = @{ status = 'passed'; uuid = $uuid }
+    $detailsBeforeNotifications = Get-GuiDetails $window
+    $list = [XfsGuiNative]::GetDlgItem($window, 1009)
+    $driveChoice = [XfsGuiNative]::GetDlgItem($window, 1016)
+    [void][XfsGuiNative]::SendMessage($window, [XfsGuiNative]::WM_COMMAND, [IntPtr]([long]0x00010000 + 1009), $list)
+    [void][XfsGuiNative]::SendMessage($window, [XfsGuiNative]::WM_COMMAND, [IntPtr]([long]0x00010000 + 1016), $driveChoice)
+    Start-Sleep -Milliseconds 250
+    if ((Get-GuiDetails $window) -ne $detailsBeforeNotifications) {
+        throw 'List or drive-choice notifications were incorrectly routed as button actions.'
+    }
     $list = [XfsGuiNative]::GetDlgItem($window, 1009)
     [void][XfsGuiNative]::SendMessage($list, [XfsGuiNative]::LB_SETCURSEL, [IntPtr](-1), [IntPtr]::Zero)
     Click-Gui $window 1005
@@ -251,6 +323,9 @@ try {
     Assert-ReleaseCommandOk $mounted 'post-GUI mount diagnostics'
     $mountedDevice = @((ConvertFrom-Json -InputObject $mounted.output).devices | Where-Object { $_.uuid -eq $uuid })
     if ($mountedDevice.Count -ne 1 -or $mountedDevice[0].effective_mode -notmatch '(?i)read.only|ro') { throw 'GUI did not mount the exact fixture read-only.' }
+    if (-not ([string]$mountedDevice[0].drive).Equals($drive, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "GUI reported mount drive $drive but CLI diagnostics report $($mountedDevice[0].drive) for UUID $uuid."
+    }
     $operations.mount_ro = @{ status = 'passed'; drive = $drive; response = $details }
 
     Click-Gui $window 1001
@@ -319,14 +394,21 @@ try {
     if ($disabledDevice.Count -ne 1 -or $disabledDevice[0].automount_enabled) { throw 'GUI Disable did not deregister the fixture automount entry.' }
     $operations.automount_disable = @{ status = 'passed'; response = $details }
 
-    $textPath = Join-Path $OutputDirectory "gui-diagnostics-$Architecture.txt"
-    Invoke-GuiExport $window 1008 $textPath
+    $textBasePath = Join-Path $OutputDirectory "gui-diagnostics-$Architecture"
+    $textPath = Invoke-GuiExport $window 1008 $textBasePath
     $textExport = Get-Content -LiteralPath $textPath -Raw
-    if ([string]::IsNullOrWhiteSpace($textExport) -or $textExport -match [regex]::Escape($uuid)) { throw 'GUI text diagnostics export is empty or contains the fixture UUID.' }
-    $jsonPath = Join-Path $OutputDirectory "gui-diagnostics-$Architecture.json"
-    Invoke-GuiExport $window 1013 $jsonPath
+    if ([IO.Path]::GetExtension($textPath) -ne '.txt' -or
+        [string]::IsNullOrWhiteSpace($textExport) -or
+        -not $textExport.StartsWith('XFS for Windows diagnostics (schema ') -or
+        $textExport -match [regex]::Escape($uuid)) {
+        throw 'GUI text diagnostics export is malformed, empty, has the wrong extension, or contains the fixture UUID.'
+    }
+    $jsonBasePath = Join-Path $OutputDirectory "gui-diagnostics-$Architecture"
+    $jsonPath = Invoke-GuiExport $window 1013 $jsonBasePath
     $jsonExport = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    if ($jsonExport -isnot [pscustomobject]) { throw 'GUI JSON diagnostics export is not a JSON object.' }
+    if ([IO.Path]::GetExtension($jsonPath) -ne '.json' -or $jsonExport -isnot [pscustomobject]) {
+        throw 'GUI JSON diagnostics export is not a JSON object with the correct extension.'
+    }
     $jsonText = Get-Content -LiteralPath $jsonPath -Raw
     if ($jsonText -match [regex]::Escape($uuid)) { throw 'GUI JSON diagnostics export contains the fixture UUID.' }
     $operations.diagnostics_export = @{
@@ -341,12 +423,7 @@ try {
 } catch {
     $operations.failure = @{ status = 'failed'; message = $_.Exception.Message }
     if ($null -ne $process) {
-        $owner = [uint32]0
-        $window = [XfsGuiNative]::FindWindow('XfswinManagementWindow', 'XFS for Windows')
-        if ($window -ne [IntPtr]::Zero) {
-            [void][XfsGuiNative]::GetWindowThreadProcessId($window, [ref]$owner)
-            if ($owner -ne $process.Id) { $window = [IntPtr]::Zero }
-        }
+        $window = [XfsGuiNative]::FindWindowForProcess([uint32]$process.Id)
         try { Save-GuiFailureScreenshot $window } catch { Write-Warning "Could not capture GUI failure screenshot: $($_.Exception.Message)" }
     }
     $results = [ordered]@{ kind = 'xfswin-gui-acceptance'; architecture = $Architecture; operations = $operations; failure = $_.Exception.Message; screenshot = if (Test-Path $screenshotPath) { $screenshotPath } else { $null }; started_utc = (Get-Date).ToUniversalTime().ToString('o'); completed_utc = (Get-Date).ToUniversalTime().ToString('o') }

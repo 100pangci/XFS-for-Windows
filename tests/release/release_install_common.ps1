@@ -266,8 +266,8 @@ function Get-ReleasePackage {
         'payload.xfswin.sha256', 'assets.payload_exe.sha256',
         'artifacts.xfswin.sha256', 'artifacts.payload.xfswin.sha256') 'payload xfswin.exe SHA-256').ToLowerInvariant()
     $payloadGuiSha = (Get-ReleaseMetadataValue $metadata @(
-        'payload_gui_sha256', 'assets.payload_gui.sha256', 'payload.xfswin_gui.sha256')
-        'payload xfswin-gui.exe SHA-256').ToLowerInvariant()
+        'payload_gui_sha256', 'assets.payload_gui.sha256',
+        'payload.xfswin_gui.sha256') 'payload xfswin-gui.exe SHA-256').ToLowerInvariant()
     Assert-Release ($archValue -eq $Architecture) `
         "package metadata architecture '$archValue' does not match $Architecture"
     Assert-Release ($version -match '^0\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') `

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 
+import stateful_contract
 import stateful_range
 
 
@@ -142,26 +143,18 @@ def main(argv):
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv[1:])
 
-    own_mount = False
-    mountpoint = args.mount
-    if not mountpoint:
-        if not args.image:
-            parser.error("--mount or --image is required")
-        mountpoint = args.mountpoint or tempfile.mkdtemp(prefix="fuzz2-mnt-")
-        os.makedirs(mountpoint, exist_ok=True)
-        command = ["mount", "-o", "loop,ro,nouuid", args.image, mountpoint]
-        result = subprocess.run(command)
-        if result.returncode != 0:
-            fail("cannot mount %s" % args.image)
-        own_mount = True
+    if not args.mount and not args.image:
+        parser.error("--mount or --image is required")
 
     with open(args.manifest, "r", encoding="utf-8-sig") as f:
         manifest = json.load(f)
     if manifest.get("format") != "xfswin-stateful-v1":
         fail("unknown manifest format")
     states = manifest.get("states", [])
-    if not states:
-        fail("manifest has no states")
+    try:
+        candidates = stateful_contract.state_candidates(manifest)
+    except ValueError as error:
+        fail("invalid state contract: %s" % error)
     range_mode = manifest.get("state_mode") == "range"
     allowed_sizes = {}
     range_contract = range_before = range_after = None
@@ -174,16 +167,27 @@ def main(argv):
             fail("invalid range contract: %s" % exc)
         if range_contract is None or range_target is None:
             fail("range manifest is missing its target or byte contract")
-        for state in states:
-            for entry in state["entries"]:
+        for index in candidates:
+            for entry in states[index]["entries"]:
                 if entry["type"] == "file" and entry["id"] == range_target:
                     for path in entry["paths"]:
                         allowed_sizes.setdefault(path, set()).add(entry["size"])
+
+    mountpoint = args.mount
+    own_mount = not mountpoint
+    if own_mount:
+        mountpoint = args.mountpoint or tempfile.mkdtemp(prefix="fuzz2-mnt-")
+        os.makedirs(mountpoint, exist_ok=True)
+        command = ["mount", "-o", "loop,ro,nouuid", args.image, mountpoint]
+        result = subprocess.run(command)
+        if result.returncode != 0:
+            fail("cannot mount %s" % args.image)
+
     errors = []
     try:
-        for index, state in enumerate(states):
+        for index in candidates:
             try:
-                count = check_state(mountpoint, state, range_mode, allowed_sizes,
+                count = check_state(mountpoint, states[index], range_mode, allowed_sizes,
                                     range_target, range_contract, range_before,
                                     range_after)
                 if not args.quiet:

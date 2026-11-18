@@ -66,15 +66,27 @@ def invoke(command, log, expected=None):
     return result.returncode
 
 
-def base_command(exe, ops, image, trace, manifest, steps, crash_op, point, observer, seed):
+def base_command(exe, ops, image, trace, manifest, steps, crash_op, point, observer,
+                 seed, state_expectation):
     return [exe, "--seed", str(seed), "--steps", str(steps), "--ops-file", str(ops),
             "--image", str(image), "--trace", str(trace), "--manifest", str(manifest),
             "--profile", "modern", "--workload", "mixed", "--crash-op", str(crash_op),
-            "--crash-point", point, "--concurrent-observer", observer, "--quiet"]
+            "--crash-point", point, "--state-expectation", state_expectation,
+            "--concurrent-observer", observer, "--quiet"]
 
 
-def mutate_manifest_negative(exe, image, manifest, work):
-    """Prove the raw oracle still rejects unrelated expected-state corruption."""
+def change_expected_xattrs(node):
+    attrs = node["xattrs"]
+    if not attrs:
+        attrs.append({"name": "user.s2", "length": 8, "value_fnv": "0000000000000000"})
+    else:
+        attr = attrs[0]
+        attr["value_fnv"] = ("ffffffffffffffff" if attr["value_fnv"] == "0000000000000000"
+                             else "0000000000000000")
+
+
+def mutate_manifest_negative(image, manifest, work):
+    """Prove the raw oracle rejects changes to the expected file, links and xattrs."""
     original = json.loads(manifest.read_text(encoding="utf-8"))
     states = original.get("states", [])
     if not states:
@@ -88,9 +100,7 @@ def mutate_manifest_negative(exe, image, manifest, work):
     mutations = {
         "file": lambda node: node.__setitem__("size", int(node.get("size", 0)) + 1),
         "link": lambda node: node.__setitem__("nlink", int(node.get("nlink", 0)) + 1),
-        "xattr": lambda node: node["xattrs"][0].__setitem__(
-            "value_fnv", "0000000000000000" if node["xattrs"][0].get("value_fnv") != "0000000000000000"
-            else "ffffffffffffffff"),
+        "xattr": change_expected_xattrs,
     }
     oracle = Path(__file__).parents[1] / "tools" / "stateful_probe.py"
     for kind, mutate in mutations.items():
@@ -98,8 +108,6 @@ def mutate_manifest_negative(exe, image, manifest, work):
         targets = [next(node for node in state["entries"]
                         if "/f3" in node.get("paths", []))
                    for state in candidate["states"]]
-        if kind == "xattr" and any(not target.get("xattrs") for target in targets):
-            raise SystemExit("concurrent crash: fixture file has no xattr")
         for target in targets:
             mutate(target)
         bad = work / ("negative-unrelated-%s.manifest.json" % kind)
@@ -115,8 +123,8 @@ def mutate_manifest_negative(exe, image, manifest, work):
             raise SystemExit("concurrent crash: unrelated %s mutation did not produce a semantic oracle failure" % kind)
 
 
-def run_case(exe, ops, work, crash_op, point, observer, seed, case_index,
-             kernel_replay, kernel_recovered):
+def run_case(exe, ops, work, crash_op, point, observer, state_expectation,
+             seed, case_index, kernel_replay, kernel_recovered):
     case = work / ("seed%d-case%d-op%d-%s-%s" %
                    (seed, case_index, crash_op, point, observer))
     case.mkdir()
@@ -126,7 +134,7 @@ def run_case(exe, ops, work, crash_op, point, observer, seed, case_index,
     schedule = case / "recorded.schedule"
     steps = 6
     command = base_command(exe, ops, image, trace, manifest, steps,
-                           crash_op, point, observer, seed)
+                           crash_op, point, observer, seed, state_expectation)
     invoke(command + ["--schedule-out", str(schedule)], case / "record.log", CRASH_EXIT)
     choices = schedule.read_text(encoding="utf-8").splitlines()
     if not choices or any(not choice.isdecimal() for choice in choices):
@@ -147,13 +155,14 @@ def run_case(exe, ops, work, crash_op, point, observer, seed, case_index,
     recover = [exe, "--seed", str(seed), "--steps", str(steps), "--ops-file", str(ops),
                "--image", str(image), "--trace", str(trace), "--manifest", str(manifest),
                "--profile", "modern", "--workload", "mixed", "--crash-op", str(crash_op),
-               "--crash-point", point, "--recover", "--quiet"]
+               "--crash-point", point, "--state-expectation", state_expectation,
+               "--recover", "--quiet"]
     invoke(recover, case / "recover.log")
 
     probe = [sys.executable, "-I", str(Path(__file__).parents[1] / "tools" / "stateful_probe.py"),
              str(image), "--manifest", str(manifest), "--quiet"]
     invoke(probe, case / "oracle.log")
-    mutate_manifest_negative(exe, image, manifest, case)
+    mutate_manifest_negative(image, manifest, case)
     repair = shutil.which("xfs_repair")
     if not repair:
         raise SystemExit("concurrent crash: xfs_repair is required for this matrix")
@@ -183,28 +192,35 @@ def main(argv):
     if work.exists() and any(work.iterdir()):
         work = work / ("run-%d-%d" % (time.time_ns(), os.getpid()))
     work.mkdir(parents=True, exist_ok=True)
+    invoke([exe, "--self-test-runner-contracts"],
+           work / "runner-contract-self-test.log")
     ops = work / "fixed.ops"
     ops.write_text(OPS, encoding="utf-8")
 
+    # Strong expectations are limited to the fixed 8-byte local setxattr and
+    # non-replacing rename, each executed in one transaction. The data-write
+    # case is multi-stage, so it keeps either logical state and checks only its
+    # old/new physical payload contract.
     if args.mode == "smoke":
-        cases = ((4, "after_log_commit", "flush"),
-                 (6, "mid_metadata_write", "read"),
-                 (5, "after_data_write", "read"),
-                 (5, "before_log_write", "flush"))
+        cases = ((4, "after_log_commit", "flush", "after"),
+                 (6, "mid_metadata_write", "read", "after"),
+                 (5, "after_data_write", "read", "either"),
+                 (4, "before_log_write", "flush", "before"))
         seeds = (42,)
     else:
-        cases = ((4, "after_log_commit", "flush"),
-                 (6, "mid_metadata_write", "read"),
-                 (5, "after_data_write", "read"),
-                 (5, "before_log_write", "flush"))
+        cases = ((4, "after_log_commit", "flush", "after"),
+                 (6, "mid_metadata_write", "read", "after"),
+                 (5, "after_data_write", "read", "either"),
+                 (4, "before_log_write", "flush", "before"))
         seeds = (42, 0x2468ACE1)
     case_count = 0
     for seed in seeds:
         seed_ops = work / ("fixed-%d.ops" % seed)
         seed_ops.write_text(OPS.replace("seed=42", "seed=%d" % seed), encoding="utf-8")
-        for case_index, (crash_op, point, observer) in enumerate(cases):
-            run_case(exe, seed_ops, work, crash_op, point, observer, seed,
-                     case_index, args.kernel_replay, args.kernel_recovered)
+        for case_index, (crash_op, point, observer, state_expectation) in enumerate(cases):
+            run_case(exe, seed_ops, work, crash_op, point, observer,
+                     state_expectation, seed, case_index,
+                     args.kernel_replay, args.kernel_recovered)
             case_count += 1
 
     # A successful ordinary replay with a valid schedule plus one extra choice

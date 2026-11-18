@@ -252,16 +252,19 @@ VerifyResult VerifyModel(xfs::XfsFilesystem& fs, const ModelFs& model,
   return Ok();
 }
 
-VerifyResult VerifyRangeCrash(xfs::XfsFilesystem& fs, const ModelFs& before,
-                              const ModelFs& after, const Operation& op) {
+VerifyResult VerifyRangeCrash(xfs::XfsFilesystem& fs, const ModelFs& skeleton,
+                              const ModelFs& before, const ModelFs& after,
+                              const Operation& op, bool require_expected_size) {
   const uint64_t target_id =
       op.type == OpType::kReflink ? op.dst_node : op.node;
-  VerifyResult skeleton = VerifyModel(fs, after, target_id);
-  if (!skeleton.ok) return skeleton;
+  VerifyResult checked_skeleton = VerifyModel(fs, skeleton, target_id);
+  if (!checked_skeleton.ok) return checked_skeleton;
 
+  const ModelNode* skeleton_node = skeleton.Find(target_id);
   const ModelNode* before_node = before.Find(target_id);
   const ModelNode* after_node = after.Find(target_id);
-  if (!before_node || !after_node ||
+  if (!skeleton_node || !before_node || !after_node ||
+      skeleton_node->type != NodeType::kFile ||
       before_node->type != NodeType::kFile ||
       after_node->type != NodeType::kFile) {
     // A data operation always targets an existing regular file; anything else
@@ -284,7 +287,14 @@ VerifyResult VerifyRangeCrash(xfs::XfsFilesystem& fs, const ModelFs& before,
   const uint64_t before_size = before_node->data.size();
   const uint64_t after_size = after_node->data.size();
   const uint64_t actual_size = actual.size();
-  if (actual_size != before_size && actual_size != after_size) {
+  if (require_expected_size) {
+    const uint64_t expected_size = skeleton_node->data.size();
+    if (actual_size != expected_size) {
+      return Fail("crash size for " + path + " is " +
+                  std::to_string(actual_size) + ", expected state size " +
+                  std::to_string(expected_size));
+    }
+  } else if (actual_size != before_size && actual_size != after_size) {
     return Fail("crash size for " + path + " is " +
                 std::to_string(actual_size) + ", neither old " +
                 std::to_string(before_size) + " nor new " +

@@ -205,9 +205,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Release helper JSON regression tests
+      - name: Check PowerShell syntax and release helper behavior
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = Get-ChildItem -LiteralPath tests, scripts -Recurse -File -Filter '*.ps1'
+          $syntaxErrors = @(foreach ($scriptFile in $scripts) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $scriptFile.FullName, [ref]$tokens, [ref]$parseErrors)
+            foreach ($parseError in $parseErrors) {
+              '{0}:{1}:{2}: {3}' -f $scriptFile.FullName, $parseError.Extent.StartLineNumber,
+                $parseError.Extent.StartColumnNumber, $parseError.Message
+            }
+          })
+          if ($syntaxErrors.Count -ne 0) { throw ($syntaxErrors -join "`n") }
           & pwsh -NoProfile -File tests/release/release_common_tests.ps1
           if ($LASTEXITCODE -ne 0) { throw 'release metadata regression tests failed' }
 

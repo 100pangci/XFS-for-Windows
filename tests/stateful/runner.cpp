@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 #include "stateful/generator.h"
 #include "stateful/verifier.h"
@@ -40,6 +41,40 @@ std::string HexHash(uint64_t value) {
   std::snprintf(buffer, sizeof(buffer), "%016llx",
                 static_cast<unsigned long long>(value));
   return buffer;
+}
+
+enum class RecoveryStateExpectation { kEither, kBefore, kAfter };
+
+RecoveryStateExpectation ParseRecoveryExpectation(const std::string& value) {
+  if (value == "before") return RecoveryStateExpectation::kBefore;
+  if (value == "after") return RecoveryStateExpectation::kAfter;
+  if (value == "either") return RecoveryStateExpectation::kEither;
+  throw std::invalid_argument("state expectation must be before, after, or either");
+}
+
+const char* ToString(RecoveryStateExpectation expectation) {
+  switch (expectation) {
+    case RecoveryStateExpectation::kBefore:
+      return "before";
+    case RecoveryStateExpectation::kAfter:
+      return "after";
+    case RecoveryStateExpectation::kEither:
+      return "either";
+  }
+  return "either";
+}
+
+template <typename Function>
+std::string CaptureObserverException(Function&& function) {
+  try {
+    function();
+  } catch (const std::exception& error) {
+    const char* message = error.what();
+    return *message ? message : "observer threw an exception without a message";
+  } catch (...) {
+    return "observer threw a non-standard exception";
+  }
+  return {};
 }
 
 void EnsureParent(const std::string& path) {
@@ -82,7 +117,8 @@ void WriteManifest(const FuzzOptions& options, const std::string& mode,
                    const std::vector<ModelFs>& states,
                    const std::vector<std::string>& labels,
                    uint64_t target_node = 0,
-                   const Operation* range_op = nullptr) {
+                   const Operation* range_op = nullptr,
+                   const std::string& state_expectation = {}) {
   if (options.manifest.empty()) return;
   std::string range_data_file;
   const ModelNode* before_target = nullptr;
@@ -126,6 +162,10 @@ void WriteManifest(const FuzzOptions& options, const std::string& mode,
   out << "  \"steps\": " << options.steps << ",\n";
   out << "  \"crash_op\": " << options.crash_op << ",\n";
   out << "  \"crash_point\": \"" << JsonEscape(options.crash_point) << "\",\n";
+  if (!state_expectation.empty()) {
+    out << "  \"state_expectation\": \""
+        << JsonEscape(state_expectation) << "\",\n";
+  }
   if (target_node != 0) out << "  \"target_node\": " << target_node << ",\n";
   if (!range_data_file.empty()) {
     out << "  \"range_contract\": {\n";
@@ -437,30 +477,35 @@ ExecResult ExecuteConcurrent(xfs::XfsFilesystem& fs, const ModelFs& model,
 #else
   auto& controller = xfs::conc::Controller::Get();
   controller.Enable();
-  struct JoinGuard {
-    xfs::conc::Controller& controller;
-    ~JoinGuard() noexcept { try { controller.JoinAll(); } catch (...) {} }
-  } join_guard{controller};
   ExecResult result;
   std::string observer_error;
   bool observer_ran = false;
   const uint64_t root = model.Find(model.root())->actual_ino;
+  // Join before destroying the locals captured by the workers.
+  struct JoinGuard {
+    xfs::conc::Controller& controller;
+    ~JoinGuard() noexcept { try { controller.JoinAll(); } catch (...) {} }
+  } join_guard{controller};
   const uint64_t mutator = controller.Spawn("stateful-mutator", [&] {
     result = ExecuteOperation(fs, model, op, new_ino);
   });
   const uint64_t observer = controller.Spawn("stateful-observer", [&] {
     observer_ran = true;
-    if (options.concurrent_observer == "flush") {
-      auto status = fs.Flush();
-      if (!status.ok()) observer_error = status.error().Format();
-    } else {
-      auto lookup = fs.LookupName(root, "..");
-      if (!lookup.ok()) {
-        observer_error = lookup.error().Format();
-      } else if (lookup.value().ino != root) {
-        observer_error = "root parent lookup did not resolve to the root inode";
+    std::string status_error;
+    observer_error = CaptureObserverException([&] {
+      if (options.concurrent_observer == "flush") {
+        auto status = fs.Flush();
+        if (!status.ok()) status_error = status.error().Format();
+      } else {
+        auto lookup = fs.LookupName(root, "..");
+        if (!lookup.ok()) {
+          status_error = lookup.error().Format();
+        } else if (lookup.value().ino != root) {
+          status_error = "root parent lookup did not resolve to the root inode";
+        }
       }
-    }
+    });
+    if (observer_error.empty()) observer_error = std::move(status_error);
   });
   const uint64_t ids[] = {mutator, observer};
   for (uint32_t index = 0; index < 2; ++index) {
@@ -891,7 +936,8 @@ int RunFresh(const FuzzOptions& options) {
                       : crash_plan.capture_op.node,
                   IsRangeCrashOperation(crash_plan.capture_op.type)
                       ? &crash_plan.capture_op
-                      : nullptr);
+                      : nullptr,
+                  ToString(ParseRecoveryExpectation(options.state_expectation)));
     for (size_t i = 0; i < crash_plan.ops.size(); ++i) {
       AppendTrace(options, "plan " + std::to_string(i + 1) + " " +
                                crash_plan.ops[i].Describe());
@@ -1086,6 +1132,53 @@ int RunFresh(const FuzzOptions& options) {
   return 0;
 }
 
+int RunRunnerContractSelfTest() {
+  struct ExpectationCase {
+    const char* value;
+    RecoveryStateExpectation expected;
+  };
+  const ExpectationCase cases[] = {
+      {"before", RecoveryStateExpectation::kBefore},
+      {"after", RecoveryStateExpectation::kAfter},
+      {"either", RecoveryStateExpectation::kEither},
+  };
+  for (const ExpectationCase& test : cases) {
+    if (ParseRecoveryExpectation(test.value) != test.expected) {
+      std::fprintf(stderr, "FAIL runner contract: %s expectation\n", test.value);
+      return 1;
+    }
+  }
+  bool rejected_invalid_expectation = false;
+  try {
+    (void)ParseRecoveryExpectation("transaction-committed");
+  } catch (const std::invalid_argument&) {
+    rejected_invalid_expectation = true;
+  }
+  if (!rejected_invalid_expectation) {
+    std::fprintf(stderr, "FAIL runner contract: invalid expectation accepted\n");
+    return 1;
+  }
+
+  const std::string standard_error = CaptureObserverException([] {
+    throw std::runtime_error("synthetic observer exception");
+  });
+  if (standard_error != "synthetic observer exception") {
+    std::fprintf(stderr, "FAIL runner contract: standard observer exception\n");
+    return 1;
+  }
+  const std::string unknown_error = CaptureObserverException([] { throw 7; });
+  if (unknown_error != "observer threw a non-standard exception") {
+    std::fprintf(stderr, "FAIL runner contract: non-standard observer exception\n");
+    return 1;
+  }
+  if (!CaptureObserverException([] {}).empty()) {
+    std::fprintf(stderr, "FAIL runner contract: successful observer\n");
+    return 1;
+  }
+  std::printf("PASS stateful runner synthetic contract checks\n");
+  return 0;
+}
+
 int RunRecover(const FuzzOptions& options) {
   if (options.image.empty()) throw FuzzFailure{"--image is required", 0};
   if (options.crash_op == 0) {
@@ -1103,6 +1196,8 @@ int RunRecover(const FuzzOptions& options) {
     throw FuzzFailure{"internal: recovery plan has no capture",
                       options.crash_op};
   }
+  const RecoveryStateExpectation expectation =
+      ParseRecoveryExpectation(options.state_expectation);
   auto mounted = OpenAndRecover(options, &error);
   if (!mounted) throw FuzzFailure{error, options.crash_op};
   xfs::XfsFilesystem& fs = *mounted;
@@ -1117,8 +1212,12 @@ int RunRecover(const FuzzOptions& options) {
 
   if (IsRangeCrashOperation(op.type)) {
     range = true;
-    VerifyResult verified =
-        VerifyRangeCrash(fs, plan.before_capture, plan.after_capture, op);
+    const ModelFs& skeleton = expectation == RecoveryStateExpectation::kBefore
+                                  ? plan.before_capture
+                                  : plan.after_capture;
+    VerifyResult verified = VerifyRangeCrash(
+        fs, skeleton, plan.before_capture, plan.after_capture, op,
+        expectation != RecoveryStateExpectation::kEither);
     if (!verified.ok) {
       throw FuzzFailure{"recovered image violates the crash data contract: " +
                             verified.error,
@@ -1131,7 +1230,18 @@ int RunRecover(const FuzzOptions& options) {
     VerifyResult after = VerifyModel(fs, plan.after_capture);
     matches_after = after.ok;
     if (!after.ok) after_error = after.error;
-    if (!matches_before && !matches_after) {
+    if (expectation == RecoveryStateExpectation::kBefore && !matches_before) {
+      throw FuzzFailure{"recovered image violates the before-state contract: " +
+                            before_error,
+                        options.crash_op};
+    }
+    if (expectation == RecoveryStateExpectation::kAfter && !matches_after) {
+      throw FuzzFailure{"recovered image violates the after-state contract: " +
+                            after_error,
+                        options.crash_op};
+    }
+    if (expectation == RecoveryStateExpectation::kEither &&
+        !matches_before && !matches_after) {
       throw FuzzFailure{"recovered image matches neither the old nor the new "
                         "state (before: " +
                             before_error + "; after: " + after_error + ")",
@@ -1145,16 +1255,18 @@ int RunRecover(const FuzzOptions& options) {
   CheckConsistency(fs, false, &check_error);
   if (!check_error.empty()) throw FuzzFailure{check_error, options.crash_op};
 
+  const std::string expectation_name = ToString(expectation);
   if (range) {
     WriteManifest(options, "recovered", "range",
                   {plan.before_capture, plan.after_capture},
-                  {"before", "after"}, target, &op);
-  } else if (matches_after) {
-    WriteManifest(options, "recovered", "exact", {plan.after_capture},
-                  {"after"});
-  } else {
+                  {"before", "after"}, target, &op, expectation_name);
+  } else if (expectation == RecoveryStateExpectation::kBefore ||
+             (!matches_after && matches_before)) {
     WriteManifest(options, "recovered", "exact", {plan.before_capture},
-                  {"before"});
+                  {"before"}, 0, nullptr, expectation_name);
+  } else {
+    WriteManifest(options, "recovered", "exact", {plan.after_capture},
+                  {"after"}, 0, nullptr, expectation_name);
   }
   if (!options.quiet) {
     std::printf("FUZZ-2 RECOVER PASS: seed=%s crash_op=%llu point=%s "
@@ -1162,7 +1274,7 @@ int RunRecover(const FuzzOptions& options) {
                 HexSeed(options.seed).c_str(),
                 static_cast<unsigned long long>(options.crash_op),
                 options.crash_point.c_str(),
-                range ? "old-or-new-data" : (matches_after ? "new" : "old"),
+                range ? "old-or-new-data" : expectation_name.c_str(),
                 options.image.c_str());
   }
   return 0;

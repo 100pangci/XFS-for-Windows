@@ -37,12 +37,14 @@ void Usage() {
       "  --crash-op <n>          arm the crash point at operation n\n"
       "  --crash-point <name>    XFSWIN_CRASH_AT point (e.g. after_log_commit)\n"
       "  --crash-hit <n>         occurrence inside the operation (default 1)\n"
+      "  --state-expectation <before|after|either> recovery contract (default either)\n"
       "  --recover               replay/verify a crashed image instead of\n"
       "                          executing a new sequence\n"
       "  --check-every <n>       full semantic check interval (default 5)\n"
       "  --consistency-every <n> CheckConsistency interval (default 50)\n"
       "  --plan-only <path>      write the deterministic operation plan\n"
       "  --list-crash-points     print all crash point names\n"
+      "  --self-test-runner-contracts check synthetic recovery/observer contracts\n"
       "  --quiet                 only print failures\n"
       "\n"
       "A crash run exits with 0x58435348 after the injected termination; run\n"
@@ -120,7 +122,8 @@ std::string Reproducer(const char* argv0, const FuzzOptions& options,
   }
   if (options.crash_op) {
     command += " --crash-op " + std::to_string(options.crash_op) +
-               " --crash-point " + options.crash_point;
+               " --crash-point " + options.crash_point +
+               " --state-expectation " + options.state_expectation;
     if (options.crash_hit != 1) {
       command += " --crash-hit " + std::to_string(options.crash_hit);
     }
@@ -168,6 +171,7 @@ int main(int argc, char** argv) {
   std::string plan_only;
   std::string ops_out;
   bool list_points = false;
+  bool self_test_runner_contracts = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -184,6 +188,10 @@ int main(int argc, char** argv) {
     }
     if (arg == "--list-crash-points") {
       list_points = true;
+      continue;
+    }
+    if (arg == "--self-test-runner-contracts") {
+      self_test_runner_contracts = true;
       continue;
     }
     if (arg == "--seed") {
@@ -230,6 +238,15 @@ int main(int argc, char** argv) {
       if (!xfs::ParseCrashPoint(options.crash_point, &point)) {
         std::fprintf(stderr, "unknown --crash-point '%s'\n",
                      options.crash_point.c_str());
+        return 2;
+      }
+    } else if (arg == "--state-expectation") {
+      options.state_expectation = value("--state-expectation");
+      if (options.state_expectation != "before" &&
+          options.state_expectation != "after" &&
+          options.state_expectation != "either") {
+        std::fprintf(stderr,
+                     "--state-expectation must be before, after, or either\n");
         return 2;
       }
     } else if (arg == "--crash-hit") {
@@ -280,6 +297,7 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (self_test_runner_contracts) return RunRunnerContractSelfTest();
 
 #ifndef XFSWIN_CONCURRENCY_HOOKS
   if (!options.concurrent_observer.empty() || !options.schedule_out.empty() ||
