@@ -115,20 +115,32 @@ failures=0
 skips=0
 run_case() {
   local category="$1" op="$2" type="$3" point="$4"
+  local expected=either
+  # Link commits the new name and the inode's link count in one transaction.
+  # Do not infer an operation-wide boundary for general multi-transaction cases.
+  if [ "$type" = hardlink ]; then
+    case "$point" in
+      before_log_write|mid_log_record) expected=before ;;
+      after_log_commit|before_metadata_write|mid_metadata_write|after_metadata_write)
+        expected=after ;;
+    esac
+  fi
   local name="$category-$type"
   local base="$WORK/$name-op$op-$point"
   local image="$base.img"
   local trace="$base.trace.txt"
   local manifest="$base.manifest.json"
+  local crash_manifest="$base.pre.manifest.json"
   rm -f "$image" "$trace" "$manifest" "$manifest.range.bin" \
+    "$crash_manifest" "$crash_manifest.range.bin" \
     "$base.pre.img" "$base.rec.img" "$base.log" "$base.recover.log"
 
-  echo "== $name op=$op point=$point"
+  echo "== $name op=$op point=$point expected=$expected"
   set +e
   "$EXE" --seed "$SEED" --steps "$op" --image "$image" --trace "$trace" \
-    --manifest "$manifest" --profile "$PROFILE" --workload "$WORKLOAD" \
+    --manifest "$crash_manifest" --profile "$PROFILE" --workload "$WORKLOAD" \
     --image-size-mb "$SIZE_MB" --crash-op "$op" --crash-point "$point" \
-    --check-every 10 --consistency-every 0 >"$base.log" 2>&1
+    --state-expectation "$expected" --check-every 10 --consistency-every 0 >"$base.log" 2>&1
   local rc=$?
   set -e
   if [ "$rc" -ne 72 ]; then
@@ -137,7 +149,7 @@ run_case() {
       echo "== $name op=$op point=$point SKIP (point not reached)"
       skips=$((skips + 1))
       if [ "$KEEP_IMAGES" -eq 0 ]; then
-        rm -f "$image" "$trace" "$manifest" "$manifest.range.bin" \
+        rm -f "$image" "$trace" "$crash_manifest" "$crash_manifest.range.bin" \
           "$base.log" "$base.recover.log"
       fi
       return 0
@@ -152,19 +164,20 @@ run_case() {
   "$EXE" --seed "$SEED" --steps "$op" --image "$image" --trace "$trace" \
     --manifest "$manifest" --profile "$PROFILE" --workload "$WORKLOAD" \
     --image-size-mb "$SIZE_MB" --crash-op "$op" --crash-point "$point" \
-    --recover >"$base.recover.log" 2>&1
+    --state-expectation "$expected" --recover >"$base.recover.log" 2>&1
   cp "$image" "$base.rec.img"
 
   if [ "$SKIP_LINUX" -eq 0 ]; then
     bash "$ROOT/tests/scripts/verify_stateful_linux.sh" \
-      "$base.pre.img" "$manifest" "$base.pre.work" --kernel-replay
+      "$base.pre.img" "$crash_manifest" "$base.pre.work" --kernel-replay
     bash "$ROOT/tests/scripts/verify_stateful_linux.sh" \
       "$base.rec.img" "$manifest" "$base.rec.work"
   fi
   echo "== $name op=$op point=$point OK"
   if [ "$KEEP_IMAGES" -eq 0 ]; then
     rm -f "$base.pre.img" "$base.rec.img" "$image" "$trace" \
-      "$manifest" "$manifest.range.bin" "$base.log" "$base.recover.log"
+      "$manifest" "$manifest.range.bin" "$crash_manifest" \
+      "$crash_manifest.range.bin" "$base.log" "$base.recover.log"
     rm -rf "$base.pre.work" "$base.rec.work"
   fi
 }

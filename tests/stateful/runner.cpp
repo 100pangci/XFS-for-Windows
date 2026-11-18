@@ -1166,6 +1166,10 @@ int RunRunnerContractSelfTest() {
     std::fprintf(stderr, "FAIL runner contract: standard observer exception\n");
     return 1;
   }
+  if (CaptureObserverException([] { throw std::runtime_error(""); }).empty()) {
+    std::fprintf(stderr, "FAIL runner contract: exception without a message\n");
+    return 1;
+  }
   const std::string unknown_error = CaptureObserverException([] { throw 7; });
   if (unknown_error != "observer threw a non-standard exception") {
     std::fprintf(stderr, "FAIL runner contract: non-standard observer exception\n");
