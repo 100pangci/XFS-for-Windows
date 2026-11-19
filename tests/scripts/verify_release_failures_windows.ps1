@@ -199,6 +199,18 @@ function Uninstall-OfficialWinFsp {
         'the official WinFsp runtime survived its uninstall'
 }
 
+function Assert-ReleaseInjectedSetupFailure {
+    param($Result, [string]$Stage, [string]$LogName)
+    Assert-Release (-not $Result.timed_out -and @(0, 3010) -notcontains [int]$Result.exit_code) `
+        "/test-fail $Stage did not produce an installer failure (exit $($Result.exit_code))"
+    $logPath = Join-Path $script:ReleaseOutputDirectory ($LogName + '.setup.log')
+    $log = Get-Content -LiteralPath $logPath -Raw
+    Assert-Release ($log -match ('(?m)installer stderr: error=.*injected installer failure: ' + [regex]::Escape($Stage) + '\r?$')) `
+        "setup failed without reaching the requested $Stage injection (see $logPath)"
+    Assert-Release ($log -match '(?m)\] rollback completed\r?$') `
+        "setup did not report completing the $Stage rollback (see $logPath)"
+}
+
 function Wait-InstalledHash {
     param([string]$Hash, [int]$TimeoutSeconds = 120)
     for ($attempt = 0; $attempt -lt ($TimeoutSeconds * 2); ++$attempt) {
@@ -287,8 +299,7 @@ try {
                 'WinFsp must be present before the setup failure case'
             $failed = Invoke-ReleaseSetupInstall -Installer $testInstaller `
                 -LogName $point.case -ExtraArguments @('/test-fail', $point.value)
-            Assert-Release (@(0, 3010) -notcontains [int]$failed.exit_code) `
-                "/test-fail $($point.value) did not fail the setup"
+            Assert-ReleaseInjectedSetupFailure $failed $point.value $point.case
             Assert-CleanFailureState
         }
     }
@@ -335,10 +346,10 @@ try {
         $unrelatedLink.Save()
 
         foreach ($stage in @('after-files', 'verify')) {
+            $logName = "upgrade-rollback-$stage"
             $failedUpgrade = Invoke-ReleaseSetupInstall -Installer $testInstaller `
-                -LogName "upgrade-rollback-$stage" -ExtraArguments @('/test-fail', $stage)
-            Assert-Release (@(0, 3010) -notcontains [int]$failedUpgrade.exit_code) `
-                "/test-fail $stage did not fail the major upgrade"
+                -LogName $logName -ExtraArguments @('/test-fail', $stage)
+            Assert-ReleaseInjectedSetupFailure $failedUpgrade $stage $logName
             $restored = Wait-InstalledHash $before.exe_sha256 120
             Assert-Release ($null -ne $restored) `
                 "the $stage failure did not restore the synthetic older executable"

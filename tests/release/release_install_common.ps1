@@ -658,9 +658,10 @@ function Get-ReleaseProductDirectory {
 }
 
 function Get-ReleaseInstalledState {
-    $directory = Get-ReleaseProductDirectory
-    $exePath = Join-Path $directory 'xfswin.exe'
-    $versionPath = Join-Path $directory 'version.json'
+    param([string]$Directory = (Get-ReleaseProductDirectory))
+    $exePath = Join-Path $Directory 'xfswin.exe'
+    $versionPath = Join-Path $Directory 'version.json'
+    $guiPath = Join-Path $Directory 'xfswin-gui.exe'
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { return $null }
     Assert-Release (Test-Path -LiteralPath $versionPath -PathType Leaf) `
         "installed xfswin.exe has no adjacent version.json: $versionPath"
@@ -671,11 +672,13 @@ function Get-ReleaseInstalledState {
             "installed version.json is missing '$field'"
     }
     return [pscustomobject]@{
-        directory = $directory
+        directory = $Directory
         exe = $exePath
         exe_sha256 = Get-ReleaseSha256 $exePath
-        gui = Join-Path $directory 'xfswin-gui.exe'
-        gui_sha256 = Get-ReleaseSha256 (Join-Path $directory 'xfswin-gui.exe')
+        gui = $guiPath
+        # A legacy installation can have a CLI and metadata but no GUI. The
+        # current-package and evidence assertions still require the GUI hash.
+        gui_sha256 = if (Test-Path -LiteralPath $guiPath -PathType Leaf) { Get-ReleaseSha256 $guiPath } else { $null }
         version_path = $versionPath
         version_json = $versionInfo
         version_json_sha256 = Get-ReleaseSha256 $versionPath
@@ -1524,6 +1527,8 @@ function Assert-ReleaseInstalledPackage {
     Assert-Release ($null -ne $state) 'installed xfswin.exe is missing'
     Assert-Release ($state.exe_sha256 -eq $Package.payload_xfswin_sha256) `
         "installed xfswin.exe hash does not match package metadata (actual $($state.exe_sha256))"
+    Assert-Release ($null -ne $state.gui_sha256 -and $state.gui_sha256 -eq $Package.payload_gui_sha256) `
+        'installed xfswin-gui.exe is missing or its hash does not match package metadata'
     $version = [string]$state.version_json.version
     $gitSha = ([string]$state.version_json.git_sha).ToLowerInvariant()
     $arch = [string]$state.version_json.architecture
