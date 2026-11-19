@@ -2358,8 +2358,7 @@ jobs:
       - name: Capture a surviving RUI
         run: |
           sudo env SIZE_MB=768 FILES=6 EXTENTS=6000 ROUNDS=40 \
-            MAX_SNAPS=1200 COW_MB=256 \
-            bash tests/scripts/make_rw6b_rui_linux.sh rw6b-rui
+            MAX_SNAPS=1200 bash tests/scripts/make_rw6b_rui_linux.sh rw6b-rui
           sudo chown -R "$USER" rw6b-rui
           cat rw6b-rui/rui.manifest.json
           grep -q RUI rw6b-rui/rui.logprint.txt
