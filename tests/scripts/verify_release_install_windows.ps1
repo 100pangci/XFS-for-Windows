@@ -639,7 +639,7 @@ try {
         Assert-Release ((Get-ReleaseSha256 $configPath) -eq $configHash) `
             'GUI acceptance did not restore the exact automount configuration bytes'
     }
-    Complete-ReleaseCase 'gui-operations' 'passed' 'native GUI discovery, RO enroll/mount, Open, Unmount, Disable and diagnostics export passed'
+    Complete-ReleaseCase 'gui-operations' 'passed' 'native GUI tested with separate ordinary and administrator tokens; discovery, RO enroll/mount, Open, Unmount, Disable and diagnostics export passed; interactive UAC consent not tested'
 
     # Final uninstall and retention check.
     $finalUninstall = Invoke-ReleaseSetupUninstall -Installer $package.installer -LogName 'final-uninstall'

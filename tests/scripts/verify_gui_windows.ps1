@@ -80,6 +80,20 @@ public static class XfsGuiNative {
   }
   [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
   [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] private static extern bool GetTokenInformation(IntPtr token, int info, out uint value, uint size, out uint bytes);
+  public static bool IsTokenElevated(IntPtr token) {
+    uint elevated, bytes;
+    if (!GetTokenInformation(token, 20, out elevated, sizeof(uint), out bytes)) // TokenElevation
+      throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    return elevated != 0;
+  }
+  public static bool IsProcessElevated(IntPtr process) {
+    IntPtr token;
+    if (!OpenProcessToken(process, 0x0008, out token)) // TOKEN_QUERY
+      throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try { return IsTokenElevated(token); }
+    finally { CloseHandle(token); }
+  }
   [DllImport("advapi32.dll", SetLastError=true)] public static extern bool CreateRestrictedToken(IntPtr existing, uint flags, uint disableCount, IntPtr sidsToDisable, uint deleteCount, IntPtr privilegesToDelete, uint restrictCount, IntPtr sidsToRestrict, out IntPtr token);
   [StructLayout(LayoutKind.Sequential)] public struct STARTUPINFO { public uint cb; public IntPtr reserved, desktop, title; public uint x,y,xsize,ysize,xcount,ycount,fill,flags; public ushort show, reserved2; public IntPtr reservedPtr, stdin, stdout, stderr; }
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr process, thread; public uint processId, threadId; }
@@ -222,6 +236,7 @@ function Start-GuiWithLimitedToken([string]$Executable) {
         if (-not [XfsGuiNative]::CreateRestrictedToken($processToken, [uint32]0x5, 0, [IntPtr]::Zero, 0, [IntPtr]::Zero, 0, [IntPtr]::Zero, [ref]$limitedToken)) {
             throw "CreateRestrictedToken failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
+        if ([XfsGuiNative]::IsTokenElevated($limitedToken)) { throw 'The restricted GUI token is still elevated.' }
         $startup = [XfsGuiNative+STARTUPINFO]::new()
         $startup.cb = [uint32][Runtime.InteropServices.Marshal]::SizeOf([type][XfsGuiNative+STARTUPINFO])
         $desktop = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('winsta0\default')
@@ -259,6 +274,9 @@ function Save-GuiFailureScreenshot([IntPtr]$Window) {
 }
 
 try {
+    if (-not [XfsGuiNative]::IsProcessElevated([XfsGuiNative]::GetCurrentProcess())) {
+        throw 'The isolated CI runner does not have an elevated token for the administrator GUI tests.'
+    }
     Initialize-ReleaseVhdContext -FixtureDirectory $Fixtures -OutputDirectory $OutputDirectory -RequiredFixtures @('single')
     $fixture = Get-ReleaseFixtureEntry -Name 'single'
     $uuid = [string]$fixture.entry.partitions[0].uuid
@@ -291,29 +309,24 @@ try {
     $process = $limitedProcess
     $window = Get-GuiWindow ([uint32]$limitedProcess.Id)
     $details = Wait-GuiDetails $window { param($text) Test-GuiDiscovery $text $uuid -AllowPartial } 'unprivileged diagnostics discovery'
-    $operations.unprivileged_start = @{ status = 'passed'; process_id = $limitedProcess.Id; response = $details }
-    # Privileged storage operations are reached through the GUI's own explicit
-    # Run elevated action, never by starting the ordinary GUI with an admin token.
-    $guiPath = [IO.Path]::GetFullPath($Gui)
-    $existingGuiPids = @((Get-Process -Name 'xfswin-gui' -ErrorAction SilentlyContinue).Id)
-    Click-Gui $window 1012
-    $elevatedProcess = $null
-    for ($attempt = 0; $attempt -lt 120 -and $null -eq $elevatedProcess; $attempt++) {
-        foreach ($candidate in @(Get-Process -Name 'xfswin-gui' -ErrorAction SilentlyContinue)) {
-            if ($candidate.Id -eq $limitedProcess.Id -or $candidate.Id -in $existingGuiPids) { continue }
-            try { $candidatePath = [IO.Path]::GetFullPath($candidate.Path) } catch { continue }
-            if ($candidatePath.Equals($guiPath, [StringComparison]::OrdinalIgnoreCase)) {
-                $elevatedProcess = $candidate
-                break
-            }
-        }
-        if ($null -eq $elevatedProcess) { Start-Sleep -Milliseconds 500 }
-    }
-    if ($null -eq $elevatedProcess) { throw 'The GUI Run elevated control did not start a new GUI process from the expected executable.' }
+    $operations.unprivileged_start = @{ status = 'passed'; process_id = $limitedProcess.Id; elevated = $false; response = $details }
     Stop-Process -Id $limitedProcess.Id -Force -ErrorAction SilentlyContinue
     Wait-Process -Id $limitedProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
-    $process = $elevatedProcess
-    $window = Get-GuiWindow ([uint32]$elevatedProcess.Id)
+
+    # UAC consent is a human action on a separate desktop. Launch the admin
+    # instance from this already elevated, authorized CI process; do not alter
+    # UAC policy or treat this as a test of the interactive Run elevated button.
+    $operations.interactive_uac = @{ status = 'not-tested'; reason = 'Requires human consent on the Windows secure desktop.' }
+    $guiPath = [IO.Path]::GetFullPath($Gui)
+    $startup = [Diagnostics.ProcessStartInfo]::new($guiPath)
+    $startup.WorkingDirectory = Split-Path -Parent $guiPath
+    $startup.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($startup)
+    if (-not [XfsGuiNative]::IsProcessElevated($process.Handle)) {
+        throw 'The administrator GUI did not inherit the elevated CI token.'
+    }
+    $operations.administrator_start = @{ status = 'passed'; process_id = $process.Id; elevated = $true; method = 'inherit-ci-token' }
+    $window = Get-GuiWindow ([uint32]$process.Id)
     $details = Wait-GuiDetails $window { param($text) Test-GuiDiscovery $text $uuid } 'elevated GUI diagnostics discovery'
     $operations.discovery = @{ status = 'passed'; uuid = $uuid }
     $detailsBeforeNotifications = Get-GuiDetails $window

@@ -38,7 +38,16 @@ successful results from other sections.
 Windows GUI behavior and native x64/ARM64 installation need actual Actions
 execution. See `tests/scripts/verify_gui_windows.ps1` for virtual-disk GUI
 acceptance and `docs/INSTALL.md` for first use. Cross-compilation and portable
-core tests do not establish Windows interaction results.
+core tests do not establish Windows interaction results. Hosted acceptance
+checks the GUI with separately verified ordinary and administrator tokens. The
+administrator instance inherits the already elevated runner's token; the test
+does not change UAC policy or approve a prompt.
+
+To check **Run elevated** on an interactive Windows desktop with UAC enabled,
+start the GUI without elevation and select **Run elevated**. Cancel the Windows
+prompt and verify that the original window remains usable and no elevated
+instance starts. Then repeat and approve the prompt; verify that a second GUI
+window opens and that its process is elevated. Neither step needs a test disk.
 
 ## The happy path
 
