@@ -19,6 +19,7 @@
 #include <sddl.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -80,21 +81,15 @@ DWORD CreateCliOutputPipe(HANDLE* read_pipe, HANDLE* write_pipe) {
   // A filtered administrator's default DACL can grant access only to SYSTEM
   // and the now deny-only Administrators SID. CreatePipe must open both ends.
   // Grant access to the actual caller, not to other users on the machine.
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-    return GetLastError();
+  // The read-only pseudo-handle works even if the token's own DACL does
+  // not allow opening a query handle. It does not need to be closed.
+  const HANDLE token = GetCurrentProcessToken();
   DWORD size = 0;
   GetTokenInformation(token, TokenUser, nullptr, 0, &size);
-  if (size == 0) {
-    const DWORD error = GetLastError();
-    CloseHandle(token);
-    return error;
-  }
+  if (size == 0) return GetLastError();
   std::vector<BYTE> user(size);
-  const BOOL queried = GetTokenInformation(token, TokenUser, user.data(), size, &size);
-  const DWORD query_error = queried ? ERROR_SUCCESS : GetLastError();
-  CloseHandle(token);
-  if (!queried) return query_error;
+  if (!GetTokenInformation(token, TokenUser, user.data(), size, &size))
+    return GetLastError();
 
   LPWSTR sid = nullptr;
   if (!ConvertSidToStringSidW(reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid, &sid))
@@ -141,13 +136,15 @@ std::wstring StartCapturedCli(const std::vector<std::wstring>& args,
   for (const auto& arg : args) command += L" " + Quote(arg);
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
-  startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-  startup.wShowWindow = SW_HIDE;
+  startup.dwFlags = STARTF_USESTDHANDLES;
   startup.hStdOutput = write_pipe;
   startup.hStdError = write_pipe;
   startup.hStdInput = null_input;
+  // CREATE_NO_WINDOW still initializes a console, which can fail under a
+  // filtered token. The GUI supplies all standard handles, so no console is
+  // needed. This also lets a mount outlive the GUI that started it.
   const BOOL started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr,
-                                      TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                                      TRUE, DETACHED_PROCESS, nullptr, nullptr,
                                       &startup, process);
   const DWORD error = started ? ERROR_SUCCESS : GetLastError();
   CloseHandle(write_pipe);
@@ -196,7 +193,13 @@ std::wstring RunCli(const std::vector<std::wstring>& args, DWORD* exit_code = nu
   CloseHandle(process.hProcess);
   if (exit_code) *exit_code = timed_out ? WAIT_TIMEOUT : code;
   if (timed_out) return L"The CLI command timed out after " + std::to_wstring(timeout_ms / 1000) + L" seconds and was stopped.";
-  if (bytes.empty()) return code ? L"The command failed. Check permissions, WinFsp, service state, and drive-letter availability." : L"Command completed successfully.";
+  if (bytes.empty()) {
+    if (!code) return L"Command completed successfully.";
+    wchar_t exit_status[11]{};
+    std::swprintf(exit_status, std::size(exit_status), L"0x%08lX", code);
+    return std::wstring(L"The command failed without output (exit ") + exit_status +
+           L"). Check permissions, WinFsp, service state, and drive-letter availability.";
+  }
   const int chars = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
   std::wstring result(chars > 0 ? chars : 0, L'\0');
   if (chars) MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), result.data(), chars);
@@ -899,6 +902,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+  // Captured CLI children inherit this mode: startup failures must return an
+  // exit status instead of blocking on a system error dialog behind the GUI.
+  SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
   WNDCLASSW wc{};
   wc.lpfnWndProc = WindowProc;
   wc.hInstance = instance;
