@@ -15,15 +15,15 @@ The baseline values above identify the starting point only. They are not the rel
 
 Run the complete CI for the exact release commit and require all required jobs to succeed. In addition to existing project checks, the REL-1 acceptance run must build and validate **native x64 and native ARM64** packages and test the real setup executable on isolated GitHub-hosted Windows runners.
 
-For each architecture, the 20 required cases in `packaging/REL1_INTERFACES.json` cover installation, upgrade from a complete synthetic `0.0.0` executable, `version.json`, payload archive and setup fixture, ordinary uninstall, service cleanup and temporary VHD use. Upgrade refusal is checked for both manual and service-owned active mounts. Failure coverage includes a successful service start followed by verification failure, for both fresh installation and upgrade rollback. Run these only in isolated hosted runners and project-specific tool directories. Do not use a developer host service or any existing physical disk as an installer test target. The acceptance must exercise the real installed service and runtime, not merely inspect registry keys. An ARM64 cross-build and an `AA64` PE header prove the output architecture only; they do not prove that the package ran on ARM64 Windows. Record native ARM64 execution only when the acceptance job actually runs on a native ARM64 Windows runner.
+For each architecture, the 21 required cases in `packaging/REL1_INTERFACES.json` cover installation, the real GUI interaction flow, upgrade from a complete synthetic `0.0.0` executable, `version.json`, payload archive and setup fixture, ordinary uninstall, service cleanup and temporary VHD use. Upgrade refusal is checked for both manual and service-owned active mounts. Failure coverage includes a successful service start followed by verification failure, for both fresh installation and upgrade rollback. Run these only in isolated hosted runners and project-specific tool directories. Do not use a developer host service or any existing physical disk as an installer test target. The acceptance must exercise the real installed service and runtime, not merely inspect registry keys. An ARM64 cross-build and an `AA64` PE header prove the output architecture only; they do not prove that the package ran on ARM64 Windows. Record native ARM64 execution only when the acceptance job actually runs on a native ARM64 Windows runner.
 
 The setup acceptance test must bind the file it actually executed to its recorded evidence. Each `qualification-<arch>.json` must include:
 
 - SHA-256 of the setup executable tested (`installer_sha256`);
-- SHA-256 of the installed `xfswin.exe` (`installed_exe_sha256`);
+- SHA-256 of the installed `xfswin.exe` (`installed_exe_sha256`) and `xfswin-gui.exe` (`installed_gui_sha256`);
 - the installed `version.json` values for `version`, `git_sha` and `architecture`;
 - the GitHub Actions `run_id` and source `head_sha`;
-- each install, upgrade, uninstall, service and temporary-VHD case outcome.
+- each install, upgrade, uninstall, service, GUI-control and temporary-VHD case outcome.
 
 Reject evidence if the setup's actual PE machine does not match the claimed architecture, if an unrelated or stale setup binary was tested, if the installed executable/version metadata do not match the tagged source, or if a required case is missing or failed. Do not infer installer identity from the portable ZIP's metadata or from a renamed output file.
 
@@ -41,7 +41,7 @@ The package output is expected to contain, for each architecture:
 - `xfswin-<version>-windows-<arch>-setup.exe` — the native Rust setup;
 - `package-metadata-<arch>.json` — build provenance and payload/setup digests.
 
-The portable payload contains `xfswin.exe`, `LICENSE`, `README.md`, `version.json`, the installation and maintainer documentation under `docs/`, `THIRD-PARTY-NOTICES.txt` and the complete WinFsp license under `licenses/WinFsp-LICENSE.txt`. The allow-list in `scripts/release/manifest.py` defines the accepted layout. Build intermediates and app-local WinFsp DLLs are rejected. The generated `version.json` carries `version`, `git_sha`, `architecture`, `toolchain`, `generator`, `build_timestamp` and `source_url`. Confirm the executable PE machine is `8664` for x64 or `AA64` for ARM64. The setup's PE machine must also match its architecture.
+The portable payload contains `xfswin.exe`, `xfswin-gui.exe`, `LICENSE`, `README.md`, `version.json`, the installation and maintainer documentation under `docs/`, `THIRD-PARTY-NOTICES.txt` and the complete WinFsp license under `licenses/WinFsp-LICENSE.txt`. The allow-list in `scripts/release/manifest.py` defines the accepted layout. Build intermediates and app-local WinFsp DLLs are rejected. The generated `version.json` carries `version`, `git_sha`, `architecture`, `toolchain`, `generator`, `build_timestamp` and `source_url`. Confirm the executable PE machine is `8664` for x64 or `AA64` for ARM64. The setup's PE machine must also match its architecture.
 
 Authenticode signing is optional. When no certificate is configured, the build produces unsigned artifacts and records that status explicitly. When signing is configured, sign the staged executable before it is embedded, then the public setup, the acceptance test setup and the synthetic fixture setup before installer acceptance. Verify signatures and timestamps and test those exact final bytes. A partial signing configuration or an invalid signature fails the build; an absent certificate does not fail qualification. Calculate all package metadata, evidence and SHA-256 sums against the bytes to be published. Signing credentials are supplied through protected environment variables or CI secrets and never enter the source tree. The workflow passes those secrets only after the publishing tag passes the identity gate; PR and qualification-only package builds are unsigned.
 
@@ -59,7 +59,14 @@ Rollback and package install/update do not alter XFS filesystem contents or qual
 
 ## Current qualification record
 
-REL-1 is **READY**. Release workflow run `42330239020` on PR #22 test-merge commit `d5b85ea646d72e38de2507663bcde01c87e5afa7` passed every required job on both native architectures: `installer-acceptance` and `installer-failure` on `windows-2025` (x64) and `windows-11-arm` (native ARM64), `release-qualification`, and the core-qualification matrix. Each architecture passed 27/27 acceptance cases with no failed or skipped case (the 20 required cases in `packaging/REL1_INTERFACES.json` plus the 7 additional coverage cases); the aggregated `qualification.json` reports `total=54`, `success=54`, `failure_count=0`, and every recorded case is `passed`. Both builds used the CMake-declared version recorded in `release-manifest.json`, MSVC 19.51.36260.0 / Visual Studio 18 2026, and the pinned official WinFsp MSI 2.1.25156 (`sha256 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`). No Authenticode certificate was configured for this qualification, so the qualified artifacts are unsigned.
+The historical REL-1 record below does **not** qualify subsequent management
+GUI changes. Those require a fresh run of the Windows GUI interaction and
+package acceptance jobs on the evaluated revision, on both x64 and ARM64.
+The GUI must be exercised through its controls against virtual-disk fixtures;
+PE inspection and Linux cross-compilation alone are insufficient. Until those
+runs finish, GUI interaction and updated-package acceptance remain pending.
+
+REL-1 is **READY**. Release workflow run `42330239020` on PR #22 test-merge commit `d5b85ea646d72e38de2507663bcde01c87e5afa7` passed every required job on both native architectures: `installer-acceptance` and `installer-failure` on `windows-2025` (x64) and `windows-11-arm` (native ARM64), `release-qualification`, and the core-qualification matrix. At that time each architecture passed 27/27 acceptance cases with no failed or skipped case (the then-current 20 required cases plus the 7 additional coverage cases); the aggregated `qualification.json` reports `total=54`, `success=54`, `failure_count=0`, and every recorded case is `passed`. Both builds used the CMake-declared version recorded in `release-manifest.json`, MSVC 19.51.36260.0 / Visual Studio 18 2026, and the pinned official WinFsp MSI 2.1.25156 (`sha256 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`). No Authenticode certificate was configured for this qualification, so the qualified artifacts are unsigned.
 
 | Architecture | Setup SHA-256 | Installed `xfswin.exe` SHA-256 |
 | --- | --- | --- |

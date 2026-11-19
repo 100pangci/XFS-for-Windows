@@ -572,9 +572,18 @@ CI: `linux-concurrency` (hooks build + full suite + Linux oracle chain),
 `windows-concurrency-core` + `linux-verify-conc-windows` (MSVC core images
 verified on Linux), and the `windows-mount` concurrent WinFsp step +
 `linux-verify-conc-winfsp` (real driver threads, sha256 manifest re-read on
-Linux). The known coverage gaps (forced multi-AG allocation, journal wrap,
-crash+concurrency, bounded WinFsp iteration counts) are listed in
-`docs/CONCURRENCY.md` and are not claimed as covered.
+Linux). The mounted test also keeps a real WinFsp handle open across rename,
+POSIX unlink and creation of a replacement at the same name. A separate DELETE
+handle sets `FileDispositionInfoEx` with `DELETE | POSIX_SEMANTICS` and closes
+before the test asserts that the name is gone; the original data handle remains
+open, matching the [Windows disposition contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_file_disposition_information_ex).
+Event handshakes order writes and durable flushes through the orphan handle; the replacement's
+bytes must remain unchanged. `open-handle-schedule.txt` retains the operation
+order on success and failure. This Windows scenario requires an actual Actions
+run; Linux compilation is not evidence that it passed.
+
+The known coverage boundaries are listed in `docs/CONCURRENCY.md`; no bounded
+scenario qualifies arbitrary schedules, physical power loss or new hardware.
 
 ## Regression rule
 

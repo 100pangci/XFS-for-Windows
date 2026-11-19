@@ -66,6 +66,7 @@ $qualificationPath = Get-ReleaseQualificationPath $Architecture
 Initialize-ReleaseCases @($script:ReleaseFailureCases + @('script-integrity'))
 
 $configPath = Join-Path $env:ProgramData 'xfswin\automount.ini'
+$script:rollbackUnrelatedShortcut = $null
 $winFspMsi = Find-ReleaseWinFspMsi
 $script:ReleaseMsiPolicy = $null
 $failure = $null
@@ -198,6 +199,18 @@ function Uninstall-OfficialWinFsp {
         'the official WinFsp runtime survived its uninstall'
 }
 
+function Assert-ReleaseInjectedSetupFailure {
+    param($Result, [string]$Stage, [string]$LogName)
+    Assert-Release (-not $Result.timed_out -and @(0, 3010) -notcontains [int]$Result.exit_code) `
+        "/test-fail $Stage did not produce an installer failure (exit $($Result.exit_code))"
+    $logPath = Join-Path $script:ReleaseOutputDirectory ($LogName + '.setup.log')
+    $log = Get-Content -LiteralPath $logPath -Raw
+    Assert-Release ($log -match ('(?m)installer stderr: error=.*injected installer failure: ' + [regex]::Escape($Stage) + '\r?$')) `
+        "setup failed without reaching the requested $Stage injection (see $logPath)"
+    Assert-Release ($log -match '(?m)\] rollback completed\r?$') `
+        "setup did not report completing the $Stage rollback (see $logPath)"
+}
+
 function Wait-InstalledHash {
     param([string]$Hash, [int]$TimeoutSeconds = 120)
     for ($attempt = 0; $attempt -lt ($TimeoutSeconds * 2); ++$attempt) {
@@ -286,8 +299,7 @@ try {
                 'WinFsp must be present before the setup failure case'
             $failed = Invoke-ReleaseSetupInstall -Installer $testInstaller `
                 -LogName $point.case -ExtraArguments @('/test-fail', $point.value)
-            Assert-Release (@(0, 3010) -notcontains [int]$failed.exit_code) `
-                "/test-fail $($point.value) did not fail the setup"
+            Assert-ReleaseInjectedSetupFailure $failed $point.value $point.case
             Assert-CleanFailureState
         }
     }
@@ -308,11 +320,36 @@ try {
             'the rollback source is not older than the evaluated package'
         [void](Wait-ServiceFromPath $before.exe 120)
 
+        # Model the latest formal release's no-GUI installation while retaining
+        # its command/documentation links.  The synthetic setup is built from
+        # current sources, so remove only the manager added by the evaluated package.
+        $legacyDirectory = Split-Path -Parent $before.exe
+        $legacyGui = Join-Path $legacyDirectory 'xfswin-gui.exe'
+        $legacyMenuDirectory = Join-Path (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') 'XFS for Windows'
+        $legacyGuiLink = Join-Path $legacyMenuDirectory 'XFS for Windows.lnk'
+        $legacyCommandLink = Join-Path $legacyMenuDirectory 'XFS for Windows Command Prompt.lnk'
+        $legacyDocumentationLink = Join-Path $legacyMenuDirectory 'XFS for Windows Documentation.lnk'
+        Assert-Release (Test-Path -LiteralPath $legacyGui -PathType Leaf) `
+            'the synthetic previous setup did not contain the manager needed to model a legacy install'
+        Assert-Release (Test-Path -LiteralPath $legacyGuiLink -PathType Leaf) `
+            'the synthetic previous setup did not create its GUI Start Menu shortcut'
+        Assert-Release (Test-Path -LiteralPath $legacyCommandLink -PathType Leaf) `
+            'the synthetic previous setup did not create its command Start Menu shortcut'
+        Assert-Release (Test-Path -LiteralPath $legacyDocumentationLink -PathType Leaf) `
+            'the synthetic previous setup did not create its documentation Start Menu shortcut'
+        Remove-Item -LiteralPath $legacyGui -Force
+        Remove-Item -LiteralPath $legacyGuiLink -Force
+        $script:rollbackUnrelatedShortcut = Join-Path $legacyMenuDirectory ("User-created shortcut-" + [Guid]::NewGuid().ToString('N') + '.lnk')
+        $shell = New-Object -ComObject WScript.Shell
+        $unrelatedLink = $shell.CreateShortcut($script:rollbackUnrelatedShortcut)
+        $unrelatedLink.TargetPath = Join-Path $env:SystemRoot 'System32\notepad.exe'
+        $unrelatedLink.Save()
+
         foreach ($stage in @('after-files', 'verify')) {
+            $logName = "upgrade-rollback-$stage"
             $failedUpgrade = Invoke-ReleaseSetupInstall -Installer $testInstaller `
-                -LogName "upgrade-rollback-$stage" -ExtraArguments @('/test-fail', $stage)
-            Assert-Release (@(0, 3010) -notcontains [int]$failedUpgrade.exit_code) `
-                "/test-fail $stage did not fail the major upgrade"
+                -LogName $logName -ExtraArguments @('/test-fail', $stage)
+            Assert-ReleaseInjectedSetupFailure $failedUpgrade $stage $logName
             $restored = Wait-InstalledHash $before.exe_sha256 120
             Assert-Release ($null -ne $restored) `
                 "the $stage failure did not restore the synthetic older executable"
@@ -321,6 +358,18 @@ try {
             [void](Wait-ServiceFromPath $restored.exe 120)
             [void](Assert-ReleaseProductRegistration -Package $package `
                 -ExpectedVersion ([string]$before.version_json.version))
+            $restoredDirectory = Split-Path -Parent $restored.exe
+            $restoredGui = Join-Path $restoredDirectory 'xfswin-gui.exe'
+            Assert-Release (-not (Test-Path -LiteralPath $restoredGui -PathType Leaf)) `
+                "the $stage rollback unexpectedly restored the manager into the legacy installation"
+            Assert-Release (-not (Test-Path -LiteralPath $legacyGuiLink -PathType Leaf)) `
+                "the $stage rollback left the new GUI Start Menu shortcut in the legacy installation"
+            Assert-Release (Test-Path -LiteralPath $legacyCommandLink -PathType Leaf) `
+                "the $stage rollback removed the legacy command Start Menu shortcut"
+            Assert-Release (Test-Path -LiteralPath $legacyDocumentationLink -PathType Leaf) `
+                "the $stage rollback removed the legacy documentation Start Menu shortcut"
+            Assert-Release (Test-Path -LiteralPath $script:rollbackUnrelatedShortcut -PathType Leaf) `
+                "the $stage rollback removed an unrelated Start Menu shortcut"
             Assert-Release (-not (Test-Path -LiteralPath (Join-Path $env:ProgramData 'xfswin\maintenance.fence'))) `
                 "the $stage rollback left the maintenance fence behind"
             $leftover = @(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory `
@@ -363,6 +412,19 @@ try {
         $cleanup = Invoke-ReleaseSetupUninstall -Installer $uninstaller -LogName 'cleanup-product-uninstall'
         if (@(0, 3010) -notcontains [int]$cleanup.exit_code -and -not $failure) {
             $failure = [Exception]::new("cleanup product uninstall failed ($($cleanup.exit_code)): $($cleanup.output)")
+        }
+    }
+} catch { if (-not $failure) { $failure = $_ } }
+try {
+    if ($script:rollbackUnrelatedShortcut -and
+        (Test-Path -LiteralPath $script:rollbackUnrelatedShortcut -PathType Leaf)) {
+        $shortcutDirectory = Split-Path -Parent $script:rollbackUnrelatedShortcut
+        Remove-Item -LiteralPath $script:rollbackUnrelatedShortcut -Force
+        if (Test-Path -LiteralPath $shortcutDirectory -PathType Container) {
+            $remainingShortcuts = @(Get-ChildItem -LiteralPath $shortcutDirectory -Force -ErrorAction Stop)
+            if ($remainingShortcuts.Count -eq 0) {
+                Remove-Item -LiteralPath $shortcutDirectory -Force
+            }
         }
     }
 } catch { if (-not $failure) { $failure = $_ } }

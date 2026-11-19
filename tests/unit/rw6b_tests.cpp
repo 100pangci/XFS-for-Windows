@@ -811,12 +811,34 @@ TEST(rw6b_rui_rud_preflight_matrix) {
   CHECK(!ParseRui(MakeRui(18, kRmapOwnerAg, fsb, 4, 1, lf::kRmapExtentAlloc),
                   image.geo)
              .ok());
-  // Reflink-only OWN_REFC/OWN_COW are unsupported.
-  CHECK(ParseRui(MakeRui(19, kRmapOwnerRefc, fsb, 0, 1,
-                         lf::kRmapExtentAlloc),
-                 image.geo)
-            .error()
-            .code == XfsError::kUnsupportedFeature);
+  // Linux logs refcountbt and CoW staging ownership as metadata ALLOC/FREE.
+  XfsGeometry reflink_geo = image.geo;
+  reflink_geo.features.reflink = true;
+  for (uint64_t owner : {kRmapOwnerRefc, kRmapOwnerCow}) {
+    for (uint32_t op : {lf::kRmapExtentAlloc, lf::kRmapExtentFree}) {
+      const auto rui = MakeRui(19, owner, fsb, 0, 1, op);
+      auto without_reflink = ParseRui(rui, image.geo);
+      CHECK(!without_reflink.ok());
+      CHECK_EQ(without_reflink.error().code, XfsError::kUnsupportedFeature);
+      CHECK(ParseRui(rui, reflink_geo).ok());
+    }
+    CHECK(!ParseRui(MakeRui(19, owner, fsb, 0, 1, lf::kRmapExtentConvert),
+                    reflink_geo)
+               .ok());
+    CHECK(!ParseRui(MakeRui(19, owner, fsb, 0, 1, lf::kRmapExtentMapShared),
+                    reflink_geo)
+               .ok());
+    CHECK(!ParseRui(MakeRui(19, owner, fsb, 1, 1, lf::kRmapExtentAlloc),
+                    reflink_geo)
+               .ok());
+    CHECK(!ParseRui(MakeRui(19, owner, fsb, 0, 1,
+                            lf::kRmapExtentFree | lf::kRmapExtentUnwritten),
+                    reflink_geo)
+               .ok());
+  }
+  CHECK(!ParseRui(MakeRui(19, kRmapOwnerMin, fsb, 0, 1, lf::kRmapExtentAlloc),
+                  reflink_geo)
+             .ok());
 
   std::vector<uint8_t> rud(lf::kRudFormatSize, 0);
   StoreLE16(rud.data(), lf::kItemRud);

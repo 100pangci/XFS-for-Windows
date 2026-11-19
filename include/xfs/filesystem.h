@@ -566,6 +566,8 @@ class XfsFilesystem {
   void CacheDirectoryAdd(uint64_t ino, std::string_view name, uint64_t child_ino,
                          uint8_t ftype) const;
   void CacheDirectoryRemove(uint64_t ino, std::string_view name) const;
+  bool CacheDirectoryRename(uint64_t ino, std::string_view old_name,
+                            std::string_view new_name) const;
 
   // Barrier-protected read helpers. Every ...Locked function requires the
   // caller to hold write_barrier_ at least shared (some hold it exclusively)

@@ -17,14 +17,14 @@ import sys
 import zipfile
 
 ARCHITECTURES = {"x64": 0x8664, "arm64": 0xAA64}
-REQUIRED_ZIP_FILES = {"xfswin.exe", "LICENSE", "README.md", "version.json", "docs/INSTALL.md"}
+REQUIRED_ZIP_FILES = {"xfswin.exe", "xfswin-gui.exe", "LICENSE", "README.md", "version.json", "docs/INSTALL.md"}
 OPTIONAL_ZIP_FILES = {
     "THIRD-PARTY-NOTICES.txt", "WINFSP-LICENSE.txt", "licenses/WinFsp-LICENSE.txt",
     "docs/INSTALLER.md", "docs/RELEASE.md", "docs/RW_STABILITY.md", "docs/UX.md",
     "docs/WINDOWS_BLOCK_DEVICE.md",
 }
 REQUIRED_CASES = {
-    "clean-install", "version", "path", "service", "ro-mount", "rw-smoke",
+    "clean-install", "version", "path", "service", "gui-operations", "ro-mount", "rw-smoke",
     "active-upgrade-refusal", "upgrade", "legacy-config", "uninstall",
     "config-preservation", "reinstall", "dependency-failure", "failure-before-service",
     "failure-after-files", "failure-service-start", "upgrade-rollback",
@@ -131,21 +131,27 @@ def inspect_zip(path: Path, architecture: str, version: str, git_sha: str) -> di
         require(metadata.get("architecture") == architecture, f"Portable architecture metadata mismatch: {path.name}")
         require(metadata.get("configuration") == "Release" and metadata.get("production_build") is True
                 and metadata.get("source_tree_dirty") is False, "Portable payload is not a clean production Release build")
+        for executable_name in ("xfswin.exe", "xfswin-gui.exe"):
+            executable = archive.read(executable_name)
+            require(pe_machine(executable) == ARCHITECTURES[architecture],
+                    f"Portable {executable_name} is not native {architecture}")
         executable = archive.read("xfswin.exe")
-        require(pe_machine(executable) == ARCHITECTURES[architecture], f"Portable executable is not native {architecture}")
+        gui_executable = archive.read("xfswin-gui.exe")
         for key in ("toolchain", "build_timestamp"):
             require(isinstance(metadata.get(key), str) and metadata[key], f"Portable metadata missing {key}")
         datetime.fromisoformat(metadata["build_timestamp"].replace("Z", "+00:00"))
         metadata["_payload_exe_sha256"] = hashlib.sha256(executable).hexdigest()
+        metadata["_payload_gui_sha256"] = hashlib.sha256(gui_executable).hexdigest()
         return metadata
 
 
 def checked_evidence(proof: dict, architecture: str, version: str, git_sha: str,
-                     installer_hash: str, payload_hash: str) -> dict:
+                     installer_hash: str, payload_hash: str, payload_gui_hash: str) -> dict:
     """Bind the *executed* installer to the installed payload, not ZIP naming."""
     require(proof.get("architecture") == architecture and proof.get("head_sha") == git_sha, "Acceptance evidence architecture/commit mismatch")
     require(proof.get("installer_sha256") == installer_hash, "Acceptance evidence belongs to a different installer")
     require(proof.get("installed_exe_sha256") == payload_hash, "Installed executable differs from the portable payload")
+    require(proof.get("installed_gui_sha256") == payload_gui_hash, "Installed GUI executable differs from the portable payload")
     installed = proof.get("installed_metadata", {})
     require(isinstance(installed, dict) and installed.get("version") == version
             and installed.get("git_sha") == git_sha and installed.get("architecture") == architecture,
@@ -159,6 +165,7 @@ def checked_evidence(proof: dict, architecture: str, version: str, git_sha: str,
     require(all(status == "passed" for status in cases.values()), "Failed/skipped installer acceptance case")
     return {"architecture": architecture, "head_sha": git_sha, "run_id": run_id,
             "installer_sha256": installer_hash, "installed_exe_sha256": payload_hash,
+            "installed_gui_sha256": payload_gui_hash,
             "installed_metadata": installed, "cases": dict(sorted(cases.items()))}
 
 
@@ -183,13 +190,16 @@ def inventory(directory: Path, version: str, git_sha: str, winfsp: dict,
             require(isinstance(saved_evidence, dict), "Clean-machine installer acceptance evidence is required")
             proof = saved_evidence.get(architecture, {})
         proofs[architecture] = checked_evidence(proof, architecture, version, git_sha,
-                                               installer_hash, metadata["_payload_exe_sha256"])
+                                               installer_hash, metadata["_payload_exe_sha256"],
+                                               metadata["_payload_gui_sha256"])
         for path, kind in ((portable, "portable"), (installer, "installer")):
             expected.add(path.name)
             artifacts.append({"name": path.name, "kind": kind, "architecture": architecture,
                               "version": version, "git_sha": git_sha, "sha256": digest(path),
                               "size_bytes": path.stat().st_size, "toolchain": metadata["toolchain"],
                               "build_timestamp": metadata["build_timestamp"],
+                              "payload_exe_sha256": metadata["_payload_exe_sha256"],
+                              "payload_gui_sha256": metadata["_payload_gui_sha256"],
                               "winfsp_dependency_version": winfsp["version"]})
     require(len({proof["run_id"] for proof in proofs.values()}) == 1, "Architecture evidence must come from the same qualification run")
     actual = {p.name for p in directory.iterdir() if p.is_file() and p.name.startswith("xfswin-")

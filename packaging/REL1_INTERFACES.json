@@ -21,14 +21,14 @@
     "previous_installer": "testing/xfswin-previous-windows-<arch>-setup.exe",
     "metadata_file": "package-metadata-<arch>.json",
     "testing_metadata_file": "testing/testing-metadata-<arch>.json",
-    "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "toolchain", "build_timestamp", "rust", "cmake", "signing", "testing"]
+    "metadata_fields": ["version", "git_sha", "architecture", "installer_name", "installer_sha256", "portable_name", "portable_sha256", "payload_exe_sha256", "payload_gui_sha256", "toolchain", "build_timestamp", "rust", "cmake", "signing", "testing"]
   },
   "acceptance_evidence": {
     "filename": "qualification-<arch>.json",
-    "fields": ["architecture", "head_sha", "run_id", "installer_sha256", "installed_exe_sha256", "installed_metadata", "cases"],
+    "fields": ["architecture", "head_sha", "run_id", "installer_sha256", "installed_exe_sha256", "installed_gui_sha256", "installed_metadata", "cases"],
     "installed_metadata": "Actual installed version.json, including clean production Release flags",
     "cases_format": "Object: exact case name -> passed, failed, or skipped",
-    "required_cases": ["clean-install", "version", "path", "service", "ro-mount", "rw-smoke", "active-upgrade-refusal", "active-service-upgrade-refusal", "upgrade", "legacy-config", "uninstall", "config-preservation", "reinstall", "dependency-failure", "failure-before-service", "failure-after-files", "failure-service-start", "failure-verify", "upgrade-rollback", "upgrade-verify-rollback"],
+    "required_cases": ["clean-install", "version", "path", "service", "gui-operations", "ro-mount", "rw-smoke", "active-upgrade-refusal", "active-service-upgrade-refusal", "upgrade", "legacy-config", "uninstall", "config-preservation", "reinstall", "dependency-failure", "failure-before-service", "failure-after-files", "failure-service-start", "failure-verify", "upgrade-rollback", "upgrade-verify-rollback"],
     "all_cases_must_pass": true,
     "architectures_must_share_run_id_and_sha": true
   },

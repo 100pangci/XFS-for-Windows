@@ -28,8 +28,10 @@ The setup package is the managed option: it installs for all users, registers
 the automount service, and handles the shared WinFsp runtime. The portable ZIP
 preserves the manual workflow: extract it to a folder and run `xfswin.exe`
 there. It does not register a service or copy WinFsp DLLs; install the official
-shared WinFsp runtime separately before mounting. There is no GUI, tray
-application or automatic updater.
+shared WinFsp runtime separately before mounting. Run `xfswin-gui.exe` for the
+native management window, or keep using `xfswin.exe` independently. The manager
+uses the existing CLI, device policy and automount service. It does not add an
+automatic updater, telemetry or a separate device-removal mechanism.
 
 Once the package is available, start in an elevated PowerShell with WinFsp
 installed and change to the folder containing `xfswin.exe`:
@@ -53,6 +55,7 @@ tested device. Keep backups and review
 
 | Layer | Role |
 |---|---|
+| Native Windows manager | device and mount status, existing CLI operations, local diagnostics export |
 | `xfswin` CLI | format, inspect, check, mutate, journal dump/recovery |
 | WinFsp adapter | native `X:` mount, read-only or read-write for the supported profile |
 | XFS core | on-disk parser, typed structures, verifier, transaction writer |

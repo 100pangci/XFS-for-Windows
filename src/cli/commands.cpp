@@ -29,6 +29,7 @@
 #include "xfs/automount_config.h"
 #include "xfs/deployment.h"
 #include "xfs/device_discovery.h"
+#include "xfs/diagnostics.h"
 #include "xfs/device_selection.h"
 #include "xfs/directory.h"
 #include "xfs/drive_letter.h"
@@ -150,6 +151,7 @@ void PrintUsage() {
       "      --drive <X:|auto>         preferred drive letter (default auto)\n"
       "  devices                       list attached XFS filesystems\n"
       "  status                        automount service state and mounted XFS\n"
+      "  diagnostics [--json] [--include-identifiers] export system diagnostics\n"
       "  automount install|uninstall   install/remove the resident service\n"
       "  automount start|stop          start/stop the resident service\n"
       "  automount status              same view as `xfswin status`\n"
@@ -2264,6 +2266,22 @@ int CommandMountInteractive(const Options& options, bool drive_specified,
 int CommandMountAutoDrive(const std::string& target,
                           const std::string& preferred,
                           const Options& options) {
+  Uuid selected_uuid{};
+  if (ParseUuid(target, &selected_uuid)) {
+    std::string discovery_error;
+    auto discovered = EnumerateXfsFilesystems(DiscoveryOptions{}, &discovery_error);
+    if (!discovered.ok()) {
+      std::cerr << "error: " << DiscoveryErrorText(discovered.error()) << "\n";
+      return 1;
+    }
+    auto index = SelectDiscoveredFilesystem(target, discovered.value().filesystems);
+    if (!index.ok()) {
+      std::cerr << "error: " << index.error().message << "\n";
+      return 1;
+    }
+    return MountDiscoveredFilesystem(discovered.value().filesystems[index.value()],
+                                     preferred, options);
+  }
   const bool raw = IsRawDevicePath(target);
   if (raw && options.read_write &&
       !options.device_write_qualification) {
@@ -4486,6 +4504,8 @@ int Run(const std::vector<std::string>& args) {
       options.device_concurrency_rounds = static_cast<int>(rounds);
     } else if (arg == "--json") {
       options.json = true;
+    } else if (arg == "--include-identifiers") {
+      options.diagnostics_include_identifiers = true;
     } else if (StartsWith(arg, "--action=")) {
       installer_action = arg.substr(9);
     } else if (arg == "--action") {
@@ -4653,6 +4673,10 @@ int Run(const std::vector<std::string>& args) {
     return 1;
   }
   const std::string& command = positional[0];
+  if (options.diagnostics_include_identifiers && command != "diagnostics") {
+    std::cerr << "error: --include-identifiers is only valid with diagnostics\n";
+    return 1;
+  }
 
   if (command == "list") return CommandList();
   if (command == "devices") {
@@ -4668,6 +4692,22 @@ int Run(const std::vector<std::string>& args) {
       return 1;
     }
     return CommandStatus(options);
+  }
+  if (command == "diagnostics") {
+    if (options.diagnostics_include_identifiers && !options.json) {
+      std::cerr << "error: --include-identifiers requires --json\n";
+      return 1;
+    }
+    if (positional.size() != 1) {
+      std::cerr << "usage: xfswin diagnostics [--json] [--include-identifiers]\n";
+      return 1;
+    }
+    const auto snapshot = CollectDiagnostics();
+    std::cout << (options.json
+                      ? FormatDiagnosticsJson(snapshot,
+                                              options.diagnostics_include_identifiers)
+                      : FormatDiagnosticsText(snapshot));
+    return snapshot.discovery_state == "unavailable" ? 1 : 0;
   }
   if (command == "automount") {
     return CommandAutomount(positional, options, drive_option_given,

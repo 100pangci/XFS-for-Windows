@@ -22,6 +22,7 @@ add_executable(xfs_tests
   unit/recovery_tests.cpp
   unit/device_tests.cpp
   unit/ux_tests.cpp
+  unit/diagnostics_tests.cpp
   unit/rel1_deployment_tests.cpp
   integration/formatter_tests.cpp
   integration/corruption_tests.cpp
@@ -126,3 +127,32 @@ add_test(NAME stateful_fuzz_xattr_regression
     --profile modern --workload xattr
     --check-every 100 --consistency-every 0 --quiet)
 set_tests_properties(stateful_fuzz_xattr_regression PROPERTIES TIMEOUT 600)
+
+# ---------------------------------------------------------------------------
+# FUZZ-2 reducer regression and concurrent crash record/replay qualification.
+# The crash test uses an image file only; the optional Linux kernel path is
+# deliberately invoked by hand because it requires root and a loop device.
+# ---------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME stateful_schedule_reducer
+    COMMAND "${Python3_EXECUTABLE}" -I
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_reduce_schedule.py")
+  add_test(NAME stateful_range_oracle
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_stateful_range.py")
+endif()
+if(XFSWIN_CONCURRENCY_HOOKS AND Python3_Interpreter_FOUND AND
+   CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_program(XFS_REPAIR_EXECUTABLE xfs_repair)
+  if(XFS_REPAIR_EXECUTABLE)
+    add_test(NAME stateful_concurrent_crash_smoke
+      COMMAND "${Python3_EXECUTABLE}" -I
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/concurrent_stateful_crash.py"
+        --exe "$<TARGET_FILE:stateful_fuzz>"
+        --mode smoke)
+    set_tests_properties(stateful_concurrent_crash_smoke PROPERTIES TIMEOUT 120)
+  else()
+    message(STATUS "Skipping stateful concurrent crash CTest: xfs_repair not found")
+  endif()
+endif()

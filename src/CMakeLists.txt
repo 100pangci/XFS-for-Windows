@@ -9,6 +9,7 @@ add_library(xfs_core STATIC
   core/log_checker.cpp
   core/crash.cpp
   core/perf_stats.cpp
+  diagnostics/diagnostics.cpp
   core/endian.cpp
   core/crc32c.cpp
   core/verifier.cpp
@@ -125,9 +126,25 @@ endif()
 # build intentionally does not synthesize a second CLI.
 # ---------------------------------------------------------------------------
 if(WIN32)
+  add_executable(xfswin-gui WIN32
+    gui/main.cpp
+    "${PROJECT_BINARY_DIR}/generated/xfswin-gui.rc"
+  )
+  target_link_libraries(xfswin-gui PRIVATE shell32 comdlg32 advapi32)
+  if(XFSWIN_RELEASE_BUILD)
+    add_dependencies(xfswin-gui xfswin_release_source_check)
+  endif()
+  if(MSVC)
+    target_compile_options(xfswin-gui PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+    target_compile_definitions(xfswin-gui PRIVATE
+      _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+  install(TARGETS xfswin-gui RUNTIME DESTINATION .)
+
   add_executable(xfswin
     cli/main.cpp
     cli/commands.cpp
+    diagnostics/diagnostics_collect.cpp
     "${PROJECT_BINARY_DIR}/generated/xfswin.rc"
   )
 

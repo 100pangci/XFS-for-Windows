@@ -212,6 +212,9 @@ pub fn extract(staging: &Path, log: &mut Log) -> io::Result<ExtractedPayload> {
     if !xfswin.is_file() {
         return Err(failure("payload is missing app/xfswin.exe"));
     }
+    if !app.join("xfswin-gui.exe").is_file() {
+        return Err(failure("payload is missing app/xfswin-gui.exe"));
+    }
     if !app.join("docs").join("INSTALL.md").is_file() {
         return Err(failure("payload is missing app/docs/INSTALL.md"));
     }
@@ -233,7 +236,8 @@ pub fn extract(staging: &Path, log: &mut Log) -> io::Result<ExtractedPayload> {
     }
 
     verify_version_json(&app.join("version.json"))?;
-    verify_pe(&xfswin)?;
+    verify_pe(&xfswin, "xfswin.exe")?;
+    verify_pe(&app.join("xfswin-gui.exe"), "xfswin-gui.exe")?;
     verify_no_app_local_winfsp(&app)?;
     log.line(format!(
         "payload verified: {} files, version {}, git {}",
@@ -336,13 +340,13 @@ fn verify_version_json(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_pe(xfswin: &Path) -> io::Result<()> {
-    let mut file = File::open(xfswin)?;
+fn verify_pe(executable: &Path, name: &str) -> io::Result<()> {
+    let mut file = File::open(executable)?;
     let mut header = vec![0u8; 1024 * 1024];
     let read = file.read(&mut header)?;
     header.truncate(read);
     let machine = win::pe_machine(&header)
-        .ok_or_else(|| failure("payload xfswin.exe is not a valid PE file"))?;
+        .ok_or_else(|| failure(format!("payload {name} is not a valid PE file")))?;
     let expected = win::expected_pe_machine()?;
     if machine != expected.0 {
         return Err(failure(format!(
@@ -412,6 +416,7 @@ mod tests {
         let mut log = Log::new(None, true);
         let extracted = extract(&staging, &mut log).expect("extract embedded payload");
         assert!(extracted.xfswin.is_file());
+        assert!(extracted.app.join("xfswin-gui.exe").is_file());
         assert!(extracted.winfsp_msi.is_file());
         assert!(extracted.app.join("version.json").is_file());
         fs::remove_dir_all(&staging).ok();

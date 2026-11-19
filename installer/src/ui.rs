@@ -19,6 +19,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage,
@@ -68,6 +69,28 @@ pub fn info(text: &str) {
         PROGRESS_TITLE,
         MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
     );
+}
+
+pub fn offer_first_use_guide(path: &Path) {
+    let result = message(
+        "XFS for Windows Manager is available from the Start Menu. It discovers XFS volumes and mounts them read-only by default.\r\n\r\nWould you like to open the installation and first-use guide now?",
+        PROGRESS_TITLE,
+        MB_OKCANCEL | MB_ICONINFORMATION | MB_SETFOREGROUND,
+    );
+    if result == IDOK.0 {
+        let operation = wide("open");
+        let path = wide(&path.to_string_lossy());
+        unsafe {
+            let _ = ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOW,
+            );
+        }
+    }
 }
 
 /// Ask for explicit consent before installing or upgrading.  The default

@@ -16,6 +16,14 @@ line printed by the harness.
 usage:
   reduce_stateful_trace.py --ops failure.ops --exe build/tests/stateful_fuzz \
       --signature "content hash differs" [--work-dir out] [--max-runs 80]
+  reduce_stateful_trace.py --concurrency-schedule failure.schedule \
+      --scenario conc_stress_mixed_namespace_data_xattr_seeded --workers 4 \
+      --exe build/tests/xfs_tests --signature "semantic mismatch" \
+      [--seed 123 --iterations 5]
+
+Concurrency mode preserves schedule length and replaces choices only when the
+same failure signature reproduces. It reduces scheduler choices for a fixed
+worker program; it does not delete or rewrite the C++ worker operations.
 """
 
 import argparse
@@ -53,9 +61,102 @@ def write_ops(path, header, lines):
             f.write(line + "\n")
 
 
+def read_schedule(path):
+    text = open(path, "r", encoding="utf-8").read().strip()
+    if not text:
+        raise SystemExit("reduce: concurrency schedule is empty")
+    try:
+        values = [int(token, 10) for token in text.split(",")]
+    except ValueError:
+        raise SystemExit("reduce: concurrency schedule has an invalid choice")
+    if any(value < 0 for value in values):
+        raise SystemExit("reduce: concurrency schedule has a negative choice")
+    return values
+
+
+def write_schedule(path, choices):
+    with open(path, "w", encoding="utf-8", newline="\n") as output:
+        output.write(",".join(str(choice) for choice in choices) + "\n")
+
+
+def reduce_concurrency_schedule(args):
+    if args.max_runs < 2:
+        raise SystemExit("reduce: concurrency mode needs --max-runs >= 2")
+    if not args.scenario or not args.workers or args.workers < 1:
+        raise SystemExit("reduce: concurrency mode requires --scenario and --workers")
+    original = read_schedule(args.concurrency_schedule)
+    work = args.work_dir or tempfile.mkdtemp(prefix="conc-reduce-")
+    os.makedirs(work, exist_ok=True)
+    runs = 0
+    current = list(original)
+
+    def reproduces(schedule):
+        nonlocal runs
+        if runs >= args.max_runs:
+            return False
+        runs += 1
+        env = os.environ.copy()
+        env["XFSWIN_CONC_REPLAY"] = ",".join(str(choice) for choice in schedule)
+        env["XFSWIN_CONC_STRESS_SEED"] = str(args.seed)
+        env["XFSWIN_CONC_STRESS_ITERS"] = str(args.iterations)
+        try:
+            result = subprocess.run(
+                [args.exe, "--filter=" + args.scenario], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        output = result.stdout.decode("utf-8", "replace")
+        if any(marker in output for marker in (
+                "invalid choice", "non-runnable operation",
+                "index out of range", "schedule ended before")):
+            return False
+        return result.returncode != 0 and args.signature in output
+
+    if not reproduces(current):
+        raise SystemExit("reduce: original concurrency failure does not reproduce")
+
+    changed = False
+    for position in range(len(current)):
+        original_choice = current[position]
+        for choice in range(min(args.workers, original_choice + 1)):
+            if runs >= args.max_runs - 1:
+                break
+            if choice == original_choice:
+                continue
+            candidate = list(current)
+            candidate[position] = choice
+            if reproduces(candidate):
+                current = candidate
+                changed = True
+                break
+            if runs >= args.max_runs:
+                break
+        if runs >= args.max_runs:
+            break
+
+    if not reproduces(current):
+        raise SystemExit("reduce: final concurrency schedule stopped reproducing")
+    if not changed:
+        raise SystemExit("reduce: unable to minimize scheduler choices within the run budget")
+    output_path = os.path.join(work, "reduced.schedule")
+    write_schedule(output_path, current)
+    print("concurrency schedule choices simplified: %d entries (%d runs)" %
+          (len(current), runs))
+    print("schedule: %s" % output_path)
+    print("reproduce with XFSWIN_CONC_REPLAY=<contents of schedule> %s --filter=%s" %
+          (args.exe, args.scenario))
+    return 0
+
+
 def main(argv):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ops", required=True)
+    parser.add_argument("--ops", default=None)
+    parser.add_argument("--concurrency-schedule", default=None)
+    parser.add_argument("--scenario", default=None)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--exe", required=True)
     parser.add_argument("--signature", required=True)
     parser.add_argument("--work-dir", default=None)
@@ -63,6 +164,12 @@ def main(argv):
     parser.add_argument("--timeout", type=int, default=300)
     args = parser.parse_args(argv[1:])
 
+    if args.concurrency_schedule:
+        if args.ops:
+            raise SystemExit("reduce: use either --ops or --concurrency-schedule")
+        return reduce_concurrency_schedule(args)
+    if not args.ops:
+        raise SystemExit("reduce: --ops is required for FUZZ-2 mode")
     header, original = read_ops(args.ops)
     if not original:
         raise SystemExit("reduce: operation file is empty")

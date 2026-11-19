@@ -27,6 +27,9 @@ void Usage() {
       "  --steps <n>             number of operations (default 200)\n"
       "  --image <path>          image to create or recover\n"
       "  --trace <path>          human-readable operation trace\n"
+      "  --concurrent-observer read|flush run a concurrent observer (hooks build)\n"
+      "  --schedule-out <path>   record each scheduler choice before stepping\n"
+      "  --schedule-file <path>  strictly replay a recorded schedule\n"
       "  --manifest <path>       JSON semantic manifest for independent checks\n"
       "  --profile default|modern (default: modern)\n"
       "  --workload mixed|dir|xattr|alloc|enospc (default: mixed)\n"
@@ -34,12 +37,14 @@ void Usage() {
       "  --crash-op <n>          arm the crash point at operation n\n"
       "  --crash-point <name>    XFSWIN_CRASH_AT point (e.g. after_log_commit)\n"
       "  --crash-hit <n>         occurrence inside the operation (default 1)\n"
+      "  --state-expectation <before|after|either> recovery contract (default either)\n"
       "  --recover               replay/verify a crashed image instead of\n"
       "                          executing a new sequence\n"
       "  --check-every <n>       full semantic check interval (default 5)\n"
       "  --consistency-every <n> CheckConsistency interval (default 50)\n"
       "  --plan-only <path>      write the deterministic operation plan\n"
       "  --list-crash-points     print all crash point names\n"
+      "  --self-test-runner-contracts check synthetic recovery/observer contracts\n"
       "  --quiet                 only print failures\n"
       "\n"
       "A crash run exits with 0x58435348 after the injected termination; run\n"
@@ -106,9 +111,19 @@ std::string Reproducer(const char* argv0, const FuzzOptions& options,
   if (!options.ops_file.empty()) {
     command += " --ops-file " + Quote(options.ops_file);
   }
+  if (!options.concurrent_observer.empty()) {
+    command += " --concurrent-observer " + options.concurrent_observer;
+  }
+  if (!options.schedule_out.empty()) {
+    command += " --schedule-out " + Quote(options.schedule_out);
+  }
+  if (!options.schedule_file.empty()) {
+    command += " --schedule-file " + Quote(options.schedule_file);
+  }
   if (options.crash_op) {
     command += " --crash-op " + std::to_string(options.crash_op) +
-               " --crash-point " + options.crash_point;
+               " --crash-point " + options.crash_point +
+               " --state-expectation " + options.state_expectation;
     if (options.crash_hit != 1) {
       command += " --crash-hit " + std::to_string(options.crash_hit);
     }
@@ -156,6 +171,7 @@ int main(int argc, char** argv) {
   std::string plan_only;
   std::string ops_out;
   bool list_points = false;
+  bool self_test_runner_contracts = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -172,6 +188,10 @@ int main(int argc, char** argv) {
     }
     if (arg == "--list-crash-points") {
       list_points = true;
+      continue;
+    }
+    if (arg == "--self-test-runner-contracts") {
+      self_test_runner_contracts = true;
       continue;
     }
     if (arg == "--seed") {
@@ -220,6 +240,15 @@ int main(int argc, char** argv) {
                      options.crash_point.c_str());
         return 2;
       }
+    } else if (arg == "--state-expectation") {
+      options.state_expectation = value("--state-expectation");
+      if (options.state_expectation != "before" &&
+          options.state_expectation != "after" &&
+          options.state_expectation != "either") {
+        std::fprintf(stderr,
+                     "--state-expectation must be before, after, or either\n");
+        return 2;
+      }
     } else if (arg == "--crash-hit") {
       if (!ParseU32(value("--crash-hit"), &options.crash_hit) ||
           options.crash_hit == 0) {
@@ -242,6 +271,12 @@ int main(int argc, char** argv) {
       ops_out = value("--ops-out");
     } else if (arg == "--ops-file") {
       options.ops_file = value("--ops-file");
+    } else if (arg == "--concurrent-observer") {
+      options.concurrent_observer = value("--concurrent-observer");
+    } else if (arg == "--schedule-out") {
+      options.schedule_out = value("--schedule-out");
+    } else if (arg == "--schedule-file") {
+      options.schedule_file = value("--schedule-file");
     } else if (arg == "--recover") {
       options.recover = true;
     } else if (arg == "--require-enospc") {
@@ -262,7 +297,32 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (self_test_runner_contracts) return RunRunnerContractSelfTest();
 
+#ifndef XFSWIN_CONCURRENCY_HOOKS
+  if (!options.concurrent_observer.empty() || !options.schedule_out.empty() ||
+      !options.schedule_file.empty()) {
+    std::fprintf(stderr,
+                 "--concurrent-observer and schedule options require "
+                 "XFSWIN_CONCURRENCY_HOOKS\n");
+    return 2;
+  }
+#endif
+  if (!options.concurrent_observer.empty() &&
+      options.concurrent_observer != "read" &&
+      options.concurrent_observer != "flush") {
+    std::fprintf(stderr, "--concurrent-observer must be read or flush\n");
+    return 2;
+  }
+  if (!options.schedule_out.empty() && !options.schedule_file.empty()) {
+    std::fprintf(stderr, "--schedule-out and --schedule-file are mutually exclusive\n");
+    return 2;
+  }
+  if ((!options.schedule_out.empty() || !options.schedule_file.empty()) &&
+      options.concurrent_observer.empty()) {
+    std::fprintf(stderr, "schedule options require --concurrent-observer\n");
+    return 2;
+  }
   if (options.image.empty()) {
     std::fprintf(stderr, "--image is required\n");
     return 2;

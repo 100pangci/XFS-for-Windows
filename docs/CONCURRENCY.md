@@ -304,7 +304,64 @@ scheduler:
 `XFSWIN_CONC_STRESS_SEED` control them. A failure prints the seed and the
 full schedule; `XFSWIN_CONC_REPLAY` replays it. The reproducibility test
 proves that the same seed yields the same normalized event stream on a fresh
-image, and that a truncated replay schedule is rejected.
+image, and that truncated and out-of-range replay schedules are rejected.
+
+For repeatable seeded runs and schedule replay, use
+`tests/scripts/concurrency_stateful_matrix.py`:
+
+```bash
+python3 tests/scripts/concurrency_stateful_matrix.py \
+  --exe build/tests/xfs_tests --work-dir out/concurrency-matrix --mode smoke
+```
+
+The matrix drives the existing `Controller` stress workloads through the real
+filesystem API. It writes a worker operation catalog (`*.ops.txt`), the exact
+scheduler choice sequence (`*.schedule`) and normalized controller events
+(`*.events.txt`), then replays each recorded schedule and compares event
+streams. `--mode soak` runs four fixed seeds and 20 iterations. The artifacts
+make a failure replayable with `XFSWIN_CONC_REPLAY`; they are separate from the
+sequential FUZZ-2 operation format. To simplify scheduler choices for a fixed
+worker program while preserving a failure signature, use:
+
+```bash
+python3 -I tests/scripts/reduce_stateful_trace.py \
+  --concurrency-schedule out/concurrency-matrix/failing.schedule \
+  --scenario conc_stress_mixed_namespace_data_xattr_seeded --workers 4 \
+  --exe build/tests/xfs_tests --signature "failure text" \
+  --work-dir out/concurrency-reduced
+```
+
+The reducer keeps the schedule length and accepts a replacement choice only
+when the same failure signature still appears. It cannot delete operations from
+the compiled worker program.
+
+## FUZZ-2 crash plus concurrency
+
+`tests/scripts/concurrent_stateful_crash.py` runs fixed FUZZ-2 operation plans
+with one mutator and one observer scheduled by the existing `conc::Controller`.
+The observer either looks up the stable root parent entry or calls `Flush`; the
+mutator is the only worker that changes the filesystem. Namespace operations
+retain their existing barrier serialization. The model is updated by the
+runner after both workers finish, and crash manifests keep the normal exact or
+range contract.
+
+The matrix covers `setxattr/flush/after_log_commit`,
+`rename/read/mid_metadata_write`, and `write` with `read/after_data_write` and
+`flush/before_log_write`. It records each scheduler choice to the schedule file
+before stepping, replays the same choices, then runs project recovery, the raw
+stateful oracle and `xfs_repair -n`. Failed cases retain their log and image.
+
+```bash
+python3 -I tests/scripts/concurrent_stateful_crash.py \
+  --exe build-concurrent-crash/tests/stateful_fuzz \
+  --work-dir out/concurrent-crash --mode smoke
+```
+
+The Linux CI job can add `--kernel-replay --kernel-recovered`. Kernel replay
+uses a byte-for-byte copy of the dirty image saved before project recovery;
+the recovered image is verified separately. Both flags require root and loop
+mount support. The local smoke does not invoke sudo. `--mode soak` runs the four
+combinations over two fixed seeds.
 
 ## External validation
 
@@ -393,9 +450,10 @@ Honest coverage limits of CONC-1:
 - **Journal wrap is not forced.** The exported images use the normal log
   size; the transaction tests cover the wrap logic, but no stress scenario
   drives enough transactions to wrap the physical log under concurrency.
-- **No crash + concurrency combination.** Crash matrices and concurrency
-  tests are separate; a crash between a concurrent commit and a cache publish
-  is not injected.
+- **Crash interleavings are bounded.** The FUZZ-2 combination matrix keeps a
+  single mutator operation active and uses one read or flush observer. It does
+  not model arbitrary multi-mutator workloads or every possible cache publish
+  interleaving.
 - **WinFsp coverage is bounded.** The Windows script uses 4 runspaces and 20
   iterations on a hosted runner; it exercises unique names and one shared
   directory, not rename-replace with an open handle, hard links or symlinks

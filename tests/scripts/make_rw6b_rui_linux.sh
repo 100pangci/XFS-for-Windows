@@ -30,7 +30,19 @@ FILES=${FILES:-6}
 EXTENTS=${EXTENTS:-12000}
 ROUNDS=${ROUNDS:-40}
 MAX_SNAPS=${MAX_SNAPS:-1200}
-COW_MB=${COW_MB:-256}
+# The writer can touch every origin chunk before the probe and copy finish.
+# Reserve room for the whole origin plus persistent exception metadata (each
+# 4 KiB chunk uses one 16-byte exception entry, plus the store header).
+if [[ ! "$SIZE_MB" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SIZE_MB must be a positive decimal integer" >&2
+    exit 2
+fi
+MIN_COW_MB=$((SIZE_MB + (SIZE_MB + 7) / 8 + 1))
+COW_MB=${COW_MB:-$MIN_COW_MB}
+if [[ ! "$COW_MB" =~ ^[1-9][0-9]*$ ]] || [ "$COW_MB" -lt "$MIN_COW_MB" ]; then
+    echo "COW_MB must be at least $MIN_COW_MB for a $SIZE_MB MiB origin" >&2
+    exit 2
+fi
 WORK=$(mktemp -d)
 LOOP=""
 COW_LOOP=""
@@ -71,7 +83,7 @@ if [ "$(id -u)" != "0" ]; then
     echo "must run as root (loop device/dm-snapshot/mount)" >&2
     exit 1
 fi
-for tool in mkfs.xfs xfs_repair xfs_logprint xfs_db losetup dmsetup python3 dd; do
+for tool in mkfs.xfs xfs_repair xfs_logprint xfs_db losetup dmsetup python3 dd fallocate; do
     command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
 done
 if ! dmsetup targets 2>/dev/null | grep -q '^snapshot '; then
@@ -91,9 +103,7 @@ MKFS_OPTS="-m crc=1,rmapbt=1,reflink=0,finobt=1,inobtcount=1,bigtime=1 -i sparse
 
 LIVE="$WORK/live.img"
 COW="$WORK/cow.img"
-rm -f "$LIVE" "$COW"
-truncate -s "${SIZE_MB}M" "$LIVE"
-truncate -s "${COW_MB}M" "$COW"
+fallocate -l "${SIZE_MB}M" "$LIVE"
 SECTORS=$((SIZE_MB * 1024 * 1024 / 512))
 LOOP=$(losetup --find --show "$LIVE")
 udevadm settle --timeout=5 >/dev/null 2>&1 || true
@@ -121,7 +131,8 @@ if [ ! -b "$ORIGIN" ]; then
     echo "device-mapper origin node $ORIGIN did not appear" >&2
     exit 1
 fi
-mkfs.xfs -f -q $MKFS_OPTS $PARENT_OPT "$ORIGIN"
+# Do not discard the blocks reserved in the live backing file above.
+mkfs.xfs -K -f -q $MKFS_OPTS $PARENT_OPT "$ORIGIN"
 mount "$ORIGIN" "$MOUNT"
 
 # Pre-create the fragmented files.  Each write leaves a hole between 4 KiB
@@ -249,9 +260,16 @@ create_snapshot() {
     for _ in $(seq 1 5); do
         remove_snapshot
         detach_cow
-        truncate -s 0 "$COW"
-        truncate -s "${COW_MB}M" "$COW"
-        COW_LOOP=$(losetup --find --show "$COW")
+        # Clear persistent snapshot metadata from the previous attempt, then
+        # reserve real backing space so an unrelated host write cannot run the
+        # loop device out of blocks in the middle of a capture.
+        truncate -s 0 "$COW" || return 1
+        if ! fallocate -l "${COW_MB}M" "$COW"; then
+            echo "could not reserve $COW_MB MiB for the snapshot COW store" >&2
+            df -h "$WORK" >&2 || true
+            return 1
+        fi
+        COW_LOOP=$(losetup --find --show "$COW") || return 1
         udevadm settle --timeout=5 >/dev/null 2>&1 || true
         if ! dmsetup suspend --nolockfs "$ORIGIN_NAME" >/dev/null 2>&1; then
             echo "could not suspend the snapshot origin (nolockfs)" >&2
@@ -317,11 +335,20 @@ if [ -z "$FOUND" ]; then
 fi
 
 echo "capture: found after $attempts snapshots ($rui_seen with any RUI)" >&2
-# The workload cannot invalidate the snapshot, but stopping it keeps the COW
-# small while the snapshot is copied out.
+# Stopping the writer reduces churn, but cannot cancel already queued kernel
+# writes. The preallocated COW store must hold even a full origin rewrite.
 kill -STOP "$WRITER_PID" >/dev/null 2>&1 || true
+snapshot_status=$(dmsetup status --noflush "$SNAP_NAME")
+echo "capture: snapshot status before copy: $snapshot_status ($COW_MB MiB reserved)" >&2
+if [[ "$snapshot_status" =~ (Invalid|Overflow) ]]; then
+    echo "selected RUI snapshot is no longer readable" >&2
+    exit 1
+fi
 if ! dd if="$FOUND" of="$OUT/rui.img" bs=4M conv=sparse status=none; then
-    echo "copying the snapshot failed (COW overflow?)" >&2
+    echo "copying the selected RUI snapshot failed" >&2
+    dmsetup status --noflush "$SNAP_NAME" >&2 || true
+    df -h "$WORK" "$OUT" >&2 || true
+    dmesg | tail -40 >&2 || true
     exit 1
 fi
 sync
