@@ -36,6 +36,23 @@ pwsh tests/perf/run_core_perf.ps1 `
 Artifacts: `perf.json`, `perf.txt`. `XFSWIN_PERF_STATS=1` is set by the
 script.
 
+## Small-file and metadata workloads
+
+The existing `xfswin_perf` runner also measures one- and four-thread small-file
+create/write/read/delete loops, a 128-file source-like tree copy, 1000-entry
+directory enumeration with core-cold and core-warm caches, and 100 same-directory
+renames. JSON includes device read/write/flush counts, journal commits/flushes,
+cache misses and process peak resident memory (peak working set on Windows).
+Peak memory is cumulative for the process, not a per-workload allocation delta;
+zero means that the platform query was unavailable.
+
+Core-cold enumeration explicitly invalidates the directory cache. It does not
+flush the operating system page cache and does not claim cold-device results.
+Use fresh images with the same geometry and feature profile for comparisons.
+The rename gate checks that a committed non-replacing rename retains a warm
+parent directory cache; it does not impose a timing threshold. Before/after
+measurement details and the remaining flush cost are in `docs/PERFORMANCE.md`.
+
 ## A/B
 
 Build the baseline-compatible runner against the baseline checkout (the source

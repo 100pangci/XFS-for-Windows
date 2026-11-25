@@ -131,10 +131,21 @@ Result<RmapIntent> ParseRui(const std::vector<uint8_t>& format,
 
     const bool special = RmapNonInodeOwner(e.owner);
     if (special) {
-      if (e.owner > kRmapOwnerFs || e.owner < kRmapOwnerInodes) {
+      const bool reflink_owner =
+          e.owner == kRmapOwnerRefc || e.owner == kRmapOwnerCow;
+      if (e.owner > kRmapOwnerFs || e.owner < kRmapOwnerCow ||
+          (reflink_owner && !geo.features.reflink)) {
         return XFS_ERR(XfsError::kUnsupportedFeature,
                        "RUI has an unsupported special owner")
             .Actual(e.owner)
+            .Metadata("RUI");
+      }
+      // Linux logs allocation and freeing of reflink metadata as ALLOC/FREE.
+      if (reflink_owner && op != lf::kRmapExtentAlloc &&
+          op != lf::kRmapExtentFree) {
+        return XFS_ERR(XfsError::kCorruptBtree,
+                       "RUI reflink metadata extent requires ALLOC or FREE")
+            .Actual(e.flags)
             .Metadata("RUI");
       }
       if (e.startoff != 0 || (e.flags & (lf::kRmapExtentAttrFork |

@@ -16,9 +16,10 @@ This tool reads the raw image with the existing independent Python parsers
   * the inobt/AGI/AGF/free-space structures through the existing oracles.
 
 The manifest may contain one exact state (normal run) or two old/new states
-(crash recovery).  A ``state_mode == "range"`` manifest is the weaker data
-contract: metadata and the allowed size set are checked, while byte ranges are
-validated by the C++ runner that has the before/after buffers.
+(crash recovery).  Crash manifests can set ``state_expectation`` to ``before``,
+``after``, or ``either``; older manifests default to ``either``.  A
+``state_mode == "range"`` manifest pins the target size to the selected state,
+while the target payload is checked against the saved before/after byte contract.
 
 usage:
   stateful_probe.py <image> --manifest <manifest.json> [--quiet]
@@ -37,6 +38,7 @@ import rw6_inode_probe  # noqa: E402
 import rw6d_xattr_probe  # noqa: E402
 import rw6e_parent_probe  # noqa: E402
 import rw4_probe  # noqa: E402
+import stateful_contract  # noqa: E402
 import stateful_range  # noqa: E402
 
 TYPE_BY_FT = {1: "file", 2: "dir", 7: "symlink"}
@@ -199,12 +201,10 @@ def check_entry(img, geo, entry, path_set, records, range_target=None,
              (entry["paths"][0], record["nlink"], nlink))
     if want_type != "dir":
         if range_contract is not None and entry["id"] == range_target:
-            allowed_sizes = {int(range_contract["before_size"]),
-                             int(range_contract["after_size"])}
-            if record["size"] not in allowed_sizes:
-                fail("%s: size %d not in allowed set %s" %
-                     (entry["paths"][0], record["size"],
-                      sorted(allowed_sizes)))
+            error = stateful_contract.range_size_error(
+                record["size"], size, range_contract)
+            if error:
+                fail("%s: %s" % (entry["paths"][0], error))
         elif record["size"] != size:
             fail("%s: size %d != %d" %
                  (entry["paths"][0], record["size"], size))
@@ -273,10 +273,11 @@ def main(argv):
     geo = Geometry(img)
     rw2_probe.check_image(img, verbose=False)
 
-    # The manifest's exact states are alternatives for a crash image.
     states = manifest.get("states", [])
-    if not states:
-        fail("manifest has no states")
+    try:
+        candidates = stateful_contract.state_candidates(manifest)
+    except (KeyError, TypeError, ValueError) as exc:
+        fail("invalid state contract: %s" % exc)
     range_mode = manifest.get("state_mode") == "range"
     if range_mode:
         try:
@@ -287,27 +288,40 @@ def main(argv):
         target = manifest.get("target_node")
         if target is None or contract is None:
             fail("range manifest is missing its target or byte contract")
-        checked = check_state(img, geo, states[0], True,
-                              range_target=int(target),
-                              range_contract=contract,
-                              range_before=before, range_after=after)
-    else:
         errors = []
-        for index, state in enumerate(states):
+        for index in candidates:
             try:
-                checked = check_state(img, geo, state, False)
-                if not args.quiet:
-                    print("state %s matches (%d entries)" %
-                          (manifest.get("labels", ["state"])[index]
-                           if index < len(manifest.get("labels", []))
-                           else index, checked))
-                print("OK: FUZZ-2 stateful manifest verified")
-                return 0
+                checked = check_state(img, geo, states[index], True,
+                                      range_target=int(target),
+                                      range_contract=contract,
+                                      range_before=before,
+                                      range_after=after)
             except SystemExit as exc:
                 errors.append(str(exc))
-        fail("no manifest state matches:\n  " + "\n  ".join(errors))
-    print("OK: FUZZ-2 stateful manifest metadata verified (range contract)")
-    return 0
+                continue
+            if not args.quiet:
+                labels = manifest.get("labels", [])
+                label = labels[index] if index < len(labels) else index
+                print("state %s matches (%d entries)" % (label, checked))
+            print("OK: FUZZ-2 stateful manifest verified (range contract)")
+            return 0
+        fail("no manifest state matches the range contract:\n  " +
+             "\n  ".join(errors))
+
+    errors = []
+    for index in candidates:
+        state = states[index]
+        try:
+            checked = check_state(img, geo, state, False)
+            if not args.quiet:
+                labels = manifest.get("labels", [])
+                label = labels[index] if index < len(labels) else index
+                print("state %s matches (%d entries)" % (label, checked))
+            print("OK: FUZZ-2 stateful manifest verified")
+            return 0
+        except SystemExit as exc:
+            errors.append(str(exc))
+    fail("no manifest state matches:\n  " + "\n  ".join(errors))
 
 
 if __name__ == "__main__":

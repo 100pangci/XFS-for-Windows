@@ -25,11 +25,14 @@ struct VerifyResult {
 VerifyResult VerifyModel(xfs::XfsFilesystem& fs, const ModelFs& model,
                          uint64_t skip_node = 0);
 
-// Crash verification for a data operation.  The namespace, link counts,
-// xattrs and symlink targets must be exactly the post-operation state; the
-// target file must obey the documented old/new (or partial-data) contract.
-VerifyResult VerifyRangeCrash(xfs::XfsFilesystem& fs, const ModelFs& before,
-                              const ModelFs& after, const Operation& op);
+// Crash verification for a data operation.  `skeleton` selects the logical
+// before/after state guaranteed by the crash point; independently written file
+// payload bytes still follow the old/new (or partial-data) contract.  When
+// requested, the target's logical size must match that selected state.
+VerifyResult VerifyRangeCrash(xfs::XfsFilesystem& fs, const ModelFs& skeleton,
+                              const ModelFs& before, const ModelFs& after,
+                              const Operation& op,
+                              bool require_expected_size);
 
 // Reads a file through the public API.  Holes read as zero bytes.
 bool ReadAll(xfs::XfsFilesystem& fs, uint64_t ino, uint64_t size,

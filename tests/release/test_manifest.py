@@ -35,13 +35,14 @@ class ReleaseGateTests(unittest.TestCase):
                         "toolchain": "synthetic fixture", "build_timestamp": "2026-11-06T00:00:00Z"}
             with zipfile.ZipFile(self.portable(architecture), "w") as archive:
                 for name in manifest.REQUIRED_ZIP_FILES:
-                    content = executable if name == "xfswin.exe" else json.dumps(metadata).encode() if name == "version.json" else b"Test fixture\n"
+                    content = executable if name in ("xfswin.exe", "xfswin-gui.exe") else json.dumps(metadata).encode() if name == "version.json" else b"Test fixture\n"
                     archive.writestr(name, content)
             self.installer(architecture).write_bytes(executable)
             checksum = hashlib.sha256(executable).hexdigest()
             self.proof_path(architecture).write_text(json.dumps({
                 "architecture": architecture, "head_sha": self.sha, "run_id": "1",
                 "installer_sha256": checksum, "installed_exe_sha256": checksum,
+                "installed_gui_sha256": checksum,
                 "installed_metadata": metadata,
                 "cases": {case: "passed" for case in manifest.REQUIRED_CASES},
             }), encoding="utf-8")
@@ -113,6 +114,18 @@ class ReleaseGateTests(unittest.TestCase):
     def test_emulated_x64_is_not_an_arm64_installer(self):
         self.installer("arm64").write_bytes(self.pe(0x8664))
         with self.assertRaisesRegex(ValueError, "not native arm64"):
+            self.create()
+
+    def test_gui_executable_must_match_portable_architecture(self):
+        path = self.portable("x64")
+        with zipfile.ZipFile(path) as archive:
+            members = [(item.filename, archive.read(item)) for item in archive.infolist()]
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, content in members:
+                if name == "xfswin-gui.exe":
+                    content = self.pe(0xAA64)
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "xfswin-gui.exe is not native x64"):
             self.create()
 
     def test_arm64ec_is_not_native_arm64(self):
@@ -199,6 +212,11 @@ class ReleaseGateTests(unittest.TestCase):
     def test_installed_executable_must_match_portable(self):
         self.edit_proof("x64", lambda proof: proof.update(installed_exe_sha256="0" * 64))
         with self.assertRaisesRegex(ValueError, "differs from the portable"):
+            self.create()
+
+    def test_installed_gui_must_match_portable(self):
+        self.edit_proof("arm64", lambda proof: proof.update(installed_gui_sha256="0" * 64))
+        with self.assertRaisesRegex(ValueError, "Installed GUI executable differs from the portable"):
             self.create()
 
     def test_stale_installer_cannot_borrow_zip_version(self):

@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 cmake_minimum_required(VERSION 3.24)
-project(XFS-for-Windows VERSION 0.2.0 LANGUAGES CXX)
+project(XFS-for-Windows VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -128,6 +128,7 @@ configure_file(cmake/xfswin_version.h.in generated/xfswin_version.h @ONLY)
 configure_file(cmake/version.json.in generated/version.json @ONLY)
 if(WIN32)
   configure_file(cmake/xfswin.rc.in generated/xfswin.rc @ONLY)
+  configure_file(cmake/xfswin-gui.rc.in generated/xfswin-gui.rc @ONLY)
 endif()
 
 # The canonical CI builds turn warnings into errors. MSVC applies /WX to

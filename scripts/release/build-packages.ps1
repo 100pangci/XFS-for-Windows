@@ -381,6 +381,7 @@ function Test-StagedPayload {
     )
     $allowedFiles = @(
         'xfswin.exe',
+        'xfswin-gui.exe',
         'LICENSE',
         'README.md',
         'version.json',
@@ -396,6 +397,7 @@ function Test-StagedPayload {
     )
     $requiredFiles = @(
         'xfswin.exe',
+        'xfswin-gui.exe',
         'LICENSE',
         'README.md',
         'version.json',
@@ -410,7 +412,7 @@ function Test-StagedPayload {
             if (@('docs', 'THIRD-PARTY-NOTICES') -cnotcontains $entry.Name) {
                 throw "Unexpected top-level directory in the CMake install tree: $($entry.Name)"
             }
-        } elseif (@('xfswin.exe', 'LICENSE', 'README.md', 'version.json') -cnotcontains $entry.Name) {
+        } elseif (@('xfswin.exe', 'xfswin-gui.exe', 'LICENSE', 'README.md', 'version.json') -cnotcontains $entry.Name) {
             throw "Unexpected top-level file in the CMake install tree: $($entry.Name)"
         }
     }
@@ -432,7 +434,7 @@ function Test-StagedPayload {
         if ($forbiddenExtensions -contains $extension) {
             throw "Build/dependency artifact leaked into the CMake install tree: $($file.FullName)"
         }
-        if ($extension -eq '.exe' -and $relative -ne 'xfswin.exe') {
+        if ($extension -eq '.exe' -and @('xfswin.exe', 'xfswin-gui.exe') -cnotcontains $relative) {
             throw "Unexpected executable in the CMake install tree: $($file.FullName)"
         }
     }
@@ -474,9 +476,23 @@ function Test-StagedPayload {
         throw 'Staged version.json records a dirty source tree; manifest.py rejects it.'
     }
 
-    $machine = Get-PeMachine -Path (Join-Path $Staging 'xfswin.exe')
-    if ($machine -ne $ExpectedPeMachine) {
-        throw "Staged xfswin.exe is $(Get-PeMachineName -Machine $machine), expected $Architecture."
+    foreach ($executableName in @('xfswin.exe', 'xfswin-gui.exe')) {
+        $executablePath = Join-Path $Staging $executableName
+        $machine = Get-PeMachine -Path $executablePath
+        if ($machine -ne $ExpectedPeMachine) {
+            throw "Staged $executableName is $(Get-PeMachineName -Machine $machine), expected $Architecture."
+        }
+        if ($executableName -eq 'xfswin-gui.exe') {
+            $guiInfo = (Get-Item -LiteralPath $executablePath).VersionInfo
+            $expectedFileVersion = $Version
+            if ($guiInfo.ProductName -ne 'XFS-for-Windows' -or
+                $guiInfo.FileDescription -ne 'XFS filesystem manager' -or
+                $guiInfo.OriginalFilename -ne 'xfswin-gui.exe' -or
+                $guiInfo.ProductVersion -ne $expectedFileVersion -or
+                $guiInfo.FileVersion -ne $expectedFileVersion) {
+                throw "Staged GUI version resources are incomplete or incorrect: $($guiInfo.ProductName) / $($guiInfo.FileDescription) / $($guiInfo.OriginalFilename) / $($guiInfo.FileVersion) / $($guiInfo.ProductVersion)"
+            }
+        }
     }
 
     return [pscustomobject]@{
@@ -558,6 +574,7 @@ function Test-PortableZip {
     )
     $allowed = @(
         'xfswin.exe',
+        'xfswin-gui.exe',
         'LICENSE',
         'README.md',
         'version.json',
@@ -573,6 +590,7 @@ function Test-PortableZip {
     )
     $required = @(
         'xfswin.exe',
+        'xfswin-gui.exe',
         'LICENSE',
         'README.md',
         'version.json',
@@ -853,7 +871,7 @@ try {
         '-DXFSWIN_WARNINGS_AS_ERRORS=OFF'
     )
     Invoke-External -FilePath $cmake -Arguments $configureArguments -WorkingDirectory $repoRoot
-    Invoke-External -FilePath $cmake -Arguments @('--build', $BuildDirectory, '--config', 'Release', '--target', 'xfswin') -WorkingDirectory $repoRoot
+    Invoke-External -FilePath $cmake -Arguments @('--build', $BuildDirectory, '--config', 'Release', '--target', 'xfswin', 'xfswin-gui') -WorkingDirectory $repoRoot
     Invoke-External -FilePath $cmake -Arguments @('--install', $BuildDirectory, '--config', 'Release', '--prefix', $stagingDirectory) -WorkingDirectory $repoRoot
 
     $expectedPeMachine = if ($Architecture -eq 'arm64') { 0xAA64 } else { 0x8664 }
@@ -865,8 +883,11 @@ try {
         -ExpectedPeMachine $expectedPeMachine
 
     $stagedExe = Join-Path $stagingDirectory 'xfswin.exe'
+    $stagedGui = Join-Path $stagingDirectory 'xfswin-gui.exe'
     Invoke-ReleaseSigning -TargetPath $stagedExe
+    Invoke-ReleaseSigning -TargetPath $stagedGui
     $payloadExeSha256 = Get-FileSha256 -Path $stagedExe
+    $payloadGuiSha256 = Get-FileSha256 -Path $stagedGui
 
     $portableDirectory = Join-Path $BuildDirectory "portable-$Architecture"
     New-PortablePayload -Staging $stagingDirectory -PortableDirectory $portableDirectory
@@ -980,7 +1001,7 @@ try {
                 '-DXFSWIN_WARNINGS_AS_ERRORS=OFF'
             )
             Invoke-External -FilePath $cmake -Arguments $fixtureConfigureArguments -WorkingDirectory $repoRoot
-            Invoke-External -FilePath $cmake -Arguments @('--build', $fixtureBuild, '--config', 'Release', '--target', 'xfswin') -WorkingDirectory $repoRoot
+            Invoke-External -FilePath $cmake -Arguments @('--build', $fixtureBuild, '--config', 'Release', '--target', 'xfswin', 'xfswin-gui') -WorkingDirectory $repoRoot
             Invoke-External -FilePath $cmake -Arguments @('--install', $fixtureBuild, '--config', 'Release', '--prefix', $fixtureStaging) -WorkingDirectory $repoRoot
 
             [void](Test-StagedPayload `
@@ -990,8 +1011,11 @@ try {
                 -Architecture $Architecture `
                 -ExpectedPeMachine $expectedPeMachine)
             $fixtureExe = Join-Path $fixtureStaging 'xfswin.exe'
+            $fixtureGui = Join-Path $fixtureStaging 'xfswin-gui.exe'
             Invoke-ReleaseSigning -TargetPath $fixtureExe
+            Invoke-ReleaseSigning -TargetPath $fixtureGui
             $fixtureExeSha256 = Get-FileSha256 -Path $fixtureExe
+            $fixtureGuiSha256 = Get-FileSha256 -Path $fixtureGui
             if ($fixtureExeSha256 -eq $payloadExeSha256) {
                 throw 'The synthetic older executable is identical to the evaluated payload; the fixture is not an older build.'
             }
@@ -1034,6 +1058,12 @@ try {
                     size_bytes = (Get-Item -LiteralPath $fixtureExe).Length
                     authenticode_status = (Get-AuthenticodeStatusText -Path $fixtureExe)
                 }
+                gui_executable = [ordered]@{
+                    name = 'xfswin-gui.exe'
+                    sha256 = $fixtureGuiSha256
+                    size_bytes = (Get-Item -LiteralPath $fixtureGui).Length
+                    authenticode_status = (Get-AuthenticodeStatusText -Path $fixtureGui)
+                }
                 version_json_sha256 = $fixtureVersionJsonSha256
                 payload = [ordered]@{
                     sha256 = $syntheticPayload.sha256
@@ -1064,6 +1094,7 @@ try {
     }
 
     $payloadAuthenticode = Get-AuthenticodeStatusText -Path $stagedExe
+    $payloadGuiAuthenticode = Get-AuthenticodeStatusText -Path $stagedGui
     $setupAuthenticode = Get-AuthenticodeStatusText -Path $setupPath
     $testSetupAuthenticode = Get-AuthenticodeStatusText -Path $testSetupPath
     $winFspAuthenticode = Get-AuthenticodeStatusText -Path $winFspMsiPath
@@ -1128,6 +1159,7 @@ try {
         portable_sha256 = $zipSha256
         portable_zip_sha256 = $zipSha256
         payload_exe_sha256 = $payloadExeSha256
+        payload_gui_sha256 = $payloadGuiSha256
         assets = [ordered]@{
             portable_zip = [ordered]@{
                 name = $zipName
@@ -1144,6 +1176,11 @@ try {
                 sha256 = $payloadExeSha256
                 size_bytes = (Get-Item -LiteralPath $stagedExe).Length
             }
+            payload_gui = [ordered]@{
+                name = 'xfswin-gui.exe'
+                sha256 = $payloadGuiSha256
+                size_bytes = (Get-Item -LiteralPath $stagedGui).Length
+            }
             version_json_sha256 = $versionJsonSha256
         }
         payload = [ordered]@{
@@ -1156,6 +1193,7 @@ try {
             mode = $signingMode
             artifacts = [ordered]@{
                 payload_exe = $payloadAuthenticode
+                payload_gui = $payloadGuiAuthenticode
                 setup = $setupAuthenticode
                 test_setup = $testSetupAuthenticode
                 synthetic_setup = if ($null -ne $syntheticMetadata) { $syntheticMetadata.setup.authenticode_status } else { $null }
@@ -1226,7 +1264,7 @@ try {
     Write-Host "Payload      : $($payload.path) ($($payload.sha256))"
     Write-Host "Metadata     : $packageMetadataPath"
     Write-Host "Rust         : $($cargo.version) ($($cargo.host))"
-    Write-Host "Signing      : $signingMode (payload=$payloadAuthenticode, setup=$setupAuthenticode, test=$testSetupAuthenticode)"
+    Write-Host "Signing      : $signingMode (cli=$payloadAuthenticode, gui=$payloadGuiAuthenticode, setup=$setupAuthenticode, test=$testSetupAuthenticode)"
 } catch {
     throw ("REL-1 package build failed: " + $_.Exception.Message)
 }

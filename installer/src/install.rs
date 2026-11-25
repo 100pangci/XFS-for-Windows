@@ -664,14 +664,21 @@ fn rollback(
     if let Err(error) = win::write_machine_path(&state.path_value, state.path_type) {
         problems.push(format!("cannot restore the machine PATH: {error}"));
     }
-    if !state.start_menu_present {
-        if let Err(error) = win::remove_shortcuts() {
-            problems.push(format!("cannot remove Start Menu shortcuts: {error}"));
+    if state.start_menu_present {
+        if install_dir.join("xfswin.exe").is_file() {
+            if let Err(error) = win::create_shortcuts(install_dir) {
+                log.line(format!(
+                    "warning: cannot refresh Start Menu shortcuts: {error}"
+                ));
+            }
         }
-    } else if install_dir.join("xfswin.exe").is_file() {
-        if let Err(error) = win::create_shortcuts(install_dir) {
-            log.line(format!("warning: cannot refresh Start Menu shortcuts: {error}"));
+        if let Err(error) = win::remove_shortcuts_not_present(&state.start_menu_shortcuts) {
+            problems.push(format!(
+                "cannot restore the previous Start Menu shortcuts: {error}"
+            ));
         }
+    } else if let Err(error) = win::remove_shortcuts() {
+        problems.push(format!("cannot remove Start Menu shortcuts: {error}"));
     }
 
     let rollback_helper = if install_dir.join("xfswin.exe").is_file() {
@@ -956,6 +963,8 @@ struct SetupState {
     arp_present: bool,
     product_present: bool,
     start_menu_present: bool,
+    #[serde(default)]
+    start_menu_shortcuts: Vec<String>,
     backup_dir: Option<String>,
     staging_dir: String,
     files_moved: bool,
@@ -984,6 +993,7 @@ impl SetupState {
             arp_present: win::reg_exists(win::ARP_KEY),
             product_present: previous.is_some(),
             start_menu_present: win::shortcut_directory_exists(),
+            start_menu_shortcuts: win::owned_shortcuts_present()?,
             backup_dir: backup.map(|path| path.to_string_lossy().into_owned()),
             staging_dir: staging.to_string_lossy().into_owned(),
             files_moved: false,

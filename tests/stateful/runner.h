@@ -24,11 +24,15 @@ struct FuzzOptions {
   std::string trace;
   std::string manifest;
   std::string ops_file;  // replay an explicit operation list instead of seed
+  std::string concurrent_observer;  // read or flush; requires concurrency hooks
+  std::string schedule_out;
+  std::string schedule_file;
   ImageProfile profile = ImageProfile::kModern;
   Workload workload = Workload::kMixed;
   uint64_t size_bytes = 0;  // 0 = profile default
   uint64_t crash_op = 0;
   std::string crash_point;
+  std::string state_expectation = "either";  // explicit recovery state contract
   uint32_t crash_hit = 1;
   uint64_t consistency_every = 25;
   uint64_t check_every = 1;
@@ -52,6 +56,10 @@ int RunFresh(const FuzzOptions& options);
 // Re-opens a crashed image, replays the log through the project recovery
 // path, verifies the allowed old/new state and closes the log.
 int RunRecover(const FuzzOptions& options);
+
+// Runs synthetic checks for crash-state policy and observer exception capture.
+// Does not open or create an image.
+int RunRunnerContractSelfTest();
 
 // Reconstructs the deterministic plan and final model without touching an
 // image.  Used by the reducer and diagnostics.

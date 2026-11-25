@@ -24,6 +24,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
 
 #include "xfs/filesystem.h"
 #include "xfs/image_device.h"
@@ -48,9 +54,12 @@ struct Workload {
   uint64_t device_read_bytes = 0;
   uint64_t device_write_calls = 0;
   uint64_t device_write_bytes = 0;
+  uint64_t device_flush_calls = 0;
   uint64_t flush_calls = 0;
   uint64_t journal_commits = 0;
+  uint64_t journal_flushes = 0;
   uint64_t journal_bytes = 0;
+  uint64_t peak_rss_bytes = 0;
   uint64_t max_concurrent_reads = 0;
   uint64_t max_concurrent_writes = 0;
   uint64_t inode_cache_hits = 0;
@@ -66,6 +75,25 @@ struct Workload {
 
 uint64_t Counter(const std::atomic<uint64_t>& value) {
   return value.load(std::memory_order_relaxed);
+}
+
+uint64_t PeakRssBytes() {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS usage{};
+  usage.cb = sizeof(usage);
+  if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &usage, sizeof(usage))) return 0;
+  return static_cast<uint64_t>(usage.PeakWorkingSetSize);
+#elif defined(__linux__) || defined(__APPLE__)
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+#if defined(__APPLE__)
+  return static_cast<uint64_t>(usage.ru_maxrss);
+#else
+  return static_cast<uint64_t>(usage.ru_maxrss) * 1024;
+#endif
+#else
+  return 0;
+#endif
 }
 
 void ResetCounters(xfs::PerfStats& stats) {
@@ -87,9 +115,12 @@ Workload Snapshot(const std::string& name, uint64_t ns, uint64_t bytes,
   w.device_read_bytes = Counter(stats.device_read_bytes);
   w.device_write_calls = Counter(stats.device_write_calls);
   w.device_write_bytes = Counter(stats.device_write_bytes);
+  w.device_flush_calls = Counter(stats.device_flush_calls);
   w.flush_calls = Counter(stats.flush_calls);
   w.journal_commits = Counter(stats.journal_commits);
+  w.journal_flushes = Counter(stats.journal_flushes);
   w.journal_bytes = Counter(stats.journal_bytes);
+  w.peak_rss_bytes = PeakRssBytes();
   w.max_concurrent_reads = Counter(stats.max_concurrent_reads);
   w.max_concurrent_writes = Counter(stats.max_concurrent_writes);
   w.inode_cache_hits = Counter(stats.inode_cache_hits);
@@ -144,9 +175,12 @@ void EmitWorkload(std::ostream& out, const Workload& w, bool last) {
       << "\"device\":{\"read_calls\":" << w.device_read_calls
       << ",\"read_bytes\":" << w.device_read_bytes
       << ",\"write_calls\":" << w.device_write_calls
-      << ",\"write_bytes\":" << w.device_write_bytes << "},"
+      << ",\"write_bytes\":" << w.device_write_bytes
+      << ",\"flush_calls\":" << w.device_flush_calls << "},"
       << "\"journal\":{\"commits\":" << w.journal_commits
+      << ",\"flushes\":" << w.journal_flushes
       << ",\"bytes\":" << w.journal_bytes << "},"
+      << "\"memory\":{\"peak_rss_bytes\":" << w.peak_rss_bytes << "},"
       << "\"caches\":{\"inode_hits\":" << w.inode_cache_hits
       << ",\"inode_misses\":" << w.inode_cache_misses
       << ",\"extent_hits\":" << w.extent_cache_hits
@@ -180,6 +214,193 @@ xfs::Result<uint64_t> EnsureBenchFile(xfs::XfsFilesystem& filesystem,
   auto entry = filesystem.LookupName(filesystem.RootInode(), name);
   if (entry.ok()) return entry.value().ino;
   return filesystem.CreateRegularFile(filesystem.RootInode(), name, 0644, 0, 0);
+}
+
+bool MakeDirectory(xfs::XfsFilesystem& filesystem, uint64_t parent,
+                   const std::string& name, uint64_t* ino) {
+  auto made = filesystem.Mkdir(parent, name, 0755, 0, 0);
+  if (!made.ok()) return false;
+  auto entry = filesystem.LookupName(parent, name);
+  if (!entry.ok()) return false;
+  *ino = entry.value().ino;
+  return true;
+}
+
+Workload SmallFileThreads(xfs::XfsFilesystem& filesystem, int files,
+                          int thread_count, xfs::PerfStats& stats) {
+  std::vector<uint64_t> dirs(static_cast<size_t>(thread_count));
+  for (int i = 0; i < thread_count; ++i) {
+    if (!MakeDirectory(filesystem, filesystem.RootInode(),
+                       "perf-small-t" + std::to_string(thread_count) + "-" +
+                           std::to_string(i),
+                       &dirs[static_cast<size_t>(i)])) {
+      Workload failed;
+      failed.name = "small_file_create_read_delete_" +
+                    std::to_string(thread_count) + "threads";
+      Gate(failed, false, "could not create worker directory");
+      return failed;
+    }
+  }
+  const std::vector<uint8_t> payload(4096, 0x5a);
+  ResetCounters(stats);
+  const auto start = Clock::now();
+  std::atomic<int> failures{0};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < thread_count; ++worker) {
+    workers.emplace_back([&, worker] {
+      std::vector<uint8_t> readback(payload.size());
+      const int begin = files * worker / thread_count;
+      const int end = files * (worker + 1) / thread_count;
+      const uint64_t dir = dirs[static_cast<size_t>(worker)];
+      for (int i = begin; i < end; ++i) {
+        const std::string name = "f" + std::to_string(i) + ".bin";
+        auto created = filesystem.CreateRegularFile(dir, name, 0644, 0, 0);
+        if (!created.ok() ||
+            !filesystem.WriteFileData(created.value(), 0, payload.data(),
+                                      payload.size())
+                 .ok()) {
+          failures.fetch_add(1);
+          return;
+        }
+        auto read = filesystem.ReadFile(created.value(), 0, readback.data(),
+                                        readback.size());
+        if (!read.ok() || read.value() != readback.size() ||
+            readback != payload ||
+            !filesystem.Unlink(dir, name, /*defer_inode_free=*/false).ok()) {
+          failures.fetch_add(1);
+          return;
+        }
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  Workload result = Snapshot(
+      "small_file_create_read_delete_" + std::to_string(files) + "_" +
+          std::to_string(thread_count) + "threads",
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now() - start)
+                                .count()),
+      static_cast<uint64_t>(files) * payload.size(),
+      static_cast<uint64_t>(files) * 3, stats);
+  Gate(result, failures.load() == 0, "small-file operation failed");
+  return result;
+}
+
+Workload TreeCopy(xfs::XfsFilesystem& filesystem, int thread_count,
+                  xfs::PerfStats& stats) {
+  constexpr int kSubdirs = 4;
+  constexpr int kFilesPerDir = 32;
+  const std::string tag = std::to_string(thread_count);
+  uint64_t source = 0;
+  if (!MakeDirectory(filesystem, filesystem.RootInode(), "perf-tree-src-" + tag,
+                     &source)) {
+    Workload failed;
+    failed.name = "source_tree_copy_" + tag + "threads";
+    Gate(failed, false, "could not create source directory");
+    return failed;
+  }
+  std::vector<uint64_t> source_dirs(kSubdirs);
+  for (int d = 0; d < kSubdirs; ++d) {
+    if (!MakeDirectory(filesystem, source, "d" + std::to_string(d),
+                       &source_dirs[static_cast<size_t>(d)])) {
+      Workload failed;
+      failed.name = "source_tree_copy_" + tag + "threads";
+      Gate(failed, false, "could not create source subdirectory");
+      return failed;
+    }
+    for (int f = 0; f < kFilesPerDir; ++f) {
+      auto file = filesystem.CreateRegularFile(
+          source_dirs[static_cast<size_t>(d)], "f" + std::to_string(f), 0644,
+          0, 0);
+      const std::vector<uint8_t> data(4096,
+                                      static_cast<uint8_t>((d * 37 + f) & 0xff));
+      if (!file.ok() ||
+          !filesystem.WriteFileData(file.value(), 0, data.data(), data.size())
+               .ok()) {
+        Workload failed;
+        failed.name = "source_tree_copy_" + tag + "threads";
+        Gate(failed, false, "could not populate source file");
+        return failed;
+      }
+    }
+  }
+  uint64_t destination = 0;
+  if (!MakeDirectory(filesystem, filesystem.RootInode(),
+                     "perf-tree-dst-" + tag, &destination)) {
+    Workload failed;
+    failed.name = "source_tree_copy_" + tag + "threads";
+    Gate(failed, false, "could not create destination directory");
+    return failed;
+  }
+  std::vector<uint64_t> target_dirs(kSubdirs);
+  ResetCounters(stats);
+  const auto start = Clock::now();
+  std::atomic<int> failures{0};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < thread_count; ++worker) {
+    workers.emplace_back([&, worker] {
+      for (int d = worker; d < kSubdirs; d += thread_count) {
+        uint64_t target_dir = 0;
+        if (!MakeDirectory(filesystem, destination, "d" + std::to_string(d),
+                           &target_dir)) {
+          failures.fetch_add(1);
+          return;
+        }
+        target_dirs[static_cast<size_t>(d)] = target_dir;
+        auto entries = filesystem.ListDirectory(source_dirs[static_cast<size_t>(d)]);
+        if (!entries.ok()) {
+          failures.fetch_add(1);
+          return;
+        }
+        for (const auto& entry : entries.value()) {
+          if (entry.name == "." || entry.name == "..") continue;
+          std::vector<uint8_t> data(4096);
+          auto read = filesystem.ReadFile(entry.ino, 0, data.data(), data.size());
+          auto created = filesystem.CreateRegularFile(target_dir, entry.name,
+                                                       0644, 0, 0);
+          if (!read.ok() || read.value() != data.size() || !created.ok() ||
+              !filesystem.WriteFileData(created.value(), 0, data.data(),
+                                        data.size())
+                   .ok()) {
+            failures.fetch_add(1);
+            return;
+          }
+        }
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  Workload result = Snapshot(
+      "source_tree_copy_" + std::to_string(kSubdirs * kFilesPerDir) + "_" +
+          tag + "threads",
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now() - start)
+                                .count()),
+      static_cast<uint64_t>(kSubdirs * kFilesPerDir * 4096),
+      static_cast<uint64_t>(kSubdirs * kFilesPerDir * 3), stats);
+  Gate(result, failures.load() == 0, "tree copy operation failed");
+  // Verify outside the measured interval so validation I/O is not benchmark I/O.
+  if (result.gate_ok) {
+    for (int d = 0; d < kSubdirs; ++d) {
+      for (int f = 0; f < kFilesPerDir; ++f) {
+        auto file = filesystem.LookupName(target_dirs[static_cast<size_t>(d)],
+                                          "f" + std::to_string(f));
+        if (!file.ok()) {
+          Gate(result, false, "tree copy destination file missing");
+          return result;
+        }
+        std::vector<uint8_t> actual(4096);
+        const std::vector<uint8_t> expected(4096,
+            static_cast<uint8_t>((d * 37 + f) & 0xff));
+        auto read = filesystem.ReadFile(file.value().ino, 0, actual.data(), actual.size());
+        if (!read.ok() || read.value() != actual.size() || actual != expected) {
+          Gate(result, false, "tree copy destination content mismatch");
+          return result;
+        }
+      }
+    }
+  }
+  return result;
 }
 
 void PrintWorkload(const Workload& w) {
@@ -512,6 +733,90 @@ int main(int argc, char** argv) {
   Gate(flush, flushed.ok() && flush.flush_calls == 1,
        "explicit flush did not reach the device");
   results.push_back(flush);
+
+  // Namespace and copy workloads run after the original sequential gates.
+  results.push_back(SmallFileThreads(filesystem, small_files, 1, stats));
+  results.push_back(SmallFileThreads(filesystem, small_files, 4, stats));
+  results.push_back(TreeCopy(filesystem, 1, stats));
+  results.push_back(TreeCopy(filesystem, 4, stats));
+
+  // A 1000-entry directory is intentionally cache-invalidated for the first
+  // enumeration. This means cold in the core directory cache; the host kernel
+  // page cache is deliberately left untouched and is not claimed cold.
+  uint64_t large_dir_ino = 0;
+  bool large_dir_ok = MakeDirectory(filesystem, filesystem.RootInode(),
+                                    "perf-large-dir", &large_dir_ino);
+  for (int i = 0; i < 1000 && large_dir_ok; ++i) {
+    auto made = filesystem.CreateRegularFile(
+        large_dir_ino, "entry-" + std::to_string(i), 0644, 0, 0);
+    large_dir_ok = made.ok();
+  }
+  if (large_dir_ok) {
+    filesystem.InvalidateCaches(xfs::CacheInvalidation::Directory(large_dir_ino));
+    ResetCounters(stats);
+    start = Clock::now();
+    auto cold_listing = filesystem.ListDirectory(large_dir_ino);
+    Workload cold = Snapshot(
+        "large_directory_core_cold_1000",
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  Clock::now() - start)
+                                  .count()),
+        0, cold_listing.ok() ? cold_listing.value().size() : 0, stats);
+    Gate(cold, cold_listing.ok() && cold_listing.value().size() == 1002,
+         "core-cold directory listing was incomplete");
+    Gate(cold, cold.directory_cache_misses == 1,
+         "cold listing did not produce exactly one core cache miss");
+    results.push_back(cold);
+    ResetCounters(stats);
+    start = Clock::now();
+    auto warm_listing = filesystem.ListDirectory(large_dir_ino);
+    Workload warm_large = Snapshot(
+        "large_directory_core_warm_1000",
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  Clock::now() - start)
+                                  .count()),
+        0, warm_listing.ok() ? warm_listing.value().size() : 0, stats);
+    Gate(warm_large, warm_listing.ok() &&
+                         warm_large.directory_cache_hits == 1 &&
+                         warm_large.directory_cache_misses == 0,
+         "warm large-directory listing missed the core cache");
+    results.push_back(warm_large);
+  } else {
+    Workload failed;
+    failed.name = "large_directory_core_cold_warm_1000";
+    Gate(failed, false, "could not create large directory");
+    results.push_back(failed);
+  }
+
+  uint64_t rename_dir = 0;
+  bool rename_ok = MakeDirectory(filesystem, filesystem.RootInode(),
+                                 "perf-rename", &rename_dir);
+  constexpr int kRenameFiles = 100;
+  for (int i = 0; i < kRenameFiles && rename_ok; ++i) {
+    rename_ok = filesystem.CreateRegularFile(rename_dir,
+                                              "f" + std::to_string(i), 0644,
+                                              0, 0)
+                    .ok();
+  }
+  ResetCounters(stats);
+  start = Clock::now();
+  for (int i = 0; i < kRenameFiles && rename_ok; ++i) {
+    const std::string from = "f" + std::to_string(i);
+    const std::string to = "r" + std::to_string(i);
+    rename_ok = filesystem.Rename(rename_dir, from, rename_dir, to,
+                                  /*replace_existing=*/false)
+                    .ok();
+  }
+  Workload rename = Snapshot(
+      "same_directory_rename_100",
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now() - start)
+                                .count()),
+      0, kRenameFiles, stats);
+  Gate(rename, rename_ok, "rename workload failed");
+  Gate(rename, rename.directory_cache_misses == 0,
+       "same-directory rename discarded its warm parent cache");
+  results.push_back(rename);
 
   // ------ report ------
   std::printf("PERF-1 core benchmark label=%s block=%llu agcount=%u\n",

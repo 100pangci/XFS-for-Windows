@@ -7,7 +7,7 @@ This release is the first REL-1 delivery: native Windows setup packages and port
 | Method | What it does | Best for |
 |---|---|---|
 | Windows setup (`xfswin-<version>-windows-<arch>-setup.exe`) | Installs the matching native build for all users, registers and starts the automount service, and installs WinFsp when needed. | A stable, managed installation with upgrades and uninstall through Windows. |
-| Portable ZIP (`xfswin-<version>-windows-<arch>.zip`) | Extracts `xfswin.exe`, its license and documentation, and build-version metadata. It does not register a service or copy WinFsp files. | Running the CLI from a folder you manage, or keeping a portable copy. |
+| Portable ZIP (`xfswin-<version>-windows-<arch>.zip`) | Extracts `xfswin.exe`, `xfswin-gui.exe`, licenses, documentation and build-version metadata. It does not register a service or copy WinFsp files. | Running the manager or CLI from a folder you manage. |
 
 Choose the package for the processor architecture of Windows. Setup requires administrator approval because it installs a per-machine service and the shared WinFsp runtime. The portable ZIP does not require an installer, but raw-device discovery and service management still require an elevated PowerShell window.
 
@@ -21,6 +21,44 @@ The setup manages the official WinFsp runtime as a shared system dependency. The
 - SHA-256: `073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a`
 
 Check the downloaded MSI hash before running it. An already-installed compatible WinFsp 2.x runtime is kept; setup does not downgrade it. See [INSTALLER.md](https://github.com/100pangci/XFS-for-Windows/blob/main/INSTALLER.md) for compatibility and license details.
+
+## Management window and first use
+
+Keep `xfswin-gui.exe` beside `xfswin.exe`. Start the manager from the installed
+Start Menu entry, or open `xfswin-gui.exe` in the extracted portable folder.
+The CLI remains independently usable with the commands below. Installing or
+opening the manager does not enroll a disk or enable writes.
+
+The manager distinguishes a filesystem discovered on an attached device, a
+saved automount registration, and a currently mounted drive. A registration can
+remain visible while its device is disconnected. A failed or incomplete scan
+is not proof that no filesystem is present. Windows raw-device access requires
+Administrator rights; ordinary report viewing does not grant those rights.
+
+Start with read-only access. Review the displayed identity and the existing
+hardware qualification limits before any explicit read-write request. An
+unsupported filesystem or dirty journal must be handled through the documented
+CLI policy; the manager does not repair or recover it automatically.
+
+Closing the management window does not stop the automount service. Unmounting
+releases a filesystem session; ejecting asks the existing safe-removal path to
+release the entire removable device. Only unplug after the removal result says
+it is safe. Another filesystem or process on that device can veto removal.
+
+Diagnostics are generated locally and are read-only. The default export hides
+identifiers and private paths, contains no user file contents and is not
+uploaded. A partial report retains successful checks alongside unavailable or
+failed checks. CLI equivalents are:
+
+```powershell
+& .\xfswin.exe diagnostics
+& .\xfswin.exe diagnostics --json
+```
+
+Windows GUI interaction, WinFsp mounting and native x64/ARM64 package acceptance
+must be verified by the corresponding GitHub Actions jobs for the evaluated
+revision. A Linux build or a cross-compilation check does not establish those
+results.
 
 ## First mount
 

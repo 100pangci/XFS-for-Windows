@@ -35,7 +35,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
 $prefix = 'conc1'
 
 function Assert([bool]$condition, [string]$message) {
@@ -65,23 +64,24 @@ if ($Iterations -lt 1) {
 $script:exe = (Resolve-Path $Xfswin).Path
 $pristine = (Resolve-Path $Image).Path
 $workDir = Join-Path (Split-Path -Parent $pristine) 'conc-work'
-if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir }
-New-Item -ItemType Directory -Force $workDir | Out-Null
+if (Test-Path $workDir) {
+    throw "Evidence directory already exists: $workDir; preserve it or choose a fresh fixture directory"
+}
+New-Item -ItemType Directory $workDir | Out-Null
 $modified = Join-Path $workDir 'conc-win.img'
 Copy-Item $pristine $modified
 $manifestPath = if ($Manifest) { $Manifest } else {
     Join-Path $workDir 'conc-win.manifest.json'
 }
 
+Assert ($Drive -match '^[D-Zd-z]:$') '-Drive must be a drive letter D: through Z:'
 $mountPoint = "$Drive\"
-& $script:exe unmount $Drive 2>$null | Out-Null
-Start-Sleep -Milliseconds 300
 Assert-DriveFree $Drive
 
-$outLog = Join-Path $tempDir 'xfswin-conc.out'
-$errLog = Join-Path $tempDir 'xfswin-conc.err'
+$outLog = Join-Path $workDir 'mount-stdout.log'
+$errLog = Join-Path $workDir 'mount-stderr.log'
 $proc = Start-Process -FilePath $script:exe `
-    -ArgumentList @('mount', $modified, $Drive, '--rw', '--verbose') `
+    -ArgumentList @('mount', ('"' + $modified + '"'), $Drive, '--rw', '--verbose') `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
     -NoNewWindow -PassThru
 $mounted = $false
@@ -184,6 +184,122 @@ try {
     }
     "all $Threads runspaces completed without a failed operation"
 
+    # Keep a real WinFsp handle alive through rename, POSIX unlink and name reuse.
+    # Each turn is released by an event, so failures retain the exact ordering.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
+public static class XfsOpenLifetime {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle file, int kind,
+        ref uint info, uint length);
+    public static void Run(string root, string tracePath) {
+        var trace = new List<string>();
+        string original = Path.Combine(root, "conc1-open-original.bin");
+        string renamed = Path.Combine(root, "conc1-open-renamed.bin");
+        using (var turn = new AutoResetEvent(false))
+        using (var done = new AutoResetEvent(false)) {
+            int command = 0;
+            Exception failure = null;
+            var worker = Task.Run(() => {
+                try {
+                    using (var handle = CreateFileW(original, 0xC0010000, 7,
+                            IntPtr.Zero, 1, 0, IntPtr.Zero)) {
+                        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                        using (var stream = new FileStream(handle, FileAccess.ReadWrite, 4096, false)) {
+                            stream.WriteByte(0x31);
+                            stream.Flush(true);
+                            done.Set();
+                            while (true) {
+                                if (!turn.WaitOne(30000)) throw new TimeoutException("handle turn");
+                                if (command == 3) break;
+                                if (command == 2) {
+                                    // POSIX disposition removes the name when
+                                    // this handle closes. Keep the original
+                                    // handle alive to verify the open inode
+                                    // survives that namespace removal.
+                                    using (var deleteHandle = CreateFileW(renamed,
+                                            0x00010000, 7, IntPtr.Zero, 3, 0,
+                                            IntPtr.Zero)) {
+                                        if (deleteHandle.IsInvalid)
+                                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                                        uint flags = 3; // DELETE | POSIX_SEMANTICS
+                                        if (!SetFileInformationByHandle(deleteHandle, 21,
+                                                ref flags, 4))
+                                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                                    }
+                                } else {
+                                    stream.Position = 0;
+                                    if (stream.ReadByte() != 0x31)
+                                        throw new IOException("open inode changed after namespace mutation");
+                                    stream.Position = 1;
+                                    stream.WriteByte(0x72);
+                                    stream.Flush(true);
+                                }
+                                done.Set();
+                            }
+                        }
+                    }
+                } catch (Exception ex) { failure = ex; }
+                finally { done.Set(); }
+            });
+            Action wait = () => {
+                if (!done.WaitOne(30000)) throw new TimeoutException("handle completion");
+                if (failure != null) throw new IOException("handle worker failed", failure);
+            };
+            Action<int, string> step = (next, label) => {
+                trace.Add(label);
+                command = next;
+                turn.Set();
+                wait();
+            };
+            try {
+                trace.Add("create/open/write/flush original");
+                wait();
+                trace.Add("rename original -> renamed while handle open");
+                File.Move(original, renamed);
+                if (File.Exists(original) || !File.Exists(renamed))
+                    throw new IOException("rename visibility");
+                step(1, "read/write/flush through renamed open handle");
+                step(2, "POSIX unlink with handle retained");
+                if (File.Exists(renamed)) throw new IOException("unlink retained name");
+                trace.Add("create replacement at unlinked name");
+                File.WriteAllBytes(renamed, new byte[] { 0x44, 0x55 });
+                step(1, "read/write/flush orphan; replacement must stay unchanged");
+                byte[] replacement = File.ReadAllBytes(renamed);
+                if (replacement.Length != 2 || replacement[0] != 0x44 || replacement[1] != 0x55)
+                    throw new IOException("old handle changed replacement inode");
+                trace.Add("close orphan handle");
+                command = 3;
+                turn.Set();
+                if (!worker.Wait(30000)) throw new TimeoutException("handle close");
+                if (failure != null) throw new IOException("handle close failed", failure);
+                File.Delete(renamed);
+                trace.Add("delete replacement; complete");
+            } finally {
+                command = 3;
+                turn.Set();
+                bool joined = worker.Wait(30000);
+                File.WriteAllLines(tracePath, trace);
+                if (!joined) throw new TimeoutException("handle worker teardown");
+            }
+        }
+    }
+}
+'@
+    $handleTrace = Join-Path $workDir 'open-handle-schedule.txt'
+    [XfsOpenLifetime]::Run($mountPoint, $handleTrace)
+    "open-handle rename/unlink/reuse/flush schedule passed: $handleTrace"
+
     # Verify the deterministic keep files and build the Linux-side manifest.
     $files = @()
     $emptyDirs = @()
@@ -221,20 +337,19 @@ try {
     & $script:exe unmount $Drive 2>$null | Out-Null
     $exited = $proc.WaitForExit(60000)
     if (-not $exited) {
-        "mount process did not exit after unmount; killing it"
+        "mount process did not exit after unmount; terminating only this test's process"
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
     $proc.Refresh()
-    if ($proc.HasExited -and $proc.ExitCode -ne 0) {
-        "WARNING: mount host exited with code $($proc.ExitCode)"
-    }
-    if ($mounted -and (Test-Path $mountPoint)) {
-        "warning: $mountPoint still present after unmount"
-    }
     "== mount stdout =="
     Get-Content $outLog -ErrorAction SilentlyContinue
     "== mount stderr =="
     Get-Content $errLog -ErrorAction SilentlyContinue
+    Assert $exited 'clean unmount timed out; forced termination is not a passing result'
+    Assert ($proc.HasExited -and $proc.ExitCode -eq 0) "mount host exit code $($proc.ExitCode)"
+    if ($mounted) {
+        Assert (Wait-DriveReleased $Drive) "drive $Drive remained after clean unmount"
+    }
 }
 
 Assert (Wait-DriveReleased $Drive) "drive letter $Drive was not released"

@@ -437,6 +437,135 @@ TEST(perf_file_mode_roundtrip_preserves_type) {
   CHECK(!fs.value()->SetFileMode(created.value(), 0040755).ok());
 }
 
+TEST(perf_same_directory_rename_preserves_warm_directory_cache) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto created = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                               "rename-before", 0644, 0, 0);
+  CHECK(created.ok());
+  auto before = fs.value()->ListDirectory(fs.value()->RootInode());
+  CHECK(before.ok());
+
+  EnablePerf();
+  auto renamed = fs.value()->Rename(fs.value()->RootInode(), "rename-before",
+                                    fs.value()->RootInode(), "rename-after",
+                                    /*replace_existing=*/false);
+  CHECK(renamed.ok());
+  auto after = fs.value()->ListDirectory(fs.value()->RootInode());
+  CHECK(after.ok());
+  CHECK(xfs::PerfStats::Get().directory_cache_hits.load() >= 1);
+  CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 0u);
+  auto old_lookup = fs.value()->LookupName(fs.value()->RootInode(),
+                                           "rename-before");
+  auto new_lookup = fs.value()->LookupName(fs.value()->RootInode(),
+                                           "rename-after");
+  CHECK(!old_lookup.ok());
+  CHECK(new_lookup.ok());
+  CHECK_EQ(new_lookup.value().ino, created.value());
+  CHECK_EQ(after.value().size(), before.value().size());
+}
+
+TEST(perf_rename_noop_and_failed_attempt_keep_warm_cache) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto source = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                             "rename-source", 0644, 0, 0);
+  auto target = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                             "rename-target", 0644, 0, 0);
+  CHECK(source.ok());
+  CHECK(target.ok());
+  CHECK(fs.value()->ListDirectory(fs.value()->RootInode()).ok());
+
+  EnablePerf();
+  auto noop = fs.value()->Rename(fs.value()->RootInode(), "rename-source",
+                                 fs.value()->RootInode(), "rename-source",
+                                 /*replace_existing=*/false);
+  CHECK(noop.ok());
+  CHECK(fs.value()->ListDirectory(fs.value()->RootInode()).ok());
+  CHECK(xfs::PerfStats::Get().directory_cache_hits.load() >= 1);
+  CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 0u);
+
+  xfs::PerfStats::Get().Reset();
+  auto failed = fs.value()->Rename(fs.value()->RootInode(), "rename-source",
+                                   fs.value()->RootInode(), "rename-target",
+                                   /*replace_existing=*/false);
+  CHECK(!failed.ok());
+  auto after_failure = fs.value()->ListDirectory(fs.value()->RootInode());
+  CHECK(after_failure.ok());
+  CHECK(xfs::PerfStats::Get().directory_cache_hits.load() >= 1);
+  CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 0u);
+  auto source_lookup = fs.value()->LookupName(fs.value()->RootInode(),
+                                               "rename-source");
+  auto target_lookup = fs.value()->LookupName(fs.value()->RootInode(),
+                                               "rename-target");
+  CHECK(source_lookup.ok());
+  CHECK_EQ(source_lookup.value().ino, source.value());
+  CHECK(target_lookup.ok());
+  CHECK_EQ(target_lookup.value().ino, target.value());
+}
+
+TEST(perf_rename_replace_invalidates_parent_cache) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  auto source = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                             "replace-source", 0644, 0, 0);
+  auto target = fs.value()->CreateRegularFile(fs.value()->RootInode(),
+                                             "replace-target", 0644, 0, 0);
+  CHECK(source.ok());
+  CHECK(target.ok());
+  CHECK(fs.value()->ListDirectory(fs.value()->RootInode()).ok());
+
+  EnablePerf();
+  auto replaced = fs.value()->Rename(fs.value()->RootInode(), "replace-source",
+                                     fs.value()->RootInode(), "replace-target",
+                                     /*replace_existing=*/true);
+  CHECK(replaced.ok());
+  auto listing = fs.value()->ListDirectory(fs.value()->RootInode());
+  CHECK(listing.ok());
+  CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 1u);
+  auto lookup = fs.value()->LookupName(fs.value()->RootInode(), "replace-target");
+  CHECK(lookup.ok());
+  CHECK_EQ(lookup.value().ino, source.value());
+  CHECK(!fs.value()->LookupName(fs.value()->RootInode(), "replace-source").ok());
+}
+
+TEST(perf_cross_directory_rename_invalidates_both_parent_caches) {
+  FixtureImage::Instance().Reset();
+  auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);
+  CHECK(fs.ok());
+  CHECK(fs.value()->Mkdir(fs.value()->RootInode(), "rename-src-dir", 0755, 0, 0)
+            .ok());
+  CHECK(fs.value()->Mkdir(fs.value()->RootInode(), "rename-dst-dir", 0755, 0, 0)
+            .ok());
+  auto source_parent = fs.value()->LookupName(fs.value()->RootInode(),
+                                               "rename-src-dir");
+  auto target_parent = fs.value()->LookupName(fs.value()->RootInode(),
+                                               "rename-dst-dir");
+  CHECK(source_parent.ok());
+  CHECK(target_parent.ok());
+  auto source = fs.value()->CreateRegularFile(source_parent.value().ino,
+                                             "cross-source", 0644, 0, 0);
+  CHECK(source.ok());
+  CHECK(fs.value()->ListDirectory(source_parent.value().ino).ok());
+  CHECK(fs.value()->ListDirectory(target_parent.value().ino).ok());
+
+  EnablePerf();
+  auto moved = fs.value()->Rename(source_parent.value().ino, "cross-source",
+                                  target_parent.value().ino, "cross-target",
+                                  /*replace_existing=*/false);
+  CHECK(moved.ok());
+  CHECK(fs.value()->ListDirectory(source_parent.value().ino).ok());
+  CHECK(fs.value()->ListDirectory(target_parent.value().ino).ok());
+  CHECK_EQ(xfs::PerfStats::Get().directory_cache_misses.load(), 2u);
+  auto lookup = fs.value()->LookupName(target_parent.value().ino, "cross-target");
+  CHECK(lookup.ok());
+  CHECK_EQ(lookup.value().ino, source.value());
+  CHECK(!fs.value()->LookupName(source_parent.value().ino, "cross-source").ok());
+}
+
 TEST(perf_misaligned_overwrite_preserves_neighbors) {
   FixtureImage::Instance().Reset();
   auto fs = FixtureImage::Instance().Mount(/*read_write=*/true);

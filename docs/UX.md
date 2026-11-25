@@ -6,6 +6,49 @@ information Explorer shows, and the optional resident automount service.
 All of it is read-only by default and none of it relaxes the DEV-1 raw-device
 qualification boundary.
 
+## Native management window
+
+`xfswin-gui.exe` is a lightweight Win32 front end to the existing CLI and
+service. Keep it beside the matching `xfswin.exe`; the portable package uses
+the same layout as the installed application. The manager owns presentation
+and background operations, while discovery, drive allocation, device write
+policy, identity enrollment, WinFsp sessions and recovery retain their existing
+owners. Opening the window never grants write access or enrolls media.
+
+Three states have different meanings: **discovered** means a present device
+was probed; **registered** means an automount entry is saved; **mounted** means
+an active filesystem session owns a drive. A disconnected registration remains
+configuration, not a live filesystem. A partial scan or access-denied result
+must remain visible even when other status checks succeed.
+
+Scanning and management operations run in the background. Read-only is the
+initial mode; read-write requires explicit consent and the ordinary CLI
+identity/profile checks. Closing the window leaves the service and independent
+manual mount processes running. Unmount releases a filesystem; Eject uses the
+existing automount safe-removal path and can be vetoed by Windows or another
+handle owner. Neither operation replaces the documented recovery command.
+
+The shared `xfswin diagnostics` command produces a read-only local report;
+`--json` selects a versioned machine-readable report. Default exports hide
+sensitive identifiers and paths, contain no file contents and do not upload
+anything. `--json --include-identifiers` is an explicit management/inventory
+view and should not be shared as a redacted report. Failed sections retain
+successful results from other sections.
+
+Windows GUI behavior and native x64/ARM64 installation need actual Actions
+execution. See `tests/scripts/verify_gui_windows.ps1` for virtual-disk GUI
+acceptance and `docs/INSTALL.md` for first use. Cross-compilation and portable
+core tests do not establish Windows interaction results. Hosted acceptance
+checks the GUI with separately verified ordinary and administrator tokens. The
+administrator instance inherits the already elevated runner's token; the test
+does not change UAC policy or approve a prompt.
+
+To check **Run elevated** on an interactive Windows desktop with UAC enabled,
+start the GUI without elevation and select **Run elevated**. Cancel the Windows
+prompt and verify that the original window remains usable and no elevated
+instance starts. Then repeat and approve the prompt; verify that a second GUI
+window opens and that its process is elevated. Neither step needs a test disk.
+
 ## The happy path
 
 1. Build with WinFsp support and put `winfsp-x64.dll` next to `xfswin.exe`

@@ -111,7 +111,7 @@ function Wait-ServiceRunning {
 
 function Assert-ProductFiles([object]$State) {
     $required = @(
-        'xfswin.exe', 'uninstall.exe', 'version.json', 'LICENSE', 'README.md',
+        'xfswin.exe', 'xfswin-gui.exe', 'uninstall.exe', 'version.json', 'LICENSE', 'README.md',
         (Join-Path 'docs' 'INSTALL.md')
     )
     foreach ($relative in $required) {
@@ -272,7 +272,19 @@ try {
     $expectedMachine = if ($Architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
     Assert-Release ((Get-ReleasePeMachine $currentInstalled.exe) -eq $expectedMachine) `
         "installed xfswin.exe is not native $Architecture"
-    Complete-ReleaseCase 'version' 'passed' 'version.json, --version and native PE match package metadata'
+    $installedGui = Join-Path $currentInstalled.directory 'xfswin-gui.exe'
+    Assert-Release ((Get-ReleaseSha256 $installedGui) -eq $package.payload_gui_sha256) `
+        'installed xfswin-gui.exe does not match the portable package SHA-256'
+    Assert-Release ((Get-ReleasePeMachine $installedGui) -eq $expectedMachine) `
+        "installed xfswin-gui.exe is not native $Architecture"
+    $guiVersionInfo = (Get-Item -LiteralPath $installedGui).VersionInfo
+    Assert-Release ($guiVersionInfo.ProductName -eq 'XFS-for-Windows' -and
+                    $guiVersionInfo.FileDescription -eq 'XFS filesystem manager' -and
+                    $guiVersionInfo.OriginalFilename -eq 'xfswin-gui.exe' -and
+                    $guiVersionInfo.ProductVersion -eq $package.version -and
+                    $guiVersionInfo.FileVersion -eq $package.version) `
+        'installed GUI version resources do not match the product version'
+    Complete-ReleaseCase 'version' 'passed' 'CLI and GUI version, metadata and native PE match package metadata'
     Complete-ReleaseCase 'native-pe' 'passed' "installed PE machine is native $Architecture"
 
     # PATH and Start Menu.
@@ -282,6 +294,13 @@ try {
     $shortcuts = @(Get-ReleaseShortcuts $currentInstalled.directory)
     Assert-Release ($shortcuts.Count -ge 1) `
         'the installer did not create a Start Menu shortcut to the installed product'
+    $guiShortcutPaths = @($shortcuts | Where-Object { [IO.Path]::GetFileName($_) -eq 'XFS for Windows.lnk' })
+    Assert-Release ($guiShortcutPaths.Count -eq 1) `
+        'the installer did not create exactly one Start Menu GUI shortcut'
+    $shell = New-Object -ComObject WScript.Shell
+    $guiShortcut = $shell.CreateShortcut($guiShortcutPaths[0])
+    Assert-Release ([IO.Path]::GetFullPath($guiShortcut.TargetPath).Equals($installedGui, [StringComparison]::OrdinalIgnoreCase)) `
+        'the Start Menu GUI shortcut does not target the installed xfswin-gui.exe'
     Complete-ReleaseCase 'path' 'passed' 'machine PATH entry and Start Menu shortcut point at the product directory'
     Complete-ReleaseCase 'start-menu' 'passed' ($shortcuts -join '; ')
 
@@ -597,6 +616,30 @@ try {
         "reinstall service is not running: $($statusReinstall)"
     Assert-ReleaseNoLiveMounts $statusReinstall
     Complete-ReleaseCase 'reinstall' 'passed' 'reinstall reused the preserved configuration, ran the service and mounted nothing'
+
+    # Exercise the installed GUI in the native architecture job. Preserve the
+    # exact user configuration bytes because this isolated GUI test enrolls and
+    # disables its own disposable fixture.
+    $guiOutput = Join-Path $OutputDirectory 'gui-acceptance'
+    $guiConfigBytes = if (Test-Path -LiteralPath $configPath -PathType Leaf) { [IO.File]::ReadAllBytes($configPath) } else { $null }
+    try {
+        & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify_gui_windows.ps1') `
+            -Gui (Join-Path $currentInstalled.directory 'xfswin-gui.exe') `
+            -Cli $currentInstalled.exe -Fixtures $Fixtures -OutputDirectory $guiOutput `
+            -Architecture $Architecture -AllowCiMachineChanges
+        if ($LASTEXITCODE -ne 0) { throw "actual GUI control acceptance failed with exit code $LASTEXITCODE" }
+    } finally {
+        if ($null -ne $guiConfigBytes) { [IO.File]::WriteAllBytes($configPath, $guiConfigBytes) }
+        elseif (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath -Force }
+    }
+    if ([string]::IsNullOrWhiteSpace($configHash)) {
+        Assert-Release (-not (Test-Path -LiteralPath $configPath)) `
+            'GUI acceptance left an automount configuration that was absent before the test'
+    } else {
+        Assert-Release ((Get-ReleaseSha256 $configPath) -eq $configHash) `
+            'GUI acceptance did not restore the exact automount configuration bytes'
+    }
+    Complete-ReleaseCase 'gui-operations' 'passed' 'native GUI tested with separate ordinary and administrator tokens; discovery, RO enroll/mount, Open, Unmount, Disable and diagnostics export passed; interactive UAC consent not tested'
 
     # Final uninstall and retention check.
     $finalUninstall = Invoke-ReleaseSetupUninstall -Installer $package.installer -LogName 'final-uninstall'

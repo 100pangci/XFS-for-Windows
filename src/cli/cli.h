@@ -19,6 +19,7 @@ struct Options {
   bool yes_i_really_mean_it = false;
   // Machine-readable output for `journal` (the recovery differential).
   bool json = false;
+  bool diagnostics_include_identifiers = false;
   // The documented read-write writer switch.  Image files need this flag
   // alone; a real device additionally needs device_write_qualification and the
   // class opt-in, and the backend's device policy still applies.

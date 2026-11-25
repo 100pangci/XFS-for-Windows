@@ -52,6 +52,13 @@ fn main() {
                     ));
                     if !options.quiet && !options.passive && outcome.show_ui {
                         ui::info(&outcome.message);
+                        if !options.uninstall {
+                            if let Ok(install_dir) = win::install_directory() {
+                                ui::offer_first_use_guide(
+                                    &install_dir.join("docs").join("INSTALL.md"),
+                                );
+                            }
+                        }
                     }
                     std::process::exit(outcome.code as i32);
                 }

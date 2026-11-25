@@ -205,9 +205,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Release helper JSON regression tests
+      - name: Check PowerShell syntax and release helper behavior
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = Get-ChildItem -LiteralPath tests, scripts -Recurse -File -Filter '*.ps1'
+          $syntaxErrors = @(foreach ($scriptFile in $scripts) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $scriptFile.FullName, [ref]$tokens, [ref]$parseErrors)
+            foreach ($parseError in $parseErrors) {
+              '{0}:{1}:{2}: {3}' -f $scriptFile.FullName, $parseError.Extent.StartLineNumber,
+                $parseError.Extent.StartColumnNumber, $parseError.Message
+            }
+          })
+          if ($syntaxErrors.Count -ne 0) { throw ($syntaxErrors -join "`n") }
           & pwsh -NoProfile -File tests/release/release_common_tests.ps1
           if ($LASTEXITCODE -ne 0) { throw 'release metadata regression tests failed' }
 
@@ -359,7 +372,7 @@ jobs:
           $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
           $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           foreach ($required in @('installer_name', 'installer_sha256', 'portable_name',
-              'portable_sha256', 'payload_exe_sha256', 'toolchain', 'build_timestamp',
+              'portable_sha256', 'payload_exe_sha256', 'payload_gui_sha256', 'toolchain', 'build_timestamp',
               'signing', 'rust', 'cmake', 'testing')) {
             if ($null -eq $metadata.PSObject.Properties[$required]) {
               throw "package metadata is missing the REL1 top-level field '$required'"
@@ -885,7 +898,7 @@ jobs:
                   sys.exit(f"package-metadata-{arch}.json: git_sha mismatch")
               if metadata.get("architecture") != arch:
                   sys.exit(f"package-metadata-{arch}.json: architecture mismatch")
-              for key in ("toolchain", "build_timestamp"):
+              for key in ("toolchain", "build_timestamp", "payload_gui_sha256"):
                   if not metadata.get(key):
                       sys.exit(f"package-metadata-{arch}.json: missing {key}")
               if metadata.get("winfsp", {}).get("sha256", "").lower() != winfsp_sha:
@@ -905,11 +918,17 @@ jobs:
                   sys.exit(f"package-metadata-{arch}.json: assets.portable_zip SHA-256 mismatch")
               with zipfile.ZipFile(portable) as archive:
                   payload = archive.read("xfswin.exe")
+                  gui_payload = archive.read("xfswin-gui.exe")
               payload_sha = hashlib.sha256(payload).hexdigest()
+              gui_payload_sha = hashlib.sha256(gui_payload).hexdigest()
               if metadata.get("payload_exe_sha256") != payload_sha:
                   sys.exit(f"package-metadata-{arch}.json: payload SHA-256 mismatch")
               if metadata.get("assets", {}).get("payload_exe", {}).get("sha256") != payload_sha:
                   sys.exit(f"package-metadata-{arch}.json: assets.payload_exe SHA-256 mismatch")
+              if metadata.get("payload_gui_sha256") != gui_payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: GUI payload SHA-256 mismatch")
+              if metadata.get("assets", {}).get("payload_gui", {}).get("sha256") != gui_payload_sha:
+                  sys.exit(f"package-metadata-{arch}.json: assets.payload_gui SHA-256 mismatch")
           print("package metadata matches the four public assets")
           PY
 
